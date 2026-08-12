@@ -19,7 +19,7 @@ rocksdb-ssd = ["dep:rocksdb"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 zstd = "0.13"
 rocksdb = { version = "0.22", default-features = false, optional = true }
 
