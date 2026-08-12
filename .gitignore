@@ -1,0 +1,13 @@
+target/
+ssd-*/
+*.sst
+LOG
+LOG.old.*
+LOCK
+IDENTITY
+CURRENT
+MANIFEST-*
+OPTIONS-*
+.DS_Store
+__pycache__/
+*.pyc

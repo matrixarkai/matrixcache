@@ -1,0 +1,43 @@
+[package]
+name = "matrixcache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Rust-native multi-tier cache library with in-memory, persistent-memory, and RocksDB-backed SSD tiers."
+repository = "https://github.com/bjmeetsfo/MatrixCache"
+homepage = "https://github.com/bjmeetsfo/MatrixCache"
+documentation = "https://docs.rs/matrixcache"
+readme = "README.md"
+keywords = ["cache", "multi-tier", "rocksdb", "ssd", "temporalstore"]
+categories = ["caching", "data-structures"]
+exclude = ["/.github"]
+
+[features]
+default = ["rocksdb-ssd"]
+rocksdb-ssd = ["dep:rocksdb"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+zstd = "0.13"
+rocksdb = { version = "0.22", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "=3.10.1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# `if x == 0 { 0 } else { total / x }` guards and explicit alias branches that fall
+# through to the same default are kept for readability; the checked-ops and
+# merged-branch rewrites clippy suggests do not improve clarity here.
+manual_checked_ops = "allow"
+if_same_then_else = "allow"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
