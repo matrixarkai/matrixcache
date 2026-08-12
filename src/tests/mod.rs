@@ -1,0 +1,9293 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cxx_rdma_response_hash_table_and_index_surface_round_trip() {
+        let mut response = RDMAResponse::New(32);
+        let first_allocation = response.allocation_addr();
+        assert_eq!(response.GetRespSize(), 32);
+        assert_eq!(response.allocation_count(), 1);
+        assert_eq!(response.allocation_bytes(), 32);
+        response.Fill(b"value");
+        assert_eq!(response.GetRespSize(), 5);
+        assert_eq!(response.GetResponse(), b"value");
+        assert_ne!(response.allocation_addr(), first_allocation);
+        assert_eq!(response.allocation_count(), 1);
+        assert_eq!(response.allocation_bytes(), 5);
+        response.Clear();
+        assert!(response.GetResponse().is_empty());
+        assert_eq!(response.GetRespSize(), usize::MAX);
+        assert_eq!(response.allocation_count(), 0);
+        response.Init(64);
+        assert_eq!(response.GetRespSize(), 64);
+        assert_eq!(response.allocation_count(), 1);
+        response.Fill(b"after-init");
+        assert_eq!(response.GetResponse(), b"after-init");
+
+        let key = "alpha".to_string();
+        let bucket_pos = 3;
+        let sig96 = Signature_96(&key, bucket_pos);
+        let sig128 = Signature_128(&key, bucket_pos);
+        assert_ne!(sig96, [0; 12]);
+        assert_ne!(sig128, [0; 16]);
+        assert_eq!(HashCode1B(&key), rdma_hash_code_1b(&key));
+        assert!(VerifyCRC(b"payload", DataCRC(b"payload")));
+        assert!(!VerifyCRC(b"payload2", DataCRC(b"payload")));
+        assert!(VerifyKey(b"key", b"key"));
+        assert!(IsEqual(b"same", b"same"));
+
+        let mut entry = RdmaIndexEntry::default();
+        entry.set_signature_96(sig96);
+        entry.SetDataLength(128);
+        entry.SetVersion();
+        entry.set_packed_addr(0x1234, RdmaStorageEngineType::PMEM, 128);
+        assert_eq!(entry.GetPtr(), 0x1234);
+        assert_eq!(entry.GetType(), RdmaStorageEngineType::PMEM.as_code());
+        assert_eq!(entry.GetOverflowFlag(), 0);
+        assert_eq!(entry.GetLength(), 128);
+        assert_eq!(entry.GetVersion(), 0);
+        assert_eq!(EntryCRC(&entry), entry.entry_crc());
+
+        let mut overflow = RdmaIndexEntry::default();
+        overflow.set_signature_128(sig128);
+        overflow.SetDataLength(i32::MAX);
+        overflow.SetVersion();
+        overflow.set_packed_addr(0x2222, RdmaStorageEngineType::SSD, RDMA_MAX_BLOCK_SIZE + 1);
+        assert_eq!(overflow.GetPtr(), 0x2222);
+        assert_eq!(overflow.GetType(), RdmaStorageEngineType::SSD.as_code());
+        assert_eq!(overflow.GetOverflowFlag(), 1);
+        assert_eq!(overflow.GetSignature128b(), sig128);
+
+        let mut table = RdmaHashTable::<String>::new(4);
+        assert_eq!(table.GetSize(), 4 * RDMA_BUCKET_SIZE);
+        assert_eq!(table.GetNumEntries(), 0);
+        assert!(table.AllBucketsUnlocked());
+
+        let put = table.Put(key.clone(), 0x1000, 11, RdmaStorageEngineType::DRAM);
+        assert_eq!(put.status, RDMA_OP_SUCCESS);
+        assert_eq!(put.old_addr, None);
+        assert_eq!(table.GetNumEntries(), 1);
+
+        let got = table.Get(&key);
+        assert_eq!(got.addr, Some(0x1000));
+        assert_eq!(got.len, 11 + RDMA_DATA_HEADER + RDMA_CRC_LEN);
+        assert_eq!(got.storage_type, RdmaStorageEngineType::DRAM);
+
+        let update = table.Put(key.clone(), 0x2000, 17, RdmaStorageEngineType::SSD);
+        assert_eq!(update.status, RDMA_OP_SUCCESS);
+        assert_eq!(update.old_addr, Some(0x1000));
+        assert_eq!(update.old_len, 11 + RDMA_DATA_HEADER + RDMA_CRC_LEN);
+        assert_eq!(update.old_type, RdmaStorageEngineType::DRAM);
+        assert_eq!(table.GetNumEntries(), 1);
+
+        let got = table.Get(&key);
+        assert_eq!(got.addr, Some(0x2000));
+        assert_eq!(got.storage_type, RdmaStorageEngineType::SSD);
+
+        let del = table.Del(&key);
+        assert_eq!(del.status, RDMA_OP_SUCCESS);
+        assert_eq!(del.addr, Some(0x2000));
+        assert_eq!(del.storage_type, RdmaStorageEngineType::SSD);
+        assert_eq!(table.GetNumEntries(), 0);
+        assert_eq!(table.Get(&key).storage_type, RdmaStorageEngineType::INVALID);
+        assert_eq!(table.Del(&key).status, RDMA_NOT_FOUND);
+        assert!(table.AllBucketsUnlocked());
+    }
+
+    #[test]
+    fn cxx_rdma_std_allocator_allocates_and_frees_virtual_regions() {
+        fn round_trip<A: RdmaCacheAllocatorApi>(allocator: &mut A) -> AllocatorPtr {
+            let addr = allocator.allocate(64).expect("allocator ptr");
+            allocator.free(addr, 64);
+            addr
+        }
+
+        let mut allocator = StdAllocator::new();
+        let addr = allocator.Allocate(128).expect("std allocator ptr");
+        assert!(addr > 0);
+        assert_eq!(allocator.outstanding_allocations(), 1);
+        assert_eq!(allocator.outstanding_bytes(), 128);
+        allocator.Free(addr, 128);
+        assert_eq!(allocator.outstanding_allocations(), 0);
+        allocator.Free(addr, 128);
+        assert_eq!(allocator.outstanding_allocations(), 0);
+
+        let first = round_trip(&mut allocator);
+        let second = round_trip(&mut allocator);
+        assert_ne!(first, second);
+        assert!(allocator.Allocate(0).is_none());
+    }
+
+    #[test]
+    fn cxx_rdma_dram_and_pmem_storage_engines_round_trip_blocks() {
+        let mut dram = RdmaStorageEngineDram::with_capacity(1024);
+        let key = 1_i32.to_le_bytes();
+        let value = 7_i32.to_le_bytes();
+        let addr = dram.Put(&key, &value).expect("dram block address");
+        let size = RDMA_DATA_HEADER + key.len() + value.len() + RDMA_CRC_LEN;
+
+        let mut response = RDMAResponse::new();
+        assert_eq!(dram.Get(&key, size, &mut response, addr), RDMA_OP_SUCCESS);
+        assert_eq!(response.GetResponse(), value);
+
+        response.Clear();
+        let missing_key = 2_i32.to_le_bytes();
+        assert_eq!(
+            dram.Get(&missing_key, size, &mut response, addr),
+            RDMA_NOT_FOUND
+        );
+        assert_eq!(response.GetResponse(), value);
+        response.Clear();
+
+        assert_eq!(
+            dram.Get(&key, std::mem::size_of::<i32>() * 2, &mut response, addr),
+            RDMA_CRC_MISMATCH
+        );
+        assert_eq!(dram.Get(&key, 0, &mut response, addr), RDMA_OP_SUCCESS);
+
+        let stats = dram.Stats();
+        assert_eq!(stats.0, 1024);
+        assert_eq!(stats.1, size);
+        assert_eq!(stats.2, 1);
+        assert_eq!(dram.Del(addr, size), RDMA_OP_SUCCESS);
+        assert_eq!(dram.Stats().1, 0);
+        assert_eq!(dram.Get(&key, size, &mut response, addr), RDMA_NOT_FOUND);
+
+        let mut tiny = RdmaStorageEngineDram::with_capacity(size - 1);
+        assert!(tiny.Put(&key, &value).is_none());
+
+        let mut pmem = RdmaStorageEnginePMem::with_capacity(1024);
+        let pmem_addr = pmem.Put(&key, &value).expect("pmem block address");
+        response.Clear();
+        assert_eq!(
+            pmem.Get(&key, size, &mut response, pmem_addr),
+            RDMA_OP_SUCCESS
+        );
+        assert_eq!(response.GetResponse(), value);
+        assert_eq!(pmem.Del(pmem_addr, size), RDMA_OP_SUCCESS);
+        assert_eq!(pmem.Stats().2, 0);
+    }
+
+    #[test]
+    fn cxx_rdma_cache_composes_index_storage_and_replacement_policy() {
+        let key = 1_i32.to_le_bytes();
+        let value_one = 1_i32.to_le_bytes();
+        let value_two = 2_i32.to_le_bytes();
+
+        let mut cache = RDMACache::new(1024, 1024, 1024, RdmaReplacementPolicyType::FIFO);
+        assert_eq!(cache.GetCapacity(RdmaStorageEngineType::DRAM), 1024);
+        assert_eq!(
+            cache.GetReplacementPolicyType(),
+            RdmaReplacementPolicyType::FIFO
+        );
+        cache.SetReplacementPolicy(RdmaReplacementPolicyType::LRU);
+        assert_eq!(
+            cache.GetReplacementPolicyType(),
+            RdmaReplacementPolicyType::LRU
+        );
+        assert_eq!(
+            RdmaReplacementPolicyType::LRU.as_replacement_policy_type(),
+            ReplacementPolicyType::kLRU
+        );
+
+        let mut response = RDMAResponse::new();
+        assert_eq!(cache.Insert(&key, &value_one), RDMA_OP_SUCCESS);
+        assert_eq!(cache.Lookup(&key, &mut response), RDMA_OP_SUCCESS);
+        assert_eq!(response.GetResponse(), value_one);
+        assert_eq!(cache.num_index_entries(), 1);
+        assert_eq!(
+            cache.storage_stats(RdmaStorageEngineType::DRAM).unwrap().2,
+            1
+        );
+
+        response.Clear();
+        assert_eq!(cache.Insert(&key, &value_two), RDMA_OP_SUCCESS);
+        assert_eq!(cache.Lookup(&key, &mut response), RDMA_OP_SUCCESS);
+        assert_eq!(response.GetResponse(), value_two);
+        assert_eq!(cache.num_index_entries(), 1);
+        assert_eq!(
+            cache.storage_stats(RdmaStorageEngineType::DRAM).unwrap().2,
+            1
+        );
+
+        assert_eq!(cache.Remove(&key), RDMA_OP_SUCCESS);
+        response.Clear();
+        assert_eq!(cache.Lookup(&key, &mut response), RDMA_NOT_FOUND);
+        assert_eq!(cache.Remove(&key), RDMA_NOT_FOUND);
+        assert_eq!(cache.num_index_entries(), 0);
+
+        let pmem_key = b"pmem-key";
+        assert_eq!(
+            cache.InsertToStorage(RdmaStorageEngineType::PMEM, pmem_key, b"pmem-value"),
+            RDMA_OP_SUCCESS
+        );
+        response.Clear();
+        assert_eq!(cache.Lookup(pmem_key, &mut response), RDMA_OP_SUCCESS);
+        assert_eq!(response.GetResponse(), b"pmem-value");
+
+        let ssd_key = b"ssd-key";
+        assert_eq!(
+            cache.InsertToStorage(RdmaStorageEngineType::SSD, ssd_key, b"ssd-value"),
+            RDMA_OP_SUCCESS
+        );
+        response.Clear();
+        assert_eq!(cache.Lookup(ssd_key, &mut response), RDMA_OP_SUCCESS);
+        assert_eq!(response.GetResponse(), b"ssd-value");
+
+        let mut dram_only = RDMACache::with_dram_capacity(8);
+        assert_eq!(dram_only.Insert(b"too-large", b"value"), RDMA_FAIL_ALLOC);
+        assert_eq!(
+            dram_only.InsertToStorage(RdmaStorageEngineType::PMEM, b"k", b"v"),
+            RDMA_FAIL_ALLOC
+        );
+        dram_only.InitStorageEngine(RdmaStorageEngineType::PMEM, 128);
+        assert_eq!(
+            dram_only.InsertToStorage(RdmaStorageEngineType::PMEM, b"k", b"v"),
+            RDMA_OP_SUCCESS
+        );
+    }
+
+    #[test]
+    fn lifecycle_capacity_and_size_match_unified_cache_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 32,
+                ssd_capacity_bytes: 128,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 32,
+                max_ssd_block_bytes: 128,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+
+        assert!(cache.is_started());
+        assert!(cache.stop_bool());
+        assert!(!cache.is_started());
+        assert!(cache.start_bool());
+        assert!(cache.is_started());
+        assert!(cache.stop());
+        assert!(!cache.is_started());
+        cache.start().unwrap();
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 16);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Pmem), 32);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 128);
+        assert_eq!(cache.capacity(), 128);
+
+        let hot = CacheKey::string(7, "hot");
+        cache.put(hot.clone(), b"12345678".to_vec()).unwrap();
+        assert!(cache.size_for_tier(CacheTier::Memory) > 0);
+        assert!(cache.size() >= cache.size_for_tier(CacheTier::Memory));
+
+        cache.set_capacity_for_tier(CacheTier::Memory, 4);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 4);
+        assert!(cache.size_for_tier(CacheTier::Memory) <= 4);
+        assert_eq!(
+            cache.get_with_tier(&hot).unwrap().unwrap().tier,
+            CacheReadTier::Ssd
+        );
+    }
+
+    #[test]
+    fn cxx_unified_size_is_placement_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 32,
+                pmem_capacity_bytes: 32,
+                ssd_capacity_bytes: 0,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 4,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: u32::MAX,
+                max_memory_block_bytes: 32,
+                max_pmem_block_bytes: 32,
+                max_ssd_block_bytes: 0,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions::default(),
+        );
+        let memory_key = CacheKey::string(7, "memory-size");
+        let pmem_key = CacheKey::string(7, "pmem-size");
+        cache
+            .TEST_Insert(CacheInstanceType::kDRAM, memory_key, b"abcd".to_vec(), 4)
+            .unwrap();
+        cache
+            .TEST_Insert(
+                CacheInstanceType::kPMEM,
+                pmem_key,
+                b"0123456789".to_vec(),
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 4);
+        assert_eq!(cache.size_for_tier(CacheTier::Pmem), 10);
+        assert_eq!(cache.Size(), 10);
+
+        cache.SetDataPlacementType(CacheDataPlacement::SideBySide);
+        assert_eq!(cache.Size(), 14);
+    }
+
+    #[test]
+    fn cxx_cache_api_aliases_match_insert_lookup_remove_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(32, dir.path());
+        let key = CacheKey::string(31, "cxx-api");
+
+        assert_eq!(cache.capacity(), cache.capacity_for_tier(CacheTier::Ssd));
+        assert_eq!(cache.size(), 0);
+        assert_eq!(cache.lookup(&key).unwrap(), None);
+
+        cache
+            .insert(key.clone(), b"value".to_vec(), b"value".len())
+            .unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"value".to_vec()));
+        assert!(cache.size() > 0);
+
+        let handle = cache.acquire(&key).unwrap().expect("handle");
+        assert_eq!(handle.as_slice(), b"value");
+        cache.release(handle);
+
+        cache.remove(&key).unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), None);
+
+        cache
+            .insert(key.clone(), b"value2".to_vec(), b"value2".len())
+            .unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"value2".to_vec()));
+        cache.remove_all().unwrap();
+        assert_eq!(cache.size(), 0);
+        assert_eq!(cache.lookup(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn multilayer_cache_batch_api_preserves_order_and_ssd_refill() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let keys = (0..5)
+            .map(|i| CacheKey::string(41, &format!("batch-key-{i}")))
+            .collect::<Vec<_>>();
+        let entries = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let value = format!("batch-value-{i}").into_bytes();
+                (key.clone(), value.clone(), value.len())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(cache.put_batch_sized(entries).unwrap(), keys.len());
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+
+        let values = cache.get_batch(&keys).unwrap();
+        assert_eq!(values.len(), keys.len());
+        for (i, value) in values.into_iter().enumerate() {
+            assert_eq!(value, Some(format!("batch-value-{i}").into_bytes()));
+        }
+        let stats = cache.stats();
+        assert!(stats.disk_hits >= keys.len() as u64);
+        assert!(stats.get_latency_samples >= keys.len() as u64);
+        assert!(stats.put_latency_samples >= keys.len() as u64);
+    }
+
+    #[test]
+    fn get_batch_coalesces_duplicate_ssd_reads_and_refills_once() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("batch-get-coalesces-ssd-duplicates"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let key = CacheKey::string(41, "batch-get-dup");
+        let value = b"batch-get-duplicate-value".to_vec();
+        cache.put(key.clone(), value.clone()).unwrap();
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+        cache.set_capacity_for_tier(CacheTier::Memory, 64);
+
+        let before = cache.stats();
+        assert_eq!(
+            cache
+                .get_batch(&[key.clone(), key.clone(), key.clone()])
+                .unwrap(),
+            vec![Some(value.clone()), Some(value.clone()), Some(value)]
+        );
+        let after = cache.stats();
+        assert_eq!(after.disk_hits.saturating_sub(before.disk_hits), 3);
+        assert_eq!(after.memory_fills.saturating_sub(before.memory_fills), 1);
+
+        assert_eq!(
+            cache.get(&key).unwrap(),
+            Some(b"batch-get-duplicate-value".to_vec())
+        );
+        assert!(cache.stats().memory_hits > after.memory_hits);
+    }
+
+    #[test]
+    fn storage_engine_rocksdb_batch_get_and_put_preserve_order() {
+        let path = unique_temp_path("rocksdb-batch-get-put");
+        let mut storage = StorageEngineRocksDB::new(path.to_string_lossy().to_string());
+        assert!(storage.start());
+        assert_eq!(
+            storage
+                .put_batch(vec![
+                    ("batch-a".to_string(), b"a".to_vec()),
+                    ("batch-b".to_string(), b"b".to_vec()),
+                    ("batch-b".to_string(), b"b-new".to_vec()),
+                    ("batch-c".to_string(), b"c".to_vec()),
+                ])
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            storage
+                .get_batch(&[
+                    "batch-b".to_string(),
+                    "missing".to_string(),
+                    "batch-a".to_string(),
+                    "batch-b".to_string(),
+                    "batch-c".to_string(),
+                ])
+                .unwrap(),
+            vec![
+                Some(b"b-new".to_vec()),
+                None,
+                Some(b"a".to_vec()),
+                Some(b"b-new".to_vec()),
+                Some(b"c".to_vec())
+            ]
+        );
+        assert!(storage.stop());
+
+        let mut recovered = StorageEngineRocksDB::new(path.to_string_lossy().to_string());
+        assert!(recovered.start());
+        assert_eq!(
+            recovered
+                .get_batch(&["batch-c".to_string(), "missing".to_string()])
+                .unwrap(),
+            vec![Some(b"c".to_vec()), None]
+        );
+        assert_eq!(
+            recovered.get_batch(&["batch-b".to_string()]).unwrap(),
+            vec![Some(b"b-new".to_vec())]
+        );
+        assert!(recovered.stop());
+    }
+
+    #[test]
+    fn storage_engine_multi_ssd_is_path_backed_and_recovers_by_device() {
+        let paths = [unique_temp_path("multi-ssd-device-a"),
+            unique_temp_path("multi-ssd-device-b")];
+        let path_strings = paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let mut storage = StorageEngineMultiSSD::new(path_strings.clone(), 4096);
+        assert!(storage.Start());
+        assert_eq!(storage.StorageCount(), 2);
+
+        let mut routed = Vec::new();
+        for index in 0..128 {
+            let key = format!("multi-ssd-key-{index}");
+            let Some(device) = storage.device_for_key(&key).map(str::to_string) else {
+                continue;
+            };
+            if !routed
+                .iter()
+                .any(|(_, existing): &(String, String)| existing == &device)
+            {
+                routed.push((key, device));
+            }
+            if routed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(routed.len(), 2);
+
+        for (key, device) in &routed {
+            assert!(path_strings.contains(device));
+            storage
+                .Put(key, format!("value-for-{key}").into_bytes())
+                .unwrap();
+        }
+        assert!(storage.Stop());
+
+        let mut recovered = StorageEngineMultiSSD::new(path_strings, 4096);
+        assert!(recovered.Start());
+        for (key, _) in &routed {
+            assert_eq!(
+                recovered.Get(key).unwrap().to_vec(),
+                format!("value-for-{key}").into_bytes()
+            );
+        }
+        assert!(recovered.Stop());
+    }
+
+    #[test]
+    fn multilayer_cache_uses_all_configured_ssd_paths_and_recovers() {
+        let paths = vec![
+            unique_temp_path("cache-multi-ssd-device-a"),
+            unique_temp_path("cache-multi-ssd-device-b"),
+        ];
+        let ssd_store_paths = paths
+            .iter()
+            .map(|path| path.join("rocksdb-cache-blocks"))
+            .collect::<Vec<_>>();
+        let routing_probe = StorageEngineMultiSSD::with_paths(ssd_store_paths.clone(), 16 * 1024);
+
+        let mut routed = Vec::new();
+        for index in 0..512 {
+            let key = CacheKey::page_with_slot(9, index, index * 64, 64, Some(index as u32 % 8));
+            let store_key = CacheManifestRecord::from_entry(&key, 0).encode_line();
+            let Some(device) = routing_probe.device_for_key(&store_key).map(str::to_string) else {
+                continue;
+            };
+            if !routed
+                .iter()
+                .any(|(_, existing): &(CacheKey, String)| existing == &device)
+            {
+                routed.push((key, device));
+            }
+            if routed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(routed.len(), 2);
+
+        let options = CacheOptions::new(0, 0, 16 * 1024)
+            .with_ssd_paths(paths.clone())
+            .with_ssd_instance_only(true);
+        let cache = MultiLayerCache::with_options(options.clone());
+        for (index, (key, _device)) in routed.iter().enumerate() {
+            cache
+                .put_sized(
+                    key.clone(),
+                    format!("cache-device-value-{index}").into_bytes(),
+                    64,
+                )
+                .unwrap();
+        }
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 2);
+        assert!(cache.stop());
+
+        struct Collector {
+            keys: Vec<String>,
+        }
+
+        impl RecoverDataCallback for Collector {
+            fn on_recover_data(&mut self, key: &str, _buffer: CacheBuffer) {
+                self.keys.push(key.to_string());
+            }
+        }
+
+        let mut storage_probe = StorageEngineMultiSSD::with_paths(ssd_store_paths, 16 * 1024);
+        assert!(storage_probe.Start());
+        let mut collector = Collector { keys: Vec::new() };
+        storage_probe.RecoverData(&mut collector).unwrap();
+        assert_eq!(collector.keys.len(), 2);
+        assert!(storage_probe.Stop());
+
+        let recovered = MultiLayerCache::with_options(options);
+        let report = recovered.recover_disk_index().unwrap();
+        assert_eq!(report.recovered_files, 2);
+        for (index, (key, _device)) in routed.iter().enumerate() {
+            let result = recovered.get_with_tier(key).unwrap().unwrap();
+            assert_eq!(result.tier, CacheReadTier::Ssd);
+            assert_eq!(
+                result.value,
+                format!("cache-device-value-{index}").into_bytes()
+            );
+        }
+        assert!(recovered.stop());
+    }
+
+    #[test]
+    fn storage_engine_rocksdb_batch_delete_is_persistent_and_idempotent() {
+        let path = unique_temp_path("rocksdb-batch-delete");
+        let mut storage = StorageEngineRocksDB::new(path.to_string_lossy().to_string());
+        assert!(storage.start());
+        assert_eq!(
+            storage
+                .put_batch(vec![
+                    ("delete-a".to_string(), b"a".to_vec()),
+                    ("delete-b".to_string(), b"b".to_vec()),
+                    ("delete-c".to_string(), b"c".to_vec()),
+                ])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            storage
+                .delete_batch(&[
+                    "delete-b".to_string(),
+                    "missing".to_string(),
+                    "delete-a".to_string(),
+                    "delete-a".to_string(),
+                ])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            storage
+                .get_batch(&[
+                    "delete-a".to_string(),
+                    "delete-b".to_string(),
+                    "delete-c".to_string(),
+                ])
+                .unwrap(),
+            vec![None, None, Some(b"c".to_vec())]
+        );
+        assert_eq!(
+            storage
+                .DeleteBatch(&["delete-a".to_string(), "delete-b".to_string()])
+                .unwrap(),
+            0
+        );
+        assert!(storage.stop());
+
+        let mut recovered = StorageEngineRocksDB::new(path.to_string_lossy().to_string());
+        assert!(recovered.start());
+        assert_eq!(
+            recovered
+                .get_batch(&[
+                    "delete-a".to_string(),
+                    "delete-b".to_string(),
+                    "delete-c".to_string(),
+                ])
+                .unwrap(),
+            vec![None, None, Some(b"c".to_vec())]
+        );
+        assert!(recovered.stop());
+    }
+    #[test]
+    fn multilayer_cache_batch_remove_clears_memory_and_ssd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let keys = (0..4)
+            .map(|i| CacheKey::string(51, &format!("remove-batch-{i}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cache
+                .put_batch(
+                    keys.iter()
+                        .enumerate()
+                        .map(|(i, key)| (key.clone(), format!("value-{i}").into_bytes()))
+                        .collect()
+                )
+                .unwrap(),
+            keys.len()
+        );
+        assert_eq!(cache.remove_batch(&keys).unwrap(), keys.len());
+        assert_eq!(
+            cache.get_batch(&keys).unwrap(),
+            vec![None, None, None, None]
+        );
+        assert_eq!(cache.stats().invalidations, keys.len() as u64);
+    }
+
+    #[test]
+    fn multilayer_cache_batch_remove_coalesces_duplicate_invalidations() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(64, 0, 4096));
+        let repeated = CacheKey::string(52, "remove-duplicate");
+        let other = CacheKey::string(52, "remove-other");
+        cache.put(repeated.clone(), b"first".to_vec()).unwrap();
+        cache.put(other.clone(), b"second".to_vec()).unwrap();
+
+        assert_eq!(
+            cache
+                .remove_batch(&[repeated.clone(), other.clone(), repeated.clone()])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            cache.get_batch(&[repeated, other]).unwrap(),
+            vec![None, None]
+        );
+        assert_eq!(cache.stats().invalidations, 2);
+    }
+
+    #[test]
+    fn cache_api_trait_exposes_batch_insert_and_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let api: &dyn CacheApi = &cache;
+        let first = CacheKey::string(42, "trait-batch-first");
+        let second = CacheKey::string(42, "trait-batch-second");
+
+        let inserted = api
+            .insert_batch_cache(vec![
+                (first.clone(), b"one".to_vec(), 3),
+                (second.clone(), b"two".to_vec(), 3),
+            ])
+            .unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            api.lookup_batch_cache(&[first.clone(), second.clone()])
+                .unwrap(),
+            vec![Some(b"one".to_vec()), Some(b"two".to_vec())]
+        );
+    }
+
+    #[test]
+    fn cxx_simple_lru_cache_wrapper_evicts_like_public_stub_cache() {
+        let cache = MatrixCacheBuilder::BuildSimpleLRUCache(12);
+        assert!(cache.Stop());
+        assert!(cache.Start());
+        assert_eq!(cache.Capacity(), 12);
+        let first = CacheKey::string(32, "first");
+        let second = CacheKey::string(32, "second");
+        let third = CacheKey::string(32, "third");
+        let default_key = CacheKey::string(32, "default-size");
+
+        cache.Insert(first.clone(), b"1111".to_vec(), 4).unwrap();
+        cache.Insert(second.clone(), b"2222".to_vec(), 4).unwrap();
+        cache
+            .InsertDefaultSize(default_key.clone(), b"d".to_vec())
+            .unwrap();
+        assert_eq!(cache.Lookup(&default_key).unwrap(), Some(b"d".to_vec()));
+        assert_eq!(cache.Lookup(&first).unwrap(), Some(b"1111".to_vec()));
+        cache.Insert(third.clone(), b"3333".to_vec(), 8).unwrap();
+
+        assert_eq!(cache.Lookup(&second).unwrap(), None);
+        assert_eq!(cache.Lookup(&first).unwrap(), Some(b"1111".to_vec()));
+        assert_eq!(cache.Lookup(&third).unwrap(), Some(b"3333".to_vec()));
+
+        cache.SetCapacity(8);
+        assert_eq!(cache.Capacity(), 8);
+        assert_eq!(cache.Lookup(&first).unwrap(), None);
+        assert_eq!(cache.Lookup(&third).unwrap(), Some(b"3333".to_vec()));
+
+        let cache_api: &dyn CacheApi = &cache;
+        let api_key = CacheKey::string(32, "api-simple");
+        assert!(cache_api.start_cache());
+        cache_api
+            .insert_cache(api_key.clone(), b"api".to_vec(), 3)
+            .unwrap();
+        assert_eq!(
+            cache_api.lookup_cache(&api_key).unwrap(),
+            Some(b"api".to_vec())
+        );
+        cache_api.remove_cache(&api_key).unwrap();
+        assert_eq!(cache_api.lookup_cache(&api_key).unwrap(), None);
+
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Size(), 0);
+    }
+
+    #[test]
+    fn cxx_zero_copy_simple_lru_cache_keeps_removed_pinned_value_readable() {
+        let cache = MatrixCacheBuilder::BuildZeroCopySimpleLRUCache(8);
+        let pinned_key = CacheKey::string(33, "pinned");
+        let cold_key = CacheKey::string(33, "cold");
+        let default_key = CacheKey::string(33, "default");
+        let default_pinned_key = CacheKey::string(33, "default-pinned");
+
+        let pinned = cache
+            .InsertPinned(pinned_key.clone(), b"pin".to_vec(), 3)
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(pinned.Value(), b"pin");
+        assert_eq!(cache.Lookup(&pinned_key).unwrap(), Some(b"pin".to_vec()));
+
+        cache
+            .InsertDefaultSize(default_key.clone(), b"d".to_vec())
+            .unwrap();
+        assert_eq!(cache.Lookup(&default_key).unwrap(), Some(b"d".to_vec()));
+        let default_pinned = cache
+            .InsertPinnedDefaultSize(default_pinned_key.clone(), b"p".to_vec())
+            .unwrap()
+            .expect("default pinned handle");
+        assert_eq!(default_pinned.Value(), b"p");
+        cache.Release(default_pinned);
+
+        cache.Remove(&pinned_key).unwrap();
+        assert_eq!(cache.Lookup(&pinned_key).unwrap(), None);
+        assert_eq!(pinned.Value(), b"pin");
+
+        cache
+            .Insert(cold_key.clone(), b"12345678".to_vec(), 8)
+            .unwrap();
+        assert_eq!(cache.Lookup(&cold_key).unwrap(), Some(b"12345678".to_vec()));
+
+        let cache_api: &dyn CacheApi = &cache;
+        let api_key = CacheKey::string(33, "api-zero-copy");
+        cache_api
+            .insert_cache(api_key.clone(), b"api".to_vec(), 3)
+            .unwrap();
+        assert_eq!(
+            cache_api.lookup_cache(&api_key).unwrap(),
+            Some(b"api".to_vec())
+        );
+
+        let zero_copy_api: &dyn ZeroCopyCacheApi = &cache;
+        let api_handle = zero_copy_api
+            .insert_pinned_cache(CacheKey::string(33, "api-pinned"), b"pin2".to_vec(), 4)
+            .unwrap()
+            .expect("zero-copy trait handle");
+        assert_eq!(api_handle.Value(), b"pin2");
+        let cloned = zero_copy_api
+            .acquire_cache(api_handle.Key())
+            .unwrap()
+            .expect("acquired through trait");
+        assert_eq!(cloned.Value(), b"pin2");
+        zero_copy_api.release_cache(cloned);
+        zero_copy_api.release_cache(api_handle);
+
+        cache.Release(pinned);
+    }
+
+    #[test]
+    fn cxx_string_cache_wrappers_match_tool_cache_interface() {
+        let simple = MatrixCacheBuilder::BuildConcurrentSimpleLRUCache(16);
+        assert!(simple.Stop());
+        assert!(simple.Start());
+        assert_eq!(simple.Capacity(), 16);
+        assert_eq!(simple.Lookup("alpha").unwrap(), None);
+
+        simple
+            .Insert("alpha", "one".to_string(), "one".len())
+            .unwrap();
+        assert_eq!(simple.Lookup("alpha").unwrap(), Some("one".to_string()));
+        assert!(simple.Size() > 0);
+
+        let string_api: &dyn StringCacheApi = &simple;
+        string_api
+            .insert_string("beta", "two".to_string(), "two".len())
+            .unwrap();
+        assert_eq!(
+            string_api.lookup_string("beta").unwrap(),
+            Some("two".to_string())
+        );
+        string_api.set_capacity_string(4);
+        assert_eq!(string_api.capacity_string(), 4);
+        string_api.remove_string("beta").unwrap();
+        assert_eq!(string_api.lookup_string("beta").unwrap(), None);
+
+        simple.Remove("alpha").unwrap();
+        assert_eq!(simple.Lookup("alpha").unwrap(), None);
+        simple.RemoveAll().unwrap();
+        assert_eq!(simple.Size(), 0);
+
+        let exact_cxx_name = ConcurrentSimpleLRUCache::new(32);
+        exact_cxx_name
+            .InsertDefaultSize("gamma", "three".to_string())
+            .unwrap();
+        assert_eq!(
+            exact_cxx_name.Lookup("gamma").unwrap(),
+            Some("three".to_string())
+        );
+
+        let string_api: &dyn StringCacheApi = &exact_cxx_name;
+        string_api
+            .insert_string_default_size("delta", "four".to_string())
+            .unwrap();
+        assert_eq!(
+            string_api.lookup_string("delta").unwrap(),
+            Some("four".to_string())
+        );
+    }
+
+    #[test]
+    fn cxx_memcached_wrapper_matches_tool_cache_surface_without_external_daemon() {
+        let cache = MatrixCacheBuilder::BuildMemcachedWrapper(8);
+        assert_eq!(cache.configured_capacity(), 8);
+        assert_eq!(cache.Capacity(), 8);
+        assert_eq!(cache.Size(), 0);
+        assert!(!cache.is_started());
+        assert!(matches!(
+            cache.Insert("before-start", "x".to_string(), 1),
+            Err(CacheError::Stopped)
+        ));
+
+        assert!(cache.Start());
+        assert!(cache.is_started());
+        let first_client = cache.get_client();
+        assert_ne!(first_client, 0);
+        cache.Insert("alpha", "one".to_string(), 3).unwrap();
+        assert_eq!(cache.Lookup("alpha").unwrap(), Some("one".to_string()));
+        assert_eq!(cache.Size(), 3);
+        assert!(matches!(
+            cache.Insert("big", "0123456789".to_string(), 10),
+            Err(CacheError::CapacityExceeded)
+        ));
+        cache.Insert("alpha", "12345678".to_string(), 8).unwrap();
+        assert_eq!(cache.Lookup("alpha").unwrap(), Some("12345678".to_string()));
+        assert_eq!(cache.Size(), 8);
+
+        cache.Remove("alpha").unwrap();
+        assert_eq!(cache.Lookup("alpha").unwrap(), None);
+        assert_eq!(cache.Size(), 0);
+        cache.Insert("beta", "two".to_string(), 3).unwrap();
+        assert_eq!(cache.Size(), 3);
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Lookup("beta").unwrap(), None);
+        assert_eq!(cache.Size(), 0);
+
+        assert_eq!(cache.reset_clients_count(), 0);
+        cache.ResetClients();
+        assert_eq!(cache.reset_clients_count(), 1);
+        cache.SetCapacity(4);
+        assert_eq!(cache.configured_capacity(), 4);
+        assert_eq!(cache.Capacity(), 4);
+        cache.Insert("gamma", "four".to_string(), 4).unwrap();
+        assert!(matches!(
+            cache.Insert("delta", "five".to_string(), 4),
+            Err(CacheError::CapacityExceeded)
+        ));
+        assert!(cache.Stop());
+        assert!(matches!(cache.Lookup("beta"), Err(CacheError::Stopped)));
+    }
+
+    #[test]
+    fn cxx_multi_tier_string_cache_wraps_zero_copy_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildMultiTierStringCache(CacheOptions {
+            dram_capacity: 8,
+            pmem_capacity: 0,
+            ssd_capacity: 128,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+
+        assert!(cache.Stop());
+        assert!(cache.Start());
+        assert_eq!(cache.Capacity(), 128);
+        cache.Insert("large", "0123456789".to_string(), 10).unwrap();
+        assert_eq!(
+            cache.Lookup("large").unwrap(),
+            Some("0123456789".to_string())
+        );
+        assert!(cache.inner().peek(&CacheKey::string(0, "large")));
+
+        cache.SetCapacity(64);
+        assert_eq!(cache.Capacity(), 64);
+        cache.Remove("large").unwrap();
+        assert_eq!(cache.Lookup("large").unwrap(), None);
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Size(), 0);
+    }
+
+    #[test]
+    fn cxx_pascal_case_cache_methods_match_matrixcache_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(34, "pascal-cache-methods");
+        let pinned_key = CacheKey::string(34, "pascal-pinned");
+
+        assert!(cache.Stop());
+        assert!(!cache.is_started());
+        assert!(cache.Start());
+        assert_eq!(cache.Capacity(), 64);
+        assert_eq!(cache.Size(), 0);
+        assert_eq!(cache.Lookup(&key).unwrap(), None);
+
+        cache
+            .Insert(key.clone(), b"value".to_vec(), b"value".len())
+            .unwrap();
+        assert_eq!(cache.Lookup(&key).unwrap(), Some(b"value".to_vec()));
+        assert!(cache.Size() > 0);
+
+        let default_key = CacheKey::string(34, "pascal-default-size");
+        cache
+            .InsertDefaultSize(default_key.clone(), b"default".to_vec())
+            .unwrap();
+        assert_eq!(
+            cache.Lookup(&default_key).unwrap(),
+            Some(b"default".to_vec())
+        );
+
+        let handle = cache.Acquire(&key).unwrap().expect("handle");
+        assert_eq!(handle.value(), b"value");
+        cache.Release(handle);
+
+        let pinned = cache
+            .InsertPinned(pinned_key.clone(), b"pinned".to_vec())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(pinned.key(), &pinned_key);
+        assert_eq!(pinned.value(), b"pinned");
+        cache.Release(pinned);
+
+        let default_pinned_key = CacheKey::string(34, "pascal-pinned-default-size");
+        let default_pinned = cache
+            .InsertPinnedDefaultSize(default_pinned_key.clone(), b"pin-default".to_vec())
+            .unwrap()
+            .expect("default pinned handle");
+        assert_eq!(default_pinned.key(), &default_pinned_key);
+        assert_eq!(default_pinned.value(), b"pin-default");
+        cache.Release(default_pinned);
+
+        let scoped = cache.scoped_lookup(&pinned_key).unwrap();
+        assert!(scoped.Found());
+        assert_eq!(scoped.Value(), Some(&b"pinned"[..]));
+        drop(scoped);
+
+        cache.SetCapacity(4);
+        assert_eq!(cache.Capacity(), 4);
+        assert!(cache.Size() <= 4);
+
+        cache.Remove(&key).unwrap();
+        assert_eq!(cache.Lookup(&key).unwrap(), None);
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Size(), 0);
+    }
+
+    #[test]
+    fn cxx_instance_controls_match_unified_cache_getters_and_setters() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 32,
+                ssd_capacity_bytes: 128,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 32,
+                max_ssd_block_bytes: 128,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kDRAM), 16);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kPMEM), 32);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 128);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kUnified), 128);
+
+        cache.SetCapacityForInstance(CacheInstanceType::kDRAM, 8);
+        cache.SetCapacityForInstance(CacheInstanceType::kPMEM, 24);
+        cache.SetCapacityForInstance(CacheInstanceType::kSSD, 96);
+        assert_eq!(cache.get_capacity(CacheInstanceType::kDRAM), 8);
+        assert_eq!(cache.get_capacity(CacheInstanceType::kPMEM), 24);
+        assert_eq!(cache.get_capacity(CacheInstanceType::kSSD), 96);
+
+        cache.SetReplacementPolicyType(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo);
+        cache.SetReplacementPolicyType(CacheInstanceType::kPMEM, CacheReplacementPolicy::Slru);
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kPMEM),
+            CacheReplacementPolicy::Slru
+        );
+
+        cache.SetDataPlacementType(CacheDataPlacement::SideBySide);
+        cache.SetDataPlacementThreshold(4);
+        assert_eq!(cache.GetDataPlacementType(), CacheDataPlacement::SideBySide);
+        assert_eq!(cache.GetDataPlacementThreshold(), 4);
+
+        let memory_key = CacheKey::string(43, "memory-used");
+        cache
+            .Insert(memory_key.clone(), b"abcd".to_vec(), b"abcd".len())
+            .unwrap();
+        assert!(cache.GetUsed(CacheInstanceType::kDRAM) > 0);
+        assert!(cache.Size() >= b"abcd".len());
+    }
+
+    #[test]
+    fn cxx_allocator_types_and_stats_match_cache_instance_storage_surface() {
+        assert_eq!(
+            AllocatorType::from_cxx_name("kLogBasedAllocator"),
+            AllocatorType::kLogBasedAllocator
+        );
+        assert_eq!(
+            AllocatorType::from_cxx_name("pool_based"),
+            AllocatorType::kPoolBasedAllocator
+        );
+        assert_eq!(AllocatorType::kJeAllocator.as_cxx_name(), "JeAllocator");
+
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        assert_eq!(
+            instance.GetAllocatorType(),
+            AllocatorType::kPoolBasedAllocator
+        );
+        assert_eq!(instance.GetAllocatorStats(), AllocatorStats::default());
+
+        instance.Put("alloc-a", b"abc".to_vec()).unwrap();
+        instance.Put("alloc-b", b"defgh".to_vec()).unwrap();
+        let stats = instance.GetAllocatorStats();
+        assert!(stats.NumOccupiedBytes() >= b"abcdefgh".len());
+        assert!(stats.NumAllocatedBytes() >= stats.NumOccupiedBytes());
+        assert_eq!(stats.NumFreedBytes(), stats.num_freed_bytes);
+
+        instance.Delete("alloc-a").unwrap();
+        let after_delete = instance.GetAllocatorStats();
+        assert!(after_delete.NumOccupiedBytes() < stats.NumOccupiedBytes());
+
+        instance.Reset().unwrap();
+        assert_eq!(instance.GetAllocatorStats(), AllocatorStats::default());
+    }
+
+    #[test]
+    fn cxx_cache_instance_latency_summary_uses_live_cache_metrics() {
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        instance.Put("latency-a", b"abc".to_vec()).unwrap();
+        instance.Put("latency-b", b"def".to_vec()).unwrap();
+        assert_eq!(
+            instance.Get("latency-a").unwrap().as_deref(),
+            Some(&b"abc"[..])
+        );
+
+        let summary = instance.latency_summary_line("unit-surface");
+        assert!(summary.contains("matrixcache_latency"));
+        assert!(summary.contains("comments=unit-surface"));
+        assert!(summary.contains("put_count=2"));
+        assert!(summary.contains("get_count=1"));
+        assert!(summary.contains("histogram_ready=true"));
+        instance.PrintLatency("unit-surface");
+    }
+
+    #[test]
+    fn cxx_allocator_metadata_structs_preserve_chunk_state() {
+        let stats = AllocatorStats::new(128, 32);
+        assert_eq!(stats.NumAllocatedBytes(), 128);
+        assert_eq!(stats.NumFreedBytes(), 32);
+        assert_eq!(stats.NumOccupiedBytes(), 96);
+
+        let chunk = ChunkMeta {
+            id: 7,
+            num_allocated_bytes: 64,
+            num_freed_bytes: 16,
+            ref_cnt: 3,
+        };
+        assert_eq!(chunk.id, 7);
+        assert_eq!(chunk.num_allocated_bytes - chunk.num_freed_bytes, 48);
+        assert_eq!(chunk.ref_cnt, 3);
+
+        let pool = PoolChunkMeta {
+            id: 8,
+            num_alloc_objects: 2,
+        };
+        assert_eq!(pool.id, 8);
+        assert_eq!(pool.num_alloc_objects, 2);
+    }
+
+    #[test]
+    fn cxx_allocator_recovery_surface_matches_pmem_and_pool_headers() {
+        assert_eq!(AllocatorType::kLogBasedAllocator as u8, 0);
+        assert_eq!(AllocatorType::kPoolBasedAllocator as u8, 1);
+        assert_eq!(AllocatorType::kJeAllocator as u8, 2);
+        assert_eq!(AllocatorType::kMaxCode as u8, 3);
+
+        assert_eq!(FlushPolicy::kNoFlush as u8, 0);
+        assert_eq!(FlushPolicy::kInstantFlush as u8, 1);
+        assert_eq!(FlushPolicy::kMiniBatchFlush as u8, 2);
+        assert_eq!(
+            FlushPolicy::from_cxx_name("kInstantFlush"),
+            FlushPolicy::kInstantFlush
+        );
+        assert_eq!(FlushPolicy::kMiniBatchFlush.as_cxx_name(), "MiniBatchFlush");
+
+        let mut recover = PmemRecoverStats::default();
+        recover.AddChunkStats(ChunkRecoverStats {
+            valid_bytes: 10,
+            freed_bytes: 2,
+            corrupted_bytes: 1,
+        });
+        recover.add_chunk_stats(ChunkRecoverStats {
+            valid_bytes: 3,
+            freed_bytes: 4,
+            corrupted_bytes: 0,
+        });
+        assert_eq!(recover.total_bytes, 20);
+        assert_eq!(recover.valid_bytes, 13);
+        assert_eq!(recover.freed_bytes, 6);
+        assert_eq!(recover.corrupted_bytes, 1);
+
+        assert_eq!(POOL_ALLOCATOR_HEADER_LEN, std::mem::size_of::<u32>());
+        assert_eq!(POOL_ALLOCATOR_TOMBSTONE_MASK, 1_u32 << 31);
+
+        #[derive(Default)]
+        struct Listener {
+            scanned: Vec<(AllocatorPtr, usize, u32)>,
+        }
+
+        impl PmemAllocatorRecoverListener for Listener {
+            fn on_scan_record(
+                &mut self,
+                ptr: AllocatorPtr,
+                len: usize,
+                crc32: u32,
+            ) -> Result<(), CacheError> {
+                self.scanned.push((ptr, len, crc32));
+                Ok(())
+            }
+        }
+
+        let mut listener = Listener::default();
+        listener.OnScanRecord(7, 32, 0xabcd).unwrap();
+        assert_eq!(listener.scanned, vec![(7, 32, 0xabcd)]);
+    }
+
+    #[test]
+    fn cxx_specialized_allocator_aliases_share_common_allocator_surface() {
+        let mut je = JeAllocator::with_capacity(32);
+        let ptr = je.Allocate(8).unwrap();
+        assert!(je.Contains(ptr));
+        je.SealWithCRC(ptr, 8, 0x1234).unwrap();
+        assert_eq!(je.crc32(ptr), Some(0x1234));
+        assert_eq!(je.TEST_GetAllocMetrics().unwrap().NumAllocatedBytes(), 8);
+        je.Free(ptr, 8).unwrap();
+        assert_eq!(je.TEST_GetGobalFreeListSize(), 1);
+
+        let mut dram = LogBasedMemoryAllocatorDram::with_capacity(16);
+        let ptr = dram.Allocate(4).unwrap();
+        dram.write(ptr, b"abcd").unwrap();
+        assert_eq!(dram.read(ptr).unwrap(), b"abcd");
+
+        let mut pmem = PoolBasedMemoryAllocatorPMem::with_capacity(16);
+        let ptr = pmem.Allocate(5).unwrap();
+        assert_eq!(pmem.Capacity().unwrap(), 16);
+        pmem.Free(ptr, 5).unwrap();
+    }
+
+    #[test]
+    fn cxx_je_allocator_enforces_capacity_and_tracks_stats() {
+        let mut allocator = JeAllocator::with_capacity(4 * 1024);
+        let ptr = allocator.Allocate(1024).unwrap();
+        assert!(allocator.Contains(ptr));
+        allocator.write(ptr, b"dram").unwrap();
+        assert_eq!(&allocator.read(ptr).unwrap()[..4], b"dram");
+
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(stats.NumAllocatedBytes(), 1024);
+        assert_eq!(stats.NumFreedBytes(), 0);
+        assert_eq!(stats.NumOccupiedBytes(), 1024);
+        assert!(allocator.Seal(ptr).is_ok());
+        assert!(allocator.Allocate(4096).is_err());
+
+        allocator.Free(ptr, 1024).unwrap();
+        let stats = allocator.TEST_GetAllocMetrics().unwrap();
+        assert_eq!(stats.NumAllocatedBytes(), 1024);
+        assert_eq!(stats.NumFreedBytes(), 1024);
+        assert_eq!(stats.NumOccupiedBytes(), 0);
+        assert!(!allocator.Contains(ptr));
+    }
+
+    #[test]
+    fn cxx_pool_allocator_reuses_fixed_objects_and_tracks_chunks() {
+        let mut allocator = PoolBasedMemoryAllocatorDram::new(
+            1 << 28,
+            PoolBasedMemoryAllocatorBase::DEFAULT_MAX_THREAD_NUM,
+            PoolBasedMemoryAllocatorBase::DEFAULT_OBJECT_LEN,
+        );
+        assert_eq!(allocator.Capacity().unwrap(), 1 << 28);
+        assert_eq!(allocator.obj_len(), 1 << 12);
+        assert!(allocator.Allocate(1 << 12).is_err());
+
+        let ptr_a = allocator.Allocate(1 << 10).unwrap();
+        allocator.Seal(ptr_a).unwrap();
+        allocator.Free(ptr_a, 0).unwrap();
+        let ptr_b = allocator.Allocate(2 << 10).unwrap();
+        assert_eq!(ptr_a, ptr_b);
+        allocator.write(ptr_b, b"pooled").unwrap();
+        assert_eq!(allocator.read(ptr_b).unwrap(), b"pooled");
+        allocator.SealWithCRC(ptr_b, 6, 0xfeed).unwrap();
+        assert_eq!(allocator.crc32(ptr_b), Some(0xfeed));
+
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(stats.NumOccupiedBytes(), 4 * (1 << 20));
+        assert_eq!(stats.NumAllocatedBytes(), 2 * (1 << 12));
+        assert_eq!(stats.NumFreedBytes(), 0);
+        assert_eq!(allocator.TEST_GetGobalFreeListSize(), 0);
+        assert_eq!(allocator.allocated_chunk_count(), 1);
+    }
+
+    #[test]
+    fn cxx_pool_allocator_rebalance_exposes_global_free_list_size() {
+        let mut allocator = PoolBasedMemoryAllocatorPMem::pmem(
+            "/tmp",
+            FlushPolicy::kNoFlush,
+            1 << 28,
+            PoolBasedMemoryAllocatorBase::DEFAULT_MAX_THREAD_NUM,
+            PoolBasedMemoryAllocatorBase::DEFAULT_OBJECT_LEN,
+        );
+        let mut allocated = Vec::new();
+        for _ in 0..1025 {
+            let ptr = allocator.Allocate(3 * (1 << 10)).unwrap();
+            allocator.Seal(ptr).unwrap();
+            allocated.push(ptr);
+        }
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(stats.NumOccupiedBytes(), 2 * 4 * (1 << 20));
+        assert_eq!(stats.NumFreedBytes(), 0);
+        assert_eq!(allocator.allocated_chunk_count(), 2);
+
+        for ptr in allocated {
+            allocator.Free(ptr, 0).unwrap();
+        }
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(stats.NumOccupiedBytes(), 2 * 4 * (1 << 20));
+        assert_eq!(stats.NumFreedBytes(), 1025 * (1 << 12));
+        assert_eq!(allocator.TEST_GetGobalFreeListSize(), 1025);
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_supports_insert_assign_find_and_erase() {
+        let map = ConcurrentHashMap::<String, i32>::new(2, 4);
+        assert!(map.Empty());
+        assert_eq!(map.Size(), 0);
+        assert_eq!(map.MaxSize(), 4);
+
+        assert!(map.Insert("a".to_string(), 1).unwrap());
+        assert!(!map.Insert("a".to_string(), 10).unwrap());
+        assert_eq!(map.Find(&"a".to_string()).unwrap().value, 1);
+        assert_eq!(map.Size(), 1);
+
+        assert!(!map.InsertOrAssign("a".to_string(), 2).unwrap());
+        assert_eq!(map.Find(&"a".to_string()).unwrap().value, 2);
+        assert!(map.InsertOrAssign("b".to_string(), 3).unwrap());
+
+        let assigned = map.Assign("a".to_string(), 4).unwrap();
+        assert_eq!(assigned.value, 4);
+        assert!(map.Assign("missing".to_string(), 9).is_none());
+
+        assert!(map.AssignIfEqual("a".to_string(), &3, 5).is_none());
+        assert_eq!(map.Find(&"a".to_string()).unwrap().value, 4);
+        assert_eq!(map.AssignIfEqual("a".to_string(), &4, 5).unwrap().value, 5);
+        assert_eq!(map.Find(&"a".to_string()).unwrap().value, 5);
+
+        assert_eq!(map.EraseIfEqual(&"a".to_string(), &4), 0);
+        assert_eq!(map.EraseIfEqual(&"a".to_string(), &5), 1);
+        assert!(map.Find(&"a".to_string()).is_none());
+        assert_eq!(map.Erase(&"b".to_string()), 1);
+        assert!(map.Empty());
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_honors_capacity_and_shared_clones() {
+        let map = ConcurrentHashMap::<u64, String>::new(1, 1);
+        assert!(map.Insert(7, "seven".to_string()).unwrap());
+        assert!(matches!(
+            map.Insert(8, "eight".to_string()),
+            Err(CacheError::CapacityExceeded)
+        ));
+
+        let cloned = map.clone();
+        assert_eq!(cloned.Find(&7).unwrap().value, "seven");
+        assert_eq!(cloned.Erase(&7), 1);
+        assert!(map.Empty());
+
+        assert!(map.map_trylock(&9));
+        map.map_lock(&9);
+        map.map_unlock(&9);
+        map.Reserve(16);
+        assert!(map.Insert(9, "nine".to_string()).unwrap());
+        map.Clear();
+        assert!(cloned.Empty());
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_exposes_at_iterate_and_emplace_surface() {
+        let map = ConcurrentHashMap::<u64, u64>::new(2, 16);
+        assert_eq!(map.At(&20), 0);
+        assert_eq!(map.GetOrDefault(&20), 0);
+        assert!(map.TryEmplace(1, 10).unwrap());
+        assert!(!map.TryEmplace(1, 11).unwrap());
+        assert_eq!(map.At(&1), 10);
+        assert!(map.Emplace(2, 20).unwrap());
+        assert!(!map.Emplace(2, 21).unwrap());
+        assert_eq!(map.At(&2), 20);
+
+        let mut entries = map.Entries();
+        entries.sort_by_key(|entry| entry.key);
+        assert_eq!(
+            entries,
+            vec![
+                ConcurrentHashMapEntry { key: 1, value: 10 },
+                ConcurrentHashMapEntry { key: 2, value: 20 },
+            ]
+        );
+        assert_eq!(map.CBegin().len(), 2);
+        assert!(map.CEnd().is_empty());
+        assert_eq!(map.Begin().len(), 2);
+        assert!(map.End().is_empty());
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_erases_by_entry_and_predicate() {
+        let map = ConcurrentHashMap::<String, u64>::new(3, 0);
+        assert!(map.Insert("live".to_string(), 10).unwrap());
+        assert!(map.Insert("stale".to_string(), 20).unwrap());
+        assert!(map.Insert("entry".to_string(), 30).unwrap());
+
+        assert_eq!(map.EraseKeyIf(&"live".to_string(), |value| *value == 11), 0);
+        assert_eq!(
+            map.EraseKeyIf(&"stale".to_string(), |value| *value == 20),
+            1
+        );
+        assert!(map.Find(&"stale".to_string()).is_none());
+
+        let entry = map.Find(&"entry".to_string()).unwrap();
+        assert_eq!(map.EraseEntry(&entry), 1);
+        assert!(map.Find(&"entry".to_string()).is_none());
+
+        assert!(map.MapTryLock(&"live".to_string()));
+        map.MapLock(&"live".to_string());
+        map.MapUnlock(&"live".to_string());
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_returns_iterator_style_insert_results() {
+        let map = ConcurrentHashMap::<u64, u64>::new(2, 4);
+        let first = map.InsertEntry(1, 10).unwrap();
+        assert!(first.second);
+        assert_eq!(first.first, ConcurrentHashMapEntry { key: 1, value: 10 });
+
+        let duplicate = map.InsertEntry(1, 99).unwrap();
+        assert!(!duplicate.second);
+        assert_eq!(
+            duplicate.first,
+            ConcurrentHashMapEntry { key: 1, value: 10 }
+        );
+        assert_eq!(map.Find(&1).unwrap().value, 10);
+
+        let inserted = map.InsertOrAssignEntry(2, 20).unwrap();
+        assert!(inserted.second);
+        assert_eq!(inserted.first, ConcurrentHashMapEntry { key: 2, value: 20 });
+
+        let assigned = map.InsertOrAssignEntry(2, 30).unwrap();
+        assert!(!assigned.second);
+        assert_eq!(assigned.first, ConcurrentHashMapEntry { key: 2, value: 20 });
+        assert_eq!(map.Find(&2).unwrap().value, 30);
+
+        assert!(map.Insert(3, 30).unwrap());
+        assert!(map.Insert(4, 40).unwrap());
+        assert!(matches!(
+            map.InsertEntry(5, 50),
+            Err(CacheError::CapacityExceeded)
+        ));
+    }
+
+    #[test]
+    fn cxx_concurrent_hash_map_erases_entries_by_snapshot_predicate() {
+        let map = ConcurrentHashMap::<u64, u64>::new(2, 0);
+        for key in 0..10 {
+            assert!(map.Insert(key, key).unwrap());
+        }
+        let removed = map.EraseEntriesIf(|entry| entry.value > 3);
+        assert_eq!(removed, 6);
+        assert_eq!(map.Size(), 4);
+        for entry in map.Entries() {
+            assert!(entry.value <= 3);
+        }
+    }
+
+    #[test]
+    fn cxx_hist_stats_reports_percentiles_average_max_and_reset() {
+        let mut stats = HistStats::with_bucket_size(8);
+        for value in [1, 2, 2, 4, 9] {
+            stats.Append(value);
+        }
+
+        assert_eq!(stats.Count(), 5);
+        let result = stats.GetResult(&[0.50, 0.90]);
+        assert_eq!(result, vec![2, 9, 3, 9]);
+        assert_eq!(
+            stats.ResultString("us"),
+            "P50:2us P90:9us P95:9us P99:9us P999:9us Avg:3us Max:9us"
+        );
+
+        stats.Reset();
+        assert_eq!(stats.Count(), 0);
+        assert_eq!(stats.GetResult(&[0.50]), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn cxx_hist_stats_merge_preserves_large_latency_tail() {
+        let mut left = HistStats::with_bucket_size(4);
+        let mut right = HistStats::with_bucket_size(4);
+        left.Append(1);
+        left.Append(8);
+        right.Append(2);
+        right.Append(16);
+
+        left.Merge(&right);
+        assert_eq!(left.Count(), 4);
+        assert_eq!(
+            left.GetResult(&[0.25, 0.50, 0.75, 1.0]),
+            vec![1, 2, 8, 16, 6, 16]
+        );
+    }
+
+    #[test]
+    fn cxx_test_instance_helpers_target_exact_cache_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 64,
+                ssd_capacity_bytes: 512,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 64,
+                max_ssd_block_bytes: 512,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let memory_key = CacheKey::string(44, "test-dram");
+        let pmem_key = CacheKey::string(44, "test-pmem");
+        let ssd_key = CacheKey::string(44, "test-ssd");
+
+        cache
+            .TEST_Insert(
+                CacheInstanceType::kDRAM,
+                memory_key.clone(),
+                b"dram".to_vec(),
+                b"dram".len(),
+            )
+            .unwrap();
+        cache
+            .TEST_Insert(
+                CacheInstanceType::kPMEM,
+                pmem_key.clone(),
+                b"pmem".to_vec(),
+                b"pmem".len(),
+            )
+            .unwrap();
+        cache
+            .TEST_Insert(
+                CacheInstanceType::kSSD,
+                ssd_key.clone(),
+                b"ssd".to_vec(),
+                b"ssd".len(),
+            )
+            .unwrap();
+
+        let memory_handle = cache
+            .TEST_Acquire(CacheInstanceType::kDRAM, &memory_key)
+            .unwrap()
+            .expect("memory handle");
+        assert_eq!(memory_handle.tier(), CacheReadTier::Memory);
+        assert_eq!(memory_handle.value(), b"dram");
+        cache.Release(memory_handle);
+
+        let pmem_handle = cache
+            .TEST_Acquire(CacheInstanceType::kPMEM, &pmem_key)
+            .unwrap()
+            .expect("pmem handle");
+        assert_eq!(pmem_handle.tier(), CacheReadTier::Pmem);
+        assert_eq!(pmem_handle.value(), b"pmem");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().pinned_bytes, b"pmem".len() as u64);
+        cache.Release(pmem_handle);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+
+        let ssd_handle = cache
+            .TEST_Acquire(CacheInstanceType::kSSD, &ssd_key)
+            .unwrap()
+            .expect("ssd handle");
+        assert_eq!(ssd_handle.tier(), CacheReadTier::Ssd);
+        assert_eq!(ssd_handle.value(), b"ssd");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().pinned_bytes, b"ssd".len() as u64);
+        cache.Release(ssd_handle);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+
+        assert!(cache
+            .TEST_Acquire(CacheInstanceType::kPMEM, &memory_key)
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .TEST_Acquire(CacheInstanceType::kDRAM, &pmem_key)
+            .unwrap()
+            .is_none());
+
+        cache
+            .TEST_Remove(CacheInstanceType::kPMEM, &pmem_key)
+            .unwrap();
+        assert!(cache
+            .TEST_Acquire(CacheInstanceType::kPMEM, &pmem_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.Lookup(&pmem_key).unwrap(), None);
+
+        cache
+            .TEST_Remove(CacheInstanceType::kSSD, &ssd_key)
+            .unwrap();
+        assert!(cache
+            .TEST_Acquire(CacheInstanceType::kSSD, &ssd_key)
+            .unwrap()
+            .is_none());
+
+        assert!(matches!(
+            cache.TEST_Insert(
+                CacheInstanceType::kUnified,
+                CacheKey::string(44, "bad"),
+                b"bad".to_vec(),
+                3,
+            ),
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+        ));
+    }
+
+    #[test]
+    fn cxx_test_counter_and_path_helpers_match_unified_cache_surface() {
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pmem_dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCache(
+            CacheOptions::new(64, 64, 128)
+                .with_pmem_paths([pmem_dir.path().to_path_buf()])
+                .with_ssd_paths([ssd_dir.path().to_path_buf()]),
+        );
+        let key = CacheKey::string(45, "counter-key");
+        let pinned_key = CacheKey::string(45, "counter-pinned");
+
+        assert_eq!(cache.TEST_GetUnifiedPutCount(), 0);
+        assert_eq!(cache.TEST_GetUnifiedAcquireCount(), 0);
+        assert_eq!(cache.TEST_GetUnifiedInsertPinnedCount(), 0);
+        assert_eq!(
+            cache.TEST_GetPmemPaths(),
+            vec![pmem_dir.path().to_string_lossy().into_owned()]
+        );
+
+        cache
+            .Insert(key.clone(), b"value".to_vec(), b"value".len())
+            .unwrap();
+        assert_eq!(cache.TEST_GetUnifiedPutCount(), 1);
+
+        let handle = cache.Acquire(&key).unwrap().expect("handle");
+        assert_eq!(handle.value(), b"value");
+        cache.Release(handle);
+        assert_eq!(cache.TEST_GetUnifiedAcquireCount(), 1);
+
+        let pinned = cache
+            .InsertPinnedSized(pinned_key.clone(), b"pinned".to_vec(), b"pinned".len())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(pinned.value(), b"pinned");
+        cache.Release(pinned);
+        assert_eq!(cache.TEST_GetUnifiedInsertPinnedCount(), 1);
+        assert!(cache.TEST_GetUnifiedPutCount() >= 2);
+
+        cache.TEST_JoinPmemWriteExecutor();
+    }
+
+    #[test]
+    fn cxx_style_cache_traits_support_abstract_interface_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(36, "trait-cache");
+        let cache_api: &dyn CacheApi = &cache;
+
+        assert!(cache_api.stop_cache());
+        assert!(cache_api.start_cache());
+        assert_eq!(cache_api.capacity_cache(), 64);
+        assert_eq!(
+            cache_api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            64
+        );
+        assert_eq!(cache_api.size_cache(), 0);
+        cache_api
+            .insert_cache(key.clone(), b"trait-value".to_vec(), b"trait-value".len())
+            .unwrap();
+        assert_eq!(
+            cache_api.lookup_cache(&key).unwrap(),
+            Some(b"trait-value".to_vec())
+        );
+        assert!(cache_api.size_cache() > 0);
+        assert!(cache_api.used_cache(CacheInstanceType::kDRAM) > 0);
+        cache_api.set_capacity_for_instance_cache(CacheInstanceType::kDRAM, 8);
+        assert_eq!(
+            cache_api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            8
+        );
+        cache_api.set_capacity_cache(4);
+        assert_eq!(cache_api.capacity_cache(), 4);
+        assert!(cache_api.size_cache() <= 4);
+        cache_api.remove_cache(&key).unwrap();
+        assert_eq!(cache_api.lookup_cache(&key).unwrap(), None);
+        cache_api
+            .insert_cache(key.clone(), b"rset".to_vec(), b"rset".len())
+            .unwrap();
+        assert!(cache_api.size_cache() > 0);
+        cache_api.reset_cache().unwrap();
+        assert_eq!(cache_api.lookup_cache(&key).unwrap(), None);
+        assert_eq!(cache_api.size_cache(), 0);
+        cache_api.remove_all_cache().unwrap();
+        assert_eq!(cache_api.size_cache(), 0);
+    }
+
+    #[test]
+    fn cxx_style_builder_can_return_boxed_cache_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildCacheApi(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(37, "boxed-cache-api");
+
+        assert_eq!(cache.capacity_cache(), 64);
+        assert_eq!(
+            cache.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            64
+        );
+        cache
+            .insert_cache(key.clone(), b"boxed".to_vec(), b"boxed".len())
+            .unwrap();
+        assert_eq!(cache.lookup_cache(&key).unwrap(), Some(b"boxed".to_vec()));
+        assert!(cache.used_cache(CacheInstanceType::kDRAM) > 0);
+        cache.reset_cache().unwrap();
+        assert_eq!(cache.lookup_cache(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn cxx_style_builder_can_return_boxed_zero_copy_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCacheApi(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(37, "boxed-zero-copy-api");
+
+        let handle = cache
+            .insert_pinned_cache(key.clone(), b"boxed-pinned".to_vec(), b"boxed-pinned".len())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(handle.key(), &key);
+        assert_eq!(handle.value(), b"boxed-pinned");
+        cache.release_cache(handle);
+        assert!(cache.acquire_cache(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn cxx_style_zero_copy_trait_preserves_pin_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(36, "trait-zero-copy");
+        let zero_copy: &dyn ZeroCopyCacheApi = &cache;
+
+        let handle = zero_copy
+            .insert_pinned_cache(key.clone(), b"pinned".to_vec(), b"pinned".len())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(handle.value(), b"pinned");
+        zero_copy.set_capacity_cache(1);
+        assert!(zero_copy.size_cache() > 1);
+        zero_copy.release_cache(handle);
+
+        zero_copy.set_capacity_cache(1);
+        assert!(zero_copy.size_cache() <= 1);
+        assert!(zero_copy.acquire_cache(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn cxx_pascal_case_handle_methods_clone_and_scoped_lookup_pin_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
+            dram_capacity: 32,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(35, "pascal-handle");
+
+        let handle = cache
+            .InsertPinned(key.clone(), b"handle-value".to_vec())
+            .unwrap()
+            .expect("insert pinned handle");
+        assert_eq!(handle.Key(), &key);
+        assert_eq!(handle.Value(), b"handle-value");
+        let handle_buffer = handle.Buffer();
+        assert_eq!(handle_buffer.Key(), "pascal-handle");
+        assert_eq!(handle_buffer.Value(), b"handle-value");
+        assert_eq!(handle_buffer.Size(), b"handle-value".len());
+        assert_eq!(handle_buffer.tier(), Some(CacheReadTier::Memory));
+
+        let detached = handle.Clone();
+        assert_eq!(detached.Key(), &key);
+        assert_eq!(detached.Value(), b"handle-value");
+        let detached_buffer = detached.Buffer();
+        assert_eq!(detached_buffer.Key(), "pascal-handle");
+        assert_eq!(detached_buffer.Value(), b"handle-value");
+
+        let cloned = handle.CloneWithCache(&cache);
+        assert_eq!(cloned.Key(), &key);
+        assert_eq!(cloned.Value(), b"handle-value");
+
+        cache.SetCapacity(1);
+        assert!(cache.Size() > 1);
+        cache.Release(handle);
+        assert!(cache.Size() > 1);
+        cache.Release(cloned);
+
+        cache.SetCapacity(1);
+        assert!(cache.Size() <= 1);
+        assert_eq!(cache.Lookup(&key).unwrap(), None);
+
+        cache.SetCapacity(32);
+        cache
+            .Insert(key.clone(), b"scoped".to_vec(), b"scoped".len())
+            .unwrap();
+        let scoped = cache.scoped_lookup(&key).unwrap();
+        assert!(scoped.Found());
+        assert_eq!(scoped.Key(), Some(&key));
+        assert_eq!(scoped.KeyRef(), &key);
+        assert_eq!(scoped.Value(), Some(&b"scoped"[..]));
+        assert_eq!(scoped.ValueRef(), b"scoped");
+        assert_eq!(scoped.tier(), Some(CacheReadTier::Memory));
+        let scoped_buffer = scoped.Buffer().expect("scoped buffer");
+        assert_eq!(scoped_buffer.Key(), "pascal-handle");
+        assert_eq!(scoped_buffer.Value(), b"scoped");
+        assert_eq!(scoped_buffer.Size(), b"scoped".len());
+        assert_eq!(scoped_buffer.tier(), Some(CacheReadTier::Memory));
+
+        cache.SetCapacity(1);
+        assert!(cache.Size() > 1);
+        drop(scoped);
+        assert!(cache.Size() > 1);
+        drop(scoped_buffer);
+        cache.SetCapacity(1);
+        assert!(cache.Size() <= 1);
+    }
+
+    #[test]
+    fn cxx_tiered_insert_uses_value_size_for_dram_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 256,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 99,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 256,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let key = CacheKey::string(31, "logical-large");
+
+        cache.insert(key.clone(), b"tiny".to_vec(), 64).unwrap();
+
+        assert_eq!(cache.get_memory(&key), Some(b"tiny".to_vec()));
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"tiny".to_vec()));
+    }
+
+    #[test]
+    fn cxx_tiered_insert_pinned_uses_value_size_for_dram_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 256,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 99,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 256,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let key = CacheKey::string(31, "logical-large-pinned");
+
+        let handle = cache
+            .insert_pinned_sized(key.clone(), b"tiny".to_vec(), 64)
+            .unwrap()
+            .expect("pinned handle");
+
+        assert_eq!(handle.key(), &key);
+        assert_eq!(handle.value(), b"tiny");
+        assert_eq!(handle.tier(), CacheReadTier::Memory);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.get_memory(&key), Some(b"tiny".to_vec()));
+        assert_eq!(cache.stats().zero_copy_handle_hits, 0);
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn cxx_cache_options_builder_constructs_equivalent_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::build_zero_copy_cache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 128,
+            ssd_capacity: 512,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            cache_dram_replacement_policy: "FIFO".to_string(),
+            cache_pmem_replacement_policy: "SLRU".to_string(),
+            cache_ssd_replacement_policy: "FIFO".to_string(),
+            cache_dram_pmem_data_placement_type: "SideBySide".to_string(),
+            cache_dram_pmem_data_placement_threshold: 32,
+            cache_ssd_instance_only: true,
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(32, "builder");
+
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 64);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Pmem), 128);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 512);
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Memory),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Pmem),
+            CacheReplacementPolicy::Slru
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Ssd),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(cache.data_placement(), CacheDataPlacement::SideBySide);
+        assert_eq!(cache.data_placement_threshold_bytes(), 32);
+        assert!(cache.ssd_instance_only());
+
+        cache
+            .insert(
+                key.clone(),
+                b"builder-value".to_vec(),
+                b"builder-value".len(),
+            )
+            .unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"builder-value".to_vec()));
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 1);
+    }
+
+    #[test]
+    fn cxx_cache_options_helpers_preserve_documented_policy_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(32, 96, 256)
+            .with_ssd_paths(vec![dir.path().to_path_buf()])
+            .with_pmem_paths(vec![PathBuf::from("/mnt/pmem0")])
+            .with_replacement_policy(CacheReplacementPolicy::Fifo)
+            .with_tier_replacement_policy(CacheTier::Pmem, CacheReplacementPolicy::Slru)
+            .with_dram_pmem_data_placement(CacheDataPlacement::SideBySide, 8)
+            .with_metric_id_prefix("matrixcache-test")
+            .with_metric_registry_tags(vec![("tenant".to_string(), "alpha".to_string())])
+            .with_ssd_instance_only(false);
+
+        assert_eq!(
+            CacheReplacementPolicy::from_cxx_name("FIFO"),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            CacheReplacementPolicy::from_cxx_name("SLRU"),
+            CacheReplacementPolicy::Slru
+        );
+        assert_eq!(
+            CacheDataPlacement::from_cxx_name("SideBySide"),
+            CacheDataPlacement::SideBySide
+        );
+        assert_eq!(
+            CacheDataPlacement::try_from_cxx_name("kSideBySide").unwrap(),
+            CacheDataPlacement::SideBySide
+        );
+        assert_eq!(
+            CacheDataPlacement::try_from_cxx_name("Tiered").unwrap(),
+            CacheDataPlacement::Tiered
+        );
+        assert_eq!(
+            DRAMPMEMDataPlacementType::try_from_cxx_name("kTiered").unwrap(),
+            DRAMPMEMDataPlacementType::kTiered
+        );
+        assert!(matches!(
+            CacheDataPlacement::try_from_cxx_name("bad-placement"),
+            Err(CacheError::InvalidConfig(_))
+        ));
+        assert_eq!(options.cache_dram_replacement_policy, "FIFO");
+        assert_eq!(options.cache_pmem_replacement_policy, "SLRU");
+        assert_eq!(options.cache_ssd_replacement_policy, "FIFO");
+        assert_eq!(options.cache_dram_pmem_data_placement_type, "SideBySide");
+        assert_eq!(options.cache_dram_pmem_data_placement_threshold, 8);
+        assert_eq!(
+            options.metric_registry_tags.get("tenant"),
+            Some(&"alpha".to_string())
+        );
+
+        let cache = MultiLayerCache::with_options(options);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 32);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Pmem), 96);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 256);
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Memory),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Pmem),
+            CacheReplacementPolicy::Slru
+        );
+        assert_eq!(cache.data_placement(), CacheDataPlacement::SideBySide);
+        assert_eq!(cache.data_placement_threshold_bytes(), 8);
+    }
+
+    #[test]
+    fn cxx_multi_tier_cache_rejects_invalid_placement_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiTierCache::try_new(
+            32,
+            64,
+            128,
+            "FIFO",
+            Vec::<PathBuf>::new(),
+            vec![dir.path().to_path_buf()],
+            "SideBySide",
+            false,
+            16,
+            "kSSD",
+        )
+        .unwrap();
+        assert_eq!(
+            cache.options().cache_dram_pmem_data_placement_type,
+            "SideBySide"
+        );
+        assert!(matches!(
+            MultiTierCache::try_new(
+                32,
+                64,
+                128,
+                "FIFO",
+                Vec::<PathBuf>::new(),
+                vec![dir.path().to_path_buf()],
+                "NotAPlacement",
+                false,
+                16,
+                "kSSD",
+            ),
+            Err(CacheError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            MultiTierCache::try_from_path_strings(
+                32,
+                64,
+                128,
+                "FIFO",
+                Vec::<String>::new(),
+                vec![dir.path().to_string_lossy().to_string()],
+                "NotAPlacement",
+                false,
+                16,
+                "kSSD",
+            ),
+            Err(CacheError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn cxx_pascal_case_builder_factories_match_matrixcache_builder_names() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let zero_copy_dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildCache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![cache_dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let zero_copy = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![zero_copy_dir.path().to_path_buf()],
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let cache_key = CacheKey::string(32, "pascal-cache");
+        let zero_copy_key = CacheKey::string(32, "pascal-zero-copy");
+
+        cache
+            .insert(cache_key.clone(), b"value".to_vec(), b"value".len())
+            .unwrap();
+        assert_eq!(cache.lookup(&cache_key).unwrap(), Some(b"value".to_vec()));
+
+        let handle = zero_copy
+            .insert_pinned(zero_copy_key.clone(), b"pinned".to_vec())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(handle.key(), &zero_copy_key);
+        assert_eq!(handle.value(), b"pinned");
+        zero_copy.release(handle);
+    }
+
+    #[test]
+    fn cxx_cache_options_zero_ssd_capacity_disables_ssd_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::build_zero_copy_cache(CacheOptions {
+            dram_capacity: 64,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            cache_dram_pmem_data_placement_type: "Tiered".to_string(),
+            cache_dram_pmem_data_placement_threshold: 32,
+            block_options: CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+            ..CacheOptions::default()
+        });
+        let key = CacheKey::string(32, "ssd-disabled");
+
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 0);
+        cache
+            .insert(key.clone(), b"memory-value".to_vec(), b"memory-value".len())
+            .unwrap();
+
+        assert_eq!(cache.get_memory(&key), Some(b"memory-value".to_vec()));
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"memory-value".to_vec()));
+    }
+
+    #[test]
+    fn used_space_and_item_count_match_cache_instance_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 128,
+                ssd_capacity_bytes: 256,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 128,
+                max_ssd_block_bytes: 256,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+
+        let memory_key = CacheKey::string(7, "memory-used");
+        let pmem_key = CacheKey::page(7, 100, 0, 96);
+        let ssd_key = CacheKey::page(7, 101, 0, 96);
+
+        cache.put_memory_only(memory_key.clone(), b"memory".to_vec());
+        cache
+            .put_with_admission(
+                pmem_key.clone(),
+                b"pmem-value".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 7,
+                    routing_slot: None,
+                    block_bytes: 96,
+                    hotness: 1,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        cache
+            .put_with_admission(
+                ssd_key.clone(),
+                b"ssd-value".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 7,
+                    routing_slot: None,
+                    block_bytes: 96,
+                    hotness: 0,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 1);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 1);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 2);
+        assert_eq!(
+            cache.used_space_for_tier(CacheTier::Memory),
+            memory_key.logical_size() + b"memory".len()
+        );
+        assert_eq!(
+            cache.used_space_for_tier(CacheTier::Pmem),
+            pmem_key.logical_size() + b"pmem-value".len()
+        );
+        assert!(
+            cache.used_space_for_tier(CacheTier::Ssd)
+                > pmem_key
+                    .logical_size()
+                    .saturating_add(ssd_key.logical_size())
+                    .saturating_add(b"pmem-value".len())
+                    .saturating_add(b"ssd-value".len())
+        );
+
+        cache.remove_all().unwrap();
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.used_space_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.used_space_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.used_space_for_tier(CacheTier::Ssd), 0);
+    }
+
+    #[test]
+    fn remove_all_clears_all_tiers_pins_metadata_and_disk_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let key = CacheKey::string(3, "wipe-me");
+        cache
+            .put(key.clone(), b"persistent-value".to_vec())
+            .unwrap();
+        cache.pin(key.clone());
+        cache
+            .enqueue_async_writeback(CacheKey::string(3, "queued"), b"queued".to_vec())
+            .unwrap();
+        assert!(cache.size() > 0);
+        assert!(dir_size(dir.path()).unwrap() > 0);
+        assert!(cache.stats().pinned_entries > 0);
+        assert!(cache.stats().async_writeback_queue_depth > 0);
+
+        cache.remove_all().unwrap();
+
+        assert_eq!(cache.size(), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.get(&key).unwrap(), None);
+        assert_eq!(dir_size(dir.path()).unwrap(), 0);
+        let stats = cache.stats();
+        assert_eq!(stats.pinned_entries, 0);
+        assert_eq!(stats.pinned_bytes, 0);
+        assert_eq!(stats.async_writeback_queue_depth, 0);
+        assert_eq!(stats.async_writeback_queue_bytes, 0);
+        assert_eq!(stats.puts, 0);
+        assert_eq!(stats.pin_operations, 0);
+    }
+
+    #[test]
+    fn reset_clears_entries_policy_state_and_stats_like_cache_instance_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+
+        cache.put(first.clone(), b"1111".to_vec()).unwrap();
+        cache.put(second.clone(), b"2222".to_vec()).unwrap();
+        assert_eq!(cache.get(&first).unwrap(), Some(b"1111".to_vec()));
+        cache.pin(first.clone());
+        assert!(cache.stats().puts > 0);
+        assert!(cache.stats().memory_hits > 0);
+        assert!(cache.stats().pin_operations > 0);
+
+        cache.reset().unwrap();
+
+        assert_eq!(cache.size(), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(dir_size(dir.path()).unwrap(), 0);
+        assert!(!cache.peek(&first));
+        assert!(!cache.peek(&second));
+        assert_eq!(cache.stats(), CacheStats::default());
+
+        cache.put(first.clone(), b"3333".to_vec()).unwrap();
+        cache.put(second.clone(), b"4444".to_vec()).unwrap();
+        assert_eq!(cache.get_memory(&first), Some(b"3333".to_vec()));
+        assert_eq!(cache.get_memory(&second), Some(b"4444".to_vec()));
+    }
+
+    #[test]
+    fn sharded_reset_clears_all_shards_and_keeps_cache_reusable() {
+        let base = unique_temp_path("sharded-reset");
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(32, 0, 1024).with_ssd_paths(vec![base]),
+            4,
+        );
+        let keys = (0..12)
+            .map(|i| CacheKey::string((i % 3) as ShardId, &format!("reset-key-{i}")))
+            .collect::<Vec<_>>();
+        cache
+            .put_batch(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, key)| (key.clone(), vec![i as u8; 16]))
+                    .collect(),
+            )
+            .unwrap();
+        cache.pin_batch(keys.iter().take(3).cloned().collect());
+        cache
+            .enqueue_async_writeback_batch(
+                keys.iter()
+                    .take(4)
+                    .map(|key| (key.clone(), b"queued".to_vec()))
+                    .collect(),
+            )
+            .unwrap();
+        assert!(cache.size() > 0);
+        assert!(cache.stats().puts >= keys.len() as u64);
+        assert!(cache.stats().pinned_entries > 0);
+        assert!(cache.stats().async_writeback_queue_depth > 0);
+
+        cache.Reset().unwrap();
+
+        assert_eq!(cache.size(), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.size_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.stats(), CacheStats::default());
+        for key in &keys {
+            assert_eq!(cache.lookup(key).unwrap(), None);
+        }
+
+        let reusable_key = CacheKey::string(99, "after-reset");
+        cache
+            .insert(reusable_key.clone(), b"reusable".to_vec(), 8)
+            .unwrap();
+        assert_eq!(
+            cache.lookup(&reusable_key).unwrap(),
+            Some(b"reusable".to_vec())
+        );
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.lookup(&reusable_key).unwrap(), None);
+    }
+
+    #[test]
+    fn peek_reports_tier_without_refilling_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "peek");
+
+        assert!(!cache.peek(&key));
+        assert_eq!(cache.peek_tier(&key), None);
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert!(cache.peek(&key));
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+
+        cache.clear_memory_for_test();
+        assert_eq!(cache.get_memory(&key), None);
+        assert!(cache.peek(&key));
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+        assert_eq!(cache.get_memory(&key), None);
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+    }
+
+    #[test]
+    fn recover_disk_index_rebuilds_ssd_enumeration_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = CacheKey::string(11, "recover-me");
+        let cache = MultiLayerCache::new(8, dir.path());
+        cache
+            .put(key.clone(), b"persistent-value".to_vec())
+            .unwrap();
+        cache.clear_memory_for_test();
+        assert!(cache.size_for_tier(CacheTier::Ssd) > 0);
+        assert_eq!(cache.entries_for_shard(11).len(), 1);
+
+        let restarted = MultiLayerCache::new(8, dir.path());
+        assert_eq!(restarted.size_for_tier(CacheTier::Ssd), 0);
+        assert!(restarted.entries_for_shard(11).is_empty());
+
+        let report = restarted.recover_disk_index().unwrap();
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.recovered_files, 1);
+        assert_eq!(report.skipped_files, 0);
+        assert!(report.recovered_bytes > 0);
+        assert_eq!(restarted.entries_for_shard(11).len(), 1);
+        assert_eq!(restarted.peek_tier(&key), Some(CacheReadTier::Ssd));
+        assert_eq!(
+            restarted.get_with_tier(&key).unwrap().unwrap().tier,
+            CacheReadTier::Ssd
+        );
+    }
+
+    #[test]
+    fn auto_recover_on_start_restores_ssd_index_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = CacheKey::string(41, "auto-recover-ssd");
+        let options = CacheOptions::new(64, 0, 4096)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_auto_recover_on_start(true);
+        let cache = MultiLayerCache::try_with_options(options.clone()).unwrap();
+        cache.put(key.clone(), b"ssd-value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+        let restarted = MultiLayerCache::try_with_options(options).unwrap();
+        assert!(restarted.auto_recover_on_start());
+        assert_eq!(restarted.peek_tier(&key), Some(CacheReadTier::Ssd));
+        let read = restarted.get_with_tier(&key).unwrap().unwrap();
+        assert_eq!(read.tier, CacheReadTier::Ssd);
+        assert_eq!(read.value, b"ssd-value".to_vec());
+        assert_eq!(restarted.peek_tier(&key), Some(CacheReadTier::Memory));
+    }
+
+    #[test]
+    fn recover_persistent_tiers_combines_pmem_and_ssd_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_path = dir.path().join("pmem");
+        let ssd_path = dir.path().join("ssd");
+        let pmem_key = CacheKey::string(42, "auto-recover-pmem");
+        let ssd_key = CacheKey::string(42, "auto-recover-ssd");
+        let options = CacheOptions::new(8, 128, 4096)
+            .with_pmem_paths([pmem_path.clone()])
+            .with_ssd_paths([ssd_path.clone()]);
+        let cache = MultiLayerCache::with_options(options.clone());
+        cache
+            .test_insert(
+                CacheInstanceType::kPMEM,
+                pmem_key.clone(),
+                b"pmem-value".to_vec(),
+                10,
+            )
+            .unwrap();
+        cache
+            .test_insert(
+                CacheInstanceType::kSSD,
+                ssd_key.clone(),
+                b"ssd-value".to_vec(),
+                9,
+            )
+            .unwrap();
+
+        let restarted = MultiLayerCache::with_options(options);
+        assert!(restarted.peek_tier(&pmem_key).is_none());
+        assert_eq!(restarted.size_for_tier(CacheTier::Ssd), 0);
+        assert!(restarted.entries_for_shard(42).is_empty());
+        let report = restarted.recover_persistent_tiers().unwrap();
+        assert_eq!(report.recovered_files, 2);
+        assert!(report.recovered_bytes >= 19);
+        assert_eq!(restarted.peek_tier(&pmem_key), Some(CacheReadTier::Pmem));
+        assert_eq!(restarted.peek_tier(&ssd_key), Some(CacheReadTier::Ssd));
+    }
+
+    #[test]
+    fn recover_disk_index_skips_stale_manifest_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = CacheKey::string(12, "stale");
+        let cache = MultiLayerCache::new(8, dir.path());
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        let block_path = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner.disk_path(&key)
+        };
+        let removed_shadow_block = fs::remove_file(&block_path);
+        if cfg!(feature = "rocksdb-ssd") {
+            if let Err(err) = removed_shadow_block {
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            }
+        } else {
+            removed_shadow_block.unwrap();
+        }
+
+        let restarted = MultiLayerCache::new(8, dir.path());
+        let report = restarted.recover_disk_index().unwrap();
+        if cfg!(feature = "rocksdb-ssd") {
+            assert!(report.scanned_files >= 1);
+            assert!(report.recovered_files >= 1);
+            assert!(report.skipped_files <= report.scanned_files);
+            assert!(restarted.size_for_tier(CacheTier::Ssd) >= 1);
+            assert_eq!(restarted.get(&key).unwrap(), Some(b"value".to_vec()));
+        } else {
+            assert_eq!(report.scanned_files, 1);
+            assert_eq!(report.recovered_files, 0);
+            assert_eq!(report.skipped_files, 1);
+            assert_eq!(restarted.size_for_tier(CacheTier::Ssd), 0);
+            assert!(restarted.entries_for_shard(12).is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_read_result_reports_serving_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 8,
+                pmem_capacity_bytes: 32,
+                ssd_capacity_bytes: 128,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 9,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 1,
+                max_memory_block_bytes: 8,
+                max_pmem_block_bytes: 32,
+                max_ssd_block_bytes: 128,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let pmem_key = CacheKey::page(1, 91, 0, 16);
+        let ssd_key = CacheKey::page(1, 92, 0, 48);
+
+        cache
+            .put_with_admission(
+                pmem_key.clone(),
+                b"pmem-block".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: None,
+                    block_bytes: 10,
+                    hotness: 3,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        cache
+            .put_with_admission(
+                ssd_key.clone(),
+                b"ssd-only-block".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: None,
+                    block_bytes: 48,
+                    hotness: 0,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        let pmem_read = cache.get_with_tier(&pmem_key).unwrap().unwrap();
+        assert_eq!(pmem_read.tier, CacheReadTier::Pmem);
+        assert_eq!(pmem_read.value, b"pmem-block".to_vec());
+        cache.clear_memory_for_test();
+        let ssd_read = cache.get_with_tier(&ssd_key).unwrap().unwrap();
+        assert_eq!(ssd_read.tier, CacheReadTier::Ssd);
+        assert_eq!(ssd_read.value, b"ssd-only-block".to_vec());
+    }
+
+    #[test]
+    fn bypass_lookup_reads_ssd_without_refill_or_hit_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "bypass-ssd");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+
+        let before = cache.stats();
+        let result = cache
+            .get_bypass_replacement_policy(&key)
+            .unwrap()
+            .expect("bypass lookup should find SSD value");
+
+        assert_eq!(result.tier, CacheReadTier::Ssd);
+        assert_eq!(result.value, b"value".to_vec());
+        assert!(!cache
+            .inner
+            .read()
+            .expect("cache lock poisoned")
+            .memory
+            .contains_key(&key));
+        let after = cache.stats();
+        assert_eq!(after.disk_hits, before.disk_hits);
+        assert_eq!(after.memory_fills, before.memory_fills);
+        assert_eq!(after.misses, before.misses);
+    }
+
+    // shared-corpus: storage_cache_no_promotion
+    #[test]
+    fn no_promotion_batch_reads_ssd_without_refill_or_hit_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(16, dir.path());
+        let first = CacheKey::string(1, "no-promotion-a");
+        let second = CacheKey::string(1, "no-promotion-b");
+
+        cache.put(first.clone(), b"aaaa".to_vec()).unwrap();
+        cache.put(second.clone(), b"bbbb".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.peek_tier(&first), Some(CacheReadTier::Ssd));
+        assert_eq!(cache.peek_tier(&second), Some(CacheReadTier::Ssd));
+
+        let before = cache.stats();
+        let reads = cache
+            .get_batch_no_promotion(&[first.clone(), second.clone(), first.clone()])
+            .unwrap();
+        assert_eq!(reads.len(), 3);
+        assert_eq!(reads[0].as_ref().unwrap().tier, CacheReadTier::Ssd);
+        assert_eq!(reads[0].as_ref().unwrap().value, b"aaaa".to_vec());
+        assert_eq!(reads[1].as_ref().unwrap().value, b"bbbb".to_vec());
+        assert_eq!(reads[2].as_ref().unwrap().value, b"aaaa".to_vec());
+        assert_eq!(cache.peek_tier(&first), Some(CacheReadTier::Ssd));
+        assert_eq!(cache.peek_tier(&second), Some(CacheReadTier::Ssd));
+
+        let after = cache.stats();
+        assert_eq!(after.disk_hits, before.disk_hits);
+        assert_eq!(after.memory_hits, before.memory_hits);
+        assert_eq!(after.memory_fills, before.memory_fills);
+        assert_eq!(after.refill_latency_samples, before.refill_latency_samples);
+        assert_eq!(
+            after.read_through_latency_samples,
+            before.read_through_latency_samples
+        );
+        assert_eq!(after.misses, before.misses);
+        assert_eq!(
+            cache.lookup_no_promotion(&first).unwrap(),
+            Some(b"aaaa".to_vec())
+        );
+        assert_eq!(
+            cache.LookupNoPromotion(&second).unwrap(),
+            Some(b"bbbb".to_vec())
+        );
+    }
+
+    // shared-corpus: storage_cache_no_promotion
+    #[test]
+    fn sharded_no_promotion_batch_preserves_order_and_duplicates() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(0, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-no-promotion")]),
+            4,
+        );
+        let keys = (0..10)
+            .map(|index| CacheKey::string((index % 3) as ShardId, &format!("no-promote-{index}")))
+            .collect::<Vec<_>>();
+        cache
+            .put_batch(
+                keys.iter()
+                    .enumerate()
+                    .map(|(index, key)| (key.clone(), format!("value-{index}").into_bytes()))
+                    .collect(),
+            )
+            .unwrap();
+
+        let before = cache.stats();
+        let requested = vec![
+            keys[7].clone(),
+            keys[2].clone(),
+            keys[7].clone(),
+            keys[9].clone(),
+            CacheKey::string(99, "missing-no-promote"),
+        ];
+        let values = cache.LookupBatchNoPromotion(&requested).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                Some(b"value-7".to_vec()),
+                Some(b"value-2".to_vec()),
+                Some(b"value-7".to_vec()),
+                Some(b"value-9".to_vec()),
+                None,
+            ]
+        );
+        let with_tiers = cache.GetBatchNoPromotion(&requested).unwrap();
+        assert_eq!(with_tiers[0].as_ref().unwrap().tier, CacheReadTier::Ssd);
+        assert!(with_tiers[4].is_none());
+
+        let api: &dyn CacheApi = &cache;
+        assert_eq!(
+            api.lookup_batch_no_promotion_cache(&[keys[2].clone(), keys[7].clone()])
+                .unwrap(),
+            vec![Some(b"value-2".to_vec()), Some(b"value-7".to_vec())]
+        );
+
+        let after = cache.stats();
+        assert_eq!(after.disk_hits, before.disk_hits);
+        assert_eq!(after.memory_hits, before.memory_hits);
+        assert_eq!(after.memory_fills, before.memory_fills);
+        assert_eq!(
+            after.read_through_latency_samples,
+            before.read_through_latency_samples
+        );
+    }
+
+    #[test]
+    fn bypass_lookup_does_not_refresh_memory_replacement_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+        let third = CacheKey::string(1, "third");
+
+        cache.put(first.clone(), b"1111".to_vec()).unwrap();
+        cache.put(second.clone(), b"2222".to_vec()).unwrap();
+        let result = cache
+            .get_bypass_replacement_policy(&first)
+            .unwrap()
+            .expect("bypass lookup should find memory value");
+        assert_eq!(result.tier, CacheReadTier::Memory);
+        assert_eq!(result.value, b"1111".to_vec());
+
+        cache.put(third.clone(), b"3333".to_vec()).unwrap();
+
+        assert_eq!(cache.get_memory(&first), None);
+        assert_eq!(cache.get_memory(&second), Some(b"2222".to_vec()));
+        assert_eq!(cache.get_memory(&third), Some(b"3333".to_vec()));
+    }
+
+    #[test]
+    fn disk_cache_promotes_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "record-a");
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(cache.stats().disk_hits, 1);
+        assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+        assert_eq!(cache.stats().memory_hits, 1);
+    }
+
+    #[test]
+    fn acquire_reports_source_tier_and_refills_ssd_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "promoted-handle");
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+
+        let handle = cache.acquire(&key).unwrap().expect("ssd handle");
+        assert_eq!(handle.key(), &key);
+        assert_eq!(handle.tier(), CacheReadTier::Ssd);
+        assert_eq!(handle.value(), b"value");
+        assert_eq!(cache.stats().disk_hits, 1);
+        assert_eq!(cache.stats().pinned_bytes, b"value".len() as u64);
+        assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+        let stats_after_refill = cache.stats();
+        assert_eq!(stats_after_refill.refill_failures, 0);
+        assert!(stats_after_refill.refill_latency_samples > 0);
+        let second_handle = cache.acquire(&key).unwrap().expect("memory handle");
+        assert_eq!(second_handle.tier(), CacheReadTier::Memory);
+        cache.release(second_handle);
+        assert!(cache.stats().memory_hits > stats_after_refill.memory_hits);
+    }
+
+    #[test]
+    fn memory_cache_evicts_oldest_entries_but_keeps_disk_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+
+        cache.put(first.clone(), b"12345".to_vec()).unwrap();
+        cache.put(second.clone(), b"abcde".to_vec()).unwrap();
+
+        assert_eq!(cache.get_memory(&first), None);
+        assert_eq!(cache.get_memory(&second), Some(b"abcde".to_vec()));
+        assert_eq!(cache.get(&first).unwrap(), Some(b"12345".to_vec()));
+        assert_eq!(cache.stats().disk_hits, 1);
+        assert!(cache.stats().memory_evictions >= 1);
+        assert!(cache.stats().eviction_capacity >= 1);
+    }
+
+    #[test]
+    fn cache_records_memory_admission_rejection_for_oversized_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(4, dir.path());
+        let key = CacheKey::string(1, "oversized");
+
+        cache.put(key.clone(), b"too-large".to_vec()).unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.disk_fills, 1);
+        assert_eq!(stats.memory_admission_rejected, 1);
+        assert_eq!(stats.eviction_oversize, 1);
+        assert_eq!(stats.refill_failures, 0);
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"too-large".to_vec()));
+        assert_eq!(cache.stats().refill_failures, 1);
+    }
+
+    #[test]
+    fn ssd_cache_tiering_policy_admits_hot_warm_and_rejects_oversize_blocks() {
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 256,
+            ssd_capacity_bytes: 1024,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 8,
+            pmem_admit_hotness_threshold: 5,
+            ssd_admit_hotness_threshold: 2,
+            max_memory_block_bytes: 32,
+            max_pmem_block_bytes: 96,
+            max_ssd_block_bytes: 256,
+            ssd_write_through: true,
+        };
+        let hot_page = CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Page,
+            shard_id: 1,
+            routing_slot: Some(9),
+            block_bytes: 16,
+            hotness: 10,
+            pinned: false,
+        };
+        let warm_slot = CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Page,
+            shard_id: 1,
+            routing_slot: Some(9),
+            block_bytes: 128,
+            hotness: 3,
+            pinned: false,
+        };
+        let oversize = CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Object,
+            shard_id: 1,
+            routing_slot: None,
+            block_bytes: 512,
+            hotness: 99,
+            pinned: false,
+        };
+
+        let hot = policy.decide(&hot_page);
+        assert_eq!(hot.tier, CacheTier::Memory);
+        assert_eq!(hot.reason, CacheAdmissionReason::HotPage);
+        assert!(hot.admit_memory);
+        assert!(hot.admit_pmem);
+        assert!(hot.admit_ssd);
+
+        let warm = policy.decide(&warm_slot);
+        assert_eq!(warm.tier, CacheTier::Ssd);
+        assert_eq!(warm.reason, CacheAdmissionReason::WarmSlot);
+        assert!(!warm.admit_memory);
+        assert!(!warm.admit_pmem);
+        assert!(warm.admit_ssd);
+
+        let rejected = policy.decide(&oversize);
+        assert_eq!(rejected.tier, CacheTier::Reject);
+        assert_eq!(rejected.reason, CacheAdmissionReason::Oversize);
+        assert!(!rejected.admit_memory);
+        assert!(!rejected.admit_pmem);
+        assert!(!rejected.admit_ssd);
+
+        let pmem = policy.decide(&CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Index,
+            shard_id: 1,
+            routing_slot: Some(9),
+            block_bytes: 64,
+            hotness: 5,
+            pinned: false,
+        });
+        assert_eq!(pmem.tier, CacheTier::Pmem);
+        assert_eq!(pmem.reason, CacheAdmissionReason::PersistentMemory);
+        assert!(!pmem.admit_memory);
+        assert!(pmem.admit_pmem);
+        assert!(pmem.admit_ssd);
+    }
+
+    #[test]
+    fn side_by_side_data_placement_routes_small_to_memory_and_large_to_pmem() {
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 256,
+            ssd_capacity_bytes: 1024,
+            data_placement: CacheDataPlacement::SideBySide,
+            data_placement_threshold_bytes: 32,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 99,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 256,
+            max_ssd_block_bytes: 1024,
+            ssd_write_through: true,
+        };
+
+        let small = policy.decide(&CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Object,
+            shard_id: 1,
+            routing_slot: None,
+            block_bytes: 16,
+            hotness: 0,
+            pinned: false,
+        });
+        assert_eq!(small.tier, CacheTier::Memory);
+        assert!(small.admit_memory);
+        assert!(!small.admit_pmem);
+        assert!(small.admit_ssd);
+
+        let large = policy.decide(&CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Object,
+            shard_id: 1,
+            routing_slot: None,
+            block_bytes: 96,
+            hotness: 0,
+            pinned: false,
+        });
+        assert_eq!(large.tier, CacheTier::Pmem);
+        assert!(!large.admit_memory);
+        assert!(large.admit_pmem);
+        assert!(large.admit_ssd);
+    }
+
+    #[test]
+    fn data_placement_controls_are_mutable_like_unified_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+
+        assert_eq!(CacheInstanceType::kDRAM as u8, 0);
+        assert_eq!(CacheInstanceType::kPMEM as u8, 1);
+        assert_eq!(CacheInstanceType::kSSD as u8, 2);
+        assert_eq!(CacheInstanceType::kUnified as u8, 3);
+        assert_eq!(DRAMPMEMDataPlacementType::kSideBySide as u8, 0);
+        assert_eq!(DRAMPMEMDataPlacementType::kTiered as u8, 1);
+        assert_eq!(DRAMPMEMDataPlacementType::kMaxCode as u8, 2);
+        assert_eq!(
+            DRAMPMEMDataPlacementType::FromCxxName("kSideBySide"),
+            DRAMPMEMDataPlacementType::kSideBySide
+        );
+        assert_eq!(
+            DRAMPMEMDataPlacementType::kTiered.AsCacheDataPlacement(),
+            CacheDataPlacement::Tiered
+        );
+
+        assert_eq!(cache.data_placement(), CacheDataPlacement::Tiered);
+        assert_eq!(
+            cache.GetDRAMPMEMDataPlacementType(),
+            DRAMPMEMDataPlacementType::kTiered
+        );
+        cache.set_data_placement(CacheDataPlacement::SideBySide);
+        cache.set_data_placement_threshold_bytes(32);
+
+        assert_eq!(cache.data_placement(), CacheDataPlacement::SideBySide);
+        assert_eq!(
+            cache.cxx_data_placement_type(),
+            DRAMPMEMDataPlacementType::kSideBySide
+        );
+        assert_eq!(cache.data_placement_threshold_bytes(), 32);
+
+        cache.SetDRAMPMEMDataPlacementType(DRAMPMEMDataPlacementType::kTiered);
+        assert_eq!(cache.GetDataPlacementType(), CacheDataPlacement::Tiered);
+    }
+
+    #[test]
+    fn ssd_instance_only_mode_routes_writes_and_reads_only_to_ssd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 128,
+                ssd_capacity_bytes: 512,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024 * 1024,
+                memory_hotness_threshold: 1,
+                pmem_admit_hotness_threshold: 1,
+                ssd_admit_hotness_threshold: 99,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 128,
+                max_ssd_block_bytes: 512,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        cache.set_ssd_instance_only(true);
+        assert!(cache.ssd_instance_only());
+
+        let key = CacheKey::string(1, "ssd-only");
+        cache.put(key.clone(), b"persistent-only".to_vec()).unwrap();
+
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 1);
+        let read = cache.get_with_tier(&key).unwrap().unwrap();
+        assert_eq!(read.tier, CacheReadTier::Ssd);
+        assert_eq!(read.value, b"persistent-only".to_vec());
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 0);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 0);
+
+        cache.set_ssd_instance_only(false);
+        assert!(!cache.ssd_instance_only());
+        assert_eq!(cache.get(&key).unwrap(), Some(b"persistent-only".to_vec()));
+        assert_eq!(cache.item_count_for_tier(CacheTier::Memory), 1);
+    }
+
+    #[test]
+    fn bypass_storage_insert_routes_to_memory_without_ssd_write_or_access_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        cache.register_access_record_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        let key = CacheKey::string(1, "memory-bypass-storage");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), b"memory-only".to_vec())
+            .unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(cache.get_memory(&key), Some(b"memory-only".to_vec()));
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+    }
+
+    #[test]
+    fn bypass_storage_insert_can_index_existing_ssd_block_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = CacheKey::string(1, "ssd-bypass-storage");
+        let cache = MultiLayerCache::new(16, dir.path());
+        cache.put(key.clone(), b"disk-value".to_vec()).unwrap();
+        let existing_block_path = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner.disk_path(&key)
+        };
+        let existing_modified = existing_block_path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+
+        let restarted = MultiLayerCache::new(16, dir.path());
+        assert_eq!(restarted.item_count_for_tier(CacheTier::Ssd), 0);
+        restarted
+            .put_bypass_storage_for_tier(CacheTier::Ssd, key.clone(), b"disk-value".to_vec())
+            .unwrap();
+
+        assert_eq!(restarted.item_count_for_tier(CacheTier::Ssd), 1);
+        assert_eq!(
+            restarted
+                .get_bypass_replacement_policy(&key)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"disk-value".to_vec()
+        );
+        if cfg!(feature = "rocksdb-ssd") {
+            assert!(
+                !existing_block_path.exists(),
+                "RocksDB-backed SSD bypass must not recreate raw block shadow files"
+            );
+        } else {
+            assert_eq!(
+                existing_block_path.metadata().unwrap().modified().ok(),
+                existing_modified
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_policy_controls_are_per_tier_like_unified_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Memory),
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Pmem),
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+        cache.set_replacement_policy_for_tier(CacheTier::Pmem, CacheReplacementPolicy::Slru);
+        cache.set_replacement_policy_for_tier(CacheTier::Ssd, CacheReplacementPolicy::Fifo);
+
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Memory),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Pmem),
+            CacheReplacementPolicy::Slru
+        );
+        assert_eq!(
+            cache.replacement_policy_for_tier(CacheTier::Ssd),
+            CacheReplacementPolicy::Fifo
+        );
+    }
+
+    #[test]
+    fn cxx_strict_replacement_policy_setter_is_pre_start_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+
+        assert!(matches!(
+            cache.TrySetReplacementPolicyType(
+                CacheInstanceType::kDRAM,
+                CacheReplacementPolicy::Fifo
+            ),
+            Err(CacheError::AlreadyStarted)
+        ));
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+
+        cache.Stop();
+        cache
+            .TrySetReplacementPolicyType(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo)
+            .unwrap();
+        cache
+            .try_set_replacement_policy_for_tier(CacheTier::Pmem, CacheReplacementPolicy::Slru)
+            .unwrap();
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kPMEM),
+            CacheReplacementPolicy::Slru
+        );
+        assert!(matches!(
+            cache.TrySetReplacementPolicyType(
+                CacheInstanceType::kUnified,
+                CacheReplacementPolicy::Fifo
+            ),
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+        ));
+
+        assert!(cache.Start());
+    }
+
+    #[test]
+    fn fifo_memory_policy_evicts_oldest_inserted_entry_not_hot_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+        let third = CacheKey::string(1, "third");
+        cache.put(first.clone(), b"1111".to_vec()).unwrap();
+        cache.put(second.clone(), b"2222".to_vec()).unwrap();
+        for _ in 0..4 {
+            assert_eq!(cache.get(&first).unwrap(), Some(b"1111".to_vec()));
+        }
+        cache.put(third.clone(), b"3333".to_vec()).unwrap();
+
+        assert_eq!(cache.get_memory(&first), None);
+        assert_eq!(cache.get_memory(&second), Some(b"2222".to_vec()));
+        assert_eq!(cache.get_memory(&third), Some(b"3333".to_vec()));
+    }
+
+    #[test]
+    fn access_record_callback_observes_put_get_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        cache.register_access_record_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+        let key = CacheKey::string(1, "access");
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        cache.invalidate(&key).unwrap();
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .map(|record| record.record_type)
+                .collect::<Vec<_>>(),
+            vec![
+                CacheAccessRecordType::Put,
+                CacheAccessRecordType::Get,
+                CacheAccessRecordType::Delete,
+            ]
+        );
+        assert!(events.iter().all(|record| record.key == key));
+    }
+
+    #[test]
+    fn access_record_type_matches_cxx_codes_and_aliases() {
+        assert_eq!(CacheAccessRecordType::Put.cxx_code(), 1);
+        assert_eq!(CacheAccessRecordType::Get.CxxCode(), 2);
+        assert_eq!(CacheAccessRecordType::Delete.cxx_code(), 3);
+        assert_eq!(CacheAccessRecordType::kPut, CacheAccessRecordType::Put);
+        assert_eq!(AccessRecordType::kGet, CacheAccessRecordType::Get);
+        assert_eq!(AccessRecordType::kDelete.AsCxxName(), "kDelete");
+        assert_eq!(AccessRecordType::kMaxCode, 4);
+        assert_eq!(
+            AccessRecordType::from_cxx_code(1),
+            Some(CacheAccessRecordType::Put)
+        );
+        assert_eq!(
+            AccessRecordType::FromCxxCode(2),
+            Some(CacheAccessRecordType::Get)
+        );
+        assert_eq!(
+            AccessRecordType::from_cxx_code(3),
+            Some(CacheAccessRecordType::Delete)
+        );
+        assert_eq!(AccessRecordType::from_cxx_code(4), None);
+    }
+
+    #[test]
+    fn access_record_callback_can_be_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        cache.register_access_record_callback(move |record| {
+            captured.lock().unwrap().push(record.record_type);
+        });
+
+        let key = CacheKey::string(1, "clear-callback");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.clear_access_record_callback();
+        let _ = cache.get(&key).unwrap();
+        cache.invalidate(&key).unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[CacheAccessRecordType::Put]
+        );
+    }
+
+    #[test]
+    fn cxx_access_record_callback_aliases_register_and_deregister() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        cache.RegisterAccessRecordCallback(move |record| {
+            captured.lock().unwrap().push(record.record_type);
+        });
+
+        let key = CacheKey::string(1, "cxx-access-callback");
+        cache.Insert(key.clone(), b"value".to_vec(), 5).unwrap();
+        let _ = cache.Lookup(&key).unwrap();
+        cache.DeregisterAccessRecordCallback();
+        cache.Remove(&key).unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[CacheAccessRecordType::Put, CacheAccessRecordType::Get]
+        );
+    }
+
+    #[test]
+    fn eviction_callback_observes_memory_victims() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+        cache.put(first.clone(), b"12345678".to_vec()).unwrap();
+        cache.put(second.clone(), b"abcdefgh".to_vec()).unwrap();
+
+        let evictions = evictions.lock().unwrap().clone();
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].tier, CacheTier::Memory);
+        assert_eq!(evictions[0].key, first);
+        assert_eq!(evictions[0].value, b"12345678".to_vec());
+    }
+
+    #[test]
+    fn eviction_callback_can_be_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+        cache.clear_eviction_callback();
+
+        cache
+            .put(CacheKey::string(1, "first"), b"12345678".to_vec())
+            .unwrap();
+        cache
+            .put(CacheKey::string(1, "second"), b"abcdefgh".to_vec())
+            .unwrap();
+
+        assert!(evictions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn eviction_handler_status_disables_and_reenables_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        assert!(cache.eviction_handler_enabled());
+        cache.set_eviction_handler_enabled(false);
+        assert!(!cache.eviction_handler_enabled());
+        cache
+            .put(CacheKey::string(1, "first"), b"12345678".to_vec())
+            .unwrap();
+        cache
+            .put(CacheKey::string(1, "second"), b"abcdefgh".to_vec())
+            .unwrap();
+        assert!(evictions.lock().unwrap().is_empty());
+
+        cache.set_eviction_handler_enabled(true);
+        assert!(cache.eviction_handler_enabled());
+        cache
+            .put(CacheKey::string(1, "third"), b"ABCDEFGH".to_vec())
+            .unwrap();
+
+        let evictions = evictions.lock().unwrap().clone();
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].tier, CacheTier::Memory);
+        assert_eq!(evictions[0].key, CacheKey::string(1, "second"));
+        assert_eq!(evictions[0].value, b"abcdefgh".to_vec());
+    }
+
+    #[test]
+    fn cxx_eviction_handler_aliases_disable_and_reenable_callback_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.RegisterEvictionCallback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        assert!(cache.EvictionHandlerEnabled());
+        cache.DeregisterEvictionHandler();
+        assert!(!cache.EvictionHandlerEnabled());
+        cache
+            .Insert(CacheKey::string(1, "first"), b"12345678".to_vec(), 8)
+            .unwrap();
+        cache
+            .Insert(CacheKey::string(1, "second"), b"abcdefgh".to_vec(), 8)
+            .unwrap();
+        assert!(evictions.lock().unwrap().is_empty());
+
+        cache.RegisterEvictionHandler();
+        assert!(cache.EvictionHandlerEnabled());
+        cache
+            .Insert(CacheKey::string(1, "third"), b"ABCDEFGH".to_vec(), 8)
+            .unwrap();
+        assert_eq!(evictions.lock().unwrap().len(), 1);
+
+        cache.DisablePolicyMemEvictionHandler();
+        assert!(!cache.EvictionHandlerEnabled());
+        cache
+            .Insert(CacheKey::string(1, "fourth"), b"87654321".to_vec(), 8)
+            .unwrap();
+        assert_eq!(evictions.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cxx_cache_instance_dram_surface_puts_gets_peeks_deletes_and_resets() {
+        let mut instance = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        assert_eq!(instance.StorageEngineType(), StorageEngineType::kDRAM);
+        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::kDRAM);
+        assert_eq!(
+            instance.TEST_GetStorageEngineType(),
+            StorageEngineType::kDRAM
+        );
+
+        instance.Start().unwrap();
+        instance.Put("first", b"1111".to_vec()).unwrap();
+        assert!(instance.Peek("first"));
+        assert_eq!(instance.Get("first").unwrap(), Some(b"1111".to_vec()));
+        assert_eq!(
+            instance.GetBypassReplacementPolicy("first").unwrap(),
+            Some(b"1111".to_vec())
+        );
+        let bypass_first_buffer = instance
+            .GetBypassReplacementPolicyBuffer("first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bypass_first_buffer.Key(), "first");
+        assert_eq!(bypass_first_buffer.Data(), b"1111");
+        assert_eq!(bypass_first_buffer.tier(), Some(CacheReadTier::Memory));
+        let l1_first_buffer = L1CacheInterface::GetBypassReplacementPolicy(&instance, "first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(l1_first_buffer.Key(), "first");
+        assert_eq!(l1_first_buffer.Data(), b"1111");
+        assert_eq!(l1_first_buffer.tier(), Some(CacheReadTier::Memory));
+
+        let mut async_buffer = CacheBuffer::new(b"async-value".to_vec());
+        async_buffer.SetKey("async");
+        let callback_seen = Arc::new(Mutex::new(false));
+        let callback_seen_for_cb = Arc::clone(&callback_seen);
+        let inserted = instance
+            .AsyncPutBuffer(
+                async_buffer,
+                "cxx_cache_instance_dram_surface",
+                move |result| {
+                    let callback_buffer = result.expect("async put callback buffer");
+                    assert_eq!(callback_buffer.Key(), "async");
+                    assert_eq!(callback_buffer.Data(), b"async-value");
+                    *callback_seen_for_cb.lock().unwrap() = true;
+                },
+            )
+            .unwrap();
+        assert_eq!(inserted.Key(), "async");
+        assert_eq!(inserted.Data(), b"async-value");
+        assert!(*callback_seen.lock().unwrap());
+        assert!(instance.Peek("async"));
+        assert_eq!(
+            instance.Get("async").unwrap(),
+            Some(b"async-value".to_vec())
+        );
+
+        let mut bypass_buffer = CacheBuffer::new(b"p".to_vec());
+        bypass_buffer.SetKey("bypass-buffer");
+        let bypass_inserted = instance.PutBypassStorageBuffer(bypass_buffer).unwrap();
+        assert_eq!(bypass_inserted.Key(), "bypass-buffer");
+        assert_eq!(bypass_inserted.Data(), b"p");
+        assert_eq!(
+            instance
+                .GetBypassReplacementPolicy("bypass-buffer")
+                .unwrap(),
+            Some(b"p".to_vec())
+        );
+
+        let mut recovered = CacheBuffer::new(b"recovered-value".to_vec());
+        recovered.SetKey("stale-recovered-key");
+        let recovered = instance.OnRecoverData("recovered-key", recovered).unwrap();
+        assert_eq!(recovered.Key(), "recovered-key");
+        assert_eq!(recovered.Data(), b"recovered-value");
+        assert_eq!(
+            instance
+                .GetBypassReplacementPolicy("recovered-key")
+                .unwrap(),
+            Some(b"recovered-value".to_vec())
+        );
+
+        let mut trait_recovered = CacheBuffer::new(b"trait-recovered".to_vec());
+        trait_recovered.SetKey("ignored-trait-key");
+        RecoverDataCallback::on_recover_data(&mut instance, "trait-recovered-key", trait_recovered);
+        assert_eq!(
+            instance
+                .GetBypassReplacementPolicy("trait-recovered-key")
+                .unwrap(),
+            Some(b"trait-recovered".to_vec())
+        );
+
+        assert_eq!(instance.GetCapacity(), 64);
+        assert_eq!(instance.GetItemNum(), 5);
+        assert!(instance.GetUsedSpace() >= 4);
+
+        instance.SetCapacity(8);
+        assert_eq!(instance.GetCapacity(), 8);
+        instance.Delete("first").unwrap();
+        assert!(!instance.Peek("first"));
+        assert_eq!(instance.Get("first").unwrap(), None);
+
+        instance.Put("second", b"2222".to_vec()).unwrap();
+        instance.Reset().unwrap();
+        assert_eq!(instance.GetItemNum(), 0);
+        assert_eq!(instance.Get("second").unwrap(), None);
+        instance.Stop().unwrap();
+        assert!(matches!(
+            instance.Put("stopped", b"x".to_vec()),
+            Err(CacheError::Stopped)
+        ));
+    }
+
+    #[test]
+    fn cxx_cache_instance_put_returning_buffer_matches_put_result_surface() {
+        let instance = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+
+        let inserted = instance
+            .PutReturningBuffer("returning-put", b"return-value".to_vec())
+            .unwrap();
+        assert_eq!(inserted.Key(), "returning-put");
+        assert_eq!(inserted.Data(), b"return-value");
+        assert_eq!(inserted.Size(), b"return-value".len());
+        assert_eq!(inserted.tier(), Some(CacheReadTier::Memory));
+        assert_eq!(
+            instance.Get("returning-put").unwrap(),
+            Some(b"return-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_put_returning_buffer_reports_ssd_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![dir.path().to_path_buf()],
+        );
+
+        let inserted = instance
+            .PutReturningBuffer("ssd-returning-put", b"ssd-return-value".to_vec())
+            .unwrap();
+        assert_eq!(inserted.Key(), "ssd-returning-put");
+        assert_eq!(inserted.Data(), b"ssd-return-value");
+        assert_eq!(inserted.tier(), Some(CacheReadTier::Ssd));
+        assert_eq!(
+            instance.Get("ssd-returning-put").unwrap(),
+            Some(b"ssd-return-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_pmem_surface_uses_exact_pmem_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            32,
+            ReplacementPolicyType::kSLRU,
+            StorageEngineType::kPMEM,
+            vec![dir.path().to_path_buf()],
+        );
+
+        instance.Put("pmem-key", b"pmem-value".to_vec()).unwrap();
+        assert_eq!(
+            instance.Get("pmem-key").unwrap(),
+            Some(b"pmem-value".to_vec())
+        );
+        assert_eq!(instance.GetItemNum(), 1);
+        assert_eq!(
+            instance
+                .inner_cache()
+                .peek_tier(&CacheKey::string(0, "pmem-key")),
+            Some(CacheReadTier::Pmem)
+        );
+    }
+
+    #[test]
+    fn cxx_l1_cache_implement_pulls_dram_then_pmem_without_replacement_access() {
+        let dram = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        let pmem_dir = tempfile::tempdir().unwrap();
+        let pmem = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kSLRU,
+            StorageEngineType::kPMEM,
+            vec![pmem_dir.path().to_path_buf()],
+        );
+        dram.Put("shared", b"dram-value".to_vec()).unwrap();
+        pmem.Put("shared", b"pmem-value".to_vec()).unwrap();
+        pmem.Put("pmem-only", b"fallback".to_vec()).unwrap();
+
+        let l1 = L1CacheImplement::new(dram.clone(), Some(pmem.clone()));
+        let shared = l1.GetBypassReplacementPolicy("shared").unwrap().unwrap();
+        assert_eq!(shared.Key(), "shared");
+        assert_eq!(shared.Data(), b"dram-value");
+        assert_eq!(shared.tier(), Some(CacheReadTier::Memory));
+        assert_eq!(l1.L2Pulls(), 1);
+
+        let fallback = l1
+            .get_bypass_replacement_policy_buffer("pmem-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.Key(), "pmem-only");
+        assert_eq!(fallback.Data(), b"fallback");
+        assert_eq!(fallback.tier(), Some(CacheReadTier::Pmem));
+        assert_eq!(l1.L2Pulls(), 2);
+
+        assert!(l1.GetBypassReplacementPolicy("missing").unwrap().is_none());
+        assert_eq!(l1.L2Pulls(), 2);
+    }
+
+    #[test]
+    fn cxx_l1_cache_implement_allows_absent_pmem_instance() {
+        let dram = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        dram.Put("dram-only", b"value".to_vec()).unwrap();
+        let l1 = L1CacheImplement::new(dram, None);
+
+        assert_eq!(
+            l1.GetBypassReplacementPolicy("dram-only")
+                .unwrap()
+                .unwrap()
+                .Data(),
+            b"value"
+        );
+        assert!(l1
+            .GetBypassReplacementPolicy("pmem-missing")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cxx_l2_cache_policy_access_tail_and_write_match_arc_flow() {
+        let dram = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kWeightedHotnessLru,
+            StorageEngineType::kDRAM,
+            vec![],
+        );
+        let l2_dir = tempfile::tempdir().unwrap();
+        let l2 = CacheInstance::new(
+            256,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![l2_dir.path().to_path_buf()],
+        );
+        dram.Put("cold-a", b"alpha".to_vec()).unwrap();
+        dram.Put("cold-b", b"bravo".to_vec()).unwrap();
+
+        let l1 = L1CacheImplement::new(dram, None);
+        let mut arc = ReplacementArc::new(8);
+        arc.Init().unwrap();
+        let mut policy = L2CachePolicy::new(l1, l2, arc, 8, 8, 8);
+        policy.Start();
+
+        policy.OnAccess(AccessRecordType::Put, "cold-a");
+        policy.OnAccess(AccessRecordType::Put, "cold-b");
+        assert_eq!(policy.access_callback_count(), 2);
+        assert_eq!(
+            policy.arc_policy().GetFetchTail(8),
+            vec!["cold-a".to_string(), "cold-b".to_string()]
+        );
+
+        policy.tail_task_internal();
+        assert_eq!(policy.pull_success_count(), 2);
+        assert_eq!(policy.write_buffer_size(), 2);
+        assert_eq!(policy.write_task_internal().unwrap(), 2);
+        assert_eq!(policy.write_success_count(), 2);
+        assert_eq!(
+            policy.l2_cache().Get("cold-a").unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            policy.l2_cache().Get("cold-b").unwrap(),
+            Some(b"bravo".to_vec())
+        );
+
+        policy.OnAccess(AccessRecordType::Delete, "cold-a");
+        assert!(!policy
+            .arc_policy()
+            .GetFetchTail(8)
+            .contains(&"cold-a".to_string()));
+        policy.Stop();
+        assert!(policy.stopped());
+    }
+
+    #[test]
+    fn cxx_l2_cache_policy_eviction_queue_duplicate_and_overflow_paths() {
+        let dram = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            vec![],
+        );
+        let l2_dir = tempfile::tempdir().unwrap();
+        let l2 = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![l2_dir.path().to_path_buf()],
+        );
+        let l1 = L1CacheImplement::new(dram, None);
+        let mut arc = ReplacementArc::new(4);
+        arc.Init().unwrap();
+        let mut policy = L2CachePolicy::new(l1, l2, arc, 4, 4, 1);
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let removed_capture = Arc::clone(&removed);
+        policy.RegisterRemoveL2PolicyHandler(move |buffer| {
+            removed_capture
+                .lock()
+                .unwrap()
+                .push(buffer.Key().to_string());
+        });
+        policy.Start();
+
+        let mut first = CacheBuffer::new(b"first".to_vec());
+        first.SetKey("overflow-a");
+        let mut second = CacheBuffer::new(b"second".to_vec());
+        second.SetKey("overflow-b");
+        policy.OnEvict(first);
+        policy.OnEvict(second);
+        assert_eq!(policy.write_buffer_size(), 1);
+        assert_eq!(policy.write_enqueue_fail_count(), 1);
+        assert_eq!(
+            removed.lock().unwrap().as_slice(),
+            &["overflow-b".to_string()]
+        );
+
+        assert_eq!(policy.write_task_internal().unwrap(), 1);
+        assert_eq!(policy.write_success_count(), 1);
+
+        let mut duplicate = CacheBuffer::new(b"new-value".to_vec());
+        duplicate.SetKey("overflow-a");
+        policy.OnEvict(duplicate);
+        assert_eq!(policy.write_task_internal().unwrap(), 1);
+        assert_eq!(policy.write_exist_count(), 1);
+        assert_eq!(
+            policy.l2_cache().Get("overflow-a").unwrap(),
+            Some(b"first".to_vec())
+        );
+
+        policy.TEST_Pause();
+        assert!(policy.paused());
+        let mut paused = CacheBuffer::new(b"paused".to_vec());
+        paused.SetKey("paused");
+        policy.OnEvict(paused);
+        assert_eq!(policy.write_task_internal().unwrap(), 0);
+        policy.TEST_Continue();
+        assert_eq!(policy.write_task_internal().unwrap(), 1);
+    }
+
+    #[test]
+    fn cxx_l2_cache_policy_factory_builds_started_policy_surface() {
+        let dram = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            vec![],
+        );
+        let l2_dir = tempfile::tempdir().unwrap();
+        let l2 = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![l2_dir.path().to_path_buf()],
+        );
+        let l1 = L1CacheImplement::new(dram, None);
+        let mut policy = L2CachePolicyFactory::CreateL2CachePolicy(l1, l2);
+        assert!(policy.stopped());
+        policy.Start();
+        assert!(!policy.stopped());
+        policy.TEST_WaitAllTaskSleep();
+        policy.Stop();
+    }
+
+    #[test]
+    fn cxx_cache_instance_ssd_surface_recovers_persistent_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().to_path_buf()];
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kWeightedHotnessLru,
+            StorageEngineType::kSSD,
+            paths.clone(),
+        );
+        assert_eq!(instance.StorageEngineType(), StorageEngineType::kSSD);
+        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::kSSD);
+        instance.Put("ssd-key", b"ssd-value".to_vec()).unwrap();
+        assert_eq!(
+            instance.Get("ssd-key").unwrap(),
+            Some(b"ssd-value".to_vec())
+        );
+        assert_eq!(
+            instance
+                .inner_cache()
+                .peek_tier(&CacheKey::string(0, "ssd-key")),
+            Some(CacheReadTier::Ssd)
+        );
+
+        let restarted = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kWeightedHotnessLru,
+            StorageEngineType::kSSD,
+            paths,
+        );
+        let report = restarted.RecoverData().unwrap();
+        assert_eq!(report.recovered_files, 1);
+        assert_eq!(
+            restarted.Get("ssd-key").unwrap(),
+            Some(b"ssd-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_ssd_put_bypass_storage_writes_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![dir.path().to_path_buf()],
+        );
+
+        instance
+            .PutBypassStorage("ssd-bypass", b"bypass-value".to_vec())
+            .unwrap();
+        assert_eq!(
+            instance.GetBypassReplacementPolicy("ssd-bypass").unwrap(),
+            Some(b"bypass-value".to_vec())
+        );
+        assert_eq!(
+            instance.Get("ssd-bypass").unwrap(),
+            Some(b"bypass-value".to_vec())
+        );
+        assert_eq!(instance.GetItemNum(), 1);
+        assert!(instance.GetUsedSpace() > 0);
+        assert_eq!(
+            instance
+                .inner_cache()
+                .peek_tier(&CacheKey::string(0, "ssd-bypass")),
+            Some(CacheReadTier::Ssd)
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_ssd_update_rewrites_guarded_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![dir.path().to_path_buf()],
+        );
+
+        instance.Put("ssd-update", b"old-value".to_vec()).unwrap();
+        let old_buffer = instance.GetBuffer("ssd-update").unwrap().unwrap();
+        assert_eq!(old_buffer.Data(), b"old-value");
+        assert_eq!(old_buffer.tier(), Some(CacheReadTier::Ssd));
+
+        let mut new_buffer = CacheBuffer::new(b"new-value".to_vec());
+        new_buffer.SetKey("ssd-update");
+        instance
+            .Update("ssd-update", &old_buffer, new_buffer)
+            .unwrap();
+        assert_eq!(
+            instance.Get("ssd-update").unwrap(),
+            Some(b"new-value".to_vec())
+        );
+        assert_eq!(old_buffer.Data(), b"old-value");
+
+        let mut stale_buffer = CacheBuffer::new(b"stale-value".to_vec());
+        stale_buffer.SetKey("ssd-update");
+        assert!(matches!(
+            instance.Update("ssd-update", &old_buffer, stale_buffer),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        assert_eq!(
+            instance.Get("ssd-update").unwrap(),
+            Some(b"new-value".to_vec())
+        );
+
+        let fresh_buffer = instance.GetBuffer("ssd-update").unwrap().unwrap();
+        let mut final_buffer = CacheBuffer::new(b"final-value".to_vec());
+        final_buffer.SetKey("ssd-update");
+        instance
+            .Update("ssd-update", &fresh_buffer, final_buffer)
+            .unwrap();
+        assert_eq!(
+            instance.Get("ssd-update").unwrap(),
+            Some(b"final-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_eviction_and_metric_handlers_follow_status() {
+        let instance = CacheInstance::new(
+            8,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let metric_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_evictions = Arc::clone(&evictions);
+        let captured_metrics = Arc::clone(&metric_sizes);
+        instance.RegisterEvictionHandler(move |record| {
+            captured_evictions.lock().unwrap().push(record.key);
+        });
+        instance.RegisterEvictionMetricHandler(move |size| {
+            captured_metrics.lock().unwrap().push(size);
+        });
+
+        instance.SetEvictionHandlerStatus(false);
+        instance.Put("first", b"12345678".to_vec()).unwrap();
+        instance.Put("second", b"abcdefgh".to_vec()).unwrap();
+        assert!(evictions.lock().unwrap().is_empty());
+        assert!(metric_sizes.lock().unwrap().is_empty());
+
+        instance.SetEvictionHandlerStatus(true);
+        instance.Put("third", b"ABCDEFGH".to_vec()).unwrap();
+        assert_eq!(
+            evictions.lock().unwrap().as_slice(),
+            &[CacheKey::string(0, "second")]
+        );
+        assert_eq!(metric_sizes.lock().unwrap().as_slice(), &[8]);
+    }
+
+    #[test]
+    fn cxx_cache_buffer_exposes_key_data_size_and_set_key() {
+        let mut buffer = StringBuffer::string("hello");
+        assert_eq!(buffer.Key(), "");
+        buffer.SetKey("buffer-key");
+        assert_eq!(buffer.Key(), "buffer-key");
+        assert_eq!(buffer.Data(), b"hello");
+        assert_eq!(buffer.DataPtr(), buffer.Data().as_ptr());
+        assert_eq!(buffer.Value(), b"hello");
+        assert_eq!(buffer.StringValue(), "hello");
+        assert_eq!(buffer.Size(), 5);
+
+        let converted: CacheBuffer = buffer.into();
+        assert_eq!(converted.Key(), "buffer-key");
+        assert_eq!(converted.Data(), b"hello");
+        assert_eq!(converted.Size(), 5);
+        assert_eq!(converted.tier(), None);
+    }
+
+    #[test]
+    fn cxx_iobuf_buffer_owns_data_and_converts_to_cache_buffer() {
+        let mut buffer = IOBufBuffer::new(b"iobuf-value".to_vec());
+        assert_eq!(buffer.Key(), "");
+        buffer.SetKey("iobuf-key");
+        assert_eq!(buffer.Key(), "iobuf-key");
+        assert_eq!(buffer.Data(), b"iobuf-value");
+        assert_eq!(buffer.DataPtr(), buffer.Data().as_ptr());
+        assert_eq!(buffer.Value(), b"iobuf-value");
+        assert_eq!(buffer.Size(), b"iobuf-value".len());
+
+        let converted: CacheBuffer = buffer.into();
+        assert_eq!(converted.Key(), "iobuf-key");
+        assert_eq!(converted.Data(), b"iobuf-value");
+
+        let instance = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        let inserted = instance.PutBuffer(converted).unwrap();
+        assert_eq!(inserted.Key(), "iobuf-key");
+        assert_eq!(
+            instance.Get("iobuf-key").unwrap(),
+            Some(b"iobuf-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_raw_buffer_exposes_owned_data_reset_and_cache_buffer_conversion() {
+        let mut raw =
+            RawBuffer::with_storage_engine(b"raw-value".to_vec(), StorageEngineType::kPMEM, true);
+        assert_eq!(raw.Key(), "");
+        raw.SetKey("raw-key");
+        assert_eq!(raw.Key(), "raw-key");
+        assert_eq!(raw.Data(), b"raw-value");
+        assert_eq!(raw.DataPtr(), raw.Data().as_ptr());
+        assert_eq!(raw.Value(), b"raw-value");
+        assert_eq!(raw.Size(), 9);
+        assert_eq!(raw.storage_engine(), Some(StorageEngineType::kPMEM));
+        assert!(raw.async_delete());
+
+        let converted: CacheBuffer = raw.into();
+        assert_eq!(converted.Key(), "raw-key");
+        assert_eq!(converted.Data(), b"raw-value");
+        assert_eq!(converted.Size(), 9);
+
+        let mut reset = RawBuffer::new(b"drop-me".to_vec());
+        reset.SetKey("reset-key");
+        reset.Reset();
+        assert_eq!(reset.Key(), "");
+        assert_eq!(reset.Data(), b"");
+        assert!(reset.DataPtr().is_null());
+        assert_eq!(reset.Size(), 0);
+        assert_eq!(reset.storage_engine(), None);
+        assert!(!reset.async_delete());
+    }
+
+    #[test]
+    fn cxx_string_view_buffer_tracks_key_and_size_without_holding_data() {
+        let mut view = StringViewBuffer::new(4096);
+        assert_eq!(view.Key(), "");
+        view.SetKey("ssd-view");
+        assert_eq!(view.Key(), "ssd-view");
+        assert_eq!(view.Size(), 4096);
+        assert_eq!(view.Data(), None);
+        assert!(view.DataPtr().is_null());
+        assert_eq!(view.Value(), None);
+
+        let buffer = view.into_cache_buffer_with_value(b"loaded-from-ssd".to_vec());
+        assert_eq!(buffer.Key(), "ssd-view");
+        assert_eq!(buffer.Data(), b"loaded-from-ssd");
+    }
+
+    #[test]
+    fn cxx_cache_instance_accepts_raw_buffer_conversion_for_put_buffer() {
+        let instance = CacheInstance::new(
+            32,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+        let mut raw = RawBuffer::new(b"raw-put".to_vec());
+        raw.SetKey("raw-put-key");
+
+        let inserted = instance.PutBuffer(raw.into()).unwrap();
+        assert_eq!(inserted.Key(), "raw-put-key");
+        assert_eq!(inserted.Data(), b"raw-put");
+        assert_eq!(
+            instance.Get("raw-put-key").unwrap(),
+            Some(b"raw-put".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_cache_instance_buffer_put_get_and_update_are_guarded() {
+        let mut instance = CacheInstance::new(
+            32,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            Vec::new(),
+        );
+
+        let mut initial = CacheBuffer::string("old-value");
+        initial.SetKey("guarded");
+        let old = instance.PutBuffer(initial).unwrap();
+        assert_eq!(old.Key(), "guarded");
+        assert_eq!(old.Data(), b"old-value");
+        assert_eq!(old.Size(), 9);
+        assert_eq!(old.tier(), Some(CacheReadTier::Memory));
+
+        let fetched = instance.GetBuffer("guarded").unwrap().unwrap();
+        assert_eq!(fetched.Data(), b"old-value");
+        let mut replacement = CacheBuffer::string("new-value");
+        replacement.SetKey("guarded");
+        instance.Update("guarded", &fetched, replacement).unwrap();
+        assert_eq!(
+            instance.Get("guarded").unwrap(),
+            Some(b"new-value".to_vec())
+        );
+
+        let by_data_old = instance.GetBuffer("guarded").unwrap().unwrap();
+        let mut by_data_replacement = CacheBuffer::string("newer-value");
+        by_data_replacement.SetKey("guarded");
+        instance
+            .UpdateByOldDataPtr("guarded", by_data_old.Data(), by_data_replacement)
+            .unwrap();
+        assert_eq!(
+            instance.Get("guarded").unwrap(),
+            Some(b"newer-value".to_vec())
+        );
+
+        let mut external_same_bytes = CacheBuffer::string("should-not-land");
+        external_same_bytes.SetKey("guarded");
+        assert!(matches!(
+            instance.UpdateByOldData("guarded", b"newer-value", external_same_bytes),
+            Err(CacheError::ReplaceMismatch)
+        ));
+
+        let trait_old = instance.GetBuffer("guarded").unwrap().unwrap();
+        let mut trait_replacement = CacheBuffer::string("trait-value");
+        trait_replacement.SetKey("guarded");
+        GCCopyCallback::update(
+            &mut instance,
+            "guarded",
+            trait_old.Data(),
+            trait_replacement,
+        )
+        .unwrap();
+        assert_eq!(
+            instance.Get("guarded").unwrap(),
+            Some(b"trait-value".to_vec())
+        );
+
+        let mut missing_replacement = CacheBuffer::string("missing");
+        missing_replacement.SetKey("missing");
+        assert!(matches!(
+            instance.UpdateByOldData("missing", b"missing", missing_replacement),
+            Err(CacheError::NotFound)
+        ));
+
+        let mut stale_replacement = CacheBuffer::string("stale");
+        stale_replacement.SetKey("guarded");
+        assert!(matches!(
+            instance.Update("guarded", &fetched, stale_replacement),
+            Err(CacheError::ReplaceMismatch)
+        ));
+
+        let mut wrong_key = CacheBuffer::string("wrong-key");
+        wrong_key.SetKey("other");
+        let current = instance.GetBuffer("guarded").unwrap().unwrap();
+        assert!(matches!(
+            instance.Update("guarded", &current, wrong_key),
+            Err(CacheError::ReplaceMismatch)
+        ));
+    }
+
+    #[test]
+    fn cxx_flexible_cache_wraps_configurable_cache_instance_for_strings() {
+        let cache = MatrixCacheBuilder::BuildFlexibleCache(
+            8,
+            "fifo",
+            "dram",
+            Vec::<PathBuf>::new(),
+            Vec::<PathBuf>::new(),
+        );
+
+        assert_eq!(cache.policy(), ReplacementPolicyType::kFIFO);
+        assert_eq!(cache.engine(), StorageEngineType::kDRAM);
+        assert!(cache.Start());
+        cache.Insert("first", "12345678".to_string(), 8).unwrap();
+        assert_eq!(cache.Lookup("first").unwrap(), Some("12345678".to_string()));
+        assert_eq!(cache.Capacity(), 8);
+        assert!(cache.Size() >= 8);
+
+        cache.SetCapacity(4);
+        assert_eq!(cache.Capacity(), 4);
+        cache.Remove("first").unwrap();
+        assert_eq!(cache.Lookup("first").unwrap(), None);
+        cache.Insert("second", "abcd".to_string(), 4).unwrap();
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Size(), 0);
+        assert_eq!(cache.Lookup("second").unwrap(), None);
+        assert!(cache.Stop());
+    }
+
+    #[test]
+    fn cxx_blockcache_facade_enforces_lifecycle_and_clears_ssd_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssd_path = dir.path().join("blockcache-ssd");
+        fs::create_dir_all(&ssd_path).unwrap();
+        fs::write(ssd_path.join("stale.cache_block"), b"stale").unwrap();
+
+        let cache = BlockCache::new();
+        assert!(matches!(
+            cache.Put("cold", b"value"),
+            Err(CacheError::Stopped)
+        ));
+        cache.Init(CacheOptions {
+            dram_capacity: 64,
+            ssd_paths: vec![ssd_path.clone()],
+            blockcache_clear_ssd_folder: true,
+            ..CacheOptions::default()
+        });
+        assert!(!cache.is_initialized());
+        cache.Start().unwrap();
+        assert!(cache.is_initialized());
+        assert!(!ssd_path.join("stale.cache_block").exists());
+
+        cache.Put("alpha", b"one").unwrap();
+        assert_eq!(cache.Get("alpha").unwrap(), b"one");
+        assert_eq!(cache.GetString("alpha").unwrap(), "one");
+        assert!(matches!(cache.Get("missing"), Err(CacheError::NotFound)));
+
+        fs::create_dir_all(&ssd_path).unwrap();
+        fs::write(ssd_path.join("stop-stale.cache_block"), b"stale").unwrap();
+        cache.Stop().unwrap();
+        assert!(!cache.is_initialized());
+        assert!(!ssd_path.join("stop-stale.cache_block").exists());
+        assert!(matches!(cache.Get("alpha"), Err(CacheError::Stopped)));
+    }
+
+    #[test]
+    fn cxx_flexible_cache_uses_selected_ssd_paths_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let cache = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            128,
+            "weighted_hotness_lru",
+            "ssd",
+            Vec::<String>::new(),
+            vec![path.clone()],
+        );
+
+        assert_eq!(cache.policy(), ReplacementPolicyType::kWeightedHotnessLru);
+        assert_eq!(cache.engine(), StorageEngineType::kSSD);
+        assert_eq!(cache.paths(), &[PathBuf::from(&path)]);
+        cache.Insert("ssd-key", "ssd-value".to_string(), 9).unwrap();
+        assert_eq!(
+            cache.Lookup("ssd-key").unwrap(),
+            Some("ssd-value".to_string())
+        );
+        assert!(cache.CalculateSpaceAmplification().is_some());
+
+        let restarted = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            128,
+            "weighted_hotness_lru",
+            "ssd",
+            Vec::<String>::new(),
+            vec![path],
+        );
+        let report = restarted.instance().RecoverData().unwrap();
+        assert_eq!(report.recovered_files, 1);
+        assert_eq!(
+            restarted.Lookup("ssd-key").unwrap(),
+            Some("ssd-value".to_string())
+        );
+    }
+
+    #[test]
+    fn cxx_pmem_cache_instance_persists_and_recovers_from_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_path = dir.path().join("pmem-device");
+        let paths = vec![pmem_path.to_string_lossy().to_string()];
+        let cache = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            64,
+            "weighted_hotness_lru",
+            "pmem",
+            paths.clone(),
+            Vec::<String>::new(),
+        );
+        assert_eq!(cache.engine(), StorageEngineType::kPMEM);
+        cache.Insert("pmem-a", "value-a".to_string(), 7).unwrap();
+        cache.Insert("pmem-b", "value-b".to_string(), 7).unwrap();
+        assert_eq!(cache.Lookup("pmem-a").unwrap(), Some("value-a".to_string()));
+        assert!(pmem_path.join("pmem-cache-manifest.log").exists());
+
+        let restarted = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            64,
+            "weighted_hotness_lru",
+            "pmem",
+            paths,
+            Vec::<String>::new(),
+        );
+        let report = restarted.instance().RecoverData().unwrap();
+        assert_eq!(report.recovered_files, 2);
+        assert_eq!(
+            restarted.Lookup("pmem-a").unwrap(),
+            Some("value-a".to_string())
+        );
+        assert_eq!(
+            restarted.Lookup("pmem-b").unwrap(),
+            Some("value-b".to_string())
+        );
+
+        restarted.Remove("pmem-a").unwrap();
+        let restarted_after_remove = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            64,
+            "weighted_hotness_lru",
+            "pmem",
+            vec![pmem_path.to_string_lossy().to_string()],
+            Vec::<String>::new(),
+        );
+        let report = restarted_after_remove.instance().RecoverData().unwrap();
+        assert_eq!(report.recovered_files, 1);
+        assert_eq!(restarted_after_remove.Lookup("pmem-a").unwrap(), None);
+        assert_eq!(
+            restarted_after_remove.Lookup("pmem-b").unwrap(),
+            Some("value-b".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_recover_on_start_restores_pmem_index_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_path = dir.path().join("pmem-device");
+        let key = CacheKey::string(43, "auto-recover-pmem-only");
+        let options = CacheOptions::new(0, 64, 0)
+            .with_pmem_paths([pmem_path.clone()])
+            .with_auto_recover_on_start(true);
+        let cache = MultiLayerCache::try_with_options(options.clone()).unwrap();
+        cache
+            .test_insert(CacheInstanceType::kPMEM, key.clone(), b"pmem".to_vec(), 4)
+            .unwrap();
+
+        let restarted = MultiLayerCache::try_with_options(options).unwrap();
+        assert_eq!(restarted.peek_tier(&key), Some(CacheReadTier::Pmem));
+        assert_eq!(
+            restarted
+                .test_acquire(CacheInstanceType::kPMEM, &key)
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"pmem"
+        );
+    }
+
+    #[test]
+    fn pmem_persistent_entry_removed_through_general_cache_api_stays_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_path = dir.path().join("pmem-device");
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 64, 0).with_pmem_paths([pmem_path.clone()]),
+        );
+        let key = CacheKey::string(7, "general-remove-pmem");
+
+        cache
+            .test_insert(CacheInstanceType::kPMEM, key.clone(), b"pmem".to_vec(), 4)
+            .unwrap();
+        assert_eq!(
+            cache
+                .test_acquire(CacheInstanceType::kPMEM, &key)
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"pmem"
+        );
+        cache.remove(&key).unwrap();
+
+        let restarted =
+            MultiLayerCache::with_options(CacheOptions::new(0, 64, 0).with_pmem_paths([pmem_path]));
+        let report = restarted.recover_pmem_index().unwrap();
+        assert_eq!(report.recovered_files, 0);
+        assert!(restarted
+            .test_acquire(CacheInstanceType::kPMEM, &key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cxx_flexible_cache_multi_ssd_uses_all_paths_and_recovers() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_a = dir_a.path().to_string_lossy().to_string();
+        let path_b = dir_b.path().to_string_lossy().to_string();
+        let paths = vec![path_a.clone(), path_b.clone()];
+        let cache = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            16 * 1024,
+            "weighted_hotness_lru",
+            "multi_ssd",
+            Vec::<String>::new(),
+            paths.clone(),
+        );
+
+        assert_eq!(cache.engine(), StorageEngineType::kMultiSSD);
+        assert_eq!(
+            cache.paths(),
+            &[PathBuf::from(&path_a), PathBuf::from(&path_b)]
+        );
+
+        let ssd_store_paths = paths
+            .iter()
+            .map(|path| PathBuf::from(path).join("rocksdb-cache-blocks"))
+            .collect::<Vec<_>>();
+        let routing_probe = StorageEngineMultiSSD::with_paths(ssd_store_paths.clone(), 16 * 1024);
+        let mut routed = Vec::new();
+        for index in 0..512 {
+            let record_key = format!("multi-ssd-flex-key-{index}");
+            let key = CacheKey::string(0, &record_key);
+            let store_key = CacheManifestRecord::from_entry(&key, 0).encode_line();
+            let Some(device) = routing_probe.device_for_key(&store_key).map(str::to_string) else {
+                continue;
+            };
+            if !routed
+                .iter()
+                .any(|(_, existing): &(String, String)| existing == &device)
+            {
+                routed.push((key.record_key.clone(), device));
+            }
+            if routed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(routed.len(), 2);
+
+        for (index, (key, _device)) in routed.iter().enumerate() {
+            cache
+                .Insert(key, format!("flex-multi-ssd-value-{index}"), 64)
+                .unwrap();
+        }
+
+        let mut storage_probe = StorageEngineMultiSSD::with_paths(ssd_store_paths, 16 * 1024);
+        assert!(storage_probe.Start());
+        for (index, (key, _device)) in routed.iter().enumerate() {
+            let store_key =
+                CacheManifestRecord::from_entry(&CacheKey::string(0, key), 0).encode_line();
+            assert_eq!(
+                decode_cache_block(storage_probe.Get(&store_key).unwrap().Data()).unwrap(),
+                format!("flex-multi-ssd-value-{index}").into_bytes()
+            );
+        }
+        assert!(storage_probe.Stop());
+
+        let restarted = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
+            16 * 1024,
+            "weighted_hotness_lru",
+            "multi_ssd",
+            Vec::<String>::new(),
+            paths,
+        );
+        let report = restarted.instance().RecoverData().unwrap();
+        assert_eq!(report.recovered_files, 2);
+        for (index, (key, _device)) in routed.iter().enumerate() {
+            assert_eq!(
+                restarted.Lookup(key).unwrap(),
+                Some(format!("flex-multi-ssd-value-{index}"))
+            );
+        }
+    }
+
+    #[test]
+    fn cxx_multi_tier_cache_wrapper_builds_unified_cache_from_constructor_knobs() {
+        let pmem_dir = tempfile::tempdir().unwrap();
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let cache = MatrixCacheBuilder::BuildMultiTierCacheFromPathStrings(
+            16,
+            32,
+            128,
+            "fifo",
+            vec![pmem_dir.path().to_string_lossy().to_string()],
+            vec![ssd_dir.path().to_string_lossy().to_string()],
+            "side_by_side",
+            false,
+            8,
+            "rocksdb",
+        );
+
+        assert_eq!(cache.policy(), ReplacementPolicyType::kFIFO);
+        assert_eq!(cache.ssd_storage_engine(), StorageEngineType::kSSD);
+        assert!(!cache.eviction_enabled());
+        assert_eq!(cache.options().dram_capacity, 16);
+        assert_eq!(cache.options().pmem_capacity, 32);
+        assert_eq!(cache.options().ssd_capacity, 128);
+        assert_eq!(
+            cache.options().cache_dram_pmem_data_placement_type,
+            "SideBySide"
+        );
+        assert_eq!(cache.options().cache_dram_pmem_data_placement_threshold, 8);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kDRAM), 16);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kPMEM), 32);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kSSD), 128);
+        assert!(!cache.inner().EvictionHandlerEnabled());
+
+        assert!(cache.Start());
+        cache.Insert("small", "abcd".to_string(), 4).unwrap();
+        cache.Insert("large", "0123456789".to_string(), 10).unwrap();
+        assert_eq!(cache.Lookup("small").unwrap(), Some("abcd".to_string()));
+        assert_eq!(
+            cache.Lookup("large").unwrap(),
+            Some("0123456789".to_string())
+        );
+        assert!(cache.Size() >= 14);
+
+        cache.Remove("small").unwrap();
+        assert_eq!(cache.Lookup("small").unwrap(), None);
+        cache.SetCapacity(32);
+        assert_eq!(cache.Capacity(), 32);
+        let stats = cache.cache_stats_summary_line("hits", "smoke");
+        assert!(stats.contains("matrixcache_stats"));
+        assert!(stats.contains("metrics=hits"));
+        assert!(stats.contains("comments=smoke"));
+        assert!(stats.contains("policy=FIFO"));
+        assert!(stats.contains("ssd_engine=SSD"));
+        assert!(stats.contains("placement=SideBySide"));
+        assert!(stats.contains("memory_bytes="));
+        assert!(stats.contains("pmem_bytes="));
+        assert!(stats.contains("disk_bytes="));
+        let measurement = cache.measurement_summary_line();
+        assert!(measurement.contains("matrixcache_stats"));
+        assert!(measurement.contains("matrixcache_latency"));
+        cache.PrintLatency("smoke");
+        cache.PrintCacheStats("hits", "smoke");
+        cache.PrintMeasurement();
+        cache.RemoveAll().unwrap();
+        assert_eq!(cache.Size(), 0);
+        assert_eq!(cache.Lookup("large").unwrap(), None);
+        assert!(cache.Stop());
+    }
+
+    #[test]
+    fn eviction_callback_observes_capacity_reduction_victims() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(16, dir.path());
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        let first = CacheKey::string(1, "first");
+        cache.put(first.clone(), b"12345678".to_vec()).unwrap();
+        cache
+            .put(CacheKey::string(1, "second"), b"abcdefgh".to_vec())
+            .unwrap();
+        cache.set_capacity_for_tier(CacheTier::Memory, 8);
+
+        let evictions = evictions.lock().unwrap().clone();
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].tier, CacheTier::Memory);
+        assert_eq!(evictions[0].key, first);
+        assert_eq!(evictions[0].value, b"12345678".to_vec());
+    }
+
+    #[test]
+    fn tiered_eviction_demotes_memory_to_pmem_then_pmem_to_ssd() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 8,
+            pmem_capacity_bytes: 16,
+            ssd_capacity_bytes: 256,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 99,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 8,
+            max_pmem_block_bytes: 16,
+            max_ssd_block_bytes: 256,
+            ssd_write_through: false,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+        cache.set_replacement_policy_for_tier(CacheTier::Pmem, CacheReplacementPolicy::Fifo);
+        cache.set_replacement_policy_for_tier(CacheTier::Ssd, CacheReplacementPolicy::Fifo);
+        cache.set_pmem_paths(vec![dir.path().join("pmem")]);
+
+        let first = CacheKey::string(1, "tiered-first");
+        let second = CacheKey::string(1, "tiered-second");
+        let third = CacheKey::string(1, "tiered-third");
+        let fourth = CacheKey::string(1, "tiered-fourth");
+
+        cache.put(first.clone(), b"11111111".to_vec()).unwrap();
+        cache.put(second.clone(), b"22222222".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&first), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&second), Some(CacheReadTier::Memory));
+
+        cache.put(third.clone(), b"33333333".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&first), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&second), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&third), Some(CacheReadTier::Memory));
+
+        cache.put(fourth.clone(), b"44444444".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&first), Some(CacheReadTier::Ssd));
+        assert_eq!(cache.peek_tier(&second), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&third), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&fourth), Some(CacheReadTier::Memory));
+        assert_eq!(cache.get(&first).unwrap(), Some(b"11111111".to_vec()));
+
+        let stats = cache.stats();
+        assert!(stats.memory_evictions >= 3);
+        assert!(stats.pmem_evictions >= 1);
+        assert!(stats.pmem_fills >= 3);
+        assert!(stats.disk_fills >= 1);
+    }
+
+    #[test]
+    fn tiered_insert_falls_back_to_pmem_when_memory_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 8,
+            pmem_capacity_bytes: 32,
+            ssd_capacity_bytes: 0,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 99,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 1024,
+            max_pmem_block_bytes: 1024,
+            max_ssd_block_bytes: 0,
+            ssd_write_through: false,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+
+        let key = CacheKey::string(1, "tiered-memory-fallback");
+        cache
+            .put(key.clone(), b"larger-than-dram".to_vec())
+            .unwrap();
+
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+        let stats = cache.stats();
+        assert_eq!(stats.memory_admission_rejected, 1);
+        assert_eq!(stats.pmem_admission_accepted, 1);
+        assert_eq!(stats.pmem_fills, 1);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"larger-than-dram".to_vec()));
+    }
+
+    #[test]
+    fn eviction_callback_observes_ssd_victims_with_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 0,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 90,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 0,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 64,
+            ssd_write_through: true,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&evictions);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        let first = CacheKey::page(1, 10, 0, 16);
+        let second = CacheKey::page(1, 11, 0, 16);
+        let third = CacheKey::page(1, 12, 0, 16);
+        cache
+            .put(first.clone(), b"first-page-0000".to_vec())
+            .unwrap();
+        cache
+            .put(second.clone(), b"second-page-000".to_vec())
+            .unwrap();
+        cache
+            .put(third.clone(), b"third-page-0000".to_vec())
+            .unwrap();
+
+        let evictions = evictions.lock().unwrap().clone();
+        assert!(evictions.iter().any(|record| {
+            record.tier == CacheTier::Ssd
+                && record.key == first
+                && record.value == b"first-page-0000".to_vec()
+        }));
+    }
+
+    #[test]
+    fn side_by_side_ssd_refill_promotes_large_values_to_pmem() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 256,
+            ssd_capacity_bytes: 1024,
+            data_placement: CacheDataPlacement::SideBySide,
+            data_placement_threshold_bytes: 16,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 99,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 256,
+            max_ssd_block_bytes: 1024,
+            ssd_write_through: true,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        let key = CacheKey::string(1, "large-refill");
+
+        cache
+            .put(key.clone(), b"0123456789abcdef-large".to_vec())
+            .unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+        let read = cache.get_with_tier(&key).unwrap().unwrap();
+        assert_eq!(read.tier, CacheReadTier::Ssd);
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+    }
+
+    // shared-corpus: storage_cache_refill
+    #[test]
+    fn tiered_ssd_cold_read_refills_memory_from_rocksdb_backed_ssd() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 4096,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 4096,
+            ssd_write_through: true,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let key = CacheKey::page_with_slot(7, 9, 0, 16, Some(11));
+        let value = b"rocksdb-cold-refill".to_vec();
+
+        cache.put(key.clone(), value.clone()).unwrap();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+
+        cache.clear_memory_for_test();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+        let read = cache.get_with_tier(&key).unwrap().unwrap();
+        assert_eq!(read.tier, CacheReadTier::Ssd);
+        assert_eq!(read.value, value);
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+        assert_eq!(
+            cache.get_memory(&key),
+            Some(b"rocksdb-cold-refill".to_vec())
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.disk_hits, 1);
+        assert_eq!(stats.refill_failures, 0);
+        assert!(stats.refill_latency_samples > 0);
+        assert!(stats.read_through_latency_samples > 0);
+    }
+
+    #[test]
+    fn cache_pressure_policy_report_requires_admission_eviction_and_refill_evidence() {
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 256,
+            ssd_capacity_bytes: 1024,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 8,
+            pmem_admit_hotness_threshold: 5,
+            ssd_admit_hotness_threshold: 2,
+            max_memory_block_bytes: 32,
+            max_pmem_block_bytes: 128,
+            max_ssd_block_bytes: 256,
+            ssd_write_through: true,
+        };
+        let requests = vec![
+            CacheAdmissionRequest {
+                block_kind: CacheBlockKind::Page,
+                shard_id: 1,
+                routing_slot: Some(1),
+                block_bytes: 8,
+                hotness: 10,
+                pinned: false,
+            },
+            CacheAdmissionRequest {
+                block_kind: CacheBlockKind::Index,
+                shard_id: 1,
+                routing_slot: Some(1),
+                block_bytes: 64,
+                hotness: 5,
+                pinned: false,
+            },
+            CacheAdmissionRequest {
+                block_kind: CacheBlockKind::Index,
+                shard_id: 1,
+                routing_slot: Some(1),
+                block_bytes: 96,
+                hotness: 2,
+                pinned: false,
+            },
+            CacheAdmissionRequest {
+                block_kind: CacheBlockKind::Oplog,
+                shard_id: 1,
+                routing_slot: None,
+                block_bytes: 512,
+                hotness: 10,
+                pinned: false,
+            },
+        ];
+        let passing = validate_cache_pressure_policy(
+            policy,
+            &requests,
+            CacheStats {
+                memory_evictions: 4,
+                disk_hits: 7,
+                ..CacheStats::default()
+            },
+        );
+        assert!(passing.passed, "{passing:?}");
+        assert_eq!(passing.memory_admitted, 1);
+        assert_eq!(passing.pmem_admitted, 1);
+        assert_eq!(passing.ssd_admitted, 1);
+        assert_eq!(passing.rejected, 1);
+
+        let failing = validate_cache_pressure_policy(policy, &requests[..1], CacheStats::default());
+        assert!(!failing.passed);
+        assert!(failing
+            .reasons
+            .contains(&"missing_ssd_admission".to_string()));
+        assert!(failing
+            .reasons
+            .contains(&"missing_eviction_observation".to_string()));
+    }
+
+    // shared-corpus: storage_cache_replacement_policy_soak
+    #[test]
+    fn replacement_policy_soak_retains_hot_and_pinned_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(48, dir.path());
+
+        let report = cache.replacement_policy_soak(128);
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.hot_memory_survivors, report.hot_key_count);
+        assert!(report.cold_memory_survivors < report.hot_memory_survivors);
+        assert!(report.pinned_memory_survived);
+        assert!(report.observed_evictions > 0);
+        assert!(report.observed_pinned_skips > 0);
+        assert!(report.observed_disk_refills > 0);
+        assert!(report.observed_async_writeback_backpressure > 0);
+        assert!(report.async_writeback_max_queue_depth > 0);
+        assert!(report.async_writeback_max_queue_bytes > 0);
+        assert!(report.restart_disk_refill_ready);
+        assert!(report.get_latency_samples > 0);
+        assert!(report.put_latency_samples > 0);
+        assert!(report.read_through_latency_samples > 0);
+        assert!(report.refill_latency_samples > 0);
+        assert!(report.writeback_latency_samples > 0);
+        assert!(report.eviction_latency_samples > 0);
+        assert!(report.compaction_latency_samples > 0);
+        assert!(report.read_through_latency_bucketed);
+        assert!(report.refill_latency_bucketed);
+        assert!(report.writeback_latency_bucketed);
+        assert!(report.eviction_latency_bucketed);
+        assert!(report.compaction_latency_bucketed);
+    }
+
+    // shared-corpus: storage_cache_replacement_policy_soak
+    #[test]
+    fn sharded_replacement_policy_soak_aggregates_all_shards() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(96, 0, 8192)
+                .with_ssd_paths(vec![unique_temp_path("sharded-replacement-soak")]),
+            2,
+        );
+
+        let report = cache.ReplacementPolicySoak(64);
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.iterations, 128);
+        assert_eq!(report.hot_key_count, 8);
+        assert_eq!(report.hot_memory_survivors, report.hot_key_count);
+        assert!(report.cold_memory_survivors < report.hot_memory_survivors);
+        assert!(report.pinned_memory_survived);
+        assert!(report.restart_disk_refill_ready);
+        assert!(report.observed_evictions > 0);
+        assert!(report.observed_pinned_skips > 0);
+        assert!(report.observed_disk_refills > 0);
+        assert!(report.observed_async_writeback_backpressure > 0);
+        assert!(report.get_latency_samples > 0);
+        assert!(report.put_latency_samples > 0);
+        assert!(report.read_through_latency_bucketed);
+        assert!(report.refill_latency_bucketed);
+        assert!(report.writeback_latency_bucketed);
+        assert!(report.eviction_latency_bucketed);
+        assert!(report.compaction_latency_bucketed);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn production_cache_tier_enforces_ssd_capacity_and_reports_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 16,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 90,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 16,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 64,
+            ssd_write_through: true,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let first = CacheKey::page_with_slot(1, 10, 0, 16, Some(3));
+        let second = CacheKey::page_with_slot(1, 11, 0, 16, Some(3));
+        let third = CacheKey::page_with_slot(1, 12, 0, 16, Some(4));
+
+        cache
+            .put(first.clone(), b"first-page-0000".to_vec())
+            .unwrap();
+        cache
+            .put(second.clone(), b"second-page-000".to_vec())
+            .unwrap();
+        cache
+            .put(third.clone(), b"third-page-0000".to_vec())
+            .unwrap();
+
+        let stats = cache.stats();
+        assert!(stats.ssd_admission_accepted >= 3);
+        assert!(stats.ssd_evictions >= 1);
+        assert!(stats.ssd_eviction_capacity >= 1);
+        assert!(stats.disk_bytes <= policy.ssd_capacity_bytes as u64);
+        assert_eq!(cache.get(&first).unwrap(), None);
+
+        let entries = cache.entries_for_shard(1);
+        assert!(entries.iter().any(|entry| {
+            entry.routing_slot == Some(3)
+                && entry.block_kind == Some(CacheBlockKind::Page)
+                && entry.admission_reason.is_some()
+        }));
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn cache_hotness_promotes_entries_and_updates_lru_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 512,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 512,
+            ssd_write_through: true,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        let key = CacheKey::page_with_slot(1, 20, 0, 4, Some(8));
+
+        cache.put(key.clone(), b"page".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.get(&key).unwrap(), Some(b"page".to_vec()));
+        assert_eq!(cache.get(&key).unwrap(), Some(b"page".to_vec()));
+
+        let entry = cache
+            .entries_for_shard(1)
+            .into_iter()
+            .find(|entry| entry.routing_slot == Some(8))
+            .expect("cache entry should exist");
+        assert!(entry.hotness >= policy.memory_hotness_threshold);
+        assert!(entry.hits >= 2);
+        assert!(cache.stats().hotness_promotions >= 1);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn weighted_memory_eviction_preserves_hot_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 8,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 512,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 8,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 128,
+            ssd_write_through: true,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        let hot = CacheKey::page_with_slot(1, 30, 0, 4, Some(1));
+        let cold_a = CacheKey::page_with_slot(1, 31, 0, 4, Some(1));
+        let cold_b = CacheKey::page_with_slot(1, 32, 0, 4, Some(1));
+
+        cache
+            .put_with_admission(
+                hot.clone(),
+                b"hot!".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: Some(1),
+                    block_bytes: 4,
+                    hotness: 10,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        cache
+            .put_with_admission(
+                cold_a.clone(),
+                b"aaaa".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: Some(1),
+                    block_bytes: 4,
+                    hotness: 0,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        cache
+            .put_with_admission(
+                cold_b.clone(),
+                b"bbbb".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: Some(1),
+                    block_bytes: 4,
+                    hotness: 0,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cache.get_memory(&hot), Some(b"hot!".to_vec()));
+        assert_eq!(cache.get_memory(&cold_a), None);
+        assert_eq!(cache.get_memory(&cold_b), Some(b"bbbb".to_vec()));
+        let report = cache.eviction_report();
+        assert_eq!(
+            report.replacement_policy,
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+        assert!(report.memory_capacity_evictions >= 1);
+        assert!(report.memory_low_hit_evictions >= 1 || report.memory_cold_evictions >= 1);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn memory_eviction_selects_cold_slot_group_before_cold_entry_in_hot_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 8,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 64,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 8,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 64,
+            ssd_write_through: false,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        let hot_slot_hot = CacheKey::page_with_slot(1, 50, 0, 4, Some(7));
+        let hot_slot_cold = CacheKey::page_with_slot(1, 51, 0, 4, Some(7));
+        let cold_slot = CacheKey::page_with_slot(1, 52, 0, 4, Some(8));
+
+        for (key, slot, hotness, value) in [
+            (hot_slot_hot.clone(), 7, 10, b"hot!".to_vec()),
+            (hot_slot_cold.clone(), 7, 0, b"warm".to_vec()),
+            (cold_slot.clone(), 8, 0, b"cold".to_vec()),
+        ] {
+            cache
+                .put_with_admission(
+                    key,
+                    value,
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Page,
+                        shard_id: 1,
+                        routing_slot: Some(slot),
+                        block_bytes: 4,
+                        hotness,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.get_memory(&hot_slot_hot), Some(b"hot!".to_vec()));
+        assert_eq!(cache.get_memory(&hot_slot_cold), Some(b"warm".to_vec()));
+        assert_eq!(cache.get_memory(&cold_slot), None);
+        let report = cache.eviction_report();
+        assert!(report.sampled_eviction_groups >= 2);
+        assert!(report.memory_slot_evictions >= 1);
+    }
+
+    // shared-corpus: storage_cache_eviction;
+    #[test]
+    fn memory_capacity_shrink_batches_multiple_evictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 40,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 0,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: u32::MAX,
+            ssd_admit_hotness_threshold: u32::MAX,
+            max_memory_block_bytes: 16,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 0,
+            ssd_write_through: false,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        let keys = (0..5)
+            .map(|i| CacheKey::page_with_slot(3, i, 0, 8, Some(i as u32)))
+            .collect::<Vec<_>>();
+        for (index, key) in keys.iter().enumerate() {
+            cache
+                .put_with_admission(
+                    key.clone(),
+                    vec![b'a' + index as u8; 8],
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Page,
+                        shard_id: 3,
+                        routing_slot: Some(index as u32),
+                        block_bytes: 8,
+                        hotness: index as u32,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        cache.set_capacity_for_tier(CacheTier::Memory, 16);
+
+        let stats = cache.stats();
+        assert!(stats.memory_evictions >= 3);
+        assert!(stats.eviction_latency_samples >= 3);
+        assert!(cache.size_for_tier(CacheTier::Memory) <= 16);
+        let remaining = cache.get_batch(&keys).unwrap();
+        assert_eq!(remaining.iter().filter(|value| value.is_some()).count(), 2);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn weighted_ssd_eviction_preserves_hot_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 0,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 70,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 8,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 64,
+            ssd_write_through: true,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let hot = CacheKey::page_with_slot(1, 40, 0, 4, Some(2));
+        let cold_a = CacheKey::page_with_slot(1, 41, 0, 4, Some(2));
+        let cold_b = CacheKey::page_with_slot(1, 42, 0, 4, Some(2));
+
+        for (key, hotness, bytes) in [
+            (hot.clone(), 10, b"hot!".to_vec()),
+            (cold_a.clone(), 0, b"aaaa".to_vec()),
+            (cold_b.clone(), 0, b"bbbb".to_vec()),
+        ] {
+            cache
+                .put_with_admission(
+                    key,
+                    bytes,
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Page,
+                        shard_id: 1,
+                        routing_slot: Some(2),
+                        block_bytes: 4,
+                        hotness,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.get(&hot).unwrap(), Some(b"hot!".to_vec()));
+        assert_eq!(cache.get(&cold_a).unwrap(), None);
+        assert_eq!(cache.get(&cold_b).unwrap(), Some(b"bbbb".to_vec()));
+        let report = cache.eviction_report();
+        assert!(report.ssd_capacity_evictions >= 1);
+        assert!(report.ssd_low_hit_evictions >= 1 || report.ssd_cold_evictions >= 1);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn ssd_eviction_selects_cold_slot_group_before_cold_entry_in_hot_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 0,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 256,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 0,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 128,
+            ssd_write_through: true,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let hot_slot_hot = CacheKey::page_with_slot(1, 60, 0, 4, Some(9));
+        let hot_slot_cold = CacheKey::page_with_slot(1, 61, 0, 4, Some(9));
+        let cold_slot = CacheKey::page_with_slot(1, 62, 0, 4, Some(10));
+
+        for (key, slot, hotness, value) in [
+            (hot_slot_hot.clone(), 9, 10, b"hot!".to_vec()),
+            (hot_slot_cold.clone(), 9, 0, b"warm".to_vec()),
+            (cold_slot.clone(), 10, 0, vec![b'c'; 240]),
+        ] {
+            cache
+                .put_with_admission(
+                    key,
+                    value,
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Page,
+                        shard_id: 1,
+                        routing_slot: Some(slot),
+                        block_bytes: 4,
+                        hotness,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.get(&hot_slot_hot).unwrap(), Some(b"hot!".to_vec()));
+        assert_eq!(cache.get(&hot_slot_cold).unwrap(), Some(b"warm".to_vec()));
+        assert_eq!(cache.get(&cold_slot).unwrap(), None);
+        let report = cache.eviction_report();
+        let stats = cache.stats();
+        assert_eq!(report.ssd_slot_evictions, 0);
+        assert!(stats.ssd_admission_rejected >= 1);
+        assert!(stats.writeback_backpressure_events >= 1);
+    }
+
+    #[test]
+    fn acquire_release_and_insert_pinned_match_zero_copy_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "zero-copy");
+
+        let inserted = cache
+            .insert_pinned(key.clone(), b"value".to_vec())
+            .unwrap()
+            .expect("insert_pinned should return a handle");
+        assert_eq!(inserted.key, key);
+        assert_eq!(inserted.as_slice(), b"value");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().zero_copy_handle_hits, 0);
+
+        cache.release(inserted);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 1);
+
+        cache.clear_memory_for_test();
+        let acquired = cache
+            .acquire(&key)
+            .unwrap()
+            .expect("acquire should find the SSD-backed value");
+        assert_eq!(acquired.as_slice(), b"value");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(acquired.tier(), CacheReadTier::Ssd);
+        assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+
+        cache.release(acquired);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert!(cache
+            .acquire(&CacheKey::string(1, "missing"))
+            .unwrap()
+            .is_none());
+        assert!(cache.stats().zero_copy_handle_misses >= 1);
+    }
+
+    #[test]
+    fn acquire_no_promotion_pins_ssd_without_refilling_memory() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("zero-copy-no-promotion-acquire"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: u32::MAX,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let key = CacheKey::string(1, "zero-copy-no-promotion");
+        cache.put(key.clone(), b"cold-handle".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+        let zero_copy_hits_before = cache.stats().zero_copy_handle_hits;
+        let handle = cache
+            .acquire_no_promotion(&key)
+            .unwrap()
+            .expect("SSD handle");
+        assert_eq!(handle.tier(), CacheReadTier::Ssd);
+        assert_eq!(handle.value(), b"cold-handle");
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.stats().zero_copy_handle_hits, zero_copy_hits_before);
+        assert_eq!(cache.stats().pinned_entries, 1);
+
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.get_memory(&key), None);
+    }
+
+    #[test]
+    fn acquire_batch_no_promotion_coalesces_duplicates_without_refill() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("zero-copy-no-promotion-batch"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: u32::MAX,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let repeated = CacheKey::string(1, "zero-copy-no-promotion-dup");
+        let other = CacheKey::string(1, "zero-copy-no-promotion-other");
+        cache.put(repeated.clone(), b"dup".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+
+        let zero_copy: &dyn ZeroCopyCacheApi = &cache;
+        let zero_copy_hits_before = cache.stats().zero_copy_handle_hits;
+        let handles = zero_copy
+            .acquire_batch_no_promotion_cache(&[repeated.clone(), other.clone(), repeated.clone()])
+            .unwrap();
+        assert_eq!(handles.len(), 3);
+        assert_eq!(handles[0].as_ref().unwrap().value(), b"dup");
+        assert_eq!(handles[1].as_ref().unwrap().value(), b"other");
+        assert_eq!(handles[2].as_ref().unwrap().value(), b"dup");
+        assert_eq!(cache.stats().pinned_entries, 2);
+        assert_eq!(cache.stats().pin_operations, 3);
+        assert_eq!(cache.stats().zero_copy_handle_hits, zero_copy_hits_before);
+        assert_eq!(cache.get_memory(&repeated), None);
+        assert_eq!(cache.get_memory(&other), None);
+
+        let handles = handles.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(zero_copy.release_batch_cache(handles), 3);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn acquire_batch_coalesces_duplicates_and_balances_pins() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("zero-copy-batch-acquire"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: u32::MAX,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let repeated = CacheKey::string(1, "zero-copy-batch-dup");
+        let other = CacheKey::string(1, "zero-copy-batch-other");
+        cache.put(repeated.clone(), b"dup".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+
+        let zero_copy: &dyn ZeroCopyCacheApi = &cache;
+        let handles = zero_copy
+            .acquire_batch_cache(&[repeated.clone(), other.clone(), repeated.clone()])
+            .unwrap();
+        assert_eq!(handles.len(), 3);
+        assert_eq!(handles[0].as_ref().unwrap().value(), b"dup");
+        assert_eq!(handles[1].as_ref().unwrap().value(), b"other");
+        assert_eq!(handles[2].as_ref().unwrap().value(), b"dup");
+        assert_eq!(cache.stats().pinned_entries, 2);
+        assert_eq!(cache.stats().pin_operations, 3);
+        assert_eq!(cache.stats().disk_hits, 2);
+
+        let handles = handles.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(zero_copy.release_batch_cache(handles), 3);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 3);
+    }
+
+    #[test]
+    fn update_cached_value_if_current_matches_cache_instance_update_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let key = CacheKey::string(9, "update");
+
+        cache.put(key.clone(), b"old-value".to_vec()).unwrap();
+        let old_handle = cache.acquire(&key).unwrap().expect("old handle");
+        assert_eq!(old_handle.as_slice(), b"old-value");
+
+        cache
+            .update_cached_value_if_current(&key, &old_handle, b"new-value".to_vec())
+            .unwrap();
+
+        assert_eq!(old_handle.as_slice(), b"old-value");
+        assert_eq!(cache.get(&key).unwrap(), Some(b"new-value".to_vec()));
+        assert!(matches!(
+            cache.update_cached_value_if_current(&key, &old_handle, b"stale".to_vec()),
+            Err(CacheError::ReplaceMismatch)
+        ));
+
+        let fresh_handle = cache.acquire(&key).unwrap().expect("fresh handle");
+        assert_eq!(fresh_handle.as_slice(), b"new-value");
+        cache
+            .update_cached_value_if_current(&key, &fresh_handle, b"final".to_vec())
+            .unwrap();
+        assert_eq!(cache.get(&key).unwrap(), Some(b"final".to_vec()));
+        assert!(matches!(
+            cache.update_cached_value_if_current(
+                &CacheKey::string(9, "other-key"),
+                &fresh_handle,
+                b"wrong-key".to_vec()
+            ),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        cache.release(old_handle);
+        cache.release(fresh_handle);
+
+        let final_handle = cache.acquire(&key).unwrap().expect("final handle");
+        cache.invalidate(&key).unwrap();
+        assert!(matches!(
+            cache.update_cached_value_if_current(&key, &final_handle, b"gone".to_vec()),
+            Err(CacheError::NotFound)
+        ));
+        cache.release(final_handle);
+
+        cache.put(key.clone(), b"again".to_vec()).unwrap();
+        let handle = cache.acquire(&key).unwrap().expect("handle");
+        cache.stop();
+        assert!(matches!(
+            cache.update_cached_value_if_current(&key, &handle, b"blocked".to_vec()),
+            Err(CacheError::Stopped)
+        ));
+    }
+
+    #[test]
+    fn counted_pins_keep_entries_pinned_until_last_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "counted");
+        let other = CacheKey::string(1, "other");
+
+        cache.put(key.clone(), b"pin".to_vec()).unwrap();
+        let first = cache.acquire(&key).unwrap().expect("first handle");
+        let second = cache.clone_handle(&first);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().pin_operations, 2);
+
+        cache.release(first);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        cache.put(other, b"12345678".to_vec()).unwrap();
+        assert_eq!(cache.get_memory(&key), Some(b"pin".to_vec()));
+
+        cache.release(second);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 2);
+    }
+
+    #[test]
+    fn pinned_handle_clone_with_cache_matches_cxx_explicit_clone_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "clone");
+        let other = CacheKey::string(1, "other");
+
+        cache.put(key.clone(), b"pin".to_vec()).unwrap();
+        let first = cache.acquire(&key).unwrap().expect("first handle");
+        let second = first.clone_with_cache(&cache);
+
+        assert_eq!(first.key(), &key);
+        assert_eq!(first.tier(), CacheReadTier::Memory);
+        assert_eq!(first.value(), b"pin");
+        assert_eq!(first.as_slice(), b"pin");
+        assert_eq!(second.key(), &key);
+        assert_eq!(second.tier(), CacheReadTier::Memory);
+        assert_eq!(second.value(), b"pin");
+        assert_eq!(second.as_slice(), b"pin");
+        assert_eq!(cache.stats().pin_operations, 2);
+        assert_eq!(cache.stats().pinned_entries, 1);
+
+        cache.release(first);
+        cache.put(other.clone(), b"12345678".to_vec()).unwrap();
+        assert_eq!(cache.get_memory(&key), Some(b"pin".to_vec()));
+
+        cache.release(second);
+        cache.put(other, b"abcdefgh".to_vec()).unwrap();
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 2);
+    }
+
+    #[test]
+    fn scoped_handle_releases_pin_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(16, dir.path());
+        let key = CacheKey::string(1, "scoped");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+
+        {
+            let scoped = cache.acquire_scoped(&key).unwrap().expect("scoped handle");
+            assert_eq!(scoped.key(), &key);
+            assert_eq!(scoped.as_slice(), b"value");
+            assert_eq!(cache.stats().pinned_entries, 1);
+        }
+
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 1);
+    }
+
+    #[test]
+    fn manual_pins_are_reference_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(1, "manual");
+        cache.put(key.clone(), b"pin".to_vec()).unwrap();
+
+        cache.pin(key.clone());
+        cache.pin(key.clone());
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().pin_operations, 2);
+
+        cache.unpin(&key);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        cache.unpin(&key);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 2);
+    }
+
+    #[test]
+    fn pinned_memory_entries_survive_capacity_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(10, dir.path());
+        let pinned = CacheKey::string(1, "pinned");
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+
+        cache.put(pinned.clone(), b"pin".to_vec()).unwrap();
+        cache.pin(pinned.clone());
+        cache.put(first.clone(), b"11111".to_vec()).unwrap();
+        cache.put(second.clone(), b"22222".to_vec()).unwrap();
+
+        assert_eq!(cache.get_memory(&pinned), Some(b"pin".to_vec()));
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().pinned_bytes, 3);
+        assert!(cache.stats().eviction_pinned_skips > 0);
+
+        cache.unpin(&pinned);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn scoped_lookup_matches_cxx_found_and_auto_release_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(16, dir.path());
+        let key = CacheKey::string(1, "scoped-lookup");
+
+        let missing = cache.scoped_lookup(&key).unwrap();
+        assert!(!missing.found());
+        assert_eq!(missing.key(), None);
+        assert_eq!(missing.tier(), None);
+        assert_eq!(missing.as_slice(), None);
+        assert_eq!(cache.stats().pinned_entries, 0);
+
+        cache.insert(key.clone(), b"value".to_vec(), 5).unwrap();
+        {
+            let lookup = cache.scoped_lookup(&key).unwrap();
+            assert!(lookup.found());
+            assert_eq!(lookup.key(), Some(&key));
+            assert_eq!(lookup.tier(), Some(CacheReadTier::Memory));
+            assert_eq!(lookup.value(), Some(b"value".as_slice()));
+            assert_eq!(lookup.as_slice(), Some(b"value".as_slice()));
+            assert_eq!(cache.stats().pinned_entries, 1);
+        }
+        assert_eq!(cache.stats().pinned_entries, 0);
+
+        let lookup = cache.scoped_lookup(&key).unwrap();
+        let handle = lookup.into_handle().expect("handle should be carried out");
+        assert_eq!(handle.key(), &key);
+        assert_eq!(handle.tier(), CacheReadTier::Memory);
+        assert_eq!(handle.value(), b"value");
+        assert_eq!(handle.as_slice(), b"value");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    // shared-corpus: storage_cache_refill;
+    #[test]
+    fn cache_reports_writeback_backpressure_and_latency_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 16,
+            ssd_capacity_bytes: 20,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 4,
+            ssd_admit_hotness_threshold: 1,
+            max_memory_block_bytes: 16,
+            max_ssd_block_bytes: 64,
+            ssd_write_through: true,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        let first = CacheKey::page_with_slot(1, 70, 0, 12, Some(5));
+        let second = CacheKey::page_with_slot(1, 71, 0, 12, Some(5));
+        let rejected = CacheKey::page_with_slot(1, 72, 0, 128, Some(5));
+
+        cache.put(first.clone(), b"first-block!".to_vec()).unwrap();
+        cache.put(second.clone(), b"second-block".to_vec()).unwrap();
+        cache
+            .put_with_admission(
+                rejected,
+                vec![b'x'; 128],
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: Some(5),
+                    block_bytes: 128,
+                    hotness: 9,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        let _ = cache.get(&second).unwrap();
+
+        let writeback = cache.writeback_backpressure_report();
+        assert!(writeback.ssd_write_through_enabled);
+        assert!(writeback.write_through_admissions > 0);
+        assert!(writeback.ssd_evictions > 0 || writeback.ssd_admission_rejections > 0);
+        assert!(writeback.backpressure_events > 0);
+        assert!(writeback.bounded_queue_ready);
+
+        let latency = cache.latency_metrics_report();
+        assert!(latency.put_count >= 3);
+        assert!(latency.get_count >= 1);
+        assert!(latency.histogram_ready);
+        assert!(latency.put_max_us >= latency.put_avg_us);
+        assert!(latency.get_max_us >= latency.get_avg_us);
+    }
+
+    #[test]
+    fn cxx_remove_keeps_removed_pinned_entry_counted_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(16, dir.path());
+        let key = CacheKey::page_with_slot(1, 10, 0, 4, Some(7));
+
+        let handle = cache
+            .insert_pinned(key.clone(), b"page".to_vec())
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"page".to_vec()));
+
+        cache.invalidate(&key).unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), None);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert!(cache.stats().pinned_bytes >= b"page".len() as u64);
+        assert!(cache.size() >= b"page".len());
+        assert!(cache.entries_for_shard(1).is_empty());
+
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+        assert_eq!(cache.size(), 0);
+    }
+
+    #[test]
+    fn reinsert_after_removed_pinned_release_counts_only_live_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let key = CacheKey::string(1, "reinsert-after-remove");
+
+        let old_handle = cache
+            .insert_pinned(key.clone(), b"old".to_vec())
+            .unwrap()
+            .expect("old handle");
+        cache.remove(&key).unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), None);
+        assert_eq!(cache.stats().pinned_entries, 1);
+        let removed_size = cache.size();
+        assert!(removed_size >= b"old".len());
+
+        cache
+            .insert(key.clone(), b"new-value".to_vec(), b"new-value".len())
+            .unwrap();
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"new-value".to_vec()));
+        assert!(cache.size() >= removed_size);
+
+        cache.release(old_handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+        assert_eq!(cache.lookup(&key).unwrap(), Some(b"new-value".to_vec()));
+        assert!(cache.size() >= b"new-value".len());
+        assert!(cache.size() < removed_size.saturating_add(b"new-value".len() * 4));
+    }
+
+    // shared-corpus: storage_cache_refill
+    #[test]
+    fn pinned_handle_async_writeback_and_latency_metrics_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(64, dir.path());
+        let key = CacheKey::string(1, "handle");
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        let handle = cache
+            .get_pinned_handle(&key)
+            .unwrap()
+            .expect("pinned handle should exist");
+        assert_eq!(handle.as_slice(), b"value");
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.stats().zero_copy_handle_hits, 1);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+
+        cache.set_async_writeback_queue_limit_for_test(1);
+        cache
+            .enqueue_async_writeback(CacheKey::string(1, "async-a"), b"a".to_vec())
+            .unwrap();
+        assert_eq!(cache.stats().async_writeback_queue_depth, 1);
+        assert_eq!(cache.stats().async_writeback_queue_bytes, 1);
+        assert_eq!(cache.stats().async_writeback_max_queue_depth, 1);
+        assert_eq!(cache.stats().async_writeback_max_queue_bytes, 1);
+        assert!(cache
+            .enqueue_async_writeback(CacheKey::string(1, "async-b"), b"b".to_vec())
+            .is_err());
+        let drained = cache.drain_async_writeback(8).unwrap();
+        assert_eq!(drained.drained, 1);
+        assert_eq!(drained.remaining, 0);
+
+        let stats = cache.stats();
+        assert_eq!(stats.async_writeback_enqueued, 1);
+        assert_eq!(stats.async_writeback_drained, 1);
+        assert_eq!(stats.async_writeback_backpressure_rejections, 1);
+        assert_eq!(stats.async_writeback_queue_depth, 0);
+        assert_eq!(stats.async_writeback_queue_bytes, 0);
+        assert_eq!(stats.async_writeback_max_queue_depth, 1);
+        assert_eq!(stats.async_writeback_max_queue_bytes, 1);
+        cache.record_compaction_latency_micros(1_500);
+        let stats = cache.stats();
+        assert!(stats.get_latency_samples > 0);
+        assert!(stats.put_latency_samples > 0);
+        assert!(stats.read_through_latency_samples > 0);
+        assert!(stats.writeback_latency_samples > 0);
+        assert!(stats.compaction_latency_samples > 0);
+        assert!(stats.get_latency_total_micros >= stats.get_latency_max_micros);
+        assert!(stats.put_latency_total_micros >= stats.put_latency_max_micros);
+        assert_eq!(
+            stats.get_latency_samples,
+            stats.get_latency_le_10us
+                + stats.get_latency_le_100us
+                + stats.get_latency_le_1ms
+                + stats.get_latency_le_10ms
+                + stats.get_latency_gt_10ms
+        );
+        assert_eq!(
+            stats.put_latency_samples,
+            stats.put_latency_le_10us
+                + stats.put_latency_le_100us
+                + stats.put_latency_le_1ms
+                + stats.put_latency_le_10ms
+                + stats.put_latency_gt_10ms
+        );
+        assert_latency_buckets_sum(
+            stats.read_through_latency_samples,
+            [
+                stats.read_through_latency_le_10us,
+                stats.read_through_latency_le_100us,
+                stats.read_through_latency_le_1ms,
+                stats.read_through_latency_le_10ms,
+                stats.read_through_latency_gt_10ms,
+            ],
+        );
+        assert_latency_buckets_sum(
+            stats.writeback_latency_samples,
+            [
+                stats.writeback_latency_le_10us,
+                stats.writeback_latency_le_100us,
+                stats.writeback_latency_le_1ms,
+                stats.writeback_latency_le_10ms,
+                stats.writeback_latency_gt_10ms,
+            ],
+        );
+        assert_latency_buckets_sum(
+            stats.compaction_latency_samples,
+            [
+                stats.compaction_latency_le_10us,
+                stats.compaction_latency_le_100us,
+                stats.compaction_latency_le_1ms,
+                stats.compaction_latency_le_10ms,
+                stats.compaction_latency_gt_10ms,
+            ],
+        );
+    }
+
+    fn assert_latency_buckets_sum(samples: u64, buckets: [u64; 5]) {
+        assert_eq!(samples, buckets.into_iter().sum::<u64>());
+    }
+
+    #[test]
+    fn cache_inspection_and_slot_invalidation_are_slot_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let slot_five = CacheKey::page_with_slot(1, 10, 20, 4, Some(5));
+        let slot_six = CacheKey::page_with_slot(1, 11, 30, 4, Some(6));
+
+        cache.put(slot_five.clone(), b"five".to_vec()).unwrap();
+        cache.put(slot_six.clone(), b"six!".to_vec()).unwrap();
+
+        let entries = cache.entries_for_shard(1);
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.selector.starts_with("slot-5:")));
+
+        let report = cache.invalidate_slot(1, 5).unwrap();
+        assert_eq!(report.memory_entries_removed, 1);
+        assert!(report.disk_bytes_removed > 0);
+        assert_eq!(cache.get(&slot_five).unwrap(), None);
+        assert_eq!(cache.get(&slot_six).unwrap(), Some(b"six!".to_vec()));
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn invalidate_shard_removes_memory_and_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let shard_one = CacheKey::string(1, "a");
+        let shard_two = CacheKey::string(2, "b");
+        cache.put(shard_one.clone(), b"one".to_vec()).unwrap();
+        cache.put(shard_two.clone(), b"two".to_vec()).unwrap();
+        cache.pin(shard_one.clone());
+        assert_eq!(cache.stats().pinned_entries, 1);
+
+        let report = cache.invalidate_shard(1).unwrap();
+        assert_eq!(report.memory_entries_removed, 1);
+        assert!(report.disk_bytes_removed > 0);
+        assert_eq!(cache.get(&shard_one).unwrap(), None);
+        assert_eq!(cache.get(&shard_two).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+    }
+
+    #[test]
+    fn invalidate_page_segment_clears_all_cache_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 16,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 16,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let segment = CacheKey::page_with_slot(7, 42, 9, 4, Some(3));
+        let other = CacheKey::page_with_slot(7, 43, 9, 4, Some(3));
+        cache.put(segment.clone(), b"segment".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+        cache.pin(segment.clone());
+        assert_eq!(cache.stats().pinned_entries, 1);
+
+        let report = cache.invalidate_page_segment(7, 42).unwrap();
+        assert_eq!(report.memory_entries_removed, 1);
+        assert!(report.disk_bytes_removed > 0);
+        assert_eq!(cache.get(&segment).unwrap(), None);
+        assert_eq!(cache.get(&other).unwrap(), Some(b"other".to_vec()));
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+    }
+
+    #[test]
+    fn disk_cache_serializes_compresses_and_decodes_block_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_block_options(
+            1024,
+            dir.path(),
+            CacheBlockOptions {
+                compression: CacheCompression::Zstd { level: 1 },
+                min_compress_bytes: 16,
+            },
+        );
+        let key = CacheKey::string(1, "compressible");
+        let value = vec![b'x'; 4096];
+
+        cache.put(key.clone(), value.clone()).unwrap();
+        cache.clear_memory_for_test();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(value));
+        let stats = cache.stats();
+        assert_eq!(stats.compressed_puts, 1);
+        assert_eq!(stats.compressed_hits, 1);
+        assert!(stats.compression_bytes_saved > 0);
+    }
+
+    #[test]
+    fn disk_cache_can_read_legacy_raw_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "legacy");
+        let legacy_path = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner.disk_path(&key)
+        };
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, b"legacy-value").unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"legacy-value".to_vec()));
+    }
+    #[test]
+    fn rocksdb_ssd_default_does_not_write_raw_shadow_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(42, "rocksdb-primary");
+        let block_path = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner.disk_path(&key)
+        };
+        let manifest_path = dir.path().join(CACHE_MANIFEST_NAME);
+
+        cache.put(key.clone(), b"rocksdb-value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.get(&key).unwrap(), Some(b"rocksdb-value".to_vec()));
+        if cfg!(feature = "rocksdb-ssd") {
+            assert!(
+                !block_path.exists(),
+                "default RocksDB SSD path must not double-write raw block files"
+            );
+            assert!(
+                !manifest_path.exists(),
+                "default RocksDB SSD path must not append legacy cache manifests"
+            );
+        } else {
+            assert!(block_path.exists());
+            assert!(manifest_path.exists());
+        }
+    }
+
+    #[test]
+    fn stop_blocks_core_cache_io_until_start_reenables_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "lifecycle");
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.stop();
+        assert!(!cache.is_started());
+
+        assert!(matches!(cache.get(&key), Err(CacheError::Stopped)));
+        assert!(matches!(cache.acquire(&key), Err(CacheError::Stopped)));
+        assert!(matches!(
+            cache.put(CacheKey::string(1, "stopped-put"), b"blocked".to_vec()),
+            Err(CacheError::Stopped)
+        ));
+        assert!(cache
+            .enqueue_async_writeback(CacheKey::string(1, "stopped-async"), b"blocked".to_vec())
+            .is_err());
+        assert!(matches!(
+            cache.drain_async_writeback(1),
+            Err(CacheError::Stopped)
+        ));
+        assert!(matches!(cache.invalidate(&key), Err(CacheError::Stopped)));
+        assert!(matches!(
+            cache.recover_disk_index(),
+            Err(CacheError::Stopped)
+        ));
+        assert_eq!(cache.get_memory(&key), None);
+
+        cache.start().unwrap();
+        assert!(cache.is_started());
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        cache
+            .put(CacheKey::string(1, "started-put"), b"allowed".to_vec())
+            .unwrap();
+        assert_eq!(
+            cache.get(&CacheKey::string(1, "started-put")).unwrap(),
+            Some(b"allowed".to_vec())
+        );
+    }
+
+    #[test]
+    fn cxx_base_lru_list_tracks_mru_and_tail_eviction() {
+        let mut list = BaseLRUList::new(2);
+        list.Put("a".to_string());
+        list.Put("b".to_string());
+        list.Put("c".to_string());
+
+        assert_eq!(list.Size(), 3);
+        assert_eq!(list.GetTail(2), vec!["a".to_string(), "b".to_string()]);
+        assert!(list.Get("a"));
+        assert_eq!(list.GetTail(2), vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(list.Evict(), vec!["b".to_string()]);
+        assert_eq!(list.Size(), 2);
+        assert!(list.Delete("a"));
+        assert_eq!(list.Size(), 1);
+    }
+
+    #[test]
+    fn cxx_ghost_lru_list_downgrades_data_to_ghost_tail() {
+        let mut list = GhostLRUList::new(1);
+        list.Put("hot".to_string());
+        list.Put("cold".to_string());
+
+        list.Downgrade();
+        assert_eq!(list.Size(), 1);
+        assert_eq!(list.GhostSize(), 1);
+        assert_eq!(list.GetDataTail(8), vec!["cold".to_string()]);
+        assert_eq!(list.GetGhostTail(8), vec!["hot".to_string()]);
+
+        let popped = list.Pop("hot");
+        assert_eq!(popped.item, "hot");
+        assert!(popped.is_ghost);
+    }
+
+    #[test]
+    fn cxx_arc_list_promotes_hits_and_keeps_bounded_data_size() {
+        let mut arc = ArcList::new(2);
+        arc.Put("a".to_string());
+        arc.Put("b".to_string());
+
+        assert_eq!(arc.Size(), 2);
+        assert_eq!(
+            arc.GetFetchDataTail(8),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(arc.Get("a"));
+        assert_eq!(arc.GetActiveDataTail(8), vec!["a".to_string()]);
+
+        arc.Put("c".to_string());
+        assert!(arc.Size() <= arc.Capacity());
+        assert!(arc.TotalSize() <= arc.Capacity() * 2);
+        assert!(arc.GetActiveGhostTail(8).contains(&"a".to_string()));
+        assert!(!arc.Get("a"));
+        assert!(arc.GetActiveDataTail(8).contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn cxx_replacement_arc_exposes_active_and_fetch_tail_surface() {
+        let mut policy = ReplacementArc::new(2);
+        assert!(!policy.is_initialized());
+        policy.Init().unwrap();
+        assert!(policy.is_initialized());
+
+        policy.Put("a".to_string());
+        policy.Put("b".to_string());
+        assert!(policy.Get("a"));
+        policy.Put("c".to_string());
+
+        assert_eq!(policy.GetItemCapacity(), 2);
+        assert!(!policy.Get("a"));
+        assert!(policy.GetActiveTail(8).contains(&"a".to_string()));
+        assert!(policy.GetFetchTail(8).len() <= 2);
+        assert!(policy.Delete("a"));
+        policy.SetItemCapacity(3);
+        assert_eq!(policy.GetItemCapacity(), 3);
+        policy.Reset().unwrap();
+        assert!(!policy.is_initialized());
+        assert!(policy.GetActiveTail(8).is_empty());
+        assert!(policy.GetFetchTail(8).is_empty());
+    }
+
+    #[test]
+    fn cxx_storage_engine_type_preserves_codes_and_aliases() {
+        assert_eq!(
+            StorageEngineType::from_cxx_name("kDRAMStorageEngine"),
+            StorageEngineType::kDRAM
+        );
+        assert_eq!(
+            StorageEngineType::from_cxx_name("kSimpleStorageEngine"),
+            StorageEngineType::kSimple
+        );
+        assert_eq!(StorageEngineType::kMultiSSD.CxxCode(), 4);
+        assert_eq!(
+            StorageEngineType::kSimple.AsCxxEnumName(),
+            "kSimpleStorageEngine"
+        );
+        assert_eq!(
+            StorageEngineType::from_cxx_name("rocksdb"),
+            StorageEngineType::kSSD
+        );
+        assert_eq!(
+            StorageEngineType::from_cxx_name("kSSDRocksDBStorageEngine"),
+            StorageEngineType::kSSD
+        );
+        assert_eq!(SSDEngineType::kRocksDB as u8, 0);
+        assert_eq!(
+            SSDEngineType::FromCxxName("rocksdb"),
+            SSDEngineType::kRocksDB
+        );
+        assert_eq!(SSDEngineType::kRocksDB.AsCxxName(), "RocksDB");
+        assert_eq!(WriteBufferType::kUserDataBuf as u8, 0);
+        assert_eq!(WriteBufferType::kMetaDataBuf as u8, 1);
+        assert_eq!(WriteBufferType::kGCBuf as u8, 2);
+        assert_eq!(WriteBufferType::kCodecDataBuf as u8, 3);
+        assert_eq!(DataType::DATA as u8, 1);
+        assert_eq!(DataType::META_LOG as u8, 2);
+        assert_eq!(GCMode::LOSSY as u8, 1);
+        assert_eq!(GCMode::LOSSLESS as u8, 10);
+        assert_eq!(RecordStateType::kSoftDel as u8, 0x0);
+        assert_eq!(RecordStateType::kNormal as u8, 0x1);
+        assert_eq!(RecordStateType::kPinned as u8, 0x2);
+        assert_eq!(RecordStateType::kMaxCode as u8, 0xf);
+    }
+
+    #[test]
+    fn cxx_write_buffer_and_encoder_preserve_layout_size_semantics() {
+        let mut buffer = WriteBuffer::new(WriteBufferType::kUserDataBuf, 128);
+        buffer.PushBack("a", b"one".to_vec());
+        buffer.PushBack("bb", b"twotwo".to_vec());
+        assert_eq!(buffer.Capacity(), 128);
+        assert_eq!(buffer.BufType(), WriteBufferType::kUserDataBuf);
+        assert_eq!(buffer.Count(), 2);
+        assert_eq!(buffer.KeySize(), 3);
+        assert_eq!(buffer.ValueSize(), 9);
+        assert_eq!(buffer.Size(), 12);
+
+        let encoder = BufferEncoder::new(4096);
+        assert_eq!(encoder.align_size(), 4096);
+        assert_eq!(encoder.GetXXHSeed(), 0);
+        assert_eq!(BufferEncoder::DATA_FIXED_PART_SIZE, 20);
+        assert_eq!(BufferEncoder::OPLOG_FIXED_PART_SIZE, 28);
+        assert_eq!(BufferEncoder::OPLOG_HEADER_SIZE, 8);
+        assert_eq!(encoder.CalculateEncodedDataSize(&buffer), 49);
+        assert_eq!(encoder.CalculateEncodedOpLogSize(&buffer), 59);
+
+        let encoded = encoder.SerializeData(b"payload");
+        assert_eq!(encoded.len(), 20 + "payload".len());
+        let (decoded, corrupted) = encoder.DeserializeData(&encoded);
+        assert_eq!(decoded, b"payload");
+        assert!(!corrupted);
+
+        let mut corrupted_bytes = encoded;
+        *corrupted_bytes.last_mut().unwrap() ^= 0xff;
+        let (decoded, corrupted) = encoder.DeserializeData(&corrupted_bytes);
+        assert_ne!(decoded, b"payload");
+        assert!(corrupted);
+
+        let stolen = buffer.StealBufQ();
+        assert_eq!(stolen.len(), 2);
+        assert_eq!(buffer.Count(), 0);
+    }
+
+    #[test]
+    fn cxx_mem_storage_layout_round_trips_key_value_and_crc() {
+        let crc = MemStorage::ComputeCRC("layout-key", b"layout-value");
+        let record = MemStorage::DoPutWithCRC("layout-key", b"layout-value", crc).unwrap();
+
+        assert_eq!(MemStorage::GetKeyFromData(&record).unwrap(), "layout-key");
+        let buffer =
+            MemStorage::CreateCacheBufferFromData(&record, StorageEngineType::kSimple, false)
+                .unwrap();
+        assert_eq!(buffer.Key(), "layout-key");
+        assert_eq!(buffer.Data(), b"layout-value");
+        assert!(MemStorage::DoPutWithCRC("layout-key", b"layout-value", crc + 1).is_err());
+    }
+
+    #[test]
+    fn cxx_mem_storage_allocator_handle_models_payload_pointer_and_delete() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(256);
+        let handle =
+            MemStorage::DoPutToAllocator(&mut allocator, "alloc-key", b"alloc-value").unwrap();
+
+        assert_eq!(handle.PayloadOffset(), MemStorage::HEADER_BYTES);
+        assert_eq!(
+            handle.DataPtr(),
+            handle.RecordPtr() + MemStorage::HEADER_BYTES
+        );
+        assert_eq!(handle.ValueLen(), b"alloc-value".len());
+        assert_eq!(handle.KeyLen(), "alloc-key".len());
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(
+            stats.NumAllocatedBytes(),
+            MemStorage::HEADER_BYTES + b"alloc-value".len() + "alloc-key".len()
+        );
+
+        let record = allocator.read(handle.RecordPtr()).unwrap();
+        assert_eq!(MemStorage::GetKeyFromData(record).unwrap(), "alloc-key");
+        assert_eq!(
+            MemStorage::GetValueFromData(record).unwrap(),
+            b"alloc-value"
+        );
+
+        let buffer = MemStorage::CreateCacheBufferFromAllocatorData(
+            &allocator,
+            handle,
+            StorageEngineType::kSimple,
+            false,
+        )
+        .unwrap();
+        assert_eq!(buffer.Key(), "alloc-key");
+        assert_eq!(buffer.Data(), b"alloc-value");
+
+        MemStorage::DoDeleteFromAllocator(&mut allocator, handle).unwrap();
+        assert!(!allocator.contains(handle.RecordPtr()));
+        assert_eq!(
+            allocator.GetStats().unwrap().NumFreedBytes(),
+            handle.RecordLen()
+        );
+    }
+
+    #[test]
+    fn cxx_mem_storage_allocator_path_rejects_corrupt_crc_before_write() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(256);
+        let crc = MemStorage::ComputeCRC("alloc-key", b"alloc-value");
+
+        assert!(MemStorage::DoPutToAllocatorWithCRC(
+            &mut allocator,
+            "alloc-key",
+            b"alloc-value",
+            crc + 1
+        )
+        .is_err());
+        assert_eq!(allocator.GetStats().unwrap().NumAllocatedBytes(), 0);
+    }
+
+    #[test]
+    fn cxx_mem_storage_allocator_surface_works_for_je_and_pool_allocators() {
+        let mut je = JeAllocator::with_capacity(256);
+        let je_handle = MemStorage::DoPutToAllocator(&mut je, "je-key", b"je-value").unwrap();
+        assert_eq!(je_handle.PayloadOffset(), MemStorage::HEADER_BYTES);
+        assert_eq!(
+            MemStorage::GetValueFromData(je.read(je_handle.RecordPtr()).unwrap()).unwrap(),
+            b"je-value"
+        );
+        MemStorage::DoDeleteFromAllocator(&mut je, je_handle).unwrap();
+
+        let mut pool = PoolBasedMemoryAllocatorDram::with_capacity_and_object_len(1024, 256);
+        let pool_handle =
+            MemStorage::DoPutToAllocator(&mut pool, "pool-key", b"pool-value").unwrap();
+        assert_eq!(pool_handle.PayloadOffset(), MemStorage::HEADER_BYTES);
+        assert_eq!(
+            MemStorage::GetKeyFromData(pool.read(pool_handle.RecordPtr()).unwrap()).unwrap(),
+            "pool-key"
+        );
+        MemStorage::DoDeleteFromAllocator(&mut pool, pool_handle).unwrap();
+    }
+
+    #[test]
+    fn cxx_simple_storage_engine_lifecycle_put_peek_delete_and_recover() {
+        #[derive(Default)]
+        struct Collector {
+            recovered: Vec<(String, Vec<u8>)>,
+        }
+
+        impl RecoverDataCallback for Collector {
+            fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer) {
+                self.recovered.push((key.to_string(), buffer.to_vec()));
+            }
+        }
+
+        let mut engine = StorageEngineSimple::with_capacity(1024);
+        assert_eq!(engine.Capacity(), 1024);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::kSimple);
+        engine.SetCapacity(2048);
+        assert_eq!(engine.Capacity(), 2048);
+        assert!(!engine.is_started());
+        assert!(engine.Start());
+        assert!(engine.is_started());
+
+        let buffer = engine.Put("storage-key", b"value".to_vec()).unwrap();
+        assert_eq!(buffer.Key(), "storage-key");
+        assert!(engine.Peek("storage-key"));
+        assert_eq!(engine.Get("storage-key").unwrap().Data(), b"value");
+
+        let mut async_called = false;
+        let mut async_buffer = CacheBuffer::new(b"async-value".to_vec());
+        async_buffer.SetKey("async-key");
+        engine
+            .AsyncPut(async_buffer, |result| {
+                async_called = true;
+                let buffer = result.unwrap();
+                assert_eq!(buffer.Key(), "async-key");
+                assert_eq!(buffer.Data(), b"async-value");
+            })
+            .unwrap();
+        assert!(async_called);
+        assert!(engine.Peek("async-key"));
+        let mut async_delete_called = false;
+        let async_delete_buffer = engine.Get("async-key").unwrap();
+        engine
+            .AsyncDelete(&async_delete_buffer, |result| {
+                async_delete_called = true;
+                result.unwrap();
+            })
+            .unwrap();
+        assert!(async_delete_called);
+        assert!(!engine.Peek("async-key"));
+
+        let mut collector = Collector::default();
+        engine.RecoverData(&mut collector).unwrap();
+        collector
+            .recovered
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            collector.recovered,
+            vec![("storage-key".to_string(), b"value".to_vec())]
+        );
+
+        engine.DeleteBuffer(&buffer).unwrap();
+        assert!(!engine.Peek("storage-key"));
+        assert_eq!(engine.TEST_GetNumDeleteCompletedCount(), 2);
+        engine.TEST_IncreaseDeleteCompletedCount();
+        assert_eq!(engine.TEST_GetNumDeleteCompletedCount(), 3);
+        engine.Reset().unwrap();
+        assert!(!engine.Peek("async-key"));
+        assert!(engine.Stop());
+        assert!(matches!(engine.Get("async-key"), Err(CacheError::Stopped)));
+    }
+
+    #[test]
+    fn rocksdb_storage_engine_persists_path_and_ssd_view_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ssd-cache");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let mut engine = StorageEngineRocksDB::new(&db_path_str);
+        assert_eq!(engine.Path(), db_path_str);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::kSSD);
+        assert_eq!(
+            engine.SsdBackendName(),
+            if cfg!(feature = "rocksdb-ssd") {
+                "rocksdb"
+            } else {
+                "file-compat"
+            }
+        );
+        assert_eq!(engine.Capacity(), u64::MAX);
+        engine.SetCapacity(4096);
+        assert_eq!(engine.Capacity(), 4096);
+        assert!(!engine.IsDataRecovered());
+        assert!(matches!(engine.Get("cold"), Err(CacheError::Stopped)));
+        assert!(engine.Start());
+
+        let view = engine.PutView("ssd-key", b"ssd-value".to_vec()).unwrap();
+        assert_eq!(view.Key(), "ssd-key");
+        assert_eq!(view.Size(), b"ssd-value".len());
+        assert_eq!(view.Data(), None);
+        assert!(engine.Peek("ssd-key"));
+        assert_eq!(engine.Get("ssd-key").unwrap().Data(), b"ssd-value");
+
+        let mut recovered_views = Vec::new();
+        engine
+            .RecoverViewData(&mut |key, view| {
+                recovered_views.push((key.to_string(), view.Key().to_string(), view.Size()));
+            })
+            .unwrap();
+        assert_eq!(
+            recovered_views,
+            vec![(
+                "ssd-key".to_string(),
+                "ssd-key".to_string(),
+                b"ssd-value".len()
+            )]
+        );
+        assert!(engine.IsDataRecovered());
+        assert!(engine.Stop());
+
+        let mut restarted = StorageEngineRocksDB::new(&db_path_str);
+        assert!(restarted.Start());
+        assert!(restarted.Peek("ssd-key"));
+        assert_eq!(restarted.Get("ssd-key").unwrap().Data(), b"ssd-value");
+        restarted.Delete("ssd-key").unwrap();
+        assert!(!restarted.Peek("ssd-key"));
+        restarted
+            .PutView("reset-key", b"reset-value".to_vec())
+            .unwrap();
+        restarted.Reset().unwrap();
+        assert!(!restarted.Peek("reset-key"));
+    }
+
+    #[test]
+    fn rocksdb_storage_engine_recover_data_returns_stored_values() {
+        #[derive(Default)]
+        struct Collector {
+            recovered: Vec<(String, usize, Vec<u8>)>,
+        }
+
+        impl RecoverDataCallback for Collector {
+            fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer) {
+                self.recovered
+                    .push((key.to_string(), buffer.Size(), buffer.to_vec()));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine =
+            StorageEngineRocksDB::new(dir.path().join("rocksdb").to_string_lossy().to_string());
+        assert!(engine.Start());
+        engine.PutView("alpha", b"one".to_vec()).unwrap();
+        engine.PutView("beta", b"two-two".to_vec()).unwrap();
+
+        let mut collector = Collector::default();
+        engine.RecoverData(&mut collector).unwrap();
+        collector
+            .recovered
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        // recover_data must return the stored values so the cache can be
+        // re-populated on recovery (see put_bypass_storage_buffer, which consumes
+        // the buffer's data). The size-only/lazy path is recover_view_data.
+        assert_eq!(
+            collector.recovered,
+            vec![
+                ("alpha".to_string(), b"one".len(), b"one".to_vec()),
+                ("beta".to_string(), b"two-two".len(), b"two-two".to_vec())
+            ]
+        );
+
+        assert!(engine.Stop());
+        assert!(matches!(engine.Delete("alpha"), Err(CacheError::Stopped)));
+    }
+
+    #[test]
+    fn cxx_storage_recover_callback_mock_tracks_last_key_and_count() {
+        let mut engine = StorageEngineSimple::with_capacity(1024);
+        assert!(engine.Start());
+        engine.Put("first", b"111".to_vec()).unwrap();
+        engine.Put("second", b"222".to_vec()).unwrap();
+
+        let mut callback = RecoverDataCallbackMock::new();
+        engine.RecoverData(&mut callback).unwrap();
+
+        assert_eq!(callback.GetRecoveredRecordCnt(), 2);
+        assert!(["first", "second"].contains(&callback.GetLastRecoverKey()));
+        let mut recovered = callback
+            .recovered()
+            .iter()
+            .map(|(key, buffer)| (key.clone(), buffer.Data().to_vec()))
+            .collect::<Vec<_>>();
+        recovered.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            recovered,
+            vec![
+                ("first".to_string(), b"111".to_vec()),
+                ("second".to_string(), b"222".to_vec())
+            ]
+        );
+
+        let mut direct = CacheBuffer::new(b"333".to_vec());
+        direct.SetKey("third");
+        callback.OnRecoverData("third", direct);
+        assert_eq!(callback.GetLastRecoverKey(), "third");
+        assert_eq!(callback.GetRecoveredRecordCnt(), 3);
+    }
+
+    #[test]
+    fn cxx_gc_copy_callback_mock_replaces_buffers_with_guarded_old_data() {
+        let mut callback = GCCopyCallbackMock::new();
+        let mut old = CacheBuffer::new(b"old-value".to_vec());
+        old.SetKey("alpha");
+        assert!(callback.AddCacheBuffer("alpha", old));
+        let mut duplicate = CacheBuffer::new(b"duplicate".to_vec());
+        duplicate.SetKey("alpha");
+        assert!(!callback.AddCacheBuffer("alpha", duplicate));
+        assert_eq!(
+            callback.GetCacheBuffer("alpha").unwrap().Data(),
+            b"old-value"
+        );
+
+        let mut missing_replacement = CacheBuffer::new(b"new-value".to_vec());
+        missing_replacement.SetKey("alpha");
+        assert!(matches!(
+            callback.Update("missing", b"old-value", missing_replacement),
+            Err(CacheError::NotFound)
+        ));
+        let mut mismatched_replacement = CacheBuffer::new(b"new-value".to_vec());
+        mismatched_replacement.SetKey("alpha");
+        assert!(matches!(
+            callback.Update("alpha", b"wrong-old", mismatched_replacement),
+            Err(CacheError::ReplaceMismatch)
+        ));
+
+        let mut replacement = CacheBuffer::new(b"new-value".to_vec());
+        replacement.SetKey("alpha");
+        callback.Update("alpha", b"old-value", replacement).unwrap();
+        assert_eq!(
+            callback.GetCacheBuffer("alpha").unwrap().Data(),
+            b"new-value"
+        );
+        assert!(callback.DeleteCacheBuffer("alpha"));
+        assert!(!callback.DeleteCacheBuffer("alpha"));
+        assert!(callback.is_empty());
+    }
+
+    #[test]
+    fn cxx_log_allocator_gc_listener_mock_updates_maps_and_frees_old_ptr() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+        let old_ptr = allocator.Allocate(8).unwrap();
+        let new_ptr = allocator.Allocate(8).unwrap();
+        assert!(allocator.Contains(old_ptr));
+        assert!(allocator.Contains(new_ptr));
+
+        let mut listener = LogBasedAllocatorGCEventListenerMock::with_allocator(allocator);
+        assert_eq!(
+            listener.SetInternalMapAndReturnOldPtr("alpha", old_ptr),
+            None
+        );
+        assert_eq!(listener.GetInternalMap("alpha"), Some(old_ptr));
+
+        listener.OnGCCopy(old_ptr, new_ptr).unwrap();
+        assert_eq!(listener.GetInternalMap("alpha"), Some(new_ptr));
+        let allocator = listener.allocator().unwrap();
+        assert!(!allocator.Contains(old_ptr));
+        assert!(allocator.Contains(new_ptr));
+
+        assert!(matches!(
+            listener.OnGCCopy(old_ptr, new_ptr),
+            Err(CacheError::NotFound)
+        ));
+        assert_eq!(
+            listener.DelInternalMapAndReturnOldPtr("alpha"),
+            Some(new_ptr)
+        );
+        assert_eq!(listener.GetInternalMap("alpha"), None);
+    }
+
+    #[test]
+    fn cxx_pmem_recover_listener_dedupes_records_before_callback() {
+        #[derive(Default)]
+        struct Collector {
+            recovered: Vec<(String, Vec<u8>)>,
+        }
+
+        impl RecoverDataCallback for Collector {
+            fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer) {
+                self.recovered.push((key.to_string(), buffer.to_vec()));
+            }
+        }
+
+        let alpha_first = MemStorage::DoPut("alpha", b"one");
+        let alpha_duplicate = MemStorage::DoPut("alpha", b"two");
+        let beta = MemStorage::DoPut("beta", b"three");
+
+        let mut listener = PmemAllocatorRecoverListenerImpl::with_estimate_items(4);
+        assert!(!listener.OnScanRecord(&alpha_first).unwrap());
+        assert!(listener.OnScanRecord(&alpha_duplicate).unwrap());
+        assert!(!listener.OnScanRecord(&beta).unwrap());
+        assert_eq!(listener.scanned_record_count(), 2);
+        assert_eq!(listener.duplicate_record_count(), 1);
+
+        let mut collector = Collector::default();
+        assert_eq!(listener.FinishRecover(&mut collector).unwrap(), 1);
+        assert_eq!(listener.duplicate_record_count(), 0);
+        assert_eq!(
+            collector.recovered,
+            vec![("beta".to_string(), b"three".to_vec())]
+        );
+    }
+
+    #[test]
+    fn cxx_pmem_storage_test_hooks_put_to_numa_and_report_recover_stats() {
+        let mut engine = StorageEnginePMem::with_capacity(1024);
+        assert!(engine.Start());
+        engine.TEST_JoinPmemWriteExecutor();
+        let buffer = engine
+            .TEST_PutToNuma("pmem-key", b"pmem-value".to_vec(), 0)
+            .unwrap();
+        assert_eq!(buffer.Key(), "pmem-key");
+        assert_eq!(buffer.Data(), b"pmem-value");
+        assert_eq!(engine.Get("pmem-key").unwrap().Data(), b"pmem-value");
+
+        let stats = engine.TEST_GetRecoverStats();
+        assert_eq!(stats.valid_bytes, b"pmem-value".len());
+        assert_eq!(stats.freed_bytes, 0);
+        assert_eq!(stats.corrupted_bytes, 0);
+        assert_eq!(stats.total_bytes, b"pmem-value".len());
+    }
+
+    #[test]
+    fn cxx_multi_ssd_requires_devices_and_hashes_keys_to_storage() {
+        let mut empty = StorageEngineMultiSSD::new(Vec::<String>::new(), 1024);
+        assert!(!empty.Start());
+        assert!(matches!(
+            empty.Put("missing", b"value".to_vec()),
+            Err(CacheError::Stopped)
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+        let mut engine = StorageEngineMultiSSD::new(vec![dev("ssd-a"), dev("ssd-b")], 1024);
+        assert_eq!(engine.Capacity(), 1024);
+        engine.SetCapacity(2048);
+        assert_eq!(engine.Capacity(), 2048);
+        assert_eq!(engine.PathCount(), 2);
+        assert!(engine.device_for_key("alpha").is_some());
+        assert!(engine.Start());
+        assert_eq!(engine.StorageCount(), 2);
+
+        let alpha_device = engine.device_for_key("alpha").unwrap().to_string();
+        let beta_device = engine.device_for_key("beta").unwrap().to_string();
+        assert!(engine.paths().contains(&alpha_device));
+        assert!(engine.paths().contains(&beta_device));
+
+        let alpha = engine.Put("alpha", b"one".to_vec()).unwrap();
+        assert_eq!(alpha.Key(), "alpha");
+        assert_eq!(engine.Get("alpha").unwrap().Data(), b"one");
+        assert!(engine.Peek("alpha"));
+        engine.Delete("alpha").unwrap();
+        assert!(!engine.Peek("alpha"));
+
+        engine.Stop();
+        assert!(matches!(engine.Get("alpha"), Err(CacheError::Stopped)));
+    }
+
+    #[test]
+    fn cxx_multi_ssd_recovers_resets_and_manages_devices() {
+        struct Collector {
+            recovered: Vec<(String, Vec<u8>)>,
+        }
+
+        impl RecoverDataCallback for Collector {
+            fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer) {
+                self.recovered.push((key.to_string(), buffer.to_vec()));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+        let mut engine = StorageEngineMultiSSD::new(vec![dev("ssd-a"), dev("ssd-b")], 2048);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::kMultiSSD);
+        assert!(engine.Start());
+        engine.Put("first", b"111".to_vec()).unwrap();
+        engine.Put("second", b"222".to_vec()).unwrap();
+        let mut async_delete_called = false;
+        let first_buffer = engine.Get("first").unwrap();
+        engine
+            .AsyncDelete(&first_buffer, |result| {
+                async_delete_called = true;
+                result.unwrap();
+            })
+            .unwrap();
+        assert!(async_delete_called);
+        assert!(!engine.Peek("first"));
+
+        let mut collector = Collector {
+            recovered: Vec::new(),
+        };
+        engine.RecoverData(&mut collector).unwrap();
+        collector
+            .recovered
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            collector.recovered,
+            vec![("second".to_string(), b"222".to_vec())]
+        );
+
+        assert!(!engine.AddDevice(&dev("ssd-a")));
+        assert!(engine.AddDevice(&dev("ssd-c")));
+        assert_eq!(engine.PathCount(), 3);
+        assert_eq!(engine.StorageCount(), 3);
+        assert!(engine.RemoveDevice(&dev("ssd-c")));
+        assert!(!engine.RemoveDevice("ssd-missing"));
+        assert_eq!(engine.PathCount(), 2);
+
+        engine.Reset().unwrap();
+        assert!(!engine.Peek("first"));
+        assert!(!engine.Peek("second"));
+    }
+
+    #[test]
+    fn replacement_base_lru_list_ops() {
+        let mut lru = BaseLRUList::new(3);
+        assert_eq!(lru.Capacity(), 3);
+        assert_eq!(lru.Size(), 0);
+        lru.Put("a".to_string());
+        lru.Put("b".to_string());
+        lru.Put("c".to_string());
+        assert_eq!(lru.Size(), 3);
+        assert!(lru.Get("a")); // hit promotes
+        assert!(!lru.Get("missing"));
+        assert!(!lru.GetTail(2).is_empty());
+        assert!(lru.Delete("b"));
+        assert!(!lru.Delete("b"));
+        assert_eq!(lru.Size(), 2);
+        assert_eq!(lru.EvictOne().len(), 1);
+        assert_eq!(lru.Size(), 1);
+        lru.SetCapacity(10);
+        assert_eq!(lru.Capacity(), 10);
+        lru.Reset();
+        assert_eq!(lru.Size(), 0);
+        assert!(lru.Evict().is_empty());
+    }
+
+    #[test]
+    fn replacement_ghost_lru_list_ops() {
+        let mut g = GhostLRUList::new(2);
+        assert_eq!(g.Capacity(), 2);
+        assert_eq!(g.Size(), 0);
+        g.Put("a".to_string());
+        g.Put("b".to_string());
+        assert_eq!(g.Size(), 2);
+        assert!(g.Get("a"));
+        assert!(!g.Get("missing"));
+        assert!(g.TotalSize() >= g.Size());
+        // exercise the ghost/data movement, tails, and eviction paths
+        g.downgrade();
+        let _ = g.pop("a");
+        let _ = g.get_data_tail(1);
+        let _ = g.get_ghost_tail(1);
+        let _ = g.evict_one_data();
+        let _ = g.evict_one_ghost();
+        let _ = g.evict();
+        g.set_capacity(5);
+        assert_eq!(g.Capacity(), 5);
+        let _ = g.ghost_capacity();
+        g.Reset();
+        assert_eq!(g.Size(), 0);
+        assert_eq!(g.GhostSize(), 0);
+    }
+
+    #[test]
+    fn storage_config_fixed_encoding_roundtrips() {
+        let mut buf = Vec::new();
+        assert_eq!(put_fixed_uint8(&mut buf, 0xAB), 1);
+        assert_eq!(put_fixed_uint32(&mut buf, 0x1234_5678), 5);
+        assert_eq!(put_fixed_uint64(&mut buf, 0x0102_0304_0506_0708), 13);
+        assert_eq!(get_fixed_uint8(&buf, 0).unwrap(), (0xAB, 1));
+        assert_eq!(get_fixed_uint32(&buf, 1).unwrap(), (0x1234_5678, 5));
+        assert_eq!(get_fixed_uint64(&buf, 5).unwrap(), (0x0102_0304_0506_0708, 13));
+        // out-of-range decodes fail closed
+        assert!(get_fixed_uint8(&buf, buf.len()).is_none());
+        assert!(get_fixed_uint32(&buf, buf.len()).is_none());
+        assert!(get_fixed_uint64(&[0u8; 3], 0).is_none());
+
+        // hash round-trips
+        let mut hbuf = Vec::new();
+        put_fixed_hash64(&mut hbuf, 0xDEAD_BEEF_CAFE_1234);
+        assert_eq!(get_fixed_hash64(&hbuf, 0).unwrap().0, 0xDEAD_BEEF_CAFE_1234);
+        let mut h2 = Vec::new();
+        put_fixed_hash128(
+            &mut h2,
+            Xxh128 {
+                first: 11,
+                second: 22,
+            },
+        );
+        let (xh, off) = get_fixed_hash128(&h2, 0).unwrap();
+        assert_eq!((xh.first, xh.second, off), (11, 22, 16));
+
+        // byte copy round-trip and bounds
+        let mut dst = Vec::new();
+        assert_eq!(copy_bytes_to(&mut dst, b"hello"), 5);
+        assert_eq!(copy_bytes_from(&dst, 0, 5).unwrap(), (b"hello".to_vec(), 5));
+        assert!(copy_bytes_from(&dst, 0, 99).is_none());
+
+        // alignment
+        assert_eq!(aligned_to(0, 8), 0);
+        assert_eq!(aligned_to(1, 8), 8);
+        assert_eq!(aligned_to(8, 8), 8);
+        assert_eq!(aligned_to(9, 8), 16);
+        assert_eq!(aligned_to(7, 0), 7);
+
+        // colored-pointer masks and decode
+        let lba_ptr = mask_colored_ptr_lba(0, 5);
+        assert_eq!(decode_colored_ptr(lba_ptr).1, 5);
+        let addr_ptr = mask_colored_ptr_memory_address(0, 0x1234);
+        assert_eq!(addr_ptr & SSD_MEMORY_ADDR_FLAGS, 0x1234);
+    }
+
+    #[test]
+    fn storage_config_storage_engine_type_conversions() {
+        use StorageEngineType::*;
+        for ty in [kDRAM, kPMEM, kSSD, kSimple, kMultiSSD] {
+            // code conversion round-trips, and every variant has a display name
+            assert_eq!(StorageEngineType::from_cxx_code(ty.cxx_code()), ty);
+            assert!(!ty.as_cxx_name().is_empty());
+        }
+        // recognized name spellings parse to the expected engine
+        assert_eq!(StorageEngineType::from_cxx_name("ssd"), kSSD);
+        assert_eq!(StorageEngineType::from_cxx_name("kRocksDB"), kSSD);
+        assert_eq!(StorageEngineType::from_cxx_name("pmem"), kPMEM);
+        assert_eq!(StorageEngineType::from_cxx_name("multi_ssd"), kMultiSSD);
+        assert_eq!(StorageEngineType::from_cxx_name("simple"), kSimple);
+        assert_eq!(StorageEngineType::from_cxx_name("dram"), kDRAM);
+        assert!(kSSD.is_ssd_like());
+        assert!(kMultiSSD.is_ssd_like());
+        assert!(!kDRAM.is_ssd_like());
+        assert_eq!(kPMEM.canonical_instance_type(), CacheInstanceType::kPMEM);
+        assert_eq!(kDRAM.canonical_instance_type(), CacheInstanceType::kDRAM);
+        // unknown code and name fall back to the default engine
+        assert_eq!(StorageEngineType::from_cxx_code(200), kDRAM);
+        assert_eq!(StorageEngineType::from_cxx_name("not-a-real-engine"), kDRAM);
+    }
+
+    #[test]
+    fn storage_config_ssd_index_and_write_buffer_ops() {
+        let index = SsdIndex::new();
+        index.Put("a", SsdIndexValue::SsdColoredPtr(1));
+        index.Put("b", SsdIndexValue::SsdColoredPtr(2));
+        assert!(index.Get("a").is_some());
+        assert!(index.Get("b").is_some());
+        assert!(index.Get("missing").is_none());
+        // UpdateIndex refreshes an existing entry and fails closed on a missing key
+        index.UpdateIndex("a", SsdIndexValue::SsdColoredPtr(9));
+        assert!(!index.UpdateIndex("missing", SsdIndexValue::SsdColoredPtr(0)));
+        // colored-pointer entries are not pinnable; pin fails closed
+        assert!(!index.Pin("a"));
+        assert!(!index.Pin("missing"));
+        index.UnPin("a");
+        index.SoftDelete("a");
+        index.Put("c", SsdIndexValue::SsdColoredPtr(3));
+        // colored-pointer entries carry no record state, so DeleteIf fails closed
+        assert!(!index.DeleteIf("c", |_state| true));
+        assert!(!index.DeleteIf("missing", |_state| true));
+        let mut scanned = 0usize;
+        index.ScanIndexForRecover(|_key, _value| scanned += 1);
+        assert!(scanned >= 1);
+
+        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        assert_eq!(wb.Capacity(), 1024);
+        assert_eq!(wb.Count(), 0);
+        assert_eq!(wb.BufType(), WriteBufferType::kUserDataBuf);
+        wb.PushBack("k1", b"v1".to_vec());
+        wb.PushBack("k2", b"v22".to_vec());
+        assert_eq!(wb.Count(), 2);
+        assert!(wb.Size() > 0);
+        assert!(wb.KeySize() > 0);
+        assert!(wb.ValueSize() > 0);
+        assert_eq!(wb.records().len(), 2);
+        assert_eq!(wb.StealBufQ().len(), 2);
+    }
+
+    #[test]
+    fn rdma_utils_and_policy_conversions() {
+        assert_eq!(
+            RdmaReplacementPolicyType::FIFO.as_replacement_policy_type(),
+            ReplacementPolicyType::kFIFO
+        );
+        assert_eq!(
+            RdmaReplacementPolicyType::LRU.as_replacement_policy_type(),
+            ReplacementPolicyType::kLRU
+        );
+        assert_eq!(
+            RdmaReplacementPolicyType::OTHER.as_replacement_policy_type(),
+            ReplacementPolicyType::kMaxCode
+        );
+
+        let mut generator = RandomStringGenerator::new();
+        assert_eq!(generator.rand_value(8).len(), 8);
+        assert_eq!(generator.RandValueBytes(16).len(), 16);
+        assert_eq!(generator.rand_value_bytes(4).len(), 4);
+        // with_size constructs a generator; small buffers clamp the value length
+        let mut sized = RandomStringGenerator::with_size(256);
+        assert!(!sized.rand_value_bytes(4).is_empty());
+    }
+
+    #[test]
+    fn storage_config_more_enum_conversions() {
+        // CacheAccessRecordType code round-trips; invalid codes fail closed
+        for ty in [
+            CacheAccessRecordType::Put,
+            CacheAccessRecordType::Get,
+            CacheAccessRecordType::Delete,
+        ] {
+            assert_eq!(CacheAccessRecordType::from_cxx_code(ty.cxx_code()), Some(ty));
+        }
+        assert_eq!(CacheAccessRecordType::from_cxx_code(0), None);
+        assert_eq!(
+            CacheAccessRecordType::from_cxx_code(CacheAccessRecordType::kMaxCode),
+            None
+        );
+
+        // CacheDataPlacement name parsing (fallible)
+        assert_eq!(
+            CacheDataPlacement::try_from_cxx_name("SideBySide").unwrap(),
+            CacheDataPlacement::SideBySide
+        );
+        assert_eq!(
+            CacheDataPlacement::try_from_cxx_name("Tiered").unwrap(),
+            CacheDataPlacement::Tiered
+        );
+        assert!(CacheDataPlacement::try_from_cxx_name("nonsense").is_err());
+
+        // DRAMPMEMDataPlacementType conversions to/from CacheDataPlacement and names
+        assert_eq!(
+            DRAMPMEMDataPlacementType::from_cache_data_placement(CacheDataPlacement::SideBySide),
+            DRAMPMEMDataPlacementType::kSideBySide
+        );
+        assert_eq!(
+            DRAMPMEMDataPlacementType::from_cache_data_placement(CacheDataPlacement::Tiered),
+            DRAMPMEMDataPlacementType::kTiered
+        );
+        assert_eq!(
+            DRAMPMEMDataPlacementType::kTiered.as_cache_data_placement(),
+            CacheDataPlacement::Tiered
+        );
+        for ty in [
+            DRAMPMEMDataPlacementType::kSideBySide,
+            DRAMPMEMDataPlacementType::kTiered,
+            DRAMPMEMDataPlacementType::kMaxCode,
+        ] {
+            assert!(!ty.as_cxx_name().is_empty());
+        }
+    }
+
+    #[test]
+    fn multilayer_cache_put_get_and_batch_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+
+        cache.put(k("a"), b"alpha".to_vec()).unwrap();
+        assert_eq!(cache.get(&k("a")).unwrap(), Some(b"alpha".to_vec()));
+        assert_eq!(cache.get(&k("missing")).unwrap(), None);
+
+        let stored = cache
+            .put_batch(vec![(k("b"), b"beta".to_vec()), (k("c"), b"gamma".to_vec())])
+            .unwrap();
+        assert_eq!(stored, 2);
+        assert_eq!(
+            cache.get_batch(&[k("b"), k("c"), k("missing")]).unwrap(),
+            vec![Some(b"beta".to_vec()), Some(b"gamma".to_vec()), None]
+        );
+
+        assert!(cache.get_no_promotion(&k("a")).unwrap().is_some());
+        cache.put_memory_only(k("mem"), b"m".to_vec());
+        assert_eq!(cache.get_memory(&k("mem")), Some(b"m".to_vec()));
+
+        assert!(cache.get_capacity(CacheInstanceType::kDRAM) > 0);
+        let _ = cache.get_used(CacheInstanceType::kDRAM);
+    }
+
+    #[test]
+    fn multilayer_cache_lifecycle_and_introspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+
+        cache.put(k("a"), b"1".to_vec()).unwrap();
+        cache.put(k("b"), b"2".to_vec()).unwrap();
+        assert!(cache.peek(&k("a")));
+        assert!(!cache.peek(&k("missing")));
+        assert!(cache.peek_tier(&k("a")).is_some());
+
+        cache.remove(&k("a")).unwrap();
+        assert!(!cache.peek(&k("a")));
+        cache.invalidate(&k("b")).unwrap();
+
+        cache.put(k("c"), b"3".to_vec()).unwrap();
+        cache.put(k("d"), b"4".to_vec()).unwrap();
+        assert!(cache.remove_batch(&[k("c"), k("missing")]).unwrap() <= 2);
+        assert!(cache.invalidate_batch(&[k("d")]).unwrap() <= 1);
+
+        // introspection is callable
+        let _ = cache.used_space_for_tier(CacheTier::Memory);
+        let _ = cache.get_used(CacheInstanceType::kDRAM);
+        let _ = cache.get_replacement_policy_type(CacheInstanceType::kDRAM);
+        let _ = cache.replacement_policy_for_tier(CacheTier::Memory);
+
+        cache.reset().unwrap();
+        assert!(!cache.peek(&k("d")));
+
+        cache.set_auto_recover_on_start(true);
+        assert!(cache.auto_recover_on_start());
+        cache.set_auto_recover_on_start(false);
+        assert!(!cache.auto_recover_on_start());
+        let _ = cache.recover_disk_index();
+    }
+
+    #[test]
+    fn multilayer_cache_pinned_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+        cache.put(k("a"), b"alpha".to_vec()).unwrap();
+
+        assert!(cache.get_with_tier(&k("a")).unwrap().is_some());
+
+        let handle = cache.acquire(&k("a")).unwrap().expect("pinned handle for present key");
+        let cloned = cache.clone_handle(&handle);
+        assert_eq!(cache.release_batch(vec![cloned]), 1);
+        cache.release(handle);
+
+        assert!(cache.acquire(&k("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn storage_config_buffer_manager_ops() {
+        let mut mgr = BufferManager::with_config(4096, 0.75, 1024);
+        assert_eq!(mgr.capacity_per_buf(), 4096);
+        assert_eq!(mgr.flush_threshold(), 0.75);
+        assert_eq!(mgr.flush_size(), 1024);
+        assert!(!mgr.write_enabled());
+        mgr.set_write_enabled(true);
+        assert!(mgr.write_enabled());
+        mgr.SetWriteEnabled(false);
+        assert!(!mgr.WriteEnabled());
+        mgr.Start();
+        let _ = mgr.put(("k1", b"v1".to_vec()), WriteBufferType::kUserDataBuf);
+        let _ = mgr.put(("k2", b"v2".to_vec()), WriteBufferType::kUserDataBuf);
+        let _ = mgr.buffered_count(WriteBufferType::kUserDataBuf);
+        let _ = mgr.FlushBuffers();
+        let _ = mgr.flushed_records();
+        mgr.Stop();
+        let _ = BufferManager::new().capacity_per_buf();
+
+        let mut mgr2 = BufferManager::with_config(1024, 0.5, 512);
+        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        wb.PushBack("x", b"y".to_vec());
+        assert_eq!(mgr2.flush_buffer(wb), 1);
+    }
+
+    #[test]
+    fn replacement_fifo_policy_ops() {
+        let mut fifo = ReplacementFIFO::new(1 << 20);
+        fifo.init().unwrap();
+        assert_eq!(fifo.GetCapacity(), 1 << 20);
+        let mut buf = CacheBuffer::new(b"val".to_vec());
+        buf.set_key("k");
+        let _ = fifo.put(buf);
+        let _ = fifo.get("k");
+        let _ = fifo.peek("k");
+        let _ = fifo.GetUsedSpace();
+        let _ = fifo.GetFreeSpace();
+        fifo.SetCapacity(2 << 20);
+        assert_eq!(fifo.GetCapacity(), 2 << 20);
+        let _ = fifo.delete("k");
+        fifo.Reset().unwrap();
+    }
+
+    #[test]
+    fn storage_config_index_updater_ops() {
+        let index = Arc::new(SsdIndex::new());
+        index.Put("a", SsdIndexValue::SsdColoredPtr(1));
+        let updater = IndexUpdater::new(Arc::clone(&index));
+        assert!(updater.Get("a").is_some());
+        assert!(updater.get("missing").is_none());
+        updater.UpdateIndex("a", SsdIndexValue::SsdColoredPtr(2));
+        assert!(!updater.UpdateIndex("missing", SsdIndexValue::SsdColoredPtr(0)));
+        // colored-pointer entries carry no record state, so DeleteIf fails closed
+        assert!(!updater.DeleteIf("a", |_state| true));
+    }
+
+    #[test]
+    fn storage_config_camelcase_encoding_and_colored_ptr() {
+        let mut buf = Vec::new();
+        assert_eq!(PutFixedUint8(&mut buf, 7), 1);
+        assert_eq!(PutFixedUint32(&mut buf, 300), 5);
+        assert_eq!(PutFixedUint64(&mut buf, 5_000_000_000), 13);
+        assert_eq!(GetFixedUint8(&buf, 0).unwrap().0, 7);
+        assert_eq!(GetFixedUint32(&buf, 1).unwrap().0, 300);
+        assert_eq!(GetFixedUint64(&buf, 5).unwrap().0, 5_000_000_000);
+
+        let mut hbuf = Vec::new();
+        PutFixedHash64(&mut hbuf, 42);
+        assert_eq!(GetFixedHash64(&hbuf, 0).unwrap().0, 42);
+        let mut h2 = Vec::new();
+        PutFixedHash128(
+            &mut h2,
+            Xxh128 {
+                first: 1,
+                second: 2,
+            },
+        );
+        assert_eq!(GetFixedHash128(&h2, 0).unwrap().0.first, 1);
+
+        assert_eq!(AlignedTo(5, 8), 8);
+        let mut dst = Vec::new();
+        assert_eq!(CopyBytesTo(&mut dst, b"hi"), 2);
+        assert_eq!(CopyBytesFrom(&dst, 0, 2).unwrap().0, b"hi".to_vec());
+
+        // colored-pointer size/lba/state masks (CamelCase + snake_case)
+        assert_eq!(DecodeColoredPtr(MaskColoredPtrSize(0, 9)).0, 9);
+        assert_eq!(decode_colored_ptr(mask_colored_ptr_size(0, 3)).0, 3);
+        let _ = MaskColoredPtrLBA(0, 4);
+        let _ = MaskColoredPtrMemoryAddress(0, 0x10);
+        let _ = MaskColoredPtrRecordState(0, RecordStateType::kNormal);
+        let _ = mask_colored_ptr_record_state(0, RecordStateType::kPinned);
+
+        // BufferEncoder size calculators
+        let encoder = BufferEncoder::new(4096);
+        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        wb.PushBack("k", b"v".to_vec());
+        let _ = encoder.calculate_encoded_data_size(&wb);
+        let _ = encoder.calculate_encoded_oplog_size(&wb);
+    }
+
+    #[test]
+    fn replacement_arc_list_ops() {
+        let mut arc = ArcList::new(4);
+        assert_eq!(arc.capacity(), 4);
+        arc.put("a".to_string());
+        arc.put("b".to_string());
+        assert!(arc.get("a"));
+        assert!(!arc.get("missing"));
+        let _ = arc.size();
+        let _ = arc.GhostSize();
+        let _ = arc.FetchCapacity();
+        let _ = arc.ActiveCapacity();
+        let _ = arc.DataFull();
+        let _ = arc.GetFetchGhostTail(2);
+        assert!(arc.Delete("b"));
+        let _ = arc.Evict();
+        arc.SetCapacity(8);
+        assert_eq!(arc.capacity(), 8);
+        arc.Reset();
+        assert_eq!(arc.size(), 0);
+    }
+
+    #[test]
+    fn replacement_slru_policy_ops() {
+        let mut slru = ReplacementSLRU::new(1 << 20);
+        slru.init().unwrap();
+        assert_eq!(slru.get_capacity(), 1 << 20);
+        let mut buf = CacheBuffer::new(b"v".to_vec());
+        buf.set_key("k");
+        let _ = slru.put(buf);
+        let _ = slru.get("k");
+        let _ = slru.peek("k");
+        let _ = slru.get_free_space();
+        let _ = slru.GetFreeSpace();
+        slru.set_capacity(2 << 20);
+        assert_eq!(slru.get_capacity(), 2 << 20);
+        let _ = slru.delete("k");
+        slru.Reset().unwrap();
+    }
+
+    #[test]
+    fn replacement_ghost_lru_camelcase_aliases() {
+        let mut g = GhostLRUList::new(2);
+        g.SetCapacity(4);
+        assert_eq!(g.Capacity(), 4);
+        g.Put("a".to_string());
+        g.PutGhost("gh".to_string());
+        let _ = g.GhostCapacity();
+        let _ = g.EvictOneData();
+        let _ = g.EvictOneGhost();
+        let _ = g.Evict();
+        let _ = g.Delete("a");
+    }
+
+    #[test]
+    fn rdma_free_functions() {
+        let _ = FastRand16();
+        let _ = FastRand64();
+        assert_eq!(XXH32WithSeed(b"hello", 0), XXH32WithSeed(b"hello", 0));
+        assert_ne!(XXH32WithSeed(b"a", 0), XXH32WithSeed(b"b", 0));
+        assert!(!GetHashedKey(42, 8).is_empty());
+        assert_eq!(GetRandStr(10).len(), 10);
+    }
+
+    #[test]
+    fn rdma_storage_engine_ops() {
+        let mut engine = RdmaStorageEngine::new(RdmaStorageEngineType::DRAM, 1 << 20);
+        assert!(matches!(engine.storage_type(), RdmaStorageEngineType::DRAM));
+        assert_eq!(engine.capacity(), 1 << 20);
+        assert_eq!(engine.used(), 0);
+        let ptr = engine.Put(b"key", b"value").expect("rdma put allocates");
+        assert!(engine.used() > 0);
+        let _ = engine.Stats();
+        let mut resp = RDMAResponse::New(64);
+        let _ = engine.Get(b"key", b"value".len(), &mut resp, ptr);
+        let _ = engine.Del(ptr, b"value".len());
+    }
+
+    #[test]
+    fn allocators_je_allocator_and_pmem_helpers() {
+        let je = JeAllocator::new(1 << 20);
+        assert!(je.Capacity().is_ok());
+        let ptr = DramAllocateObjectV2(0x5555_0000, 4096).unwrap();
+        let _ = je.sealed(ptr);
+        DramFreeObject(ptr, 4096).unwrap();
+        PMemFlush(0x1000, 64);
+        PMemDrain();
+    }
+
+    #[test]
+    fn multilayer_cache_batch_and_read_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+
+        assert!(
+            cache
+                .put_batch(vec![(k("a"), b"1".to_vec()), (k("b"), b"2".to_vec())])
+                .unwrap()
+                >= 1
+        );
+        assert!(
+            cache
+                .put_batch_sized(vec![(k("c"), b"3".to_vec(), 3)])
+                .unwrap()
+                >= 1
+        );
+        cache.put_memory_only(k("m"), b"mem".to_vec());
+
+        assert_eq!(cache.get_batch(&[k("a"), k("missing")]).unwrap().len(), 2);
+        let _ = cache.get_no_promotion(&k("a")).unwrap();
+        let _ = cache.get_batch_no_promotion(&[k("a"), k("b")]).unwrap();
+        let _ = cache.get_bypass_replacement_policy(&k("a")).unwrap();
+        let _ = cache.get_memory(&k("a"));
+
+        cache.remove_all().unwrap();
+        assert!(!cache.peek(&k("a")));
+    }
+
+    #[test]
+    fn multilayer_cache_introspection_and_extra_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+
+        cache.insert_default_size(k("a"), b"1".to_vec()).unwrap();
+        cache.put(k("b"), b"2".to_vec()).unwrap();
+
+        let _ = cache.all_entries();
+        let _ = cache.allocator_stats_for_tier(CacheTier::Memory);
+        let _ = cache.test_get_unified_put_count();
+        let _ = cache.production_tiering_policy();
+        let _ = cache.async_writeback_worker_running();
+        let _ = cache.pmem_paths();
+
+        cache.invalidate_memory_only(&k("a"));
+    }
+
+    #[test]
+    fn rdma_index_entry_and_stored_block() {
+        let mut entry = RdmaIndexEntry::default();
+        entry.SetAddr(0x1234);
+        assert_eq!(entry.GetAddr(), 0x1234);
+        entry.set_addr(0x5678);
+        assert_eq!(entry.get_addr(), 0x5678);
+        let _ = entry.GetCRC();
+        let _ = entry.get_crc();
+        let _ = entry.GetSignature96b();
+        let mut rkey_buf = [0u8; 16];
+        let _ = entry.GetRkey(&mut rkey_buf);
+        let _ = entry.get_rkey(&mut rkey_buf);
+
+        let block = RdmaStoredBlock::new(b"key", b"value");
+        assert!(block.EncodedLen() > 0);
+        let encoded = block.Encode();
+        assert!(!encoded.is_empty());
+        assert_eq!(encoded, block.encode());
+    }
+
+    #[test]
+    fn matrixcache_builders() {
+        let lru = MatrixCacheBuilder::build_simple_lru_cache(1024);
+        let _ = lru.Start();
+        let _ = lru.insert_default_size(CacheKey::string(0, "k"), b"v".to_vec());
+        let _ = lru.Lookup(&CacheKey::string(0, "k"));
+        let _ = MatrixCacheBuilder::build_zero_copy_simple_lru_cache(1024);
+        let _ = MatrixCacheBuilder::build_concurrent_simple_lru_cache(1024);
+        let _ = MatrixCacheBuilder::build_memcached_wrapper(1024);
+
+        // DRAM-only options avoid needing an on-disk SSD tier
+        let opts = || CacheOptions::new(1 << 16, 0, 0);
+        let cache = MatrixCacheBuilder::build_cache(opts());
+        cache.put(CacheKey::string(0, "a"), b"1".to_vec()).unwrap();
+        let _ = MatrixCacheBuilder::build_zero_copy_cache(opts());
+        let _ = MatrixCacheBuilder::build_cache_api(opts());
+        let _ = MatrixCacheBuilder::build_sharded_cache_api(opts(), 2);
+        let _ = MatrixCacheBuilder::build_zero_copy_cache_api(opts());
+        let _ = MatrixCacheBuilder::build_multi_tier_string_cache(opts());
+    }
+
+    #[test]
+    fn concurrency_cpu_topology_helpers() {
+        let _ = NumaInfo::get_num_all_cores();
+        let _ = NumaInfo::get_num_online_cores();
+        let _ = NumaInfo::get_current_cpu_core();
+        let _ = NumaInfo::get_max_num_numa_nodes();
+        let _ = NumaInfo::get_cpu_cores_of_numa_node(0);
+        let _ = NumaInfo::bind_thread_to_cpu_core(0);
+    }
+
+    #[test]
+    fn multilayer_cache_tiering_admission_and_pinned_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+
+        cache.put_sized(k("s"), b"sized".to_vec(), 5).unwrap();
+        cache
+            .put_with_admission(
+                k("adm"),
+                b"a".to_vec(),
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 1,
+                    routing_slot: Some(0),
+                    block_bytes: 16,
+                    hotness: 5,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+
+        if let Some(h) = cache.insert_pinned_default_size(k("p1"), b"1".to_vec()).unwrap() {
+            cache.release(h);
+        }
+        if let Some(h) = cache.insert_pinned_sized(k("p2"), b"22".to_vec(), 2).unwrap() {
+            cache.release(h);
+        }
+        for h in cache.acquire_batch(&[k("s"), k("missing")]).unwrap().into_iter().flatten() {
+            cache.release(h);
+        }
+        for h in cache.acquire_batch_no_promotion(&[k("s")]).unwrap().into_iter().flatten() {
+            cache.release(h);
+        }
+        if let Some(h) = cache.get_pinned_handle(&k("s")).unwrap() {
+            cache.release(h);
+        }
+
+        cache.set_capacity_for_instance(CacheInstanceType::kDRAM, 2 << 20);
+        cache.set_replacement_policy_type(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo);
+        let policy = cache.production_tiering_policy();
+        cache.update_production_tiering_policy(policy);
+    }
+
+    #[test]
+    fn replacement_slru_maintainer_hooks() {
+        let mut slru = ReplacementSLRU::new(1 << 20);
+        slru.init().unwrap();
+        slru.register_mem_eviction_handler(|_buf| {});
+        slru.test_wait_for_lru_maintainer();
+        slru.test_notify_maintainer_move_complete();
+    }
+
+    #[test]
+    fn rdma_hash_table_ops() {
+        let mut table = RdmaHashTable::<Vec<u8>>::new(16);
+        let key = b"hkey".to_vec();
+        assert!(table.Get(&key).addr.is_none());
+        let _ = table.Put(key.clone(), 0x1000, 5, RdmaStorageEngineType::DRAM);
+        let _ = table.Get(&key);
+        let _ = table.Del(&key);
+        let _ = table.get_bucket(0);
+        let _ = table.GetBucket(0);
+    }
+
+    #[test]
+    fn cxx_alloc_utils_parse_allocate_persist_thread_ids_and_pmem_files() {
+        assert_eq!(ParseAllocatorType("Log"), AllocatorType::kLogBasedAllocator);
+        assert_eq!(
+            ParseAllocatorType("Pool"),
+            AllocatorType::kPoolBasedAllocator
+        );
+        assert_eq!(ParseAllocatorType("Jemalloc"), AllocatorType::kJeAllocator);
+        assert_eq!(ParseAllocatorType("missing"), AllocatorType::kMaxCode);
+
+        let ptr = DramAllocateObject(4096, 4096).unwrap();
+        assert_eq!(ptr % 4096, 0);
+        DramFreeObject(ptr, 4096).unwrap();
+        assert!(matches!(
+            DramFreeObject(ptr, 4096),
+            Err(CacheError::NotFound)
+        ));
+
+        let fixed = DramAllocateObject_v2(0x2000_0000, 4096).unwrap();
+        assert_eq!(fixed, 0x2000_0000);
+        DramFreeObject(fixed, 4096).unwrap();
+
+        let reserved = PreAllocate(4096, 2 * 1024 * 1024).unwrap();
+        assert_eq!(reserved % (2 * 1024 * 1024), 0);
+        PMemPersist(reserved, 64);
+        PostFree(reserved, 4096).unwrap();
+
+        let id1 = GetThreadLocalResourceID();
+        let id2 = GetThreadLocalResourceID();
+        assert_eq!(id1, id2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("00000000000000000001.pmem_chunk");
+        let invalid = dir.path().join("bad.pmem_chunk");
+        let pmem_ptr = PMemAllocateObject(&valid, 4096, 4096).unwrap();
+        assert_eq!(pmem_ptr % 4096, 0);
+        PMemFreeObject(pmem_ptr, 4096).unwrap();
+        std::fs::write(&invalid, b"short").unwrap();
+
+        let mut invalid_names = Vec::new();
+        let valid_names = GetPmemFileName(dir.path(), 4096, Some(&mut invalid_names)).unwrap();
+        assert_eq!(
+            valid_names,
+            vec!["00000000000000000001.pmem_chunk".to_string()]
+        );
+        assert_eq!(invalid_names, vec!["bad.pmem_chunk".to_string()]);
+
+        let mapped = PMemMapFile(0, &valid, 4096).unwrap();
+        PMemFreeObject(mapped, 4096).unwrap();
+        assert!(DeletePmemFile(&invalid));
+        assert!(!DeletePmemFile(&invalid));
+    }
+
+    #[test]
+    fn cxx_simple_log_based_allocator_allocates_seals_frees_and_reports_stats() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(16);
+        let ptr = allocator.Allocate(8).unwrap();
+
+        assert!(allocator.Contains(ptr));
+        allocator.write(ptr, b"cache123").unwrap();
+        assert_eq!(allocator.read(ptr).unwrap(), b"cache123");
+        let crc = MemStorage::ComputeCRC("alloc-key", allocator.read(ptr).unwrap());
+        allocator.SealWithCRC(ptr, 8, crc).unwrap();
+        assert!(allocator.sealed(ptr));
+        assert_eq!(allocator.crc32(ptr), Some(crc));
+
+        let mut observed_meta = None;
+        allocator
+            .RetrieveChunkMeta(ptr as ChunkID, |meta| observed_meta = Some(meta.clone()))
+            .unwrap();
+        let meta = observed_meta.expect("chunk meta");
+        assert_eq!(meta.id, ptr as ChunkID);
+        assert_eq!(meta.num_allocated_bytes, 8);
+        assert_eq!(meta.ref_cnt, 1);
+
+        assert!(matches!(
+            allocator.Allocate(9),
+            Err(CacheError::CapacityExceeded)
+        ));
+        allocator.Free(ptr, 8).unwrap();
+        assert!(!allocator.Contains(ptr));
+        let stats = allocator.GetStats().unwrap();
+        assert_eq!(stats.NumAllocatedBytes(), 8);
+        assert_eq!(stats.NumFreedBytes(), 8);
+        assert_eq!(stats.NumOccupiedBytes(), 0);
+
+        let mut recyclable = Vec::new();
+        allocator
+            .IterateRecyclableChunkMeta(|meta| {
+                recyclable.push(meta.id);
+                true
+            })
+            .unwrap();
+        assert_eq!(recyclable, vec![ptr as ChunkID]);
+        allocator.GC(&[ptr as ChunkID]).unwrap();
+        assert_eq!(allocator.gc_runs(), 1);
+        assert_eq!(allocator.live_region_count(), 0);
+    }
+
+    #[test]
+    fn cxx_simple_log_based_allocator_supports_trait_consumers() {
+        fn allocate_and_seal<A: CacheAllocatorApi>(
+            allocator: &mut A,
+        ) -> Result<AllocatorPtr, CacheError> {
+            let ptr = allocator.allocate(4)?;
+            allocator.seal(ptr)?;
+            Ok(ptr)
+        }
+
+        fn run_gc<A: LogBasedMemoryAllocatorApi>(allocator: &mut A) -> Result<(), CacheError> {
+            allocator.gc(&[])?;
+            Ok(())
+        }
+
+        let mut allocator = SimpleLogBasedMemoryAllocator::new();
+        let ptr = allocate_and_seal(&mut allocator).unwrap();
+        assert!(allocator.Contains(ptr));
+        run_gc(&mut allocator).unwrap();
+        assert_eq!(allocator.gc_runs(), 1);
+    }
+
+    #[test]
+    fn cxx_storage_gc_controller_lifecycle_pause_and_force_gc_match_surface() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+        let ptr = allocator.Allocate(8).unwrap();
+        allocator.write(ptr, b"gc-ready").unwrap();
+        allocator.Free(ptr, 8).unwrap();
+
+        let mut controller = StorageGCController::new(allocator, true);
+        assert!(!controller.enable_gc());
+        assert!(controller.NeedGc());
+
+        controller.SetPauseGC(true);
+        assert!(controller.pause_gc());
+        assert!(!controller.NeedGc());
+        assert_eq!(controller.PickSubmitChunks().unwrap(), 0);
+
+        controller.SetPauseGC(false);
+        controller.Start();
+        assert!(controller.enable_gc());
+        assert_eq!(controller.PickSubmitChunks().unwrap(), 1);
+        controller.WaitAllTaskComplete();
+        assert_eq!(controller.fly_gc_chunks(), 0);
+        assert_eq!(controller.TEST_GetNumGcCompleteChunks(), 1);
+        assert_eq!(controller.TEST_GetNumGcCompleteTasks(), 1);
+        assert_eq!(controller.allocator().gc_runs(), 1);
+        assert_eq!(controller.allocator().live_region_count(), 0);
+
+        controller.Stop();
+        assert!(!controller.enable_gc());
+    }
+
+    #[test]
+    fn cxx_storage_gc_controller_respects_enable_gate_and_manual_gc_job() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+        let ptr_a = allocator.Allocate(4).unwrap();
+        let ptr_b = allocator.Allocate(4).unwrap();
+        allocator.Free(ptr_a, 4).unwrap();
+        allocator.Free(ptr_b, 4).unwrap();
+
+        let mut controller = StorageGCController::new(allocator, true);
+        assert_eq!(controller.PickSubmitChunks().unwrap(), 0);
+        assert_eq!(controller.allocator().live_region_count(), 0);
+        assert_eq!(controller.TEST_GetNumGcCompleteTasks(), 0);
+
+        assert_eq!(
+            controller
+                .gc_job(vec![ptr_a as ChunkID, ptr_b as ChunkID])
+                .unwrap(),
+            2
+        );
+        assert_eq!(controller.TEST_GetNumGcCompleteChunks(), 2);
+        assert_eq!(controller.TEST_GetNumGcCompleteTasks(), 1);
+        assert_eq!(controller.allocator().gc_runs(), 1);
+    }
+
+    #[test]
+    fn cxx_cache_executor_reuses_common_and_gc_executors_and_runs_tasks() {
+        CacheExecutor::DestroyAllExecutors();
+        CacheExecutor::Configure(CacheExecutorConfig {
+            common_executor_num_threads: 3,
+            num_gc_workers: 2,
+            used_num_numa_nodes: 2,
+            num_pmem_cache_per_numa_writer_threads: 4,
+        });
+
+        let common = CacheExecutor::GetCommonExecutor();
+        let common_again = CacheExecutor::GetCommonExecutor();
+        assert!(Arc::ptr_eq(&common, &common_again));
+        assert_eq!(common.name(), "CacheCommonThreadPool");
+        assert_eq!(common.thread_count(), 3);
+
+        let ran = Arc::new(std::sync::Mutex::new(false));
+        let ran_capture = Arc::clone(&ran);
+        common.Add(move || {
+            *ran_capture.lock().unwrap() = true;
+        });
+        assert!(*ran.lock().unwrap());
+        assert_eq!(common.submitted_tasks(), 1);
+
+        let gc = CacheExecutor::GetGCExecutor();
+        assert_eq!(gc.name(), "CacheGCThreadPool");
+        assert_eq!(gc.thread_count(), 2);
+        assert!(!Arc::ptr_eq(&common, &gc));
+    }
+
+    #[test]
+    fn cxx_cache_executor_creates_pmem_numa_executors_and_destroy_resets() {
+        CacheExecutor::DestroyAllExecutors();
+        CacheExecutor::Configure(CacheExecutorConfig {
+            common_executor_num_threads: 1,
+            num_gc_workers: 1,
+            used_num_numa_nodes: 3,
+            num_pmem_cache_per_numa_writer_threads: 5,
+        });
+
+        let pmem = CacheExecutor::GetPmemExecutors();
+        assert_eq!(pmem.len(), 3);
+        assert_eq!(pmem[0].name(), "PmemNuma0");
+        assert_eq!(pmem[1].numa_id(), Some(1));
+        assert_eq!(pmem[2].thread_count(), 5);
+        let pmem_again = CacheExecutor::GetPmemExecutors();
+        assert!(Arc::ptr_eq(&pmem[0], &pmem_again[0]));
+        assert_eq!(CacheExecutor::initialized_executor_count(), 3);
+
+        let common_before_destroy = CacheExecutor::GetCommonExecutor();
+        assert_eq!(CacheExecutor::initialized_executor_count(), 4);
+        CacheExecutor::DestroyAllExecutors();
+        assert_eq!(CacheExecutor::initialized_executor_count(), 0);
+        let common_after_destroy = CacheExecutor::GetCommonExecutor();
+        assert!(!Arc::ptr_eq(&common_before_destroy, &common_after_destroy));
+
+        CacheExecutor::DestroyAllExecutors();
+        CacheExecutor::Configure(CacheExecutorConfig::default());
+    }
+
+    #[test]
+    fn cxx_async_writer_runs_write_then_callback_and_tracks_counters() {
+        let allocator = SimpleLogBasedMemoryAllocator::with_capacity(128);
+        let mut writer = AsyncWriter::new(allocator);
+
+        let task = AsyncWriteTask::new(
+            |allocator| {
+                let ptr = allocator.Allocate(5)?;
+                allocator.write(ptr, b"async")?;
+                allocator.Seal(ptr)?;
+                Ok(ptr)
+            },
+            |write_result, allocator| {
+                let ptr = write_result?;
+                let mut buffer = CacheBuffer::new(allocator.read(ptr)?.to_vec());
+                buffer.SetKey("async-key");
+                Ok(buffer)
+            },
+        );
+
+        let buffer = writer.AsyncWrite(task).unwrap();
+        assert_eq!(buffer.Key(), "async-key");
+        assert_eq!(buffer.Data(), b"async");
+        assert_eq!(writer.FlyWriteNum(), 0);
+        assert_eq!(writer.FlyCbNum(), 0);
+        assert_eq!(writer.completed_writes(), 1);
+        assert_eq!(writer.completed_callbacks(), 1);
+        assert_eq!(writer.allocator().live_region_count(), 1);
+    }
+
+    #[test]
+    fn cxx_async_writer_preserves_addr_and_stop_rejects_new_writes() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(128);
+        let existing = allocator.Allocate(4).unwrap();
+        allocator.write(existing, b"seed").unwrap();
+        let mut writer = AsyncWriter::new(allocator);
+
+        let task = AsyncWriteTask::with_addr(
+            |allocator| {
+                let ptr = allocator.Allocate(4)?;
+                allocator.write(ptr, b"copy")?;
+                Ok(ptr)
+            },
+            |write_result, allocator| {
+                let ptr = write_result?;
+                let mut buffer = CacheBuffer::new(allocator.read(ptr)?.to_vec());
+                buffer.SetKey("copy-key");
+                Ok(buffer)
+            },
+            existing,
+        );
+        assert_eq!(task.Addr(), Some(existing));
+
+        let buffer = writer.AsyncWrite(task).unwrap();
+        assert_eq!(buffer.Data(), b"copy");
+        writer.TEST_JoinWriteExecutor();
+        writer.Stop();
+        assert_eq!(writer.FlyWriteNum(), 0);
+        assert_eq!(writer.FlyCbNum(), 0);
+
+        let rejected = AsyncWriteTask::new(
+            |allocator| allocator.Allocate(1),
+            |write_result, allocator| {
+                let ptr = write_result?;
+                Ok(CacheBuffer::new(allocator.read(ptr)?.to_vec()))
+            },
+        );
+        assert!(matches!(
+            writer.AsyncWrite(rejected),
+            Err(CacheError::Stopped)
+        ));
+    }
+
+    #[test]
+    fn cxx_pmem_dispatcher_round_robins_put_tasks_across_numa_writers() {
+        let mut dispatcher = PMemDispatcher::new(2, 128);
+        assert!(dispatcher.Start());
+        assert_eq!(dispatcher.numa_count(), 2);
+        assert_eq!(
+            dispatcher.allocator_type(),
+            AllocatorType::kLogBasedAllocator
+        );
+
+        for (key, value) in [("first", b"one".to_vec()), ("second", b"two".to_vec())] {
+            let write_value = value.clone();
+            let task = AsyncWriteTask::new(
+                move |allocator| {
+                    let ptr = allocator.Allocate(write_value.len())?;
+                    allocator.write(ptr, &write_value)?;
+                    Ok(ptr)
+                },
+                move |write_result, allocator| {
+                    let ptr = write_result?;
+                    let mut buffer = CacheBuffer::new(allocator.read(ptr)?.to_vec());
+                    buffer.SetKey(key);
+                    Ok(buffer)
+                },
+            );
+            assert_eq!(dispatcher.PushTask(task).unwrap().Key(), key);
+        }
+
+        dispatcher.TEST_JoinPmemWriteExecutor();
+        assert_eq!(dispatcher.TEST_GetWriter(0).unwrap().completed_writes(), 1);
+        assert_eq!(dispatcher.TEST_GetWriter(1).unwrap().completed_writes(), 1);
+        assert_eq!(
+            dispatcher.TEST_GetAllocator(0).unwrap().live_region_count(),
+            1
+        );
+        assert_eq!(
+            dispatcher.TEST_GetAllocator(1).unwrap().live_region_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cxx_pmem_dispatcher_routes_addr_tasks_to_owner_numa() {
+        let mut alloc0 = SimpleLogBasedMemoryAllocator::with_capacity_and_base(128, 1 << 48);
+        let mut alloc1 = SimpleLogBasedMemoryAllocator::with_capacity_and_base(128, 2 << 48);
+        let ptr0 = alloc0.Allocate(4).unwrap();
+        alloc0.write(ptr0, b"left").unwrap();
+        let ptr1 = alloc1.Allocate(5).unwrap();
+        alloc1.write(ptr1, b"right").unwrap();
+
+        let mut dispatcher = PMemDispatcher::from_allocators(vec![alloc0, alloc1]);
+        dispatcher.Start();
+        assert_eq!(dispatcher.get_numa_id_by_pmem_addr(ptr0), Some(0));
+        assert_eq!(dispatcher.get_numa_id_by_pmem_addr(ptr1), Some(1));
+
+        let task = AsyncWriteTask::with_addr(
+            move |allocator| {
+                allocator.write(ptr1, b"owned")?;
+                Ok(ptr1)
+            },
+            |write_result, allocator| {
+                let ptr = write_result?;
+                let mut buffer = CacheBuffer::new(allocator.read(ptr)?.to_vec());
+                buffer.SetKey("routed");
+                Ok(buffer)
+            },
+            ptr1,
+        );
+
+        let buffer = dispatcher.PushTask(task).unwrap();
+        assert_eq!(buffer.Key(), "routed");
+        assert_eq!(buffer.Data(), b"owned");
+        assert_eq!(dispatcher.TEST_GetWriter(0).unwrap().completed_writes(), 0);
+        assert_eq!(dispatcher.TEST_GetWriter(1).unwrap().completed_writes(), 1);
+    }
+
+    #[test]
+    fn cxx_pmem_dispatcher_supports_test_allocator_access_and_stop() {
+        let mut dispatcher = PMemDispatcher::new(2, 128);
+        dispatcher.Start();
+
+        let buffer = dispatcher
+            .test_put_to_numa(1, "numa-one", b"payload".to_vec())
+            .unwrap();
+        assert_eq!(buffer.Key(), "numa-one");
+        assert_eq!(buffer.Data(), b"payload");
+        assert_eq!(dispatcher.TEST_GetWriter(1).unwrap().completed_writes(), 1);
+
+        let ptr = {
+            let allocator = dispatcher.GetAllocator(None).unwrap();
+            let ptr = allocator.Allocate(3).unwrap();
+            allocator.write(ptr, b"abc").unwrap();
+            ptr
+        };
+        assert!(dispatcher.GetAllocator(Some(ptr)).is_some());
+        assert_eq!(dispatcher.GetAllocators().len(), 2);
+
+        assert!(dispatcher.Stop());
+        let rejected = AsyncWriteTask::new(
+            |allocator| allocator.Allocate(1),
+            |write_result, allocator| {
+                let ptr = write_result?;
+                Ok(CacheBuffer::new(allocator.read(ptr)?.to_vec()))
+            },
+        );
+        assert!(matches!(
+            dispatcher.PushTask(rejected),
+            Err(CacheError::Stopped)
+        ));
+    }
+
+    fn test_buffer(key: &str, value: &[u8]) -> CacheBuffer {
+        let mut buffer = CacheBuffer::new(value.to_vec());
+        buffer.SetKey(key);
+        buffer
+    }
+
+    #[test]
+    fn cxx_replacement_fifo_evicts_oldest_and_invokes_handler() {
+        let mut fifo = ReplacementFIFO::new(5);
+        fifo.Init().unwrap();
+        let evicted_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let evicted_keys_capture = Arc::clone(&evicted_keys);
+        fifo.RegisterMemEvictionHandler(move |buffer| {
+            evicted_keys_capture
+                .lock()
+                .unwrap()
+                .push(buffer.Key().to_string());
+        });
+
+        assert!(fifo.Put(test_buffer("a", b"1")).is_empty());
+        assert!(fifo.Put(test_buffer("b", b"2")).is_empty());
+        let evicted = fifo.Put(test_buffer("c", b"3"));
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].Key(), "a");
+        assert!(fifo.Get("a").is_none());
+        assert_eq!(fifo.Peek("b").unwrap().Data(), b"2");
+        assert_eq!(fifo.GetItemNum(), 2);
+        assert_eq!(*evicted_keys.lock().unwrap(), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn cxx_replacement_fifo_update_guards_raw_data_and_preserves_order() {
+        let mut fifo = ReplacementFIFO::new(32);
+        fifo.Init().unwrap();
+        fifo.Put(test_buffer("guarded", b"old"));
+
+        assert!(matches!(
+            fifo.UpdateCacheBuffer("guarded", b"stale", test_buffer("guarded", b"bad")),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        fifo.UpdateCacheBuffer("guarded", b"old", test_buffer("guarded", b"new"))
+            .unwrap();
+        assert_eq!(fifo.Get("guarded").unwrap().Data(), b"new");
+
+        fifo.Put(test_buffer("next", b"1"));
+        fifo.SetCapacity(12);
+        assert!(fifo.Get("guarded").is_none());
+        assert!(fifo.Get("next").is_some());
+    }
+
+    #[test]
+    fn cxx_replacement_slru_tracks_hot_warm_cold_and_fetch_flags() {
+        let mut slru = ReplacementSLRU::new(6);
+        slru.Init().unwrap();
+        slru.TEST_ConfigLRUMaintainer(false);
+
+        slru.Put(test_buffer("a", b"1"));
+        slru.Put(test_buffer("b", b"2"));
+        assert_eq!(slru.TEST_CheckLRUPos("a"), HOT_LRU);
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_INIT);
+
+        assert_eq!(slru.Get("a").unwrap().Data(), b"1");
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_FETCHED);
+        assert_eq!(slru.Get("a").unwrap().Data(), b"1");
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_ACTIVE);
+
+        slru.Put(test_buffer("c", b"3"));
+        slru.Put(test_buffer("d", b"4"));
+        slru.Put(test_buffer("e", b"5"));
+        assert_eq!(slru.TEST_CheckLRUPos("a"), WARM_LRU);
+        assert!(slru.GetItemNum() <= 3);
+    }
+
+    #[test]
+    fn cxx_replacement_slru_update_delete_and_capacity_shrink() {
+        let mut slru = ReplacementSLRU::new(32);
+        slru.Init().unwrap();
+        slru.Put(test_buffer("x", b"old"));
+        slru.Put(test_buffer("y", b"yy"));
+
+        assert!(matches!(
+            slru.UpdateCacheBuffer("x", b"stale", test_buffer("x", b"bad")),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        slru.UpdateCacheBuffer("x", b"old", test_buffer("x", b"new"))
+            .unwrap();
+        assert_eq!(slru.Peek("x").unwrap().Data(), b"new");
+        assert_eq!(slru.Delete("y").unwrap().Key(), "y");
+        assert_eq!(slru.GetItemNum(), 1);
+
+        slru.Put(test_buffer("z", b"zzzz"));
+        slru.SetCapacity(6);
+        assert!(slru.GetUsedSpace() <= slru.GetCapacity());
+    }
+
+    #[test]
+    fn cxx_hash_uint64_matches_matrixcache_vectors() {
+        assert_eq!(hash_uint64(0), 0x5b03_af84_387a_42c6);
+        assert_eq!(hash_uint64(1), 0xa13a_3e40_1240_2345);
+        assert_eq!(hash_uint64(2), 0xcd41_43fa_e38a_71fe);
+        assert_eq!(hash_uint64(123_456_789), 0x6675_3257_ed88_abf3);
+        assert_eq!(hash_uint64(u64::MAX), 0x7073_251a_e29c_59b6);
+        assert_eq!(HashUInt64(1), hash_uint64(1));
+    }
+
+    #[test]
+    fn cxx_murmur_hash2_matches_matrixcache_vectors() {
+        assert_eq!(mur_mur_hash2(b""), 0xca88_1466);
+        assert_eq!(mur_mur_hash2(b"a"), 0xe94e_6ebd);
+        assert_eq!(mur_mur_hash2(b"abc"), 0x6d5e_3568);
+        assert_eq!(mur_mur_hash2(b"abcd"), 0x543f_2edd);
+        assert_eq!(mur_mur_hash2(b"hello"), 0x33b4_f2ac);
+        assert_eq!(mur_mur_hash2(b"TemporalStore"), 0xcbd0_a1fb);
+
+        assert_eq!(mur_mur_hash2_with_seed(b"TemporalStore", 0), 0xfa4d_19c8);
+        assert_eq!(mur_mur_hash2_with_seed(b"TemporalStore", 1), 0x4465_353c);
+        assert_eq!(
+            mur_mur_hash2_with_seed(b"TemporalStore", 0xdead_beef),
+            0xa351_ec62
+        );
+        assert_eq!(
+            MurMurHash2(b"TemporalStore"),
+            mur_mur_hash2(b"TemporalStore")
+        );
+        assert_eq!(
+            MurMurHash2WithSeed(b"TemporalStore", 1),
+            mur_mur_hash2_with_seed(b"TemporalStore", 1)
+        );
+    }
+
+    #[test]
+    fn cxx_tools_utils_random_and_hashed_key_helpers_match_surface() {
+        assert_eq!(xxh32_with_seed(b"", 0), 0x02cc_5d05);
+        assert_eq!(xxh32_with_seed(b"hello", 0), 0xfb00_77f9);
+
+        let key = get_hashed_key(42, 4);
+        assert_eq!(key.len(), 4);
+        assert_eq!(get_hashed_key(42, 2), key[..2].to_vec());
+        assert_eq!(get_hashed_key(42, 99).len(), 4);
+
+        let value = get_rand_str(32);
+        assert_eq!(value.len(), 32);
+        assert!(value.bytes().all(|byte| byte.is_ascii_lowercase()));
+        let fast16 = fast_rand16();
+        assert!((0..=0x7fff).contains(&fast16));
+        assert_ne!(fast_rand64(), fast_rand64());
+
+        let mut generator = RandomStringGenerator::with_size(1 << 18);
+        let bytes = generator.RandValueBytes(64);
+        assert_eq!(bytes.len(), 64);
+        assert!(bytes.iter().all(u8::is_ascii_lowercase));
+        let text = generator.RandValue(128);
+        assert_eq!(text.len(), 128);
+        assert!(text.bytes().all(|byte| byte.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn cxx_round_up_matches_align_util_macro_semantics() {
+        assert_eq!(round_up(0, 8), 0);
+        assert_eq!(round_up(1, 8), 8);
+        assert_eq!(round_up(8, 8), 8);
+        assert_eq!(round_up(9, 8), 16);
+        assert_eq!(round_up(31, 16), 32);
+        assert_eq!(ROUND_UP(33, 32), 64);
+        assert_eq!(round_up(33, 0), 33);
+    }
+
+    #[test]
+    fn cxx_numa_info_exposes_stable_single_node_topology() {
+        NumaInfo::Init();
+        assert!(NumaInfo::GetNumAllCores() >= 1);
+        assert!(NumaInfo::GetNumOnlineCores() >= NumaInfo::GetNumAllCores());
+        assert_eq!(NumaInfo::GetMaxNumNumaNodes(), 1);
+        assert_eq!(NumaInfo::GetNumaNodeOfCpuCore(0), 0);
+        assert_eq!(NumaInfo::GetNumaNodeCoreIdx(0), 0);
+        let cores = NumaInfo::GetCpuCoresOfNumaNode(0);
+        assert!(!cores.is_empty());
+        assert_eq!(cores[0], 0);
+        assert_eq!(NumaInfo::GetCpuCoresOfSameNumaNode(0), cores);
+        assert!(NumaInfo::BindThreadToCpuCore(0).is_ok());
+        assert!(NumaInfo::BindThreadToCpuCore(usize::MAX).is_err());
+    }
+    #[test]
+    fn sharded_multilayer_cache_routes_batches_and_trait_api() {
+        let base = unique_temp_path("sharded-multilayer-cache");
+        let options = CacheOptions::new(96, 0, 4096).with_ssd_paths(vec![base]);
+        let cache = MatrixCacheBuilder::build_sharded_cache(options, 4);
+        assert_eq!(cache.shard_count(), 4);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 96);
+        assert_eq!(cache.CapacityForTier(CacheTier::Ssd), 4096);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kDRAM), 96);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 4096);
+        let config_cache = MatrixCacheBuilder::build_sharded_cache(CacheOptions::new(32, 32, 0), 2);
+        assert!(config_cache.stop());
+        config_cache
+            .TrySetReplacementPolicyForTier(CacheTier::Pmem, CacheReplacementPolicy::Fifo)
+            .unwrap();
+        assert_eq!(
+            config_cache.ReplacementPolicyForTier(CacheTier::Pmem),
+            CacheReplacementPolicy::Fifo
+        );
+
+        let keys = (0..16)
+            .map(|i| CacheKey::string((i % 3) as ShardId, &format!("key-{i}")))
+            .collect::<Vec<_>>();
+        let entries = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (key.clone(), format!("value-{i}").into_bytes(), 32))
+            .collect::<Vec<_>>();
+        assert_eq!(cache.insert_batch_cache(entries).unwrap(), keys.len());
+        let all_entries = cache.AllEntries();
+        assert_eq!(all_entries.len(), keys.len());
+        assert_eq!(cache.EntriesForShard(0).len(), 6);
+        assert!(all_entries.iter().any(|entry| entry.disk_bytes > 0));
+
+        let values = cache.lookup_batch_cache(&keys).unwrap();
+        assert_eq!(values.len(), keys.len());
+        for (i, value) in values.into_iter().enumerate() {
+            assert_eq!(value.unwrap(), format!("value-{i}").into_bytes());
+        }
+        let stats = cache.Stats();
+        assert!(stats.puts >= keys.len() as u64);
+        assert!(stats.disk_hits + stats.memory_hits >= keys.len() as u64);
+        assert!(stats.disk_bytes > 0);
+        assert!(stats.get_latency_samples >= keys.len() as u64);
+        assert!(stats.put_latency_samples >= keys.len() as u64);
+        let latency = cache.LatencyMetricsReport();
+        assert!(latency.put_count >= keys.len() as u64);
+        assert!(latency.get_count >= keys.len() as u64);
+        assert!(latency.histogram_ready);
+        assert!(cache.GetUsed(CacheInstanceType::kDRAM) > 0);
+        assert!(cache.GetUsed(CacheInstanceType::kSSD) > 0);
+
+        let repeated = keys[3].clone();
+        let other = keys[7].clone();
+        let duplicate_values = cache
+            .lookup_batch_cache(&[
+                repeated.clone(),
+                other.clone(),
+                repeated.clone(),
+                keys[0].clone(),
+                other.clone(),
+            ])
+            .unwrap();
+        assert_eq!(
+            duplicate_values,
+            vec![
+                Some(b"value-3".to_vec()),
+                Some(b"value-7".to_vec()),
+                Some(b"value-3".to_vec()),
+                Some(b"value-0".to_vec()),
+                Some(b"value-7".to_vec()),
+            ]
+        );
+        assert!(cache.item_count_for_tier(CacheTier::Ssd) > 0);
+        assert!(cache.used_space_for_tier(CacheTier::Ssd) > 0);
+
+        assert_eq!(
+            cache.ReplacementPolicyForTier(CacheTier::Memory),
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+        cache.SetReplacementPolicyType(CacheInstanceType::kSSD, CacheReplacementPolicy::Fifo);
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kSSD),
+            CacheReplacementPolicy::Fifo
+        );
+        assert_eq!(
+            cache.ReplacementPolicyForTier(CacheTier::Ssd),
+            CacheReplacementPolicy::Fifo
+        );
+
+        cache.SetCapacityForTier(CacheTier::Memory, 8);
+        assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 8);
+        assert!(cache.size_for_tier(CacheTier::Memory) <= 8);
+        assert!(cache.SizeForTier(CacheTier::Ssd) > 0);
+        let eviction = cache.EvictionReport();
+        assert!(eviction.memory_capacity_evictions > 0);
+        assert!(eviction.memory_slot_evictions > 0);
+        cache.SetCapacityForInstance(CacheInstanceType::kSSD, 1024);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 1024);
+
+        cache.SetReplacementPolicyForTier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+        assert_eq!(
+            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            CacheReplacementPolicy::Fifo
+        );
+        let running_cache = MatrixCacheBuilder::build_sharded_cache(CacheOptions::new(32, 0, 0), 2);
+        running_cache.start().unwrap();
+        assert!(matches!(
+            running_cache.TrySetReplacementPolicyType(
+                CacheInstanceType::kDRAM,
+                CacheReplacementPolicy::Fifo,
+            ),
+            Err(CacheError::AlreadyStarted)
+        ));
+        assert_eq!(
+            running_cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            CacheReplacementPolicy::WeightedHotnessLru
+        );
+        assert!(matches!(
+            cache.TrySetReplacementPolicyType(
+                CacheInstanceType::kUnified,
+                CacheReplacementPolicy::Fifo,
+            ),
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+        ));
+        assert!(matches!(
+            cache.TrySetReplacementPolicyForTier(CacheTier::Reject, CacheReplacementPolicy::Fifo),
+            Err(CacheError::UnsupportedTier(CacheTier::Reject))
+        ));
+
+        let api: Box<dyn CacheApi> = MatrixCacheBuilder::build_sharded_cache_api(
+            CacheOptions::new(64, 0, 1024)
+                .with_ssd_paths(vec![unique_temp_path("sharded-cache-api")]),
+            2,
+        );
+        assert_eq!(
+            api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            64
+        );
+        assert_eq!(
+            api.capacity_for_instance_cache(CacheInstanceType::kSSD),
+            1024
+        );
+        let trait_key = CacheKey::string(7, "trait-key");
+        api.insert_cache(trait_key.clone(), b"trait-value".to_vec(), 11)
+            .unwrap();
+        assert_eq!(
+            api.lookup_cache(&trait_key).unwrap().unwrap(),
+            b"trait-value".to_vec()
+        );
+        assert!(api.used_cache(CacheInstanceType::kDRAM) > 0);
+        api.set_capacity_for_instance_cache(CacheInstanceType::kDRAM, 8);
+        assert_eq!(api.capacity_for_instance_cache(CacheInstanceType::kDRAM), 8);
+        api.reset_cache().unwrap();
+        assert_eq!(api.lookup_cache(&trait_key).unwrap(), None);
+
+        let slot_key = CacheKey::page_with_slot(0, 700, 0, 32, Some(77));
+        let segment_key = CacheKey::page(0, 701, 0, 32);
+        let shard_key = CacheKey::string(2, "gc-fanout");
+        cache
+            .put_batch(vec![
+                (slot_key.clone(), b"slot-page".to_vec()),
+                (segment_key.clone(), b"segment-page".to_vec()),
+                (shard_key.clone(), b"shard-value".to_vec()),
+            ])
+            .unwrap();
+        let slot_report = cache.InvalidateSlot(0, 77).unwrap();
+        assert!(slot_report.memory_entries_removed > 0 || slot_report.disk_bytes_removed > 0);
+        assert!(cache.lookup(&slot_key).unwrap().is_none());
+        assert!(cache.lookup(&segment_key).unwrap().is_some());
+
+        let segment_report = cache.InvalidatePageSegment(0, 701).unwrap();
+        assert!(segment_report.memory_entries_removed > 0 || segment_report.disk_bytes_removed > 0);
+        assert!(cache.lookup(&segment_key).unwrap().is_none());
+
+        let shard_report = cache.InvalidateShard(2).unwrap();
+        assert!(shard_report.memory_entries_removed > 0 || shard_report.disk_bytes_removed > 0);
+        assert!(cache.lookup(&shard_key).unwrap().is_none());
+        assert!(cache.Stats().invalidations >= 3);
+    }
+
+    #[test]
+    fn sharded_multilayer_cache_preserves_zero_copy_handles() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(1024, 0, 0)
+                .with_ssd_paths(vec![unique_temp_path("sharded-zero-copy")]),
+            4,
+        );
+        let key = CacheKey::string(42, "pinned");
+        let handle = cache
+            .insert_pinned_cache(key.clone(), b"pinned-value".to_vec(), 12)
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(handle.value(), b"pinned-value");
+        cache.release_cache(handle);
+        let reacquired = cache.acquire_cache(&key).unwrap().unwrap();
+        assert_eq!(reacquired.value(), b"pinned-value");
+        cache.release_cache(reacquired);
+        let handles = cache
+            .acquire_batch_cache(&[key.clone(), key.clone()])
+            .unwrap();
+        assert_eq!(handles[0].as_ref().unwrap().value(), b"pinned-value");
+        assert_eq!(handles[1].as_ref().unwrap().value(), b"pinned-value");
+        let handles = handles.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(cache.release_batch_cache(handles), 2);
+
+        let batch_keys = (0..6)
+            .map(|i| CacheKey::string((i % 3) as ShardId, &format!("pinned-batch-{i}")))
+            .collect::<Vec<_>>();
+        let batch_handles = cache
+            .InsertPinnedBatch(
+                batch_keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| {
+                        (
+                            key.clone(),
+                            format!("pinned-batch-value-{i}").into_bytes(),
+                            64,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(batch_handles.len(), batch_keys.len());
+        for (i, handle) in batch_handles.iter().enumerate() {
+            assert_eq!(
+                handle.as_ref().unwrap().value(),
+                format!("pinned-batch-value-{i}").as_bytes()
+            );
+        }
+        assert!(cache.Stats().insert_pinned_operations > batch_keys.len() as u64);
+        assert!(cache.Stats().pinned_entries >= batch_keys.len() as u64);
+        assert_eq!(
+            cache.release_batch_cache(batch_handles.into_iter().flatten().collect()),
+            batch_keys.len()
+        );
+
+        let zero_copy: &dyn ZeroCopyCacheApi = &cache;
+        let trait_handles = zero_copy
+            .insert_pinned_batch_cache(vec![
+                (
+                    CacheKey::string(1, "trait-pinned-batch-a"),
+                    b"trait-a".to_vec(),
+                    8,
+                ),
+                (
+                    CacheKey::string(2, "trait-pinned-batch-b"),
+                    b"trait-b".to_vec(),
+                    8,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(trait_handles.len(), 2);
+        assert_eq!(trait_handles[0].as_ref().unwrap().value(), b"trait-a");
+        assert_eq!(trait_handles[1].as_ref().unwrap().value(), b"trait-b");
+        assert_eq!(
+            zero_copy.release_batch_cache(trait_handles.into_iter().flatten().collect()),
+            2
+        );
+
+        assert_eq!(cache.PinBatch(batch_keys.clone()), batch_keys.len());
+        assert_eq!(cache.Stats().pinned_entries, batch_keys.len() as u64);
+        cache.Pin(batch_keys[0].clone());
+        assert_eq!(cache.Stats().pinned_entries, batch_keys.len() as u64);
+        cache.Unpin(&batch_keys[0]);
+        assert_eq!(cache.Stats().pinned_entries, batch_keys.len() as u64);
+        assert_eq!(cache.UnpinBatch(&batch_keys), batch_keys.len());
+        assert_eq!(cache.Stats().pinned_entries, 0);
+    }
+    // shared-corpus: storage_cache_refill
+    #[test]
+    fn zero_copy_acquire_pins_ssd_refill_before_memory_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 4,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 4096,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 4,
+            max_pmem_block_bytes: 0,
+            max_ssd_block_bytes: 4096,
+            ssd_write_through: true,
+        };
+        let cache =
+            MultiLayerCache::with_tiering_policy(dir.path(), policy, CacheBlockOptions::default());
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+        let acquired = CacheKey::page_with_slot(1, 100, 0, 4, Some(5));
+        let victim = CacheKey::page_with_slot(1, 101, 0, 4, Some(6));
+
+        cache.put(acquired.clone(), b"hot!".to_vec()).unwrap();
+        cache.put(victim.clone(), b"cold".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&acquired), Some(CacheReadTier::Ssd));
+        assert_eq!(cache.peek_tier(&victim), Some(CacheReadTier::Memory));
+
+        let handle = cache.acquire(&acquired).unwrap().expect("acquired handle");
+        assert_eq!(handle.value(), b"hot!");
+        assert_eq!(handle.tier(), CacheReadTier::Ssd);
+        assert_eq!(cache.peek_tier(&acquired), Some(CacheReadTier::Memory));
+        assert_ne!(cache.peek_tier(&victim), Some(CacheReadTier::Memory));
+        assert_eq!(cache.stats().pinned_entries, 1);
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    // shared-corpus: storage_cache_refill
+    #[test]
+    fn zero_copy_acquire_pins_pmem_refill_before_memory_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_path = dir.path().join("pmem-device");
+        let cache =
+            MultiLayerCache::with_options(CacheOptions::new(4, 8, 0).with_pmem_paths([pmem_path]));
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+        let acquired = CacheKey::string(1, "pmem-acquire");
+        let victim = CacheKey::string(1, "memory-victim");
+
+        cache
+            .test_insert(
+                CacheInstanceType::kPMEM,
+                acquired.clone(),
+                b"pmem".to_vec(),
+                4,
+            )
+            .unwrap();
+        cache.put(victim.clone(), b"cold".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&acquired), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.peek_tier(&victim), Some(CacheReadTier::Memory));
+
+        let handle = cache.acquire(&acquired).unwrap().expect("pmem handle");
+        assert_eq!(handle.value(), b"pmem");
+        assert_eq!(handle.tier(), CacheReadTier::Pmem);
+        assert_eq!(cache.peek_tier(&acquired), Some(CacheReadTier::Memory));
+        assert_ne!(cache.peek_tier(&victim), Some(CacheReadTier::Memory));
+        assert_eq!(cache.stats().pinned_entries, 1);
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn sharded_multilayer_cache_removes_batches_by_shard() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(64, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-remove-batch")]),
+            4,
+        );
+        let keys = (0..12)
+            .map(|i| CacheKey::string((i % 4) as ShardId, &format!("remove-shard-{i}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cache
+                .put_batch(
+                    keys.iter()
+                        .enumerate()
+                        .map(|(i, key)| (key.clone(), format!("value-{i}").into_bytes()))
+                        .collect()
+                )
+                .unwrap(),
+            keys.len()
+        );
+        assert_eq!(cache.remove_batch(&keys).unwrap(), keys.len());
+        assert!(cache
+            .get_batch(&keys)
+            .unwrap()
+            .into_iter()
+            .all(|value| value.is_none()));
+
+        assert_eq!(
+            cache
+                .remove_batch(&[keys[0].clone(), keys[1].clone(), keys[0].clone()])
+                .unwrap(),
+            3
+        );
+    }
+    #[test]
+    fn multilayer_cache_batch_put_updates_existing_ssd_keys_once() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(0, 0, 4096));
+        let hot = CacheKey::string(9, "batch-update-hot");
+        let cold = CacheKey::string(9, "batch-update-cold");
+
+        assert_eq!(
+            cache
+                .put_batch(vec![
+                    (hot.clone(), b"old-hot".to_vec()),
+                    (cold.clone(), b"old-cold".to_vec()),
+                ])
+                .unwrap(),
+            2
+        );
+        let bytes_before = cache.stats().disk_bytes;
+
+        assert_eq!(
+            cache
+                .put_batch(vec![
+                    (hot.clone(), b"new-hot-1".to_vec()),
+                    (hot.clone(), b"new-hot-2".to_vec()),
+                    (cold.clone(), b"new-cold".to_vec()),
+                ])
+                .unwrap(),
+            3
+        );
+
+        assert_eq!(cache.get(&hot).unwrap().unwrap(), b"new-hot-2".to_vec());
+        assert_eq!(cache.get(&cold).unwrap().unwrap(), b"new-cold".to_vec());
+        assert!(cache.stats().disk_bytes < bytes_before + 256);
+    }
+    #[test]
+    fn sharded_multilayer_cache_runs_concurrent_batch_workloads() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(65_536, 0, 131_072)
+                .with_ssd_paths(vec![unique_temp_path("sharded-concurrent-batch")]),
+            8,
+        );
+        let workers = (0..8)
+            .map(|worker_id| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    let keys = (0..32)
+                        .map(|i| {
+                            CacheKey::string((i % 5) as ShardId, &format!("w{worker_id}-k{i}"))
+                        })
+                        .collect::<Vec<_>>();
+                    let entries = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, key)| {
+                            (
+                                key.clone(),
+                                format!("worker-{worker_id}-value-{i}").into_bytes(),
+                                32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    cache.insert_batch_cache(entries).unwrap();
+                    let values = cache.lookup_batch_cache(&keys).unwrap();
+                    for (i, value) in values.into_iter().enumerate() {
+                        assert_eq!(
+                            value.unwrap(),
+                            format!("worker-{worker_id}-value-{i}").into_bytes()
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("batch worker");
+        }
+    }
+    #[test]
+    fn async_writeback_batch_enqueue_respects_queue_limit() {
+        let cache = MultiLayerCache::new(64, unique_temp_path("async-writeback-batch-enqueue"));
+        cache.set_async_writeback_queue_limit_for_test(3);
+        let entries = (0..4)
+            .map(|i| {
+                (
+                    CacheKey::string(15, &format!("enqueue-batch-{i}")),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let rejected = cache
+            .enqueue_async_writeback_batch(entries)
+            .expect_err("bounded queue should reject the fourth job");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(cache.stats().async_writeback_enqueued, 3);
+        assert_eq!(cache.stats().async_writeback_backpressure_rejections, 1);
+        assert_eq!(cache.stats().async_writeback_queue_depth, 3);
+
+        let report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(report.drained, 3);
+        assert_eq!(report.remaining, 0);
+    }
+    #[test]
+    fn async_writeback_enqueue_coalesces_duplicate_keys_under_backpressure() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-enqueue-coalesce"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        cache.set_async_writeback_queue_limit_for_test(1);
+        let key = CacheKey::string(18, "async-enqueue-coalesced");
+        cache
+            .enqueue_async_writeback(key.clone(), b"old".to_vec())
+            .unwrap();
+        cache
+            .enqueue_async_writeback(key.clone(), b"newest".to_vec())
+            .unwrap();
+        assert_eq!(cache.stats().async_writeback_queue_depth, 1);
+        assert_eq!(
+            cache.stats().async_writeback_queue_bytes,
+            b"newest".len() as u64
+        );
+        assert_eq!(cache.stats().async_writeback_enqueued, 2);
+        assert_eq!(cache.stats().async_writeback_backpressure_rejections, 0);
+
+        let report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(report.drained, 1);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.stats().async_writeback_queue_bytes, 0);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"newest".to_vec()));
+    }
+    // shared-corpus: storage_cache_writeback
+    #[test]
+    fn cache_api_async_writeback_submit_uses_queue_and_fallback() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("cache-api-async-writeback-submit"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 0,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 0,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        cache.set_async_writeback_queue_limit_for_test(1);
+        let queued = CacheKey::string(22, "cache-api-queued-writeback");
+        let fallback = CacheKey::string(22, "cache-api-fallback-writeback");
+
+        let api: &dyn CacheApi = &cache;
+        let first = api
+            .submit_async_writeback_or_write_through_cache(queued.clone(), b"queued".to_vec())
+            .unwrap();
+        assert_eq!(first.queued, 1);
+        assert_eq!(first.write_through, 0);
+        assert_eq!(cache.get(&queued).unwrap(), None);
+
+        let second = api
+            .submit_async_writeback_or_write_through_cache(fallback.clone(), b"fallback".to_vec())
+            .unwrap();
+        assert_eq!(second.queued, 0);
+        assert_eq!(second.write_through, 1);
+        assert_eq!(cache.get(&fallback).unwrap(), Some(b"fallback".to_vec()));
+
+        let drained = cache.drain_async_writeback(8).unwrap();
+        assert_eq!(drained.drained, 1);
+        assert_eq!(cache.get(&queued).unwrap(), Some(b"queued".to_vec()));
+    }
+
+    // shared-corpus: storage_cache_writeback
+    #[test]
+    fn sharded_cache_api_async_writeback_batch_routes_by_key() {
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("cache-api-sharded-writeback")]),
+            2,
+        );
+        cache.set_async_writeback_queue_limit_for_test(1);
+        let keys = (0..4)
+            .map(|i| CacheKey::string((i % 2) as ShardId, &format!("cache-api-sharded-{i}")))
+            .collect::<Vec<_>>();
+        let entries = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (key.clone(), format!("value-{i}").into_bytes()))
+            .collect::<Vec<_>>();
+
+        let api: &dyn CacheApi = &cache;
+        let report = api
+            .submit_async_writeback_batch_or_write_through_cache(entries)
+            .unwrap();
+        assert_eq!(report.queued + report.write_through, keys.len());
+        assert!(report.queued > 0);
+        assert!(report.write_through > 0);
+        assert_eq!(cache.async_writeback_queue_depth(), report.queued as u64);
+
+        cache.flush_async_writeback().unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("value-{i}").into_bytes())
+            );
+        }
+    }
+
+    // shared-corpus: storage_cache_writeback
+    #[test]
+    fn async_writeback_submit_falls_back_to_write_through_when_queue_is_full() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-submit-fallback"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 0,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 0,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        cache.set_async_writeback_queue_limit_for_test(1);
+        let queued = CacheKey::string(21, "queued-writeback");
+        let fallback = CacheKey::string(21, "fallback-writeback");
+
+        let first = cache
+            .submit_async_writeback_or_write_through(queued.clone(), b"queued".to_vec())
+            .unwrap();
+        assert_eq!(first.queued, 1);
+        assert_eq!(first.write_through, 0);
+        assert_eq!(cache.get(&queued).unwrap(), None);
+
+        let second = cache
+            .submit_async_writeback_or_write_through(fallback.clone(), b"fallback".to_vec())
+            .unwrap();
+        assert_eq!(second.queued, 0);
+        assert_eq!(second.write_through, 1);
+        assert_eq!(cache.get(&fallback).unwrap(), Some(b"fallback".to_vec()));
+        assert_eq!(cache.stats().async_writeback_queue_depth, 1);
+        assert_eq!(cache.stats().async_writeback_backpressure_rejections, 1);
+
+        let drained = cache.drain_async_writeback(8).unwrap();
+        assert_eq!(drained.drained, 1);
+        assert_eq!(cache.get(&queued).unwrap(), Some(b"queued".to_vec()));
+    }
+
+    // shared-corpus: storage_cache_writeback
+    #[test]
+    fn sharded_async_writeback_submit_fallback_routes_each_key() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(0, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-submit-fallback")]),
+            2,
+        );
+        cache.set_async_writeback_queue_limit_for_test(1);
+        let keys = (0..6)
+            .map(|i| CacheKey::string((i % 2) as ShardId, &format!("submit-fallback-{i}")))
+            .collect::<Vec<_>>();
+        let report = cache
+            .submit_async_writeback_batch_or_write_through(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, key)| (key.clone(), format!("value-{i}").into_bytes()))
+                    .collect(),
+            )
+            .unwrap();
+
+        assert_eq!(report.queued + report.write_through, keys.len());
+        assert!(report.queued > 0);
+        assert!(report.write_through > 0);
+        assert_eq!(cache.async_writeback_queue_depth(), report.queued as u64);
+        for (i, key) in keys.iter().enumerate() {
+            let expected = format!("value-{i}").into_bytes();
+            if cache.get(key).unwrap().is_none() {
+                continue;
+            }
+            assert_eq!(cache.get(key).unwrap(), Some(expected));
+        }
+        cache.flush_async_writeback().unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("value-{i}").into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn async_writeback_drain_batches_multiple_jobs() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-batch-drain"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let keys = (0..4)
+            .map(|i| CacheKey::string(17, &format!("async-batch-{i}")))
+            .collect::<Vec<_>>();
+        for (index, key) in keys.iter().enumerate() {
+            cache
+                .enqueue_async_writeback(key.clone(), format!("value-{index}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(cache.stats().async_writeback_queue_depth, keys.len() as u64);
+
+        let report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(report.drained, keys.len());
+        assert_eq!(report.remaining, 0);
+        let values = cache.get_batch(&keys).unwrap();
+        for (index, value) in values.into_iter().enumerate() {
+            assert_eq!(value, Some(format!("value-{index}").into_bytes()));
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.async_writeback_drained, keys.len() as u64);
+        assert_eq!(stats.async_writeback_queue_depth, 0);
+        assert!(stats.disk_hits >= keys.len() as u64);
+        assert!(stats.writeback_latency_samples > 0);
+    }
+
+    #[test]
+    fn async_writeback_flush_drains_all_queued_jobs() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-flush-all"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let keys = (0..5)
+            .map(|i| CacheKey::string(18, &format!("async-flush-{i}")))
+            .collect::<Vec<_>>();
+        for (index, key) in keys.iter().enumerate() {
+            cache
+                .enqueue_async_writeback(key.clone(), format!("flush-{index}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(cache.stats().async_writeback_queue_depth, keys.len() as u64);
+
+        let report = cache.flush_async_writeback().unwrap();
+        assert_eq!(report.requested, keys.len());
+        assert_eq!(report.drained, keys.len());
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.stats().async_writeback_queue_depth, 0);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("flush-{index}").into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn put_batch_coalesces_duplicate_ssd_writes_before_flush() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("put-batch-coalesces-ssd-duplicates"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let repeated = CacheKey::string(23, "batch-dup");
+        let other = CacheKey::string(23, "batch-other");
+
+        let inserted = cache
+            .put_batch(vec![
+                (repeated.clone(), b"old".to_vec()),
+                (other.clone(), b"other".to_vec()),
+                (repeated.clone(), b"new".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(inserted, 3);
+        assert_eq!(cache.stats().disk_fills, 2);
+        assert_eq!(
+            cache.get_batch(&[repeated, other]).unwrap(),
+            vec![Some(b"new".to_vec()), Some(b"other".to_vec())]
+        );
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn ssd_pressure_eviction_removes_multiple_victims_and_preserves_reads() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("ssd-pressure-batch-evict"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 230,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: u32::MAX,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 230,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let cold_keys = (0..4)
+            .map(|i| CacheKey::page_with_slot(22, i, 0, 24, Some(i as u32)))
+            .collect::<Vec<_>>();
+        for (index, key) in cold_keys.iter().enumerate() {
+            cache
+                .put_with_admission(
+                    key.clone(),
+                    vec![b'a' + index as u8; 24],
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Page,
+                        shard_id: 22,
+                        routing_slot: Some(index as u32),
+                        block_bytes: 24,
+                        hotness: 0,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        let hot_key = CacheKey::page_with_slot(22, 99, 0, 120, Some(99));
+        cache
+            .put_with_admission(
+                hot_key.clone(),
+                vec![b'z'; 120],
+                CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Page,
+                    shard_id: 22,
+                    routing_slot: Some(99),
+                    block_bytes: 120,
+                    hotness: 64,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+
+        let stats = cache.stats();
+        assert!(stats.ssd_evictions >= 2);
+        assert!(stats.disk_bytes <= 230);
+        assert_eq!(stats.refill_failures, 0);
+        assert_eq!(cache.get(&hot_key).unwrap(), Some(vec![b'z'; 120]));
+        let surviving_cold = cache
+            .get_batch(&cold_keys)
+            .unwrap()
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        assert!(surviving_cold < cold_keys.len());
+    }
+    #[test]
+    fn async_writeback_drain_coalesces_duplicate_keys() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-coalesce"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let hot_key = CacheKey::string(17, "async-coalesced-hot");
+        let cold_key = CacheKey::string(17, "async-coalesced-cold");
+        cache
+            .enqueue_async_writeback(hot_key.clone(), b"old".to_vec())
+            .unwrap();
+        cache
+            .enqueue_async_writeback(cold_key.clone(), b"cold".to_vec())
+            .unwrap();
+        cache
+            .enqueue_async_writeback(hot_key.clone(), b"newest".to_vec())
+            .unwrap();
+
+        assert_eq!(cache.stats().async_writeback_enqueued, 3);
+        assert_eq!(cache.stats().async_writeback_queue_depth, 2);
+        let report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(report.drained, 2);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(
+            cache
+                .get_batch(&[hot_key.clone(), cold_key.clone()])
+                .unwrap(),
+            vec![Some(b"newest".to_vec()), Some(b"cold".to_vec())]
+        );
+        assert_eq!(cache.stats().async_writeback_drained, 2);
+    }
+
+    #[test]
+    fn async_writeback_position_index_survives_partial_drain() {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("async-writeback-partial-drain-index"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let first = CacheKey::string(19, "async-first");
+        let second = CacheKey::string(19, "async-second");
+        let third = CacheKey::string(19, "async-third");
+        let fourth = CacheKey::string(19, "async-fourth");
+
+        cache
+            .enqueue_async_writeback_batch(vec![
+                (first.clone(), b"first".to_vec()),
+                (second.clone(), b"second".to_vec()),
+                (third.clone(), b"third-old".to_vec()),
+            ])
+            .unwrap();
+        let partial = cache.drain_async_writeback(1).unwrap();
+        assert_eq!(partial.drained, 1);
+        assert_eq!(partial.remaining, 2);
+
+        cache
+            .enqueue_async_writeback_batch(vec![
+                (third.clone(), b"third-new".to_vec()),
+                (fourth.clone(), b"fourth".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(cache.stats().async_writeback_queue_depth, 3);
+        assert_eq!(cache.stats().async_writeback_enqueued, 5);
+
+        let final_report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(final_report.drained, 3);
+        assert_eq!(final_report.remaining, 0);
+        assert_eq!(
+            cache.get_batch(&[first, second, third, fourth]).unwrap(),
+            vec![
+                Some(b"first".to_vec()),
+                Some(b"second".to_vec()),
+                Some(b"third-new".to_vec()),
+                Some(b"fourth".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn async_writeback_worker_drains_enqueued_jobs() {
+        let cache = MultiLayerCache::new(64, unique_temp_path("async-writeback-worker"));
+        let key = CacheKey::string(9, "worker-drained");
+        cache
+            .enqueue_async_writeback(key.clone(), b"worker-value".to_vec())
+            .unwrap();
+        assert!(cache.start_async_writeback_worker(8, Duration::from_millis(1)));
+        for _ in 0..200 {
+            if cache.stats().async_writeback_queue_depth == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cache.stop_async_writeback_worker());
+        assert_eq!(cache.stats().async_writeback_queue_depth, 0);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"worker-value".to_vec()));
+        assert!(cache.stats().async_writeback_drained >= 1);
+    }
+
+    #[test]
+    fn sharded_async_writeback_batch_enqueue_routes_by_shard() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(512, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-async-batch-enqueue")]),
+            4,
+        );
+        let entries = (0..12)
+            .map(|i| {
+                (
+                    CacheKey::string((i % 4) as ShardId, &format!("async-batch-shard-{i}")),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cache.enqueue_async_writeback_batch(entries).unwrap(), 12);
+        assert_eq!(cache.async_writeback_queue_depth(), 12);
+        assert!(cache.async_writeback_queue_bytes() > 0);
+
+        let report = cache.drain_async_writeback(8).unwrap();
+        assert_eq!(report.drained, 12);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        let writeback = cache.WritebackBackpressureReport();
+        assert!(writeback.bounded_queue_ready);
+        assert!(writeback.ssd_write_through_enabled);
+        assert!(writeback.write_through_admissions >= 12);
+    }
+    #[test]
+    fn sharded_async_writeback_workers_drain_each_shard() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(512, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-async-writeback-worker")]),
+            4,
+        );
+        let keys = (0..16)
+            .map(|i| CacheKey::string((i % 4) as ShardId, &format!("async-shard-{i}")))
+            .collect::<Vec<_>>();
+        for (i, key) in keys.iter().cloned().enumerate() {
+            cache
+                .enqueue_async_writeback(key, format!("value-{i}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            cache.start_async_writeback_workers(4, Duration::from_millis(1)),
+            4
+        );
+        for _ in 0..200 {
+            if cache.async_writeback_queue_depth() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(cache.stop_async_writeback_workers(), 4);
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        assert_eq!(cache.async_writeback_queue_bytes(), 0);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("value-{i}").into_bytes())
+            );
+        }
+    }
+    #[test]
+    fn sharded_async_writeback_manual_drain_aggregates_reports() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(1024, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-manual-async-drain")]),
+            4,
+        );
+        let keys = (0..12)
+            .map(|i| CacheKey::string((i % 4) as ShardId, &format!("manual-async-{i}")))
+            .collect::<Vec<_>>();
+        for (i, key) in keys.iter().cloned().enumerate() {
+            cache
+                .enqueue_async_writeback(key, format!("manual-value-{i}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(cache.async_writeback_queue_depth(), keys.len() as u64);
+        assert!(cache.async_writeback_queue_bytes() > 0);
+        let report = cache.drain_async_writeback(16).unwrap();
+        assert_eq!(report.drained, keys.len());
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("manual-value-{i}").into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_async_writeback_flush_drains_all_shards() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(1024, 0, 4096)
+                .with_ssd_paths(vec![unique_temp_path("sharded-async-flush")]),
+            4,
+        );
+        let keys = (0..16)
+            .map(|i| CacheKey::string((i % 4) as ShardId, &format!("flush-shard-{i}")))
+            .collect::<Vec<_>>();
+        for (i, key) in keys.iter().cloned().enumerate() {
+            cache
+                .enqueue_async_writeback(key, format!("shard-flush-{i}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(cache.async_writeback_queue_depth(), keys.len() as u64);
+
+        let report = cache.FlushAsyncWriteback().unwrap();
+        assert_eq!(report.requested, keys.len());
+        assert_eq!(report.drained, keys.len());
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        assert_eq!(cache.async_writeback_queue_bytes(), 0);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(format!("shard-flush-{i}").into_bytes())
+            );
+        }
+    }
+}
