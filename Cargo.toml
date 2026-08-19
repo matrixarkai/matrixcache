@@ -21,7 +21,7 @@ rocksdb-ssd = ["dep:rocksdb"]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 zstd = "0.13"
-rocksdb = { version = "0.22", default-features = false, optional = true }
+rocksdb = { version = "0.25", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "=3.10.1"
