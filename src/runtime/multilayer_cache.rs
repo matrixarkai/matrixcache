@@ -232,15 +232,12 @@ struct CacheInner {
     memory: HashMap<CacheKey, Arc<[u8]>>,
     pmem: HashMap<CacheKey, Arc<[u8]>>,
     disk_index: HashMap<CacheKey, u64>,
-    disk_order: VecDeque<CacheKey>,
-    disk_fifo_order: VecDeque<CacheKey>,
+    disk_fifo_order: CacheKeyOrder,
     pinned: HashMap<CacheKey, u64>,
     pinned_handle_bytes: HashMap<CacheKey, usize>,
     pinned_removed_bytes: HashMap<CacheKey, usize>,
-    order: VecDeque<CacheKey>,
-    memory_fifo_order: VecDeque<CacheKey>,
-    pmem_order: VecDeque<CacheKey>,
-    pmem_fifo_order: VecDeque<CacheKey>,
+    memory_fifo_order: CacheKeyOrder,
+    pmem_fifo_order: CacheKeyOrder,
     async_writeback_queue: VecDeque<CacheWritebackJob>,
     async_writeback_positions: HashMap<CacheKey, usize>,
     async_writeback_queue_bytes: u64,
@@ -249,6 +246,8 @@ struct CacheInner {
     eviction_callback: Option<CacheEvictionCallback>,
     eviction_handler_enabled: bool,
     pending_eviction_records: VecDeque<CacheEvictionRecord>,
+    eviction_metric_callback: Option<CacheEvictionMetricCallback>,
+    pending_eviction_metric_tiers: VecDeque<CacheTier>,
     ssd_instance_only: bool,
     memory_replacement_policy: CacheReplacementPolicy,
     pmem_replacement_policy: CacheReplacementPolicy,
@@ -647,15 +646,12 @@ impl MultiLayerCache {
                 memory: HashMap::new(),
                 pmem: HashMap::new(),
                 disk_index: HashMap::new(),
-                disk_order: VecDeque::new(),
-                disk_fifo_order: VecDeque::new(),
+                disk_fifo_order: CacheKeyOrder::new(),
                 pinned: HashMap::new(),
                 pinned_handle_bytes: HashMap::new(),
                 pinned_removed_bytes: HashMap::new(),
-                order: VecDeque::new(),
-                memory_fifo_order: VecDeque::new(),
-                pmem_order: VecDeque::new(),
-                pmem_fifo_order: VecDeque::new(),
+                memory_fifo_order: CacheKeyOrder::new(),
+                pmem_fifo_order: CacheKeyOrder::new(),
                 async_writeback_queue: VecDeque::new(),
                 async_writeback_positions: HashMap::new(),
                 async_writeback_queue_bytes: 0,
@@ -664,6 +660,8 @@ impl MultiLayerCache {
                 eviction_callback: None,
                 eviction_handler_enabled: true,
                 pending_eviction_records: VecDeque::new(),
+                eviction_metric_callback: None,
+                pending_eviction_metric_tiers: VecDeque::new(),
                 ssd_instance_only: false,
                 memory_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 pmem_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
@@ -1013,6 +1011,25 @@ impl MultiLayerCache {
         inner.pending_eviction_records.clear();
     }
 
+    /// Register a callback receiving the number of entries evicted from a tier.
+    ///
+    /// Independent of the eviction handler: it keeps reporting while the
+    /// handler is disabled, so eviction rate stays observable even when nothing
+    /// is consuming the evicted entries.
+    pub fn register_eviction_metric_callback<F>(&self, callback: F)
+    where
+        F: Fn(CacheTier, usize) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.eviction_metric_callback = Some(CacheEvictionMetricCallback::new(callback));
+    }
+
+    pub fn clear_eviction_metric_callback(&self) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.eviction_metric_callback = None;
+        inner.pending_eviction_metric_tiers.clear();
+    }
+
     pub fn set_eviction_handler_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.eviction_handler_enabled = enabled;
@@ -1045,12 +1062,30 @@ impl MultiLayerCache {
     }
 
     fn drain_eviction_records(&self) {
-        let (callback, records) = {
+        let (callback, records, metric_callback, metric_tiers) = {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             let callback = inner.eviction_callback.clone();
             let records = inner.pending_eviction_records.drain(..).collect::<Vec<_>>();
-            (callback, records)
+            let metric_callback = inner.eviction_metric_callback.clone();
+            let metric_tiers = inner
+                .pending_eviction_metric_tiers
+                .drain(..)
+                .collect::<Vec<_>>();
+            (callback, records, metric_callback, metric_tiers)
         };
+        // Metrics first, and ungated: they report the eviction rate whether or
+        // not a handler is consuming the evicted entries.
+        if let Some(metric_callback) = metric_callback {
+            let mut reported: Vec<CacheTier> = Vec::new();
+            for tier in &metric_tiers {
+                if reported.contains(tier) {
+                    continue;
+                }
+                reported.push(*tier);
+                let count = metric_tiers.iter().filter(|entry| *entry == tier).count();
+                metric_callback.call(*tier, count);
+            }
+        }
         if let Some(callback) = callback {
             for record in records {
                 callback.call(record);
@@ -1182,7 +1217,6 @@ impl MultiLayerCache {
             if !inner.ssd_instance_only {
                 if let Some(value) = inner.memory.get(key).cloned() {
                     inner.stats.memory_hits += 1;
-                    inner.touch_key(key);
                     inner.record_hit(key, value.len());
                     inner.record_get_latency(started);
                     inner.record_read_through_latency(started);
@@ -1193,7 +1227,6 @@ impl MultiLayerCache {
                 }
                 if let Some(value) = inner.pmem.get(key).cloned() {
                     inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
-                    inner.touch_key(key);
                     inner.record_hit(key, value.len());
                     let decoded = value.to_vec();
                     if !inner.put_memory(key.clone(), decoded.clone()) {
@@ -1259,8 +1292,6 @@ impl MultiLayerCache {
         let mut ssd_candidates = Vec::new();
         let mut needs_eviction_drain = false;
         {
-            let mut memory_touches = Vec::new();
-            let mut pmem_touches = Vec::new();
             let mut disk_touches = Vec::new();
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
@@ -1272,7 +1303,6 @@ impl MultiLayerCache {
                     if let Some(value) = inner.memory.get(key).cloned() {
                         inner.stats.memory_hits = inner.stats.memory_hits.saturating_add(1);
                         inner.record_hit_metadata(key, value.len());
-                        memory_touches.push(key.clone());
                         if inner.disk_index.contains_key(key) {
                             disk_touches.push(key.clone());
                         }
@@ -1284,7 +1314,6 @@ impl MultiLayerCache {
                     if let Some(value) = inner.pmem.get(key).cloned() {
                         inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
                         inner.record_hit_metadata(key, value.len());
-                        pmem_touches.push(key.clone());
                         if inner.disk_index.contains_key(key) {
                             disk_touches.push(key.clone());
                         }
@@ -1303,7 +1332,6 @@ impl MultiLayerCache {
                 }
                 ssd_candidates.push((index, key.clone(), started));
             }
-            inner.touch_hit_queues_batch(&disk_touches, &memory_touches, &pmem_touches);
         }
 
         if ssd_candidates.is_empty() {
@@ -1386,7 +1414,6 @@ impl MultiLayerCache {
                     }
                 }
             }
-            inner.touch_hit_queues_batch(&disk_touches, &[], &[]);
         }
         if needs_eviction_drain {
             self.drain_eviction_records();
@@ -1403,7 +1430,6 @@ impl MultiLayerCache {
         let value = inner.memory.get(key).cloned();
         if value.is_some() {
             inner.stats.memory_hits += 1;
-            inner.touch_key(key);
             inner.record_hit(
                 key,
                 value.as_ref().map(|bytes| bytes.len()).unwrap_or_default(),
@@ -1433,7 +1459,6 @@ impl MultiLayerCache {
                 inner.stats.zero_copy_handle_hits =
                     inner.stats.zero_copy_handle_hits.saturating_add(1);
                 inner.stats.memory_hits = inner.stats.memory_hits.saturating_add(1);
-                inner.touch_key(key);
                 inner.record_hit(key, value.len());
                 inner.refresh_pin_stats();
                 inner.record_get_latency(started);
@@ -1452,7 +1477,6 @@ impl MultiLayerCache {
                 inner.stats.zero_copy_handle_hits =
                     inner.stats.zero_copy_handle_hits.saturating_add(1);
                 inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
-                inner.touch_key(key);
                 inner.record_hit(key, value.len());
                 inner.refresh_pin_stats();
                 inner.record_get_latency(started);
@@ -2651,12 +2675,10 @@ impl MultiLayerCache {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
         }
-        inner.order.retain(|candidate| candidate != key);
         if let Some(value) = inner.pmem.remove(key) {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
         }
-        inner.pmem_order.retain(|candidate| candidate != key);
         if key_pinned && removed_pinned_bytes > 0 {
             inner
                 .pinned_removed_bytes
@@ -2726,9 +2748,7 @@ impl MultiLayerCache {
         if enabled {
             inner.memory.clear();
             inner.pmem.clear();
-            inner.order.clear();
             inner.memory_fifo_order.clear();
-            inner.pmem_order.clear();
             inner.pmem_fifo_order.clear();
             inner.memory_bytes = 0;
             inner.pmem_bytes = 0;
@@ -4795,11 +4815,8 @@ impl CacheInner {
         self.write_ssd_block(&key, &block)?;
         if let Some(old_len) = self.disk_index.insert(key.clone(), block_len as u64) {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
-            self.disk_order.retain(|candidate| candidate != &key);
-            self.disk_fifo_order.retain(|candidate| candidate != &key);
         }
-        self.disk_order.push_back(key.clone());
-        self.disk_fifo_order.push_back(key.clone());
+        self.disk_fifo_order.push_back_if_absent(key.clone());
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.record_metadata(
             &key,
@@ -5011,13 +5028,9 @@ impl CacheInner {
                 .collect::<Vec<_>>();
             if staged_keys.len() > SET_MEMBERSHIP_THRESHOLD {
                 let staged_key_set = staged_keys.iter().cloned().collect::<HashSet<_>>();
-                self.disk_order
-                    .retain(|candidate| !staged_key_set.contains(candidate));
                 self.disk_fifo_order
                     .retain(|candidate| !staged_key_set.contains(candidate));
             } else {
-                self.disk_order
-                    .retain(|candidate| !staged_keys.contains(candidate));
                 self.disk_fifo_order
                     .retain(|candidate| !staged_keys.contains(candidate));
             }
@@ -5026,8 +5039,7 @@ impl CacheInner {
             if let Some(old_len) = self.disk_index.insert(entry.key.clone(), entry.block_len) {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
             }
-            self.disk_order.push_back(entry.key.clone());
-            self.disk_fifo_order.push_back(entry.key.clone());
+            self.disk_fifo_order.push_back_if_absent(entry.key.clone());
             self.ssd_bytes = self.ssd_bytes.saturating_add(entry.block_len);
             self.record_metadata(
                 &entry.key,
@@ -5103,11 +5115,8 @@ impl CacheInner {
                 };
                 if let Some(old_len) = self.disk_index.insert(key.clone(), block_len) {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
-                    self.disk_order.retain(|candidate| candidate != &key);
-                    self.disk_fifo_order.retain(|candidate| candidate != &key);
                 }
-                self.disk_order.push_back(key.clone());
-                self.disk_fifo_order.push_back(key.clone());
+                self.disk_fifo_order.push_back_if_absent(key.clone());
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block_len);
                 self.record_metadata(
                     &key,
@@ -5168,11 +5177,8 @@ impl CacheInner {
                 self.write_ssd_block(&key, &block)?;
                 if let Some(old_len) = self.disk_index.insert(key.clone(), block_len as u64) {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
-                    self.disk_order.retain(|candidate| candidate != &key);
-                    self.disk_fifo_order.retain(|candidate| candidate != &key);
                 }
-                self.disk_order.push_back(key.clone());
-                self.disk_fifo_order.push_back(key.clone());
+                self.disk_fifo_order.push_back_if_absent(key.clone());
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
                 self.record_metadata(
                     &key,
@@ -5202,8 +5208,7 @@ impl CacheInner {
                         self.pinned_removed_bytes.insert(key.clone(), value.len());
                     }
                 }
-                self.order.retain(|candidate| candidate != key);
-                self.memory_fifo_order.retain(|candidate| candidate != key);
+                self.memory_fifo_order.remove(key);
             }
             CacheTier::Pmem => {
                 if let Some(value) = self.pmem.remove(key) {
@@ -5212,8 +5217,7 @@ impl CacheInner {
                         self.pinned_removed_bytes.insert(key.clone(), value.len());
                     }
                 }
-                self.pmem_order.retain(|candidate| candidate != key);
-                self.pmem_fifo_order.retain(|candidate| candidate != key);
+                self.pmem_fifo_order.remove(key);
                 self.persist_pmem_delete(key)?;
             }
             CacheTier::Ssd => {
@@ -5221,8 +5225,7 @@ impl CacheInner {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
                 self.delete_ssd_block(key)?;
-                self.disk_order.retain(|candidate| candidate != key);
-                self.disk_fifo_order.retain(|candidate| candidate != key);
+                self.disk_fifo_order.remove(key);
                 self.stats.disk_bytes = self.ssd_bytes;
                 self.append_disk_manifest_delete(key)?;
             }
@@ -5284,7 +5287,6 @@ impl CacheInner {
                     .saturating_sub(current.len())
                     .saturating_add(new_value.len());
                 *current = Arc::clone(&new_value);
-                self.touch_key(key);
                 self.stats.memory_bytes = self.memory_bytes as u64;
                 self.refresh_pin_stats();
                 Ok(())
@@ -5301,7 +5303,6 @@ impl CacheInner {
                     .saturating_sub(current.len())
                     .saturating_add(new_value.len());
                 *current = Arc::clone(&new_value);
-                self.touch_key(key);
                 self.stats.pmem_bytes = self.pmem_bytes as u64;
                 self.refresh_pin_stats();
                 Ok(())
@@ -5325,23 +5326,20 @@ impl CacheInner {
                     .remove(key)
                     .unwrap_or(existing_block.len() as u64);
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(indexed_old_len);
-                self.disk_order.retain(|candidate| candidate != key);
-                self.disk_fifo_order.retain(|candidate| candidate != key);
+                self.disk_fifo_order.remove(key);
                 self.evict_ssd_for(block.len() as u64);
                 if self.ssd_bytes.saturating_add(block.len() as u64)
                     > self.ssd_capacity_bytes as u64
                 {
                     self.disk_index.insert(key.clone(), indexed_old_len);
-                    self.disk_order.push_back(key.clone());
-                    self.disk_fifo_order.push_back(key.clone());
+                    self.disk_fifo_order.push_back_if_absent(key.clone());
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
                     self.stats.disk_bytes = self.ssd_bytes;
                     return Err(CacheError::CapacityExceeded);
                 }
                 self.write_ssd_block(key, &block)?;
                 self.disk_index.insert(key.clone(), block.len() as u64);
-                self.disk_order.push_back(key.clone());
-                self.disk_fifo_order.push_back(key.clone());
+                self.disk_fifo_order.push_back_if_absent(key.clone());
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block.len() as u64);
                 self.record_metadata(
                     key,
@@ -5411,11 +5409,9 @@ impl MultiLayerCache {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
             }
         }
-        inner.order.retain(|key| key.shard_id != shard_id);
         inner
             .memory_fifo_order
             .retain(|key| key.shard_id != shard_id);
-        inner.pmem_order.retain(|key| key.shard_id != shard_id);
         inner.pmem_fifo_order.retain(|key| key.shard_id != shard_id);
         let disk_keys = inner
             .disk_index
@@ -5429,7 +5425,6 @@ impl MultiLayerCache {
                 disk_bytes_before.saturating_add(inner.disk_index.remove(key).unwrap_or_default());
         }
         let _ = inner.delete_ssd_blocks(&disk_keys);
-        inner.disk_order.retain(|key| key.shard_id != shard_id);
         inner.disk_fifo_order.retain(|key| key.shard_id != shard_id);
         inner.metadata.retain(|key, _| key.shard_id != shard_id);
         inner.pinned.retain(|key, _| key.shard_id != shard_id);
@@ -5497,19 +5492,10 @@ impl MultiLayerCache {
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
         inner
-            .order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
-        inner
             .memory_fifo_order
             .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
         inner
-            .pmem_order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
-        inner
             .pmem_fifo_order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
-        inner
-            .disk_order
             .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
         inner
             .disk_fifo_order
@@ -5573,19 +5559,10 @@ impl MultiLayerCache {
             inner.metadata.remove(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
-        inner.order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
-        });
         inner.memory_fifo_order.retain(|key| {
             !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
         });
-        inner.pmem_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
-        });
         inner.pmem_fifo_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
-        });
-        inner.disk_order.retain(|key| {
             !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
         });
         inner.disk_fifo_order.retain(|key| {
@@ -5825,8 +5802,6 @@ impl MultiLayerCache {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.memory.clear();
         inner.pmem.clear();
-        inner.order.clear();
-        inner.pmem_order.clear();
         inner.memory_bytes = 0;
         inner.pmem_bytes = 0;
         inner.stats.memory_bytes = 0;

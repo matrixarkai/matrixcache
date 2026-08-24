@@ -266,13 +266,6 @@ impl CacheInstance {
             if record.tier != tier {
                 return;
             }
-            if let Some(callback) = eviction_metric_callback
-                .read()
-                .expect("cache instance metric callback lock poisoned")
-                .clone()
-            {
-                callback(record.value.len());
-            }
             if let Some(callback) = eviction_callback
                 .read()
                 .expect("cache instance eviction callback lock poisoned")
@@ -281,6 +274,19 @@ impl CacheInstance {
                 callback(record);
             }
         });
+        self.cache
+            .register_eviction_metric_callback(move |record_tier, count| {
+                if record_tier != tier {
+                    return;
+                }
+                if let Some(callback) = eviction_metric_callback
+                    .read()
+                    .expect("cache instance metric callback lock poisoned")
+                    .clone()
+                {
+                    callback(count);
+                }
+            });
     }
 
     pub fn start(&self) -> Result<(), CacheError> {
@@ -926,11 +932,39 @@ impl L1CacheInterface for L1CacheImplement {
     }
 }
 
+/// Milliseconds between access-record drain passes.
+pub const L2_DEFAULT_ACCESS_INTERVAL_MS: u64 = 1;
+/// Milliseconds between passes that pull tail keys out of the upper tier.
+pub const L2_DEFAULT_TAIL_INTERVAL_MS: u64 = 1_000;
+/// Milliseconds between passes that drain the lower-tier write queue.
+pub const L2_DEFAULT_WRITE_INTERVAL_MS: u64 = 1_000;
+/// Access records buffered before further records are dropped.
+pub const L2_DEFAULT_ACCESS_BUFFER_CAPACITY: usize = 100_000;
+/// Keys pulled from a tail in one pass.
+pub const L2_DEFAULT_TAIL_BATCH_SIZE: usize = 1_000;
+/// Buffers queued for the lower tier before enqueue starts failing.
+pub const L2_DEFAULT_WRITE_BUFFER_CAPACITY: usize = 10_000;
+/// Item capacity of the adaptive policy that decides migration order.
+pub const L2_DEFAULT_MAX_ARC_CACHE_ITEMS: usize = 100_000;
+/// Whether access records are buffered rather than applied inline.
+pub const L2_DEFAULT_ASYNC_ON_ACCESS: bool = true;
+/// Whether an evicted buffer is queued for the lower tier or dropped.
+pub const L2_DEFAULT_USE_EVICTION_HANDLER: bool = false;
+
 pub struct L2CachePolicy {
     l1_cache: L1CacheImplement,
     l2_cache: CacheInstance,
     arc_policy: ReplacementArc,
     tail_batch_size: usize,
+    access_interval_ms: u64,
+    tail_interval_ms: u64,
+    write_interval_ms: u64,
+    async_on_access: bool,
+    use_eviction_handler: bool,
+    last_access_pass: Option<Instant>,
+    last_tail_pass: Option<Instant>,
+    last_write_pass: Option<Instant>,
+    access_drop_count: u64,
     access_queue: VecDeque<(AccessRecordType, String)>,
     write_buffer_queue: VecDeque<CacheBuffer>,
     access_buffer_capacity: usize,
@@ -962,6 +996,15 @@ impl L2CachePolicy {
             l2_cache,
             arc_policy,
             tail_batch_size,
+            access_interval_ms: L2_DEFAULT_ACCESS_INTERVAL_MS,
+            tail_interval_ms: L2_DEFAULT_TAIL_INTERVAL_MS,
+            write_interval_ms: L2_DEFAULT_WRITE_INTERVAL_MS,
+            async_on_access: L2_DEFAULT_ASYNC_ON_ACCESS,
+            use_eviction_handler: L2_DEFAULT_USE_EVICTION_HANDLER,
+            last_access_pass: None,
+            last_tail_pass: None,
+            last_write_pass: None,
+            access_drop_count: 0,
             access_queue: VecDeque::with_capacity(access_buffer_capacity),
             write_buffer_queue: VecDeque::with_capacity(write_buffer_capacity),
             access_buffer_capacity,
@@ -988,19 +1031,113 @@ impl L2CachePolicy {
         self.stopped = true;
     }
 
+    pub fn access_interval_ms(&self) -> u64 {
+        self.access_interval_ms
+    }
+
+    pub fn set_access_interval_ms(&mut self, interval_ms: u64) {
+        self.access_interval_ms = interval_ms;
+    }
+
+    pub fn tail_interval_ms(&self) -> u64 {
+        self.tail_interval_ms
+    }
+
+    pub fn set_tail_interval_ms(&mut self, interval_ms: u64) {
+        self.tail_interval_ms = interval_ms;
+    }
+
+    pub fn write_interval_ms(&self) -> u64 {
+        self.write_interval_ms
+    }
+
+    pub fn set_write_interval_ms(&mut self, interval_ms: u64) {
+        self.write_interval_ms = interval_ms;
+    }
+
+    pub fn async_on_access(&self) -> bool {
+        self.async_on_access
+    }
+
+    /// When set, `on_access` buffers the record instead of applying it to the
+    /// migration-order policy inline. Buffering keeps the caller off that
+    /// update path, at the cost of the policy lagging behind the workload;
+    /// records arriving once the buffer is full are dropped and counted by
+    /// [`L2CachePolicy::access_drop_count`].
+    pub fn set_async_on_access(&mut self, async_on_access: bool) {
+        self.async_on_access = async_on_access;
+    }
+
+    pub fn use_eviction_handler(&self) -> bool {
+        self.use_eviction_handler
+    }
+
+    /// When set, a buffer handed to `on_evict` is queued for the lower tier.
+    /// Off by default, so an eviction drops the data instead of writing it —
+    /// the tail passes are then the only path into the lower tier.
+    pub fn set_use_eviction_handler(&mut self, use_eviction_handler: bool) {
+        self.use_eviction_handler = use_eviction_handler;
+    }
+
+    /// Access records dropped because the buffer was full.
+    pub fn access_drop_count(&self) -> u64 {
+        self.access_drop_count
+    }
+
+    /// Run whichever passes are due, honouring the configured intervals.
+    ///
+    /// This is the scheduling half of the policy. `flush_once` runs all three
+    /// passes unconditionally; `poll` paces them the way independent timers
+    /// would, so a caller driving it from one loop does not write to the lower
+    /// tier faster than the write interval allows — the throttling exists to
+    /// keep migration writes from crowding out reads on the device. Returns
+    /// the number of buffers written by this call.
+    pub fn poll(&mut self) -> Result<usize, CacheError> {
+        if self.stopped || self.paused {
+            return Ok(0);
+        }
+        let now = Instant::now();
+        if Self::pass_due(self.last_access_pass, now, self.access_interval_ms) {
+            self.last_access_pass = Some(now);
+            self.access_task_internal();
+        }
+        if Self::pass_due(self.last_tail_pass, now, self.tail_interval_ms) {
+            self.last_tail_pass = Some(now);
+            self.tail_task_internal();
+        }
+        if Self::pass_due(self.last_write_pass, now, self.write_interval_ms) {
+            self.last_write_pass = Some(now);
+            return self.write_task_internal();
+        }
+        Ok(0)
+    }
+
+    fn pass_due(last: Option<Instant>, now: Instant, interval_ms: u64) -> bool {
+        match last {
+            None => true,
+            Some(last) => now.duration_since(last) >= Duration::from_millis(interval_ms),
+        }
+    }
+
     pub fn on_access(&mut self, record_type: AccessRecordType, key: &str) {
         if self.stopped {
             return;
         }
-        if self.access_buffer_capacity == 0 || self.access_queue.len() < self.access_buffer_capacity
-        {
-            self.access_queue.push_back((record_type, key.to_string()));
+        if !self.async_on_access {
+            self.do_access(record_type, key.to_string());
+            return;
         }
-        self.access_task_internal();
+        if self.access_buffer_capacity != 0
+            && self.access_queue.len() >= self.access_buffer_capacity
+        {
+            self.access_drop_count = self.access_drop_count.saturating_add(1);
+            return;
+        }
+        self.access_queue.push_back((record_type, key.to_string()));
     }
 
     pub fn on_evict(&mut self, cache_buffer: CacheBuffer) {
-        if self.stopped {
+        if self.stopped || !self.use_eviction_handler {
             return;
         }
         self.put_queue(cache_buffer);
@@ -1094,14 +1231,22 @@ impl L2CachePolicy {
         }
     }
 
+    /// Drain the write queue.
+    ///
+    /// A buffer that fails to write is counted and skipped rather than
+    /// aborting the drain, so one bad key cannot stall every entry queued
+    /// behind it. Failures stay visible through
+    /// [`L2CachePolicy::write_fail_count`]. Returns how many buffers were
+    /// handled, which includes keys already present in the lower tier.
     pub fn write_task_internal(&mut self) -> Result<usize, CacheError> {
         if self.stopped || self.paused {
             return Ok(0);
         }
         let mut written = 0usize;
         while let Some(buffer) = self.fetch_queue() {
-            self.do_one_write(buffer)?;
-            written = written.saturating_add(1);
+            if self.do_one_write(buffer).is_ok() {
+                written = written.saturating_add(1);
+            }
         }
         Ok(written)
     }
@@ -1229,9 +1374,16 @@ impl L2CachePolicyFactory {
         l1_cache: L1CacheImplement,
         l2_cache: CacheInstance,
     ) -> L2CachePolicy {
-        let mut arc_policy = ReplacementArc::new(1024);
+        let mut arc_policy = ReplacementArc::new(L2_DEFAULT_MAX_ARC_CACHE_ITEMS);
         let _ = arc_policy.Init();
-        L2CachePolicy::new(l1_cache, l2_cache, arc_policy, 1024, 64, 1024)
+        L2CachePolicy::new(
+            l1_cache,
+            l2_cache,
+            arc_policy,
+            L2_DEFAULT_ACCESS_BUFFER_CAPACITY,
+            L2_DEFAULT_TAIL_BATCH_SIZE,
+            L2_DEFAULT_WRITE_BUFFER_CAPACITY,
+        )
     }
 
     #[allow(non_snake_case)]
@@ -1739,7 +1891,7 @@ struct SimpleLruEntry {
 struct SimpleLruInner {
     capacity: usize,
     size: usize,
-    order: VecDeque<CacheKey>,
+    order: CacheKeyOrder,
     entries: HashMap<CacheKey, SimpleLruEntry>,
 }
 
@@ -1752,7 +1904,7 @@ impl SimpleLruInner {
         Self {
             capacity,
             size: 0,
-            order: VecDeque::new(),
+            order: CacheKeyOrder::new(),
             entries: HashMap::new(),
         }
     }
@@ -1779,7 +1931,7 @@ impl SimpleLruInner {
     fn remove(&mut self, key: &CacheKey) {
         if let Some(entry) = self.entries.remove(key) {
             self.size = self.size.saturating_sub(entry.size);
-            self.order.retain(|candidate| candidate != key);
+            self.order.remove(key);
         }
     }
 
@@ -1799,23 +1951,32 @@ impl SimpleLruInner {
     }
 
     fn touch(&mut self, key: &CacheKey) {
-        self.order.retain(|candidate| candidate != key);
+        // Moves the key to the front if it is already tracked, so a lookup
+        // costs the same whether the cache holds ten entries or ten million.
         self.order.push_front(key.clone());
     }
 
     fn evict_unpinned(&mut self) {
         while self.size > self.capacity {
-            let Some(index) = self.order.iter().rposition(|key| {
-                self.entries
-                    .get(key)
-                    .is_some_and(|entry| Arc::strong_count(&entry.value) == 1)
-            }) else {
+            // Walk from the least recently used end and stop at the first
+            // entry nobody is holding. Scanning forward for the last match
+            // visited every entry on every eviction; from this end the usual
+            // case stops immediately.
+            let victim = self
+                .order
+                .iter_rev()
+                .find(|key| {
+                    self.entries
+                        .get(key)
+                        .is_some_and(|entry| Arc::strong_count(&entry.value) == 1)
+                })
+                .cloned();
+            let Some(key) = victim else {
                 break;
             };
-            if let Some(key) = self.order.remove(index) {
-                if let Some(entry) = self.entries.remove(&key) {
-                    self.size = self.size.saturating_sub(entry.size);
-                }
+            self.order.remove(&key);
+            if let Some(entry) = self.entries.remove(&key) {
+                self.size = self.size.saturating_sub(entry.size);
             }
         }
     }
@@ -2806,5 +2967,305 @@ impl StringCacheApi for MultiTierCache {
 
     fn size_string(&self) -> usize {
         self.cache.Size()
+    }
+}
+
+const CACHE_ORDER_NIL: u32 = u32::MAX;
+
+#[derive(Debug, Clone)]
+struct CacheOrderNode {
+    key: CacheKey,
+    prev: u32,
+    next: u32,
+}
+
+/// Recency ordering over cache keys, from least recently used at the front to
+/// most recently used at the back.
+///
+/// A `VecDeque<CacheKey>` has to be rescanned to move a key to the back, so a
+/// cache hit costs O(n) in the number of resident entries. This keeps the same
+/// ordering in an intrusive doubly-linked list over a node arena, with an index
+/// from key to node, so recording a hit is O(1) regardless of how much is
+/// cached. Freed nodes are recycled, so churn does not grow the arena.
+///
+/// Bulk removal by predicate is still a scan; those run on invalidation paths,
+/// not on a hit.
+#[derive(Debug, Clone)]
+pub struct CacheKeyOrder {
+    nodes: Vec<CacheOrderNode>,
+    free: Vec<u32>,
+    index: HashMap<CacheKey, u32>,
+    head: u32,
+    tail: u32,
+}
+
+impl Default for CacheKeyOrder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheKeyOrder {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+            head: CACHE_ORDER_NIL,
+            tail: CACHE_ORDER_NIL,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn contains(&self, key: &CacheKey) -> bool {
+        self.index.contains_key(key)
+    }
+
+    /// Most recently used key.
+    pub fn back(&self) -> Option<&CacheKey> {
+        if self.tail == CACHE_ORDER_NIL {
+            return None;
+        }
+        Some(&self.nodes[self.tail as usize].key)
+    }
+
+    /// Least recently used key.
+    pub fn front(&self) -> Option<&CacheKey> {
+        if self.head == CACHE_ORDER_NIL {
+            return None;
+        }
+        Some(&self.nodes[self.head as usize].key)
+    }
+
+    /// Append `key` as most recently used, or move it there if already present.
+    pub fn push_back(&mut self, key: CacheKey) {
+        if let Some(&node) = self.index.get(&key) {
+            self.unlink(node);
+            self.link_back(node);
+            return;
+        }
+        let node = self.alloc(key.clone());
+        self.link_back(node);
+        self.index.insert(key, node);
+    }
+
+    /// Append `key` at the back only if it is not already tracked.
+    ///
+    /// First-in first-out ordering must not move a key that is rewritten, so
+    /// this leaves an existing key exactly where it is. It still inserts a key
+    /// that is missing, which keeps the order consistent with an index that
+    /// already holds the key.
+    pub fn push_back_if_absent(&mut self, key: CacheKey) {
+        if self.index.contains_key(&key) {
+            return;
+        }
+        let node = self.alloc(key.clone());
+        self.link_back(node);
+        self.index.insert(key, node);
+    }
+
+    /// Insert `key` as least recently used, or move it there if already present.
+    pub fn push_front(&mut self, key: CacheKey) {
+        if let Some(&node) = self.index.get(&key) {
+            self.unlink(node);
+            self.link_front(node);
+            return;
+        }
+        let node = self.alloc(key.clone());
+        self.link_front(node);
+        self.index.insert(key, node);
+    }
+
+    /// Record a hit: move `key` to the back if it is present. Returns whether
+    /// the key was there.
+    pub fn touch(&mut self, key: &CacheKey) -> bool {
+        let Some(&node) = self.index.get(key) else {
+            return false;
+        };
+        if node == self.tail {
+            return true;
+        }
+        self.unlink(node);
+        self.link_back(node);
+        true
+    }
+
+    /// Remove `key`, returning whether it was present.
+    pub fn remove(&mut self, key: &CacheKey) -> bool {
+        let Some(node) = self.index.remove(key) else {
+            return false;
+        };
+        self.unlink(node);
+        self.release(node);
+        true
+    }
+
+    /// Remove and return the least recently used key.
+    pub fn pop_front(&mut self) -> Option<CacheKey> {
+        if self.head == CACHE_ORDER_NIL {
+            return None;
+        }
+        let node = self.head;
+        let key = self.nodes[node as usize].key.clone();
+        self.unlink(node);
+        self.index.remove(&key);
+        self.release(node);
+        Some(key)
+    }
+
+    /// Keep only the keys for which `predicate` returns true. Order preserved.
+    pub fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&CacheKey) -> bool,
+    {
+        let mut cursor = self.head;
+        while cursor != CACHE_ORDER_NIL {
+            let next = self.nodes[cursor as usize].next;
+            if !predicate(&self.nodes[cursor as usize].key) {
+                let key = self.nodes[cursor as usize].key.clone();
+                self.index.remove(&key);
+                self.unlink(cursor);
+                self.release(cursor);
+            }
+            cursor = next;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.free.clear();
+        self.index.clear();
+        self.head = CACHE_ORDER_NIL;
+        self.tail = CACHE_ORDER_NIL;
+    }
+
+    /// Iterate from most to least recently used.
+    pub fn iter_rev(&self) -> CacheKeyOrderRevIter<'_> {
+        CacheKeyOrderRevIter {
+            order: self,
+            cursor: self.tail,
+        }
+    }
+
+    /// Iterate from least to most recently used.
+    pub fn iter(&self) -> CacheKeyOrderIter<'_> {
+        CacheKeyOrderIter {
+            order: self,
+            cursor: self.head,
+        }
+    }
+
+    fn alloc(&mut self, key: CacheKey) -> u32 {
+        if let Some(index) = self.free.pop() {
+            let node = &mut self.nodes[index as usize];
+            node.key = key;
+            node.prev = CACHE_ORDER_NIL;
+            node.next = CACHE_ORDER_NIL;
+            return index;
+        }
+        self.nodes.push(CacheOrderNode {
+            key,
+            prev: CACHE_ORDER_NIL,
+            next: CACHE_ORDER_NIL,
+        });
+        (self.nodes.len() - 1) as u32
+    }
+
+    fn release(&mut self, node: u32) {
+        self.free.push(node);
+    }
+
+    fn link_back(&mut self, node: u32) {
+        let old_tail = self.tail;
+        self.nodes[node as usize].prev = old_tail;
+        self.nodes[node as usize].next = CACHE_ORDER_NIL;
+        if old_tail == CACHE_ORDER_NIL {
+            self.head = node;
+        } else {
+            self.nodes[old_tail as usize].next = node;
+        }
+        self.tail = node;
+    }
+
+    fn link_front(&mut self, node: u32) {
+        let old_head = self.head;
+        self.nodes[node as usize].next = old_head;
+        self.nodes[node as usize].prev = CACHE_ORDER_NIL;
+        if old_head == CACHE_ORDER_NIL {
+            self.tail = node;
+        } else {
+            self.nodes[old_head as usize].prev = node;
+        }
+        self.head = node;
+    }
+
+    fn unlink(&mut self, node: u32) {
+        let prev = self.nodes[node as usize].prev;
+        let next = self.nodes[node as usize].next;
+        if prev == CACHE_ORDER_NIL {
+            self.head = next;
+        } else {
+            self.nodes[prev as usize].next = next;
+        }
+        if next == CACHE_ORDER_NIL {
+            self.tail = prev;
+        } else {
+            self.nodes[next as usize].prev = prev;
+        }
+        self.nodes[node as usize].prev = CACHE_ORDER_NIL;
+        self.nodes[node as usize].next = CACHE_ORDER_NIL;
+    }
+}
+
+impl FromIterator<CacheKey> for CacheKeyOrder {
+    fn from_iter<I: IntoIterator<Item = CacheKey>>(iter: I) -> Self {
+        let mut order = Self::new();
+        for key in iter {
+            order.push_back(key);
+        }
+        order
+    }
+}
+
+pub struct CacheKeyOrderIter<'a> {
+    order: &'a CacheKeyOrder,
+    cursor: u32,
+}
+
+pub struct CacheKeyOrderRevIter<'a> {
+    order: &'a CacheKeyOrder,
+    cursor: u32,
+}
+
+impl<'a> Iterator for CacheKeyOrderRevIter<'a> {
+    type Item = &'a CacheKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == CACHE_ORDER_NIL {
+            return None;
+        }
+        let node = &self.order.nodes[self.cursor as usize];
+        self.cursor = node.prev;
+        Some(&node.key)
+    }
+}
+
+impl<'a> Iterator for CacheKeyOrderIter<'a> {
+    type Item = &'a CacheKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == CACHE_ORDER_NIL {
+            return None;
+        }
+        let node = &self.order.nodes[self.cursor as usize];
+        self.cursor = node.next;
+        Some(&node.key)
     }
 }

@@ -689,7 +689,6 @@ impl CacheInner {
             }
         }
         self.pmem.clear();
-        self.pmem_order.clear();
         self.pmem_fifo_order.clear();
         self.pmem_bytes = 0;
         for (key, expected_len) in live {
@@ -762,8 +761,7 @@ impl CacheInner {
                 });
             }
             self.disk_index = recovered_index;
-            self.disk_order = recovered_order.clone();
-            self.disk_fifo_order = recovered_order;
+            self.disk_fifo_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             self.stats.disk_bytes = recovered_bytes;
             Ok(report)
@@ -773,7 +771,6 @@ impl CacheInner {
             let manifest_path = self.manifest_path();
             if !manifest_path.exists() {
                 self.disk_index.clear();
-                self.disk_order.clear();
                 self.ssd_bytes = 0;
                 self.stats.disk_bytes = 0;
                 return Ok(CacheRecoverReport::default());
@@ -839,8 +836,7 @@ impl CacheInner {
             }
 
             self.disk_index = recovered_index;
-            self.disk_order = recovered_order.clone();
-            self.disk_fifo_order = recovered_order;
+            self.disk_fifo_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             self.stats.disk_bytes = recovered_bytes;
             Ok(report)
@@ -930,51 +926,6 @@ impl CacheInner {
 
     fn record_hit(&mut self, key: &CacheKey, block_bytes: usize) {
         self.record_hit_metadata(key, block_bytes);
-        self.touch_hit_queues_for_key(key);
-    }
-
-    fn touch_hit_queues_for_key(&mut self, key: &CacheKey) {
-        if self.disk_index.contains_key(key) && self.disk_order.back() != Some(key) {
-            self.disk_order.retain(|candidate| candidate != key);
-            self.disk_order.push_back(key.clone());
-        }
-        if self.memory.contains_key(key) && self.order.back() != Some(key) {
-            self.order.retain(|candidate| candidate != key);
-            self.order.push_back(key.clone());
-        }
-    }
-
-    fn touch_queue_batch(queue: &mut VecDeque<CacheKey>, keys: &[CacheKey]) {
-        if keys.is_empty() {
-            return;
-        }
-        let mut seen = HashSet::new();
-        let mut ordered = Vec::new();
-        for key in keys.iter().rev() {
-            if seen.insert(key.clone()) {
-                ordered.push(key.clone());
-            }
-        }
-        ordered.reverse();
-        const SET_MEMBERSHIP_THRESHOLD: usize = 8;
-        if ordered.len() > SET_MEMBERSHIP_THRESHOLD {
-            let key_set = ordered.iter().cloned().collect::<HashSet<_>>();
-            queue.retain(|candidate| !key_set.contains(candidate));
-        } else {
-            queue.retain(|candidate| !ordered.contains(candidate));
-        }
-        queue.extend(ordered);
-    }
-
-    fn touch_hit_queues_batch(
-        &mut self,
-        disk_keys: &[CacheKey],
-        memory_keys: &[CacheKey],
-        pmem_keys: &[CacheKey],
-    ) {
-        Self::touch_queue_batch(&mut self.disk_order, disk_keys);
-        Self::touch_queue_batch(&mut self.order, memory_keys);
-        Self::touch_queue_batch(&mut self.pmem_order, pmem_keys);
     }
 
     fn put_memory(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
@@ -989,10 +940,8 @@ impl CacheInner {
         let value = Arc::<[u8]>::from(value);
         if let Some(old) = self.memory.insert(key.clone(), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
-            self.touch_key(&key);
         } else {
-            self.order.push_back(key.clone());
-            self.memory_fifo_order.push_back(key);
+            self.memory_fifo_order.push_back_if_absent(key);
         }
         self.memory_bytes += value.len();
         self.evict_memory_to_capacity_since(eviction_started);
@@ -1027,10 +976,8 @@ impl CacheInner {
         let value = Arc::<[u8]>::from(value);
         if let Some(old) = self.pmem.insert(key.clone(), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
-            self.touch_key(&key);
         } else {
-            self.pmem_order.push_back(key.clone());
-            self.pmem_fifo_order.push_back(key);
+            self.pmem_fifo_order.push_back_if_absent(key);
         }
         self.pmem_bytes = self.pmem_bytes.saturating_add(value.len());
         self.evict_pmem_to_capacity_since(eviction_started);
@@ -1074,8 +1021,7 @@ impl CacheInner {
             return false;
         }
         self.disk_index.insert(key.clone(), block_len as u64);
-        self.disk_order.push_back(key.clone());
-        self.disk_fifo_order.push_back(key.clone());
+        self.disk_fifo_order.push_back_if_absent(key.clone());
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
@@ -1122,17 +1068,6 @@ impl CacheInner {
             return self.put_pmem(key, value);
         }
         self.put_memory(key, value)
-    }
-
-    fn touch_key(&mut self, key: &CacheKey) {
-        if self.memory.contains_key(key) && self.order.back() != Some(key) {
-            self.order.retain(|candidate| candidate != key);
-            self.order.push_back(key.clone());
-        }
-        if self.pmem.contains_key(key) && self.pmem_order.back() != Some(key) {
-            self.pmem_order.retain(|candidate| candidate != key);
-            self.pmem_order.push_back(key.clone());
-        }
     }
 
     fn evict_memory_to_capacity(&mut self) {
@@ -1184,8 +1119,6 @@ impl CacheInner {
         }
         if !victim_keys.is_empty() {
             let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-            self.order
-                .retain(|candidate| !victim_key_set.contains(candidate));
             self.memory_fifo_order
                 .retain(|candidate| !victim_key_set.contains(candidate));
         }
@@ -1233,8 +1166,6 @@ impl CacheInner {
         }
         if !victim_keys.is_empty() {
             let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-            self.pmem_order
-                .retain(|candidate| !victim_key_set.contains(candidate));
             self.pmem_fifo_order
                 .retain(|candidate| !victim_key_set.contains(candidate));
         }
@@ -1253,6 +1184,7 @@ impl CacheInner {
     fn evict_ssd_for_batch(&mut self, incoming_bytes: u64) {
         let mut victim_keys = Vec::new();
         while self.ssd_bytes.saturating_add(incoming_bytes) > self.ssd_capacity_bytes as u64 {
+            let before = self.ssd_bytes;
             let Some((victim, reason, pinned_skips)) = self.select_ssd_eviction_victim() else {
                 break;
             };
@@ -1262,6 +1194,10 @@ impl CacheInner {
                 .saturating_add(pinned_skips);
             let evicted_value = self.read_ssd_value_for_eviction(&victim);
             let removed_bytes = self.disk_index.remove(&victim).unwrap_or_default();
+            // Drop the victim from the order as it is taken. Selection reads
+            // that order, so leaving it until after the loop lets the next
+            // round pick the same key, whose bytes are already gone.
+            self.disk_fifo_order.remove(&victim);
             self.record_eviction(CacheTier::Ssd, victim.clone(), evicted_value.clone());
             self.ssd_bytes = self.ssd_bytes.saturating_sub(removed_bytes);
             self.stats.ssd_evictions = self.stats.ssd_evictions.saturating_add(1);
@@ -1272,14 +1208,17 @@ impl CacheInner {
                 self.metadata.remove(&victim);
             }
             victim_keys.push(victim);
+            if self.ssd_bytes == before {
+                // Freed nothing this round; the memory and pmem loops bail out
+                // here too rather than spin.
+                break;
+            }
         }
         if victim_keys.is_empty() {
             self.stats.disk_bytes = self.ssd_bytes;
             return;
         }
         let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-        self.disk_order
-            .retain(|candidate| !victim_key_set.contains(candidate));
         self.disk_fifo_order
             .retain(|candidate| !victim_key_set.contains(candidate));
         let _ = self.delete_ssd_blocks(&victim_keys);
@@ -1327,10 +1266,10 @@ impl CacheInner {
 
     fn select_fifo_eviction_victim(
         &self,
-        keys: &VecDeque<CacheKey>,
+        keys: &CacheKeyOrder,
     ) -> Option<(CacheKey, EvictionReason, u64)> {
         let mut pinned_skips = 0u64;
-        for key in keys {
+        for key in keys.iter() {
             if self.pinned.contains_key(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
                 continue;
@@ -1458,6 +1397,11 @@ impl CacheInner {
     }
 
     fn record_eviction(&mut self, tier: CacheTier, key: CacheKey, value: Vec<u8>) {
+        // The metric counts evictions and needs no value, so it is recorded
+        // even while the eviction handler is disabled.
+        if self.eviction_metric_callback.is_some() {
+            self.pending_eviction_metric_tiers.push_back(tier);
+        }
         if self.eviction_handler_enabled && self.eviction_callback.is_some() {
             self.pending_eviction_records
                 .push_back(CacheEvictionRecord { tier, key, value });
@@ -1508,8 +1452,7 @@ impl CacheInner {
                 removed_pinned_bytes = removed_pinned_bytes.max(value.len());
                 self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
             }
-            self.order.retain(|candidate| candidate != key);
-            self.memory_fifo_order.retain(|candidate| candidate != key);
+            self.memory_fifo_order.remove(key);
             if remove_disk {
                 let disk_bytes = self.disk_index.remove(key).unwrap_or_default();
                 removed_pinned_bytes = removed_pinned_bytes.max(
@@ -1536,8 +1479,7 @@ impl CacheInner {
             if remove_disk {
                 let _ = self.persist_pmem_delete(key);
             }
-            self.pmem_order.retain(|candidate| candidate != key);
-            self.pmem_fifo_order.retain(|candidate| candidate != key);
+            self.pmem_fifo_order.remove(key);
             self.metadata.remove(key);
             if key_pinned && removed_pinned_bytes > 0 {
                 self.pinned_removed_bytes
@@ -1551,14 +1493,10 @@ impl CacheInner {
         if remove_disk {
             match key_set.as_ref() {
                 Some(key_set) => {
-                    self.disk_order
-                        .retain(|candidate| !key_set.contains(candidate));
                     self.disk_fifo_order
                         .retain(|candidate| !key_set.contains(candidate));
                 }
                 None => {
-                    self.disk_order
-                        .retain(|candidate| !keys.contains(candidate));
                     self.disk_fifo_order
                         .retain(|candidate| !keys.contains(candidate));
                 }
@@ -1577,11 +1515,8 @@ impl CacheInner {
         self.pmem.clear();
         self.clear_pmem_persistence()?;
         self.disk_index.clear();
-        self.disk_order.clear();
         self.disk_fifo_order.clear();
-        self.order.clear();
         self.memory_fifo_order.clear();
-        self.pmem_order.clear();
         self.pmem_fifo_order.clear();
         self.pinned.clear();
         self.pinned_handle_bytes.clear();
@@ -1591,6 +1526,7 @@ impl CacheInner {
         self.async_writeback_positions.clear();
         self.async_writeback_queue_bytes = 0;
         self.pending_eviction_records.clear();
+        self.pending_eviction_metric_tiers.clear();
         self.memory_bytes = 0;
         self.pmem_bytes = 0;
         self.ssd_bytes = 0;

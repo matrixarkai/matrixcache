@@ -1436,6 +1436,37 @@ impl CacheEvictionCallback {
     }
 }
 
+/// Receives the number of entries evicted from one tier in a single batch.
+///
+/// Eviction metrics are independent of the eviction handler: they are reported
+/// even while the handler is disabled. Counting entries rather than bytes is
+/// what makes that affordable, since a count needs nothing materialised.
+#[derive(Clone)]
+struct CacheEvictionMetricCallback {
+    callback: Arc<dyn Fn(CacheTier, usize) + Send + Sync + 'static>,
+}
+
+impl std::fmt::Debug for CacheEvictionMetricCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CacheEvictionMetricCallback")
+    }
+}
+
+impl CacheEvictionMetricCallback {
+    fn new<F>(callback: F) -> Self
+    where
+        F: Fn(CacheTier, usize) + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn call(&self, tier: CacheTier, count: usize) {
+        (self.callback)(tier, count);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheBlockKind {
     Page,
