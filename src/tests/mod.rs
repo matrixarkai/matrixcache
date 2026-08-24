@@ -3803,9 +3803,14 @@ mod tests {
         let mut policy = L2CachePolicy::new(l1, l2, arc, 8, 8, 8);
         policy.Start();
 
+        // Access records are buffered by default; a drain pass applies them.
         policy.OnAccess(AccessRecordType::Put, "cold-a");
         policy.OnAccess(AccessRecordType::Put, "cold-b");
+        assert_eq!(policy.access_callback_count(), 0);
+        assert_eq!(policy.access_buffer_size(), 2);
+        policy.access_task_internal();
         assert_eq!(policy.access_callback_count(), 2);
+        assert_eq!(policy.access_buffer_size(), 0);
         assert_eq!(
             policy.arc_policy().GetFetchTail(8),
             vec!["cold-a".to_string(), "cold-b".to_string()]
@@ -3826,6 +3831,7 @@ mod tests {
         );
 
         policy.OnAccess(AccessRecordType::Delete, "cold-a");
+        policy.access_task_internal();
         assert!(!policy
             .arc_policy()
             .GetFetchTail(8)
@@ -3861,6 +3867,8 @@ mod tests {
                 .unwrap()
                 .push(buffer.Key().to_string());
         });
+        // Queueing evicted buffers for the lower tier is opt-in.
+        policy.set_use_eviction_handler(true);
         policy.Start();
 
         let mut first = CacheBuffer::new(b"first".to_vec());
@@ -3897,6 +3905,146 @@ mod tests {
         assert_eq!(policy.write_task_internal().unwrap(), 0);
         policy.TEST_Continue();
         assert_eq!(policy.write_task_internal().unwrap(), 1);
+    }
+
+    fn l2_test_policy(
+        l2_dir: &Path,
+        arc_items: usize,
+        access_capacity: usize,
+        tail_batch: usize,
+        write_capacity: usize,
+    ) -> L2CachePolicy {
+        let dram = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            vec![],
+        );
+        let l2 = CacheInstance::new(
+            256,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![l2_dir.to_path_buf()],
+        );
+        let l1 = L1CacheImplement::new(dram, None);
+        let mut arc = ReplacementArc::new(arc_items);
+        arc.Init().unwrap();
+        L2CachePolicy::new(l1, l2, arc, access_capacity, tail_batch, write_capacity)
+    }
+
+    #[test]
+    fn parity_l2_cache_policy_access_buffering_modes_and_drop_on_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = l2_test_policy(dir.path(), 8, 2, 8, 8);
+        policy.Start();
+        assert!(policy.async_on_access());
+
+        // Buffered by default, and the buffer is bounded: the third record is
+        // dropped rather than letting the buffer grow without limit.
+        policy.OnAccess(AccessRecordType::Put, "a");
+        policy.OnAccess(AccessRecordType::Put, "b");
+        policy.OnAccess(AccessRecordType::Put, "c");
+        assert_eq!(policy.access_buffer_size(), 2);
+        assert_eq!(policy.access_drop_count(), 1);
+        assert_eq!(policy.access_callback_count(), 0);
+
+        policy.access_task_internal();
+        assert_eq!(policy.access_callback_count(), 2);
+        assert_eq!(policy.access_buffer_size(), 0);
+
+        // Inline mode applies the record on the calling path instead, so the
+        // buffer stays empty and nothing can be dropped.
+        policy.set_async_on_access(false);
+        policy.OnAccess(AccessRecordType::Put, "d");
+        assert_eq!(policy.access_buffer_size(), 0);
+        assert_eq!(policy.access_callback_count(), 3);
+        assert_eq!(policy.access_drop_count(), 1);
+    }
+
+    #[test]
+    fn parity_l2_cache_policy_eviction_handler_is_off_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = l2_test_policy(dir.path(), 8, 8, 8, 8);
+        policy.Start();
+        assert!(!policy.use_eviction_handler());
+
+        let mut dropped = CacheBuffer::new(b"dropped".to_vec());
+        dropped.SetKey("dropped-key");
+        policy.OnEvict(dropped);
+        // The default drops evicted data rather than writing it down a tier,
+        // leaving the tail passes as the only path into the lower tier.
+        assert_eq!(policy.write_buffer_size(), 0);
+        assert_eq!(policy.write_enqueue_fail_count(), 0);
+
+        policy.set_use_eviction_handler(true);
+        let mut kept = CacheBuffer::new(b"kept".to_vec());
+        kept.SetKey("kept-key");
+        policy.OnEvict(kept);
+        assert_eq!(policy.write_buffer_size(), 1);
+    }
+
+    #[test]
+    fn parity_l2_cache_policy_poll_paces_passes_by_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = l2_test_policy(dir.path(), 8, 8, 8, 8);
+        policy.Start();
+        assert_eq!(policy.access_interval_ms(), L2_DEFAULT_ACCESS_INTERVAL_MS);
+        assert_eq!(policy.tail_interval_ms(), L2_DEFAULT_TAIL_INTERVAL_MS);
+        assert_eq!(policy.write_interval_ms(), L2_DEFAULT_WRITE_INTERVAL_MS);
+
+        // With long intervals the first poll runs every pass, and the second
+        // runs none, because none are due yet.
+        policy.set_access_interval_ms(60_000);
+        policy.set_tail_interval_ms(60_000);
+        policy.set_write_interval_ms(60_000);
+        policy.OnAccess(AccessRecordType::Put, "paced");
+        assert_eq!(policy.poll().unwrap(), 0);
+        assert_eq!(policy.access_callback_count(), 1);
+
+        policy.OnAccess(AccessRecordType::Put, "paced-again");
+        assert_eq!(policy.poll().unwrap(), 0);
+        assert_eq!(policy.access_callback_count(), 1);
+        assert_eq!(policy.access_buffer_size(), 1);
+
+        // Dropping the interval to zero makes the pass due again.
+        policy.set_access_interval_ms(0);
+        assert_eq!(policy.poll().unwrap(), 0);
+        assert_eq!(policy.access_callback_count(), 2);
+
+        // flush_once ignores pacing entirely.
+        policy.set_access_interval_ms(60_000);
+        policy.OnAccess(AccessRecordType::Put, "flushed");
+        policy.flush_once().unwrap();
+        assert_eq!(policy.access_callback_count(), 3);
+    }
+
+    #[test]
+    fn parity_l2_cache_policy_factory_uses_reference_default_sizing() {
+        let dram = CacheInstance::new(
+            64,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kDRAM,
+            vec![],
+        );
+        let l2_dir = tempfile::tempdir().unwrap();
+        let l2 = CacheInstance::new(
+            128,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![l2_dir.path().to_path_buf()],
+        );
+        let l1 = L1CacheImplement::new(dram, None);
+        let policy = L2CachePolicyFactory::CreateL2CachePolicy(l1, l2);
+
+        assert_eq!(
+            policy.arc_policy().GetItemCapacity(),
+            L2_DEFAULT_MAX_ARC_CACHE_ITEMS
+        );
+        assert_eq!(policy.access_interval_ms(), L2_DEFAULT_ACCESS_INTERVAL_MS);
+        assert_eq!(policy.tail_interval_ms(), L2_DEFAULT_TAIL_INTERVAL_MS);
+        assert_eq!(policy.write_interval_ms(), L2_DEFAULT_WRITE_INTERVAL_MS);
+        assert!(policy.async_on_access());
+        assert!(!policy.use_eviction_handler());
     }
 
     #[test]
@@ -4050,21 +4198,25 @@ mod tests {
             Vec::new(),
         );
         let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let metric_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let metric_counts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_evictions = Arc::clone(&evictions);
-        let captured_metrics = Arc::clone(&metric_sizes);
+        let captured_metrics = Arc::clone(&metric_counts);
         instance.RegisterEvictionHandler(move |record| {
             captured_evictions.lock().unwrap().push(record.key);
         });
-        instance.RegisterEvictionMetricHandler(move |size| {
-            captured_metrics.lock().unwrap().push(size);
+        instance.RegisterEvictionMetricHandler(move |count| {
+            captured_metrics.lock().unwrap().push(count);
         });
 
+        // With the handler switched off nothing reaches it, but eviction
+        // metrics are independent of the handler and keep counting: the
+        // eviction rate stays observable even when nothing is consuming the
+        // evicted entries.
         instance.SetEvictionHandlerStatus(false);
         instance.Put("first", b"12345678".to_vec()).unwrap();
         instance.Put("second", b"abcdefgh".to_vec()).unwrap();
         assert!(evictions.lock().unwrap().is_empty());
-        assert!(metric_sizes.lock().unwrap().is_empty());
+        assert_eq!(metric_counts.lock().unwrap().as_slice(), &[1]);
 
         instance.SetEvictionHandlerStatus(true);
         instance.Put("third", b"ABCDEFGH".to_vec()).unwrap();
@@ -4072,7 +4224,9 @@ mod tests {
             evictions.lock().unwrap().as_slice(),
             &[CacheKey::string(0, "second")]
         );
-        assert_eq!(metric_sizes.lock().unwrap().as_slice(), &[8]);
+        // The metric counts evicted entries, not their bytes, which is what
+        // lets it be reported without materialising anything.
+        assert_eq!(metric_counts.lock().unwrap().as_slice(), &[1, 1]);
     }
 
     #[test]
@@ -6264,6 +6418,91 @@ mod tests {
     }
 
     #[test]
+    fn parity_arc_list_hit_on_fetch_data_promotes_to_active() {
+        let mut arc = ArcList::new(4);
+        arc.Put("a".to_string());
+        assert_eq!(arc.GetFetchDataTail(8), vec!["a".to_string()]);
+        assert!(arc.GetActiveDataTail(8).is_empty());
+
+        // A hit on a key held in the fetch data list promotes it to the active
+        // data list: one access means fetched, two means worth keeping.
+        assert!(arc.Get("a"));
+        assert!(arc.GetFetchDataTail(8).is_empty());
+        assert_eq!(arc.GetActiveDataTail(8), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn parity_arc_list_ghost_hits_adapt_the_fetch_active_split() {
+        // Capacity 2 starts split evenly, one slot each side.
+        let mut arc = ArcList::new(2);
+        assert_eq!(arc.FetchCapacity(), 1);
+        assert_eq!(arc.ActiveCapacity(), 1);
+
+        arc.Put("a".to_string());
+        assert!(arc.Get("a"));
+        arc.Put("b".to_string());
+        // This insert takes the list to capacity, so making room downgrades the
+        // active tail into the active ghost list rather than dropping it.
+        arc.Put("c".to_string());
+        assert!(arc.GetActiveGhostTail(8).contains(&"a".to_string()));
+
+        // Hitting a key in the active ghost list is evidence the active side
+        // was trimmed too far, so it takes a slot from the fetch side.
+        assert!(!arc.Get("a"));
+        assert_eq!(arc.FetchCapacity(), 0);
+        assert_eq!(arc.ActiveCapacity(), 2);
+        assert!(arc.GetActiveDataTail(8).contains(&"a".to_string()));
+        // Making room for it downgraded the fetch tail into the fetch ghost.
+        assert!(arc.GetFetchGhostTail(8).contains(&"b".to_string()));
+
+        // Hitting the fetch ghost is the mirror image, and hands the slot back.
+        assert!(!arc.Get("b"));
+        assert_eq!(arc.FetchCapacity(), 1);
+        assert_eq!(arc.ActiveCapacity(), 1);
+        assert!(arc.GetActiveDataTail(8).contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn parity_arc_list_drops_fetch_tail_outright_when_its_ghost_is_empty() {
+        let mut arc = ArcList::new(2);
+        arc.Put("a".to_string());
+        arc.Put("b".to_string());
+        assert_eq!(arc.Size(), 2);
+        assert_eq!(arc.GhostSize(), 0);
+
+        // The fetch side alone already holds the whole capacity and its ghost
+        // list is empty, so its tail is dropped outright instead of ghosted.
+        arc.Put("c".to_string());
+        assert_eq!(arc.Size(), 2);
+        assert_eq!(arc.GhostSize(), 0);
+        assert!(!arc.GetFetchDataTail(8).contains(&"a".to_string()));
+        assert!(arc.GetFetchDataTail(8).contains(&"b".to_string()));
+        assert!(arc.GetFetchDataTail(8).contains(&"c".to_string()));
+        assert!(arc.Size() <= arc.Capacity());
+        assert!(arc.TotalSize() <= arc.Capacity() * 2);
+    }
+
+    #[test]
+    fn ghost_lru_list_delete_clears_the_key_from_whichever_list_holds_it() {
+        let mut list = GhostLRUList::new(4);
+        list.Put("data-key".to_string());
+        list.PutGhost("ghost-key".to_string());
+        assert_eq!(list.Size(), 1);
+        assert_eq!(list.GhostSize(), 1);
+
+        // Delete reports whether the key was there and removes it from
+        // whichever list held it, including a key that only exists as a ghost.
+        assert!(list.Delete("data-key"));
+        assert_eq!(list.Size(), 0);
+        assert_eq!(list.GhostSize(), 1);
+
+        assert!(list.Delete("ghost-key"));
+        assert_eq!(list.GhostSize(), 0);
+
+        assert!(!list.Delete("absent"));
+    }
+
+    #[test]
     fn parity_replacement_arc_exposes_active_and_fetch_tail_surface() {
         let mut policy = ReplacementArc::new(2);
         assert!(!policy.is_initialized());
@@ -6367,6 +6606,40 @@ mod tests {
         let stolen = buffer.StealBufQ();
         assert_eq!(stolen.len(), 2);
         assert_eq!(buffer.Count(), 0);
+    }
+
+    #[test]
+    fn parity_mem_storage_crc_is_castagnoli_and_covers_the_length_header() {
+        // Pin the algorithm to its published check value rather than to
+        // whatever this implementation happens to emit.
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        assert_eq!(crc32c(b""), 0);
+
+        // Seeding continues a checksum, so a record can be covered in three
+        // pieces without first copying them into one buffer.
+        assert_eq!(
+            crc32c_with_seed(b"56789", crc32c(b"1234")),
+            crc32c(b"123456789")
+        );
+
+        // "cdef" + "ab" and "cdefa" + "b" concatenate to the same bytes and
+        // differ only in where the value ends and the key begins. A checksum
+        // over the payload alone cannot tell them apart, so covering the
+        // length header is what detects a corrupted header.
+        assert_ne!(
+            MemStorage::ComputeCRC("ab", b"cdef"),
+            MemStorage::ComputeCRC("b", b"cdefa")
+        );
+
+        // Value and key both still contribute.
+        assert_ne!(
+            MemStorage::ComputeCRC("k", b"v1"),
+            MemStorage::ComputeCRC("k", b"v2")
+        );
+        assert_ne!(
+            MemStorage::ComputeCRC("k1", b"v"),
+            MemStorage::ComputeCRC("k2", b"v")
+        );
     }
 
     #[test]
@@ -6792,6 +7065,72 @@ mod tests {
         assert_eq!(stats.freed_bytes, 0);
         assert_eq!(stats.corrupted_bytes, 0);
         assert_eq!(stats.total_bytes, b"pmem-value".len());
+    }
+
+    #[test]
+    fn parity_ssd_fifo_keeps_insertion_order_when_a_key_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            520,
+            ReplacementPolicyType::kFIFO,
+            StorageEngineType::kSSD,
+            vec![dir.path().to_path_buf()],
+        );
+        instance.Start().unwrap();
+        let big = vec![120u8; 100];
+        let small = vec![121u8; 10];
+        for key in ["a", "b", "c"] {
+            instance.Put(key, big.clone()).unwrap();
+        }
+
+        // Rewriting "a" must not move it behind "b" and "c". First-in
+        // first-out orders by when a key first entered the tier, not by when
+        // it was last written, so "a" stays the next one out.
+        instance.Put("a", small.clone()).unwrap();
+        instance.Put("d", big.clone()).unwrap();
+        instance.Put("e", big.clone()).unwrap();
+
+        assert!(
+            instance.Get("a").unwrap().is_none(),
+            "the first key inserted should still be the first evicted"
+        );
+        assert!(
+            instance.Get("b").unwrap().is_some(),
+            "rewriting another key must not push this one to the front of the queue"
+        );
+        assert!(instance.Get("e").unwrap().is_some());
+    }
+
+    #[test]
+    fn parity_multi_ssd_selects_the_device_with_the_shared_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+        let paths = vec![dev("ssd-a"), dev("ssd-b"), dev("ssd-c")];
+        let engine = StorageEngineMultiSSD::new(paths.clone(), 1 << 20);
+
+        // Device selection uses the same hash as the rest of the crate rather
+        // than an ad-hoc one, so which device holds a key is reproducible: a
+        // set of device directories written by one process is read back
+        // through the same selection by another.
+        for key in ["alpha", "beta", "gamma", "delta", "hello", "abc"] {
+            let expected = &paths[mur_mur_hash2(key.as_bytes()) as usize % paths.len()];
+            assert_eq!(
+                engine.device_for_key(key),
+                Some(expected.as_str()),
+                "device for {key}"
+            );
+        }
+
+        // Three devices is not a power of two, so selection has to be a
+        // modulo rather than a mask or the third device never gets a key.
+        let mut seen = HashSet::new();
+        for index in 0..256 {
+            let key = format!("spread-{index:04}");
+            if let Some(device) = engine.device_for_key(&key) {
+                seen.insert(device.to_string());
+            }
+        }
+        assert_eq!(seen.len(), 3, "every device should receive keys");
     }
 
     #[test]
@@ -7711,6 +8050,50 @@ mod tests {
     }
 
     #[test]
+    fn parity_storage_gc_controller_poll_paces_collection_checks() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+        let first = allocator.Allocate(8).unwrap();
+        allocator.Free(first, 8).unwrap();
+
+        let mut controller = StorageGCController::new(allocator, true);
+        assert_eq!(
+            controller.gc_check_interval_ms(),
+            GC_DEFAULT_CHECK_INTERVAL_MS
+        );
+
+        // Collection is disabled until started, so polling does nothing.
+        assert_eq!(controller.poll().unwrap(), 0);
+
+        controller.start();
+        controller.set_gc_check_interval_ms(60_000);
+        // The first check is always due.
+        assert_eq!(controller.poll().unwrap(), 1);
+
+        // Queue more work. The interval has not elapsed, so the controller
+        // leaves it for the next due check instead of scanning on every call.
+        let second = controller.allocator_mut().Allocate(8).unwrap();
+        controller.allocator_mut().Free(second, 8).unwrap();
+        assert_eq!(controller.poll().unwrap(), 0);
+
+        // Shortening the interval makes the check due and the work is taken.
+        controller.set_gc_check_interval_ms(0);
+        assert_eq!(controller.poll().unwrap(), 1);
+
+        // Pausing and disabling each suppress collection regardless of pacing.
+        let third = controller.allocator_mut().Allocate(8).unwrap();
+        controller.allocator_mut().Free(third, 8).unwrap();
+        controller.set_pause_gc(true);
+        assert_eq!(controller.poll().unwrap(), 0);
+        controller.set_pause_gc(false);
+        controller.set_enable_gc(false);
+        assert_eq!(controller.poll().unwrap(), 0);
+
+        controller.set_enable_gc(true);
+        assert_eq!(controller.poll().unwrap(), 1);
+        assert_eq!(controller.TEST_GetNumGcCompleteChunks(), 3);
+    }
+
+    #[test]
     fn parity_storage_gc_controller_respects_enable_gate_and_manual_gc_job() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
         let ptr_a = allocator.Allocate(4).unwrap();
@@ -8030,6 +8413,125 @@ mod tests {
     }
 
     #[test]
+    fn parity_replacement_fifo_overwrite_keeps_original_queue_position() {
+        let mut fifo = ReplacementFIFO::new(6);
+        fifo.Init().unwrap();
+        // Three 2-byte entries exactly fill the policy.
+        for key in ["a", "b", "c"] {
+            assert!(fifo.Put(test_buffer(key, b"1")).is_empty());
+        }
+        assert_eq!(fifo.GetItemNum(), 3);
+        assert_eq!(fifo.GetUsedSpace(), 6);
+
+        // Rewriting "a" must not move it behind "b" and "c": first-in
+        // first-out orders by first insertion, not by last write.
+        assert!(fifo.Put(test_buffer("a", b"9")).is_empty());
+        assert_eq!(fifo.Get("a").unwrap().Data(), b"9");
+        assert_eq!(fifo.GetItemNum(), 3);
+        assert_eq!(fifo.GetUsedSpace(), 6);
+
+        // So the next insert still evicts "a", the oldest by insertion order.
+        let evicted = fifo.Put(test_buffer("d", b"4"));
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].Key(), "a");
+        assert!(fifo.Peek("b").is_some());
+        assert!(fifo.Peek("c").is_some());
+        assert!(fifo.Peek("d").is_some());
+    }
+
+    #[test]
+    fn parity_replacement_fifo_delete_leaves_no_queue_tombstone() {
+        let mut fifo = ReplacementFIFO::new(1 << 12);
+        fifo.Init().unwrap();
+        for index in 0..256 {
+            fifo.Put(test_buffer(&format!("k{index:03}"), b"v"));
+        }
+        assert_eq!(fifo.GetItemNum(), 256);
+        assert_eq!(fifo.queue_len(), 256);
+
+        for index in (0..256).step_by(2) {
+            assert!(fifo.Delete(&format!("k{index:03}")).is_some());
+        }
+        // The queue tracks live entries only, so a delete-heavy workload leaves
+        // no stale keys for eviction to skip past.
+        assert_eq!(fifo.GetItemNum(), 128);
+        assert_eq!(fifo.queue_len(), 128);
+
+        for index in (0..256).step_by(2) {
+            fifo.Put(test_buffer(&format!("k{index:03}"), b"v"));
+        }
+        assert_eq!(fifo.GetItemNum(), 256);
+        assert_eq!(fifo.queue_len(), 256);
+        assert!(fifo.GetUsedSpace() <= fifo.GetCapacity());
+    }
+
+    #[test]
+    fn parity_replacement_slru_get_records_access_without_reordering() {
+        let mut slru = ReplacementSLRU::with_num_segments(100, 1);
+        slru.Init().unwrap();
+        slru.TEST_ConfigLRUMaintainer(false);
+
+        // Each entry is 1 key byte plus 4 value bytes; hot runs c, b, a from
+        // head to tail.
+        for key in ["a", "b", "c"] {
+            slru.Put(test_buffer(key, b"xxxx"));
+        }
+        assert_eq!(slru.list_item_num(0, HOT_LRU), 3);
+
+        // Reading the hot tail marks it but leaves it exactly where it was.
+        assert!(slru.Get("a").is_some());
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_FETCHED);
+        assert!(slru.Get("a").is_some());
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_ACTIVE);
+        assert_eq!(slru.TEST_CheckLRUPos("a"), HOT_LRU);
+        assert_eq!(slru.list_item_num(0, HOT_LRU), 3);
+        assert_eq!(slru.list_item_num(0, WARM_LRU), 0);
+
+        // "a" is therefore still the hot tail when the maintainer runs, and the
+        // maintainer is what promotes it -- because the two reads marked it
+        // active. Untouched "b" behind it is demoted instead.
+        slru.set_hot_lru_pct(5);
+        slru.TEST_ConfigLRUMaintainer(true);
+        assert!(slru.run_lru_maintainer_pass().is_empty());
+        assert_eq!(slru.TEST_CheckLRUPos("a"), WARM_LRU);
+        assert_eq!(slru.TEST_CheckLRUPos("b"), COLD_LRU);
+        assert_eq!(slru.TEST_CheckLRUPos("c"), HOT_LRU);
+        assert_eq!(slru.GetItemNum(), 3);
+    }
+
+    #[test]
+    fn base_lru_list_recycles_nodes_across_repeated_churn() {
+        let mut list = BaseLRUList::new(64);
+        for round in 0..8 {
+            for index in 0..64 {
+                list.Put(format!("r{round}-k{index:02}"));
+            }
+            assert_eq!(list.Size(), 64);
+            assert!(list.Evict().is_empty());
+            for index in 0..64 {
+                assert!(list.Delete(&format!("r{round}-k{index:02}")));
+            }
+            assert_eq!(list.Size(), 0);
+            assert!(list.GetTail(8).is_empty());
+        }
+
+        // Nodes freed by the churn above are reused, and the list is still
+        // correctly ordered afterwards.
+        list.Put("first".to_string());
+        list.Put("second".to_string());
+        assert_eq!(
+            list.GetTail(2),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert!(list.Get("first"));
+        assert_eq!(
+            list.GetTail(2),
+            vec!["second".to_string(), "first".to_string()]
+        );
+        assert_eq!(list.Size(), 2);
+    }
+
+    #[test]
     fn parity_replacement_slru_tracks_hot_warm_cold_and_fetch_flags() {
         let mut slru = ReplacementSLRU::new(6);
         slru.Init().unwrap();
@@ -8072,6 +8574,525 @@ mod tests {
         slru.Put(test_buffer("z", b"zzzz"));
         slru.SetCapacity(6);
         assert!(slru.GetUsedSpace() <= slru.GetCapacity());
+    }
+
+    #[test]
+    fn parity_replacement_slru_resolves_segment_count_from_capacity_and_request() {
+        // A capacity smaller than the segment count collapses to one segment,
+        // otherwise every segment would get a zero byte budget.
+        assert_eq!(ReplacementSLRU::new(6).num_segments(), 1);
+        assert_eq!(ReplacementSLRU::new(255).num_segments(), 1);
+        assert_eq!(
+            ReplacementSLRU::new(256).num_segments(),
+            SLRU_DEFAULT_NUM_SEGMENTS
+        );
+
+        // Requests are rounded up to a power of two so segment selection masks.
+        assert_eq!(
+            ReplacementSLRU::with_num_segments(1 << 20, 100).num_segments(),
+            128
+        );
+        assert_eq!(ReplacementSLRU::with_num_segments(1 << 20, 0).num_segments(), 1);
+        assert_eq!(ReplacementSLRU::with_num_segments(1 << 20, 1).num_segments(), 1);
+
+        let policy = ReplacementSLRU::with_num_segments(1024, 8);
+        assert_eq!(policy.segment_byte_limit(), 128);
+        assert_eq!(policy.GetSegmentByteLimit(), 128);
+        assert_eq!(policy.hot_lru_pct(), SLRU_DEFAULT_HOT_LRU_PCT);
+        assert_eq!(policy.warm_lru_pct(), SLRU_DEFAULT_WARM_LRU_PCT);
+    }
+
+    #[test]
+    fn parity_replacement_slru_shards_keys_and_bounds_each_segment() {
+        let mut slru = ReplacementSLRU::new(1 << 16);
+        slru.Init().unwrap();
+        assert_eq!(slru.num_segments(), SLRU_DEFAULT_NUM_SEGMENTS);
+        assert_eq!(
+            slru.segment_byte_limit(),
+            (1 << 16) / SLRU_DEFAULT_NUM_SEGMENTS
+        );
+
+        for index in 0..4096 {
+            slru.Put(test_buffer(&format!("shard-key-{index:06}"), &[b'v'; 32]));
+        }
+
+        // Eviction is segment-local: every shard is held to its own budget
+        // rather than to one global list.
+        for segment in 0..slru.num_segments() {
+            assert!(
+                slru.segment_used_size(segment) <= slru.segment_byte_limit(),
+                "segment {segment} over budget"
+            );
+        }
+
+        let summed: usize = (0..slru.num_segments())
+            .map(|segment| slru.segment_used_size(segment))
+            .sum();
+        assert_eq!(slru.GetUsedSpace(), summed);
+        assert!(slru.GetUsedSpace() <= slru.GetCapacity());
+
+        let occupied = (0..slru.num_segments())
+            .filter(|&segment| slru.segment_used_size(segment) > 0)
+            .count();
+        assert!(
+            occupied > 200,
+            "expected keys spread across shards, only {occupied} occupied"
+        );
+
+        slru.Put(test_buffer("probe-key", b"probe"));
+        let shard = slru.segment_for_key("probe-key");
+        assert_eq!(shard, slru.PickSegment("probe-key"));
+        assert!(shard < slru.num_segments());
+        assert!(slru.segment_used_size(shard) >= "probe-key".len() + b"probe".len());
+    }
+
+    #[test]
+    fn parity_replacement_slru_accounting_survives_overwrite_delete_and_reuse() {
+        let mut slru = ReplacementSLRU::with_num_segments(1 << 14, 4);
+        slru.Init().unwrap();
+
+        for index in 0..512 {
+            slru.Put(test_buffer(&format!("k{index:04}"), &[b'x'; 16]));
+        }
+        for index in 0..512 {
+            let _ = slru.Get(&format!("k{index:04}"));
+        }
+        for index in (0..512).step_by(2) {
+            let _ = slru.Delete(&format!("k{index:04}"));
+        }
+        for index in 0..512 {
+            slru.Put(test_buffer(&format!("k{index:04}"), &[b'y'; 24]));
+        }
+
+        // Per-list byte and item counts still reconcile with the shard totals
+        // and the index, so no list node was leaked or double-counted.
+        let mut items = 0usize;
+        for segment in 0..slru.num_segments() {
+            let listed: usize = [HOT_LRU, WARM_LRU, COLD_LRU]
+                .iter()
+                .map(|&lru| slru.list_used_size(segment, lru))
+                .sum();
+            assert_eq!(listed, slru.segment_used_size(segment));
+            assert_eq!(
+                listed,
+                slru.GetListUsedSize(segment, HOT_LRU)
+                    + slru.GetListUsedSize(segment, WARM_LRU)
+                    + slru.GetListUsedSize(segment, COLD_LRU)
+            );
+            assert!(slru.segment_used_size(segment) <= slru.segment_byte_limit());
+            items += [HOT_LRU, WARM_LRU, COLD_LRU]
+                .iter()
+                .map(|&lru| slru.list_item_num(segment, lru))
+                .sum::<usize>();
+        }
+        assert_eq!(items, slru.GetItemNum());
+        assert!(slru.GetUsedSpace() <= slru.GetCapacity());
+    }
+
+    #[test]
+    fn parity_replacement_slru_maintainer_promotes_active_and_demotes_untouched() {
+        let mut slru = ReplacementSLRU::with_num_segments(100, 1);
+        slru.Init().unwrap();
+        slru.TEST_ConfigLRUMaintainer(false);
+        slru.set_hot_lru_pct(20);
+        slru.set_warm_lru_pct(40);
+        assert_eq!(slru.segment_byte_limit(), 100);
+
+        // Each entry occupies 1 key byte + 4 value bytes.
+        slru.Put(test_buffer("a", b"aaaa"));
+        assert!(slru.Get("a").is_some());
+        assert!(slru.Get("a").is_some());
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_ACTIVE);
+        for key in ["b", "c", "d", "e"] {
+            slru.Put(test_buffer(key, b"xxxx"));
+        }
+        assert_eq!(slru.list_used_size(0, HOT_LRU), 25);
+        assert_eq!(slru.list_item_num(0, COLD_LRU), 0);
+
+        // A disabled maintainer is a no-op even when the hot list is over its
+        // share of the shard budget.
+        assert!(slru.run_lru_maintainer_pass().is_empty());
+        assert_eq!(slru.list_used_size(0, HOT_LRU), 25);
+
+        // One pass trims the hot list to its 20% share (20 bytes). The tail is
+        // "a", touched twice, so it is promoted to warm with its flag reset.
+        slru.TEST_ConfigLRUMaintainer(true);
+        assert!(slru.run_lru_maintainer_pass().is_empty());
+        assert_eq!(slru.TEST_CheckLRUPos("a"), WARM_LRU);
+        assert_eq!(slru.TEST_CheckBufferFlag("a"), BUFFER_INIT);
+        assert_eq!(slru.list_used_size(0, HOT_LRU), 20);
+        assert_eq!(slru.list_used_size(0, WARM_LRU), 5);
+        assert_eq!(slru.list_item_num(0, COLD_LRU), 0);
+
+        // A second pass is a fixed point: nothing is over its share any more.
+        assert!(slru.LRUMaintainerTask().is_empty());
+        assert_eq!(slru.list_used_size(0, HOT_LRU), 20);
+        assert_eq!(slru.list_used_size(0, WARM_LRU), 5);
+
+        // Shrinking the shares drains hot, then warm, into the cold list. None
+        // of the entries were touched twice since the last pass, so they are
+        // demoted rather than promoted.
+        slru.set_hot_lru_pct(0);
+        slru.set_warm_lru_pct(0);
+        assert!(slru.run_lru_maintainer_pass().is_empty());
+        assert_eq!(slru.list_item_num(0, HOT_LRU), 0);
+        assert_eq!(slru.list_item_num(0, WARM_LRU), 0);
+        assert_eq!(slru.list_item_num(0, COLD_LRU), 5);
+        assert_eq!(slru.list_used_size(0, COLD_LRU), 25);
+        assert_eq!(slru.GetUsedSpace(), 25);
+        assert_eq!(slru.GetItemNum(), 5);
+    }
+
+    #[test]
+    fn parity_replacement_slru_maintainer_evicts_cold_tail_over_segment_budget() {
+        let mut slru = ReplacementSLRU::with_num_segments(40, 1);
+        slru.Init().unwrap();
+        // Give hot and warm no share of the budget, so every insert is demoted
+        // into the cold list and reclaimed from there.
+        slru.set_hot_lru_pct(0);
+        slru.set_warm_lru_pct(0);
+
+        let evicted_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let evicted_capture = Arc::clone(&evicted_keys);
+        slru.RegisterMemEvictionHandler(move |buffer| {
+            evicted_capture
+                .lock()
+                .unwrap()
+                .push(buffer.Key().to_string());
+        });
+
+        // Four 10-byte entries exactly fill the single shard.
+        for key in ["a", "b", "c", "d"] {
+            assert!(slru.Put(test_buffer(key, b"xxxxxxxxx")).is_empty());
+        }
+        assert_eq!(slru.GetUsedSpace(), 40);
+        assert_eq!(slru.list_item_num(0, COLD_LRU), 4);
+        assert_eq!(slru.list_item_num(0, HOT_LRU), 0);
+
+        // The fifth insert puts the shard over budget; the cold tail is the
+        // oldest untouched entry and is handed to the lower tier before being
+        // dropped.
+        let evicted = slru.Put(test_buffer("e", b"xxxxxxxxx"));
+        let evicted_names: Vec<String> = evicted
+            .iter()
+            .map(|buffer| buffer.Key().to_string())
+            .collect();
+        assert_eq!(evicted_names, vec!["a".to_string()]);
+        assert_eq!(*evicted_keys.lock().unwrap(), vec!["a".to_string()]);
+        assert_eq!(slru.GetUsedSpace(), 40);
+        assert_eq!(slru.GetItemNum(), 4);
+        assert!(slru.Peek("a").is_none());
+        assert!(slru.Peek("e").is_some());
+    }
+
+    #[test]
+    fn parity_concurrent_slru_matches_the_single_threaded_segment_layout() {
+        let concurrent = ConcurrentReplacementSLRU::with_num_segments(1 << 16, 256);
+        let single = ReplacementSLRU::with_num_segments(1 << 16, 256);
+        assert_eq!(concurrent.num_segments(), single.num_segments());
+        assert_eq!(concurrent.segment_byte_limit(), single.segment_byte_limit());
+        assert_eq!(concurrent.GetCapacity(), 1 << 16);
+
+        // A key lands in the same segment either way, so the two forms shard
+        // a workload identically.
+        for key in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] {
+            assert_eq!(concurrent.segment_for_key(key), single.segment_for_key(key));
+        }
+
+        // Capacities below the segment count collapse to one segment in both.
+        assert_eq!(ConcurrentReplacementSLRU::new(6).num_segments(), 1);
+        assert_eq!(ReplacementSLRU::new(6).num_segments(), 1);
+    }
+
+    #[test]
+    fn parity_concurrent_slru_serves_threads_through_per_segment_locks() {
+        let policy = ConcurrentReplacementSLRU::with_num_segments(1 << 16, 64);
+        policy.Init().unwrap();
+
+        // Four threads share the policy with no lock of their own. Keys that
+        // hash to different segments never contend.
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let policy = &policy;
+                scope.spawn(move || {
+                    for index in 0..512 {
+                        let key = format!("w{worker}-k{index:04}");
+                        policy.Put(test_buffer(&key, b"payload"));
+                        let _ = policy.Get(&key);
+                        if index % 3 == 0 {
+                            let _ = policy.Delete(&key);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Every segment stayed inside its own budget and the totals reconcile,
+        // so no update was lost or double-counted across threads.
+        for segment in 0..policy.num_segments() {
+            assert!(
+                policy.segment_used_size(segment) <= policy.segment_byte_limit(),
+                "segment {segment} over budget"
+            );
+        }
+        assert!(policy.GetUsedSpace() <= policy.GetCapacity());
+        let summed: usize = (0..policy.num_segments())
+            .map(|segment| policy.segment_item_num(segment))
+            .sum();
+        assert_eq!(summed, policy.GetItemNum());
+        assert!(policy.GetItemNum() > 0);
+    }
+
+    #[test]
+    fn parity_concurrent_slru_reports_evictions_from_every_segment() {
+        let policy = ConcurrentReplacementSLRU::with_num_segments(256, 4);
+        policy.Init().unwrap();
+        let evicted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&evicted);
+        policy.register_mem_eviction_handler(move |buffer| {
+            capture.lock().unwrap().push(buffer.Key().to_string());
+        });
+
+        // 20 bytes per entry against a 64-byte segment budget forces eviction.
+        for index in 0..256 {
+            policy.Put(test_buffer(&format!("evict-{index:04}"), b"0123456789"));
+        }
+
+        assert!(!evicted.lock().unwrap().is_empty());
+        assert!(policy.GetUsedSpace() <= policy.GetCapacity());
+        for segment in 0..policy.num_segments() {
+            assert!(policy.segment_used_size(segment) <= policy.segment_byte_limit());
+        }
+        assert_eq!(policy.GetItemNum(), policy.GetItemNum());
+    }
+
+    #[test]
+    fn parity_concurrent_slru_round_trips_values_and_maintainer_passes() {
+        let policy = ConcurrentReplacementSLRU::with_num_segments(1 << 14, 8);
+        policy.Init().unwrap();
+        policy.Put(test_buffer("round-trip", b"value"));
+        assert_eq!(policy.Get("round-trip").unwrap().Data(), b"value");
+        assert_eq!(policy.Peek("round-trip").unwrap().Data(), b"value");
+
+        policy
+            .update_cache_buffer("round-trip", b"value", test_buffer("round-trip", b"next"))
+            .unwrap();
+        assert_eq!(policy.Peek("round-trip").unwrap().Data(), b"next");
+        assert!(matches!(
+            policy.update_cache_buffer("round-trip", b"stale", test_buffer("round-trip", b"bad")),
+            Err(CacheError::ReplaceMismatch)
+        ));
+
+        // A maintainer sweep takes each segment lock in turn and is a no-op
+        // while nothing is over its share.
+        assert!(policy.LRUMaintainerTask().is_empty());
+        assert_eq!(policy.GetItemNum(), 1);
+
+        assert_eq!(policy.Delete("round-trip").unwrap().Key(), "round-trip");
+        assert_eq!(policy.GetItemNum(), 0);
+        assert_eq!(policy.GetUsedSpace(), 0);
+        policy.Reset().unwrap();
+        assert_eq!(policy.GetItemNum(), 0);
+    }
+
+    fn order_key(index: usize) -> CacheKey {
+        CacheKey::string(0, &format!("order-key-{index:04}"))
+    }
+
+    fn order_keys(order: &CacheKeyOrder) -> Vec<CacheKey> {
+        order.iter().cloned().collect()
+    }
+
+    #[test]
+    fn cache_key_order_tracks_recency_from_front_to_back() {
+        let mut order = CacheKeyOrder::new();
+        assert!(order.is_empty());
+        assert_eq!(order.front(), None);
+        assert_eq!(order.back(), None);
+
+        for index in 0..4 {
+            order.push_back(order_key(index));
+        }
+        assert_eq!(order.len(), 4);
+        assert_eq!(order.front(), Some(&order_key(0)));
+        assert_eq!(order.back(), Some(&order_key(3)));
+
+        // A hit moves the key to the back and never duplicates it, which is
+        // what a plain deque needs a full rescan to guarantee.
+        assert!(order.touch(&order_key(0)));
+        assert_eq!(order.back(), Some(&order_key(0)));
+        assert_eq!(order.len(), 4);
+        assert_eq!(
+            order_keys(&order),
+            vec![order_key(1), order_key(2), order_key(3), order_key(0)]
+        );
+
+        // Touching the key that is already most recent is a no-op.
+        assert!(order.touch(&order_key(0)));
+        assert_eq!(
+            order_keys(&order),
+            vec![order_key(1), order_key(2), order_key(3), order_key(0)]
+        );
+
+        // Touching an absent key reports it and changes nothing.
+        assert!(!order.touch(&order_key(99)));
+        assert_eq!(order.len(), 4);
+
+        // Eviction takes the least recently used first.
+        assert_eq!(order.pop_front(), Some(order_key(1)));
+        assert_eq!(order.pop_front(), Some(order_key(2)));
+        assert_eq!(order.len(), 2);
+
+        assert!(order.remove(&order_key(3)));
+        assert!(!order.remove(&order_key(3)));
+        assert_eq!(order_keys(&order), vec![order_key(0)]);
+
+        order.push_front(order_key(7));
+        assert_eq!(order.front(), Some(&order_key(7)));
+        assert_eq!(order_keys(&order), vec![order_key(7), order_key(0)]);
+
+        order.clear();
+        assert!(order.is_empty());
+        assert_eq!(order.pop_front(), None);
+    }
+
+    #[test]
+    fn cache_key_order_walks_both_directions() {
+        let order: CacheKeyOrder = (0..4).map(order_key).collect();
+        assert_eq!(
+            order.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                order_key(0),
+                order_key(1),
+                order_key(2),
+                order_key(3)
+            ]
+        );
+        // The reverse walk starts at the most recently used end. Eviction
+        // relies on this to reach the coldest entry first.
+        assert_eq!(
+            order.iter_rev().cloned().collect::<Vec<_>>(),
+            vec![
+                order_key(3),
+                order_key(2),
+                order_key(1),
+                order_key(0)
+            ]
+        );
+        assert_eq!(order.iter_rev().next(), order.back());
+        assert_eq!(order.iter().next(), order.front());
+
+        let empty = CacheKeyOrder::new();
+        assert_eq!(empty.iter_rev().count(), 0);
+    }
+
+    #[test]
+    fn simple_lru_evicts_the_coldest_entry_first() {
+        let cache = SimpleLRUCache::new(3 * 64);
+        let key = |name: &str| CacheKey::string(0, name);
+        let value = vec![118u8; 32];
+        for name in ["a", "b", "c"] {
+            cache.Insert(key(name), value.clone(), 64).unwrap();
+        }
+
+        // Reading "a" makes "b" the coldest entry, so "b" is what the next
+        // insert must displace.
+        assert!(cache.Lookup(&key("a")).unwrap().is_some());
+        cache.Insert(key("d"), value.clone(), 64).unwrap();
+
+        assert!(
+            cache.Lookup(&key("b")).unwrap().is_none(),
+            "the least recently used entry should be evicted"
+        );
+        assert!(
+            cache.Lookup(&key("a")).unwrap().is_some(),
+            "a recently read entry must not be evicted"
+        );
+        assert!(cache.Lookup(&key("c")).unwrap().is_some());
+        assert!(cache.Lookup(&key("d")).unwrap().is_some());
+    }
+
+    #[test]
+    fn cache_key_order_retain_keeps_relative_order() {
+        let mut order: CacheKeyOrder = (0..8).map(order_key).collect();
+        order.retain(|key| !key.record_key.ends_with('3') && !key.record_key.ends_with('5'));
+        assert_eq!(
+            order_keys(&order),
+            vec![
+                order_key(0),
+                order_key(1),
+                order_key(2),
+                order_key(4),
+                order_key(6),
+                order_key(7),
+            ]
+        );
+        assert_eq!(order.len(), 6);
+        assert!(!order.contains(&order_key(3)));
+        assert!(order.contains(&order_key(4)));
+    }
+
+    #[test]
+    fn cache_key_order_matches_a_rescanning_deque_step_for_step() {
+        // The structure being replaced moved a key to the back by rescanning:
+        //     if back() != Some(key) { retain(|c| c != key); push_back(key) }
+        // Drive both through the same operation stream and require the
+        // resulting recency order to agree after every single step, so the
+        // swap cannot change which entry gets evicted.
+        let mut order = CacheKeyOrder::new();
+        let mut deque: VecDeque<CacheKey> = VecDeque::new();
+
+        for step in 0..600usize {
+            let key = order_key(step.wrapping_mul(2_654_435_761) % 48);
+            match step % 5 {
+                0..=2 => {
+                    // A hit: only reorders a key that is already resident.
+                    if deque.contains(&key) {
+                        if deque.back() != Some(&key) {
+                            deque.retain(|candidate| candidate != &key);
+                            deque.push_back(key.clone());
+                        }
+                        assert!(order.touch(&key));
+                    } else {
+                        assert!(!order.touch(&key));
+                    }
+                }
+                3 => {
+                    // An insert of a key not yet resident.
+                    if !deque.contains(&key) {
+                        deque.push_back(key.clone());
+                        order.push_back(key.clone());
+                    }
+                }
+                _ => {
+                    // A removal.
+                    deque.retain(|candidate| candidate != &key);
+                    order.remove(&key);
+                }
+            }
+            assert_eq!(
+                order_keys(&order),
+                deque.iter().cloned().collect::<Vec<_>>(),
+                "diverged at step {step}"
+            );
+        }
+        assert!(!order.is_empty());
+    }
+
+    #[test]
+    fn cache_key_order_recycles_nodes_across_churn() {
+        let mut order = CacheKeyOrder::new();
+        for round in 0..6 {
+            for index in 0..64 {
+                order.push_back(order_key(round * 64 + index));
+            }
+            assert_eq!(order.len(), 64);
+            while order.pop_front().is_some() {}
+            assert!(order.is_empty());
+        }
+        order.push_back(order_key(1));
+        order.push_back(order_key(2));
+        assert_eq!(order_keys(&order), vec![order_key(1), order_key(2)]);
     }
 
     #[test]

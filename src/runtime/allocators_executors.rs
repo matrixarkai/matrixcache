@@ -1632,6 +1632,9 @@ impl CacheExecutor {
     }
 }
 
+/// Milliseconds between collection checks in [`StorageGCController::poll`].
+pub const GC_DEFAULT_CHECK_INTERVAL_MS: u64 = 1_000;
+
 #[derive(Debug, Clone)]
 pub struct StorageGCController {
     allocator: SimpleLogBasedMemoryAllocator,
@@ -1640,6 +1643,8 @@ pub struct StorageGCController {
     enable_gc: bool,
     free_mem_min: usize,
     fragmentation_ratio_max: u8,
+    gc_check_interval_ms: u64,
+    last_gc_check: Option<Instant>,
     complete_gc_chunks: i64,
     fly_gc_chunks: i64,
     complete_gc_tasks: i64,
@@ -1663,6 +1668,8 @@ impl StorageGCController {
             enable_gc: false,
             free_mem_min,
             fragmentation_ratio_max,
+            gc_check_interval_ms: GC_DEFAULT_CHECK_INTERVAL_MS,
+            last_gc_check: None,
             complete_gc_chunks: 0,
             fly_gc_chunks: 0,
             complete_gc_tasks: 0,
@@ -1680,6 +1687,46 @@ impl StorageGCController {
 
     pub fn set_pause_gc(&mut self, pause: bool) {
         self.pause_gc = pause;
+    }
+
+    pub fn gc_check_interval_ms(&self) -> u64 {
+        self.gc_check_interval_ms
+    }
+
+    pub fn set_gc_check_interval_ms(&mut self, interval_ms: u64) {
+        self.gc_check_interval_ms = interval_ms;
+    }
+
+    /// Enable or disable collection without draining outstanding work, unlike
+    /// [`StorageGCController::stop`].
+    pub fn set_enable_gc(&mut self, enable: bool) {
+        self.enable_gc = enable;
+    }
+
+    /// Check whether collection is due and, if so, run one round.
+    ///
+    /// This is the monitoring half of the controller: it decides *when* to
+    /// look, while `pick_submit_chunks` decides what to reclaim once asked.
+    /// Because the controller has no thread of its own, a caller drives this
+    /// from its own loop and the interval keeps the fragmentation check off
+    /// the hot path rather than running it on every call. Returns the number
+    /// of chunks reclaimed.
+    pub fn poll(&mut self) -> Result<usize, CacheError> {
+        if !self.enable_gc || self.pause_gc {
+            return Ok(0);
+        }
+        let now = Instant::now();
+        let due = match self.last_gc_check {
+            None => true,
+            Some(last) => {
+                now.duration_since(last) >= Duration::from_millis(self.gc_check_interval_ms)
+            }
+        };
+        if !due {
+            return Ok(0);
+        }
+        self.last_gc_check = Some(now);
+        self.pick_submit_chunks()
     }
 
     // Completion barrier: `fly_gc_chunks` is maintained by the GC executor's

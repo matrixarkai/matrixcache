@@ -1062,19 +1062,45 @@ impl MemStorageRecordHandle {
 
 pub struct MemStorage;
 
+/// Continue a CRC-32C (Castagnoli) checksum over `bytes`, starting from the
+/// checksum `seed` returned by an earlier call. Chaining a seed gives the same
+/// result as checksumming the concatenated input in one go, which is what lets
+/// a record be checksummed header-then-value-then-key without copying it into
+/// one buffer first.
+pub fn crc32c_with_seed(bytes: &[u8], seed: u32) -> u32 {
+    let mut crc = !seed;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
+        }
+    }
+    !crc
+}
+
+/// CRC-32C (Castagnoli) checksum of `bytes`.
+pub fn crc32c(bytes: &[u8]) -> u32 {
+    crc32c_with_seed(bytes, 0)
+}
+
 impl MemStorage {
     pub const HEADER_BYTES: usize = 8;
 
+    /// Checksum of a cache record: the length header first, then the value,
+    /// then the key.
+    ///
+    /// Covering the header matters. Two records whose value and key bytes
+    /// concatenate to the same sequence but split differently are only
+    /// distinguishable by their lengths, so a checksum over the payload alone
+    /// would accept a record whose length header had been corrupted.
     pub fn compute_crc(key: &str, value: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for byte in value.iter().chain(key.as_bytes().iter()).copied() {
-            crc ^= byte as u32;
-            for _ in 0..8 {
-                let mask = 0u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
+        let mut lengths = [0u8; Self::HEADER_BYTES];
+        lengths[..4].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        lengths[4..].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        let crc = crc32c(&lengths);
+        let crc = crc32c_with_seed(value, crc);
+        crc32c_with_seed(key.as_bytes(), crc)
     }
 
     pub fn do_put(key: &str, value: &[u8]) -> Vec<u8> {
@@ -2499,13 +2525,24 @@ impl StorageEngineMultiSSD {
         storage
     }
 
+    /// Hash used to spread keys across devices.
+    ///
+    /// This is the same hash the rest of the crate uses, so the device a key
+    /// lands on is reproducible: a data directory written by one process is
+    /// read back through the same device selection by another.
     fn hash(key: &str) -> u32 {
-        let mut hash = 0x811c_9dc5u32;
-        for byte in key.as_bytes() {
-            hash ^= *byte as u32;
-            hash = hash.wrapping_mul(0x0100_0193);
+        mur_mur_hash2(key.as_bytes())
+    }
+
+    /// How many devices keys are spread across. Before start there are no
+    /// storages yet, so the configured paths stand in; `init` rebuilds the
+    /// storages from the paths one for one, so the two agree once started.
+    fn shard_count(&self) -> usize {
+        if self.initialized && !self.storages.is_empty() {
+            self.storages.len()
+        } else {
+            self.paths.len()
         }
-        hash
     }
 
     fn storage_index(&self, key: &str) -> Result<usize, CacheError> {
@@ -2550,11 +2587,14 @@ impl StorageEngineMultiSSD {
         self.storages.len()
     }
 
+    /// Path of the device that holds `key`, using the same selection as reads
+    /// and writes so the answer matches where the data actually goes.
     pub fn device_for_key(&self, key: &str) -> Option<&str> {
-        if self.paths.is_empty() {
+        let count = self.shard_count();
+        if count == 0 {
             return None;
         }
-        let index = Self::hash(key) as usize % self.paths.len();
+        let index = Self::hash(key) as usize % count;
         self.paths.get(index).map(String::as_str)
     }
 
