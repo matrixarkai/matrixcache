@@ -1819,11 +1819,11 @@ fn encode_manifest_field(value: &str) -> String {
 }
 
 fn decode_manifest_field(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
+    for chunk in value.as_bytes().as_chunks::<2>().0 {
         let high = decode_hex_nibble(chunk[0])?;
         let low = decode_hex_nibble(chunk[1])?;
         bytes.push((high << 4) | low);

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bjmeetsfo/MatrixCache/actions/workflows/ci.yml/badge.svg)](https://github.com/bjmeetsfo/MatrixCache/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.74-blue.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 
 `matrixcache` is a standalone, Rust-native multi-tier cache library extracted
 from TemporalStore and reusable by any Rust service. It manages a hot in-memory
@@ -51,7 +51,9 @@ useful as local performance/behavior evidence.
 
 ## Minimum Supported Rust Version
 
-MSRV is **1.74**.
+MSRV is **1.88**, set by the RocksDB backend that the default features build. Without
+default features the crate itself needs far less, but the number quoted here is the one that
+matters for a default `cargo build`.
 
 ## Contributing, security, and license
 
