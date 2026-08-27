@@ -1662,9 +1662,9 @@ pub fn mur_mur_hash2_with_seed(key: &[u8], seed: u32) -> u32 {
     const R: u32 = 24;
 
     let mut h = seed ^ key.len() as u32;
-    let mut chunks = key.chunks_exact(4);
-    for chunk in &mut chunks {
-        let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let (blocks, tail) = key.as_chunks::<4>();
+    for chunk in blocks {
+        let mut k = u32::from_le_bytes(*chunk);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
@@ -1673,7 +1673,6 @@ pub fn mur_mur_hash2_with_seed(key: &[u8], seed: u32) -> u32 {
         h ^= k;
     }
 
-    let tail = chunks.remainder();
     match tail.len() {
         3 => {
             h ^= ((tail[2] as i8 as i32) << 16) as u32;
