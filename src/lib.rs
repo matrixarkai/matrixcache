@@ -2,7 +2,7 @@
 // Copyright 2026 MatrixArkAI
 
 //! MatrixCache is a Rust-native multi-tier cache library. It manages a hot
-//! in-memory (DRAM) tier, a persistent-memory-like resident tier, and an SSD tier
+//! in-memory (Dram) tier, a persistent-memory-like resident tier, and an Ssd tier
 //! (RocksDB by default), with admission control, cross-tier eviction, read-through
 //! refill, pinned handles, invalidation, and asynchronous writeback with
 //! backpressure accounting.
@@ -12,7 +12,7 @@
 //! ```no_run
 //! use matrixcache::{CacheKey, MultiLayerCache};
 //!
-//! // 1 MiB in-memory tier; the SSD tier is persisted under `dir`.
+//! // 1 MiB in-memory tier; the Ssd tier is persisted under `dir`.
 //! let dir = std::env::temp_dir().join("matrixcache-doc");
 //! let cache = MultiLayerCache::new(1 << 20, dir);
 //!
@@ -22,7 +22,7 @@
 //! # Ok::<(), matrixcache::CacheError>(())
 //! ```
 //!
-//! The SSD backend is RocksDB via the default `rocksdb-ssd` feature; build with
+//! The Ssd backend is RocksDB via the default `rocksdb-ssd` feature; build with
 //! `--no-default-features` for a lightweight file-backed compatibility store.
 
 use std::collections::hash_map::DefaultHasher;

@@ -240,7 +240,7 @@ pub enum CacheReplacementPolicy {
 }
 
 impl CacheReplacementPolicy {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("fifo") {
             Self::Fifo
         } else if value.eq_ignore_ascii_case("slru") {
@@ -250,7 +250,7 @@ impl CacheReplacementPolicy {
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
             Self::Fifo => "FIFO",
             Self::Slru => "SLRU",
@@ -1028,6 +1028,13 @@ impl ReplacementArc {
         Ok(())
     }
 
+    /// Drop every tracked key and put this policy back in the uninitialized
+    /// state.
+    ///
+    /// Unlike the Fifo and SLRU policies, resetting this one *does* require
+    /// another `init()` before it will accept keys. That asymmetry is
+    /// intentional and load-bearing for callers that drive the adaptive
+    /// lists directly; do not "harmonize" it away.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         self.initialized = false;
         self.arc_list.reset();
@@ -1243,12 +1250,18 @@ impl ReplacementFIFO {
         self.base.init()
     }
 
+    /// Drop every tracked buffer and return the policy to an empty state.
+    ///
+    /// A successful reset leaves the policy *initialized and usable*: it
+    /// empties the index, not the policy's lifecycle. Clearing the
+    /// initialized flag here would make every later `put` return "no
+    /// evictions" while silently discarding the buffer, turning a reset
+    /// cache into a black hole that never reports an error.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         self.index.clear();
         self.queue.clear();
         self.arena.clear();
         self.base.used = 0;
-        self.base.initialized = false;
         Ok(())
     }
 
@@ -1485,7 +1498,7 @@ struct SlruEntry {
     node: u32,
 }
 
-/// A hash-partitioned shard: three LRU lists plus the shard byte accounting.
+/// A hash-partitioned shard: three Lru lists plus the shard byte accounting.
 #[derive(Debug)]
 struct SlruSegment {
     lists: [KeyList; SLRU_LIST_COUNT],
@@ -1522,10 +1535,10 @@ enum SlruMaintainerStep {
     Evicted(CacheBuffer),
 }
 
-/// Segmented LRU replacement policy.
+/// Segmented Lru replacement policy.
 ///
 /// The cache is hash-partitioned into [`ReplacementSLRU::num_segments`] shards,
-/// each holding an independent hot/warm/cold LRU triple with its own byte
+/// each holding an independent hot/warm/cold Lru triple with its own byte
 /// budget of `capacity / num_segments`. Inserts, lookups and eviction only ever
 /// touch the shard owning the key, so eviction scans a small shard-local list
 /// instead of one global list, and no single hot list can consume the whole
@@ -1585,6 +1598,11 @@ impl ReplacementSLRU {
         self.base.init()
     }
 
+    /// Drop every tracked buffer and return the policy to an empty state.
+    ///
+    /// As with the other policies, a successful reset leaves this one
+    /// initialized and ready to accept buffers again; see the note on
+    /// `ReplacementFIFO::reset`.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         self.index.clear();
         for segment in &mut self.segments {
@@ -1595,7 +1613,6 @@ impl ReplacementSLRU {
         }
         self.arena.clear();
         self.base.used = 0;
-        self.base.initialized = false;
         Ok(())
     }
 
@@ -1665,7 +1682,7 @@ impl ReplacementSLRU {
     ///
     /// Only the access flag moves: an entry is not re-fronted in its list on a
     /// read. List position is decided by the maintainer and by eviction, which
-    /// is what keeps this a segmented policy rather than a plain LRU — reading
+    /// is what keeps this a segmented policy rather than a plain Lru — reading
     /// a key once does not jump it ahead of one that was read twice.
     pub fn get(&mut self, key: &str) -> Option<CacheBuffer> {
         let entry = self.index.get_mut(key)?;
@@ -2243,7 +2260,7 @@ impl ReplacementSLRU {
     }
 }
 
-/// A segmented LRU that can be shared across threads, holding one lock per
+/// A segmented Lru that can be shared across threads, holding one lock per
 /// segment instead of one lock over the whole policy.
 ///
 /// [`ReplacementSLRU`] partitions its lists into segments, but it is driven

@@ -122,7 +122,7 @@ fn parse_config() -> BenchConfig {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: rocksdb_parity_bench [iterations] [--iterations N] \
+                    "usage: rocksdb_backend_bench [iterations] [--iterations N] \
                      [--value-bytes N] [--dram-capacity-bytes N] \
                      [--pmem-capacity-bytes N] [--ssd-capacity-bytes N] \
                      [--placement-threshold-bytes N] \
@@ -279,7 +279,7 @@ fn main() {
         && restart_disk_refill_ready;
 
     println!("{{");
-    println!("  \"report_version\": \"matrixcache_rocksdb_parity_v1\",");
+    println!("  \"report_version\": \"matrixcache_rocksdb_backend_v1\",");
     println!(
         "  \"backend\": \"{}\",",
         if cfg!(feature = "rocksdb-ssd") {
@@ -367,28 +367,28 @@ fn main() {
     println!("  \"matrixcache_contract_evidence\": {{");
     println!("    \"dram_to_pmem_eviction\": {{");
     println!("      \"observed\": {},", dram_to_pmem_eviction);
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"memory_evictions > 0 && pmem_fills > 0\",");
     println!("      \"memory_evictions\": {},", stats.memory_evictions);
     println!("      \"pmem_fills\": {}", stats.pmem_fills);
     println!("    }},");
     println!("    \"pmem_to_ssd_eviction\": {{");
     println!("      \"observed\": {},", pmem_to_ssd_eviction);
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"pmem_evictions > 0 && disk_fills > 0\",");
     println!("      \"pmem_evictions\": {},", stats.pmem_evictions);
     println!("      \"disk_fills\": {}", stats.disk_fills);
     println!("    }},");
     println!("    \"ssd_read_through_refill\": {{");
     println!("      \"observed\": {},", ssd_read_through_refill);
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"cold_ssd_refills > 0 && refill_failures == 0\",");
     println!("      \"cold_ssd_refills\": {},", cold_ssd_refills);
     println!("      \"refill_failures\": {}", stats.refill_failures);
     println!("    }},");
     println!("    \"replacement_soak\": {{");
     println!("      \"observed\": {},", replacement_soak_ready);
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"replacement_policy_soak.passed\",");
     println!("      \"iterations\": {},", soak_iterations);
     println!("      \"reasons\": {:?}", soak.reasons);
@@ -398,7 +398,7 @@ fn main() {
         "      \"observed\": {},",
         async_writeback_backpressure_ready
     );
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"observed_async_writeback_backpressure > 0\",");
     println!(
         "      \"observed_async_writeback_backpressure\": {}",
@@ -407,7 +407,7 @@ fn main() {
     println!("    }},");
     println!("    \"restart_disk_refill\": {{");
     println!("      \"observed\": {},", restart_disk_refill_ready);
-    println!("      \"source\": \"matrixcache_rocksdb_parity_bench\",");
+    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
     println!("      \"metric\": \"replacement_policy_soak.restart_disk_refill_ready\",");
     println!(
         "      \"restart_disk_refill_ready\": {}",

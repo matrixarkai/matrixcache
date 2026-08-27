@@ -33,47 +33,57 @@ impl AllocatorStats {
         self.num_occupied_bytes
     }
 }
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AllocatorType {
-    kLogBasedAllocator = 0,
-    kPoolBasedAllocator = 1,
-    kJeAllocator = 2,
-    kMaxCode = 3,
+    #[serde(alias = "kLogBasedAllocator")]
+    LogBasedAllocator = 0,
+    #[serde(alias = "kPoolBasedAllocator")]
+    PoolBasedAllocator = 1,
+    #[serde(alias = "kJeAllocator")]
+    JeAllocator = 2,
+    #[serde(alias = "kMaxCode")]
+    MaxCode = 3,
+}
+
+#[allow(non_upper_case_globals)]
+impl AllocatorType {
+    pub const kLogBasedAllocator: Self = Self::LogBasedAllocator;
+    pub const kPoolBasedAllocator: Self = Self::PoolBasedAllocator;
+    pub const kJeAllocator: Self = Self::JeAllocator;
+    pub const kMaxCode: Self = Self::MaxCode;
 }
 
 impl AllocatorType {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("log")
             || value.eq_ignore_ascii_case("log_based")
             || value.eq_ignore_ascii_case("logbased")
             || value.eq_ignore_ascii_case("kLogBasedAllocator")
         {
-            Self::kLogBasedAllocator
+            Self::LogBasedAllocator
         } else if value.eq_ignore_ascii_case("pool")
             || value.eq_ignore_ascii_case("pool_based")
             || value.eq_ignore_ascii_case("poolbased")
             || value.eq_ignore_ascii_case("kPoolBasedAllocator")
         {
-            Self::kPoolBasedAllocator
+            Self::PoolBasedAllocator
         } else if value.eq_ignore_ascii_case("je")
             || value.eq_ignore_ascii_case("jemalloc")
             || value.eq_ignore_ascii_case("kJeAllocator")
         {
-            Self::kJeAllocator
+            Self::JeAllocator
         } else {
-            Self::kMaxCode
+            Self::MaxCode
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kLogBasedAllocator => "LogBasedAllocator",
-            Self::kPoolBasedAllocator => "PoolBasedAllocator",
-            Self::kJeAllocator => "JeAllocator",
-            Self::kMaxCode => "MaxCode",
+            Self::LogBasedAllocator => "LogBasedAllocator",
+            Self::PoolBasedAllocator => "PoolBasedAllocator",
+            Self::JeAllocator => "JeAllocator",
+            Self::MaxCode => "MaxCode",
         }
     }
 }
@@ -91,38 +101,46 @@ pub struct PoolChunkMeta {
     pub id: ChunkID,
     pub num_alloc_objects: usize,
 }
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FlushPolicy {
-    kNoFlush = 0,
-    kInstantFlush = 1,
-    kMiniBatchFlush = 2,
+    #[serde(alias = "kNoFlush")]
+    NoFlush = 0,
+    #[serde(alias = "kInstantFlush")]
+    InstantFlush = 1,
+    #[serde(alias = "kMiniBatchFlush")]
+    MiniBatchFlush = 2,
+}
+
+#[allow(non_upper_case_globals)]
+impl FlushPolicy {
+    pub const kNoFlush: Self = Self::NoFlush;
+    pub const kInstantFlush: Self = Self::InstantFlush;
+    pub const kMiniBatchFlush: Self = Self::MiniBatchFlush;
 }
 
 impl FlushPolicy {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("no_flush")
             || value.eq_ignore_ascii_case("noflush")
             || value.eq_ignore_ascii_case("kNoFlush")
         {
-            Self::kNoFlush
+            Self::NoFlush
         } else if value.eq_ignore_ascii_case("instant_flush")
             || value.eq_ignore_ascii_case("instant")
             || value.eq_ignore_ascii_case("kInstantFlush")
         {
-            Self::kInstantFlush
+            Self::InstantFlush
         } else {
-            Self::kMiniBatchFlush
+            Self::MiniBatchFlush
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kNoFlush => "NoFlush",
-            Self::kInstantFlush => "InstantFlush",
-            Self::kMiniBatchFlush => "MiniBatchFlush",
+            Self::NoFlush => "NoFlush",
+            Self::InstantFlush => "InstantFlush",
+            Self::MiniBatchFlush => "MiniBatchFlush",
         }
     }
 }
@@ -213,7 +231,7 @@ fn free_virtual_region(ptr: AllocatorPtr) -> Result<Vec<u8>, CacheError> {
 }
 
 pub fn parse_allocator_type(allocator_type: &str) -> AllocatorType {
-    AllocatorType::from_reference_name(allocator_type)
+    AllocatorType::from_config_name(allocator_type)
 }
 
 pub fn dram_allocate_object(

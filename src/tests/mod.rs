@@ -6,7 +6,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parity_rdma_response_hash_table_and_index_surface_round_trip() {
+    fn rdma_response_hash_table_and_index_surface_round_trip() {
         let mut response = RDMAResponse::New(32);
         let first_allocation = response.allocation_addr();
         assert_eq!(response.GetRespSize(), 32);
@@ -44,9 +44,9 @@ mod tests {
         entry.set_signature_96(sig96);
         entry.SetDataLength(128);
         entry.SetVersion();
-        entry.set_packed_addr(0x1234, RdmaStorageEngineType::PMEM, 128);
+        entry.set_packed_addr(0x1234, RdmaStorageEngineType::Pmem, 128);
         assert_eq!(entry.GetPtr(), 0x1234);
-        assert_eq!(entry.GetType(), RdmaStorageEngineType::PMEM.as_code());
+        assert_eq!(entry.GetType(), RdmaStorageEngineType::Pmem.as_code());
         assert_eq!(entry.GetOverflowFlag(), 0);
         assert_eq!(entry.GetLength(), 128);
         assert_eq!(entry.GetVersion(), 0);
@@ -56,9 +56,9 @@ mod tests {
         overflow.set_signature_128(sig128);
         overflow.SetDataLength(i32::MAX);
         overflow.SetVersion();
-        overflow.set_packed_addr(0x2222, RdmaStorageEngineType::SSD, RDMA_MAX_BLOCK_SIZE + 1);
+        overflow.set_packed_addr(0x2222, RdmaStorageEngineType::Ssd, RDMA_MAX_BLOCK_SIZE + 1);
         assert_eq!(overflow.GetPtr(), 0x2222);
-        assert_eq!(overflow.GetType(), RdmaStorageEngineType::SSD.as_code());
+        assert_eq!(overflow.GetType(), RdmaStorageEngineType::Ssd.as_code());
         assert_eq!(overflow.GetOverflowFlag(), 1);
         assert_eq!(overflow.GetSignature128b(), sig128);
 
@@ -67,7 +67,7 @@ mod tests {
         assert_eq!(table.GetNumEntries(), 0);
         assert!(table.AllBucketsUnlocked());
 
-        let put = table.Put(key.clone(), 0x1000, 11, RdmaStorageEngineType::DRAM);
+        let put = table.Put(key.clone(), 0x1000, 11, RdmaStorageEngineType::Dram);
         assert_eq!(put.status, RDMA_OP_SUCCESS);
         assert_eq!(put.old_addr, None);
         assert_eq!(table.GetNumEntries(), 1);
@@ -75,31 +75,31 @@ mod tests {
         let got = table.Get(&key);
         assert_eq!(got.addr, Some(0x1000));
         assert_eq!(got.len, 11 + RDMA_DATA_HEADER + RDMA_CRC_LEN);
-        assert_eq!(got.storage_type, RdmaStorageEngineType::DRAM);
+        assert_eq!(got.storage_type, RdmaStorageEngineType::Dram);
 
-        let update = table.Put(key.clone(), 0x2000, 17, RdmaStorageEngineType::SSD);
+        let update = table.Put(key.clone(), 0x2000, 17, RdmaStorageEngineType::Ssd);
         assert_eq!(update.status, RDMA_OP_SUCCESS);
         assert_eq!(update.old_addr, Some(0x1000));
         assert_eq!(update.old_len, 11 + RDMA_DATA_HEADER + RDMA_CRC_LEN);
-        assert_eq!(update.old_type, RdmaStorageEngineType::DRAM);
+        assert_eq!(update.old_type, RdmaStorageEngineType::Dram);
         assert_eq!(table.GetNumEntries(), 1);
 
         let got = table.Get(&key);
         assert_eq!(got.addr, Some(0x2000));
-        assert_eq!(got.storage_type, RdmaStorageEngineType::SSD);
+        assert_eq!(got.storage_type, RdmaStorageEngineType::Ssd);
 
         let del = table.Del(&key);
         assert_eq!(del.status, RDMA_OP_SUCCESS);
         assert_eq!(del.addr, Some(0x2000));
-        assert_eq!(del.storage_type, RdmaStorageEngineType::SSD);
+        assert_eq!(del.storage_type, RdmaStorageEngineType::Ssd);
         assert_eq!(table.GetNumEntries(), 0);
-        assert_eq!(table.Get(&key).storage_type, RdmaStorageEngineType::INVALID);
+        assert_eq!(table.Get(&key).storage_type, RdmaStorageEngineType::Invalid);
         assert_eq!(table.Del(&key).status, RDMA_NOT_FOUND);
         assert!(table.AllBucketsUnlocked());
     }
 
     #[test]
-    fn parity_rdma_std_allocator_allocates_and_frees_virtual_regions() {
+    fn rdma_std_allocator_allocates_and_frees_virtual_regions() {
         fn round_trip<A: RdmaCacheAllocatorApi>(allocator: &mut A) -> AllocatorPtr {
             let addr = allocator.allocate(64).expect("allocator ptr");
             allocator.free(addr, 64);
@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_rdma_dram_and_pmem_storage_engines_round_trip_blocks() {
+    fn rdma_dram_and_pmem_storage_engines_round_trip_blocks() {
         let mut dram = RdmaStorageEngineDram::with_capacity(1024);
         let key = 1_i32.to_le_bytes();
         let value = 7_i32.to_le_bytes();
@@ -173,25 +173,25 @@ mod tests {
     }
 
     #[test]
-    fn parity_rdma_cache_composes_index_storage_and_replacement_policy() {
+    fn rdma_cache_composes_index_storage_and_replacement_policy() {
         let key = 1_i32.to_le_bytes();
         let value_one = 1_i32.to_le_bytes();
         let value_two = 2_i32.to_le_bytes();
 
-        let mut cache = RDMACache::new(1024, 1024, 1024, RdmaReplacementPolicyType::FIFO);
-        assert_eq!(cache.GetCapacity(RdmaStorageEngineType::DRAM), 1024);
+        let mut cache = RDMACache::new(1024, 1024, 1024, RdmaReplacementPolicyType::Fifo);
+        assert_eq!(cache.GetCapacity(RdmaStorageEngineType::Dram), 1024);
         assert_eq!(
             cache.GetReplacementPolicyType(),
-            RdmaReplacementPolicyType::FIFO
+            RdmaReplacementPolicyType::Fifo
         );
-        cache.SetReplacementPolicy(RdmaReplacementPolicyType::LRU);
+        cache.SetReplacementPolicy(RdmaReplacementPolicyType::Lru);
         assert_eq!(
             cache.GetReplacementPolicyType(),
-            RdmaReplacementPolicyType::LRU
+            RdmaReplacementPolicyType::Lru
         );
         assert_eq!(
-            RdmaReplacementPolicyType::LRU.as_replacement_policy_type(),
-            ReplacementPolicyType::kLRU
+            RdmaReplacementPolicyType::Lru.as_replacement_policy_type(),
+            ReplacementPolicyType::Lru
         );
 
         let mut response = RDMAResponse::new();
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(response.GetResponse(), value_one);
         assert_eq!(cache.num_index_entries(), 1);
         assert_eq!(
-            cache.storage_stats(RdmaStorageEngineType::DRAM).unwrap().2,
+            cache.storage_stats(RdmaStorageEngineType::Dram).unwrap().2,
             1
         );
 
@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(response.GetResponse(), value_two);
         assert_eq!(cache.num_index_entries(), 1);
         assert_eq!(
-            cache.storage_stats(RdmaStorageEngineType::DRAM).unwrap().2,
+            cache.storage_stats(RdmaStorageEngineType::Dram).unwrap().2,
             1
         );
 
@@ -222,7 +222,7 @@ mod tests {
 
         let pmem_key = b"pmem-key";
         assert_eq!(
-            cache.InsertToStorage(RdmaStorageEngineType::PMEM, pmem_key, b"pmem-value"),
+            cache.InsertToStorage(RdmaStorageEngineType::Pmem, pmem_key, b"pmem-value"),
             RDMA_OP_SUCCESS
         );
         response.Clear();
@@ -231,7 +231,7 @@ mod tests {
 
         let ssd_key = b"ssd-key";
         assert_eq!(
-            cache.InsertToStorage(RdmaStorageEngineType::SSD, ssd_key, b"ssd-value"),
+            cache.InsertToStorage(RdmaStorageEngineType::Ssd, ssd_key, b"ssd-value"),
             RDMA_OP_SUCCESS
         );
         response.Clear();
@@ -241,12 +241,12 @@ mod tests {
         let mut dram_only = RDMACache::with_dram_capacity(8);
         assert_eq!(dram_only.Insert(b"too-large", b"value"), RDMA_FAIL_ALLOC);
         assert_eq!(
-            dram_only.InsertToStorage(RdmaStorageEngineType::PMEM, b"k", b"v"),
+            dram_only.InsertToStorage(RdmaStorageEngineType::Pmem, b"k", b"v"),
             RDMA_FAIL_ALLOC
         );
-        dram_only.InitStorageEngine(RdmaStorageEngineType::PMEM, 128);
+        dram_only.InitStorageEngine(RdmaStorageEngineType::Pmem, 128);
         assert_eq!(
-            dram_only.InsertToStorage(RdmaStorageEngineType::PMEM, b"k", b"v"),
+            dram_only.InsertToStorage(RdmaStorageEngineType::Pmem, b"k", b"v"),
             RDMA_OP_SUCCESS
         );
     }
@@ -301,7 +301,40 @@ mod tests {
     }
 
     #[test]
-    fn parity_unified_size_is_placement_aware() {
+    fn unified_capacity_is_placement_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 64,
+                ssd_capacity_bytes: 16,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 4,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: u32::MAX,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 64,
+                max_ssd_block_bytes: 16,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions::default(),
+        );
+
+        // Tiered placement holds a key in at most one of the volatile tiers,
+        // so the pair contributes the larger of the two. This is the same rule
+        // Size already applies, and summing here would report a full cache as
+        // half used.
+        assert_eq!(cache.Capacity(), 64);
+
+        // Side by side holds distinct keys in each tier, so they add.
+        cache.SetDataPlacementType(CacheDataPlacement::SideBySide);
+        assert_eq!(cache.Capacity(), 128);
+    }
+
+    #[test]
+    fn unified_size_is_placement_aware() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
             dir.path(),
@@ -324,11 +357,11 @@ mod tests {
         let memory_key = CacheKey::string(7, "memory-size");
         let pmem_key = CacheKey::string(7, "pmem-size");
         cache
-            .TEST_Insert(CacheInstanceType::kDRAM, memory_key, b"abcd".to_vec(), 4)
+            .TEST_Insert(CacheInstanceType::Dram, memory_key, b"abcd".to_vec(), 4)
             .unwrap();
         cache
             .TEST_Insert(
-                CacheInstanceType::kPMEM,
+                CacheInstanceType::Pmem,
                 pmem_key,
                 b"0123456789".to_vec(),
                 10,
@@ -344,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_api_aliases_match_insert_lookup_remove_semantics() {
+    fn cache_api_aliases_match_insert_lookup_remove_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(32, dir.path());
         let key = CacheKey::string(31, "legacy-api");
@@ -791,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_simple_lru_cache_wrapper_evicts_like_public_stub_cache() {
+    fn simple_lru_cache_wrapper_evicts_like_public_stub_cache() {
         let cache = MatrixCacheBuilder::BuildSimpleLRUCache(12);
         assert!(cache.Stop());
         assert!(cache.Start());
@@ -837,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_zero_copy_simple_lru_cache_keeps_removed_pinned_value_readable() {
+    fn zero_copy_simple_lru_cache_keeps_removed_pinned_value_readable() {
         let cache = MatrixCacheBuilder::BuildZeroCopySimpleLRUCache(8);
         let pinned_key = CacheKey::string(33, "pinned");
         let cold_key = CacheKey::string(33, "cold");
@@ -899,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_string_cache_wrappers_match_tool_cache_interface() {
+    fn string_cache_wrappers_match_tool_cache_interface() {
         let simple = MatrixCacheBuilder::BuildConcurrentSimpleLRUCache(16);
         assert!(simple.Stop());
         assert!(simple.Start());
@@ -930,16 +963,16 @@ mod tests {
         simple.RemoveAll().unwrap();
         assert_eq!(simple.Size(), 0);
 
-        let exact_reference_name = ConcurrentSimpleLRUCache::new(32);
-        exact_reference_name
+        let exact_config_name = ConcurrentSimpleLRUCache::new(32);
+        exact_config_name
             .InsertDefaultSize("gamma", "three".to_string())
             .unwrap();
         assert_eq!(
-            exact_reference_name.Lookup("gamma").unwrap(),
+            exact_config_name.Lookup("gamma").unwrap(),
             Some("three".to_string())
         );
 
-        let string_api: &dyn StringCacheApi = &exact_reference_name;
+        let string_api: &dyn StringCacheApi = &exact_config_name;
         string_api
             .insert_string_default_size("delta", "four".to_string())
             .unwrap();
@@ -950,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_memcached_wrapper_matches_tool_cache_surface_without_external_daemon() {
+    fn memcached_wrapper_matches_tool_cache_surface_without_external_daemon() {
         let cache = MatrixCacheBuilder::BuildMemcachedWrapper(8);
         assert_eq!(cache.configured_capacity(), 8);
         assert_eq!(cache.Capacity(), 8);
@@ -1001,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_tier_string_cache_wraps_zero_copy_cache() {
+    fn multi_tier_string_cache_wraps_zero_copy_cache() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildMultiTierStringCache(CacheOptions {
             dram_capacity: 8,
@@ -1034,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pascal_case_cache_methods_match_matrixcache_interface() {
+    fn pascal_case_cache_methods_match_matrixcache_interface() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
             dram_capacity: 64,
@@ -1109,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_instance_controls_match_unified_cache_getters_and_setters() {
+    fn instance_controls_match_unified_cache_getters_and_setters() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
             dir.path(),
@@ -1130,26 +1163,26 @@ mod tests {
             CacheBlockOptions::default(),
         );
 
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kDRAM), 16);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kPMEM), 32);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 128);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kUnified), 128);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Dram), 16);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Pmem), 32);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Ssd), 128);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Unified), 128);
 
-        cache.SetCapacityForInstance(CacheInstanceType::kDRAM, 8);
-        cache.SetCapacityForInstance(CacheInstanceType::kPMEM, 24);
-        cache.SetCapacityForInstance(CacheInstanceType::kSSD, 96);
-        assert_eq!(cache.get_capacity(CacheInstanceType::kDRAM), 8);
-        assert_eq!(cache.get_capacity(CacheInstanceType::kPMEM), 24);
-        assert_eq!(cache.get_capacity(CacheInstanceType::kSSD), 96);
+        cache.SetCapacityForInstance(CacheInstanceType::Dram, 8);
+        cache.SetCapacityForInstance(CacheInstanceType::Pmem, 24);
+        cache.SetCapacityForInstance(CacheInstanceType::Ssd, 96);
+        assert_eq!(cache.get_capacity(CacheInstanceType::Dram), 8);
+        assert_eq!(cache.get_capacity(CacheInstanceType::Pmem), 24);
+        assert_eq!(cache.get_capacity(CacheInstanceType::Ssd), 96);
 
-        cache.SetReplacementPolicyType(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo);
-        cache.SetReplacementPolicyType(CacheInstanceType::kPMEM, CacheReplacementPolicy::Slru);
+        cache.SetReplacementPolicyType(CacheInstanceType::Dram, CacheReplacementPolicy::Fifo);
+        cache.SetReplacementPolicyType(CacheInstanceType::Pmem, CacheReplacementPolicy::Slru);
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Dram),
             CacheReplacementPolicy::Fifo
         );
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kPMEM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Pmem),
             CacheReplacementPolicy::Slru
         );
 
@@ -1162,31 +1195,31 @@ mod tests {
         cache
             .Insert(memory_key.clone(), b"abcd".to_vec(), b"abcd".len())
             .unwrap();
-        assert!(cache.GetUsed(CacheInstanceType::kDRAM) > 0);
+        assert!(cache.GetUsed(CacheInstanceType::Dram) > 0);
         assert!(cache.Size() >= b"abcd".len());
     }
 
     #[test]
-    fn parity_allocator_types_and_stats_match_cache_instance_storage_surface() {
+    fn allocator_types_and_stats_match_cache_instance_storage_surface() {
         assert_eq!(
-            AllocatorType::from_reference_name("kLogBasedAllocator"),
-            AllocatorType::kLogBasedAllocator
+            AllocatorType::from_config_name("kLogBasedAllocator"),
+            AllocatorType::LogBasedAllocator
         );
         assert_eq!(
-            AllocatorType::from_reference_name("pool_based"),
-            AllocatorType::kPoolBasedAllocator
+            AllocatorType::from_config_name("pool_based"),
+            AllocatorType::PoolBasedAllocator
         );
-        assert_eq!(AllocatorType::kJeAllocator.as_reference_name(), "JeAllocator");
+        assert_eq!(AllocatorType::JeAllocator.as_config_name(), "JeAllocator");
 
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         assert_eq!(
             instance.GetAllocatorType(),
-            AllocatorType::kPoolBasedAllocator
+            AllocatorType::PoolBasedAllocator
         );
         assert_eq!(instance.GetAllocatorStats(), AllocatorStats::default());
 
@@ -1206,11 +1239,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_latency_summary_uses_live_cache_metrics() {
+    fn cache_instance_latency_summary_uses_live_cache_metrics() {
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         instance.Put("latency-a", b"abc".to_vec()).unwrap();
@@ -1230,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_allocator_metadata_structs_preserve_chunk_state() {
+    fn allocator_metadata_structs_preserve_chunk_state() {
         let stats = AllocatorStats::new(128, 32);
         assert_eq!(stats.NumAllocatedBytes(), 128);
         assert_eq!(stats.NumFreedBytes(), 32);
@@ -1255,20 +1288,20 @@ mod tests {
     }
 
     #[test]
-    fn parity_allocator_recovery_surface_matches_pmem_and_pool_headers() {
-        assert_eq!(AllocatorType::kLogBasedAllocator as u8, 0);
-        assert_eq!(AllocatorType::kPoolBasedAllocator as u8, 1);
-        assert_eq!(AllocatorType::kJeAllocator as u8, 2);
-        assert_eq!(AllocatorType::kMaxCode as u8, 3);
+    fn allocator_recovery_surface_matches_pmem_and_pool_headers() {
+        assert_eq!(AllocatorType::LogBasedAllocator as u8, 0);
+        assert_eq!(AllocatorType::PoolBasedAllocator as u8, 1);
+        assert_eq!(AllocatorType::JeAllocator as u8, 2);
+        assert_eq!(AllocatorType::MaxCode as u8, 3);
 
-        assert_eq!(FlushPolicy::kNoFlush as u8, 0);
-        assert_eq!(FlushPolicy::kInstantFlush as u8, 1);
-        assert_eq!(FlushPolicy::kMiniBatchFlush as u8, 2);
+        assert_eq!(FlushPolicy::NoFlush as u8, 0);
+        assert_eq!(FlushPolicy::InstantFlush as u8, 1);
+        assert_eq!(FlushPolicy::MiniBatchFlush as u8, 2);
         assert_eq!(
-            FlushPolicy::from_reference_name("kInstantFlush"),
-            FlushPolicy::kInstantFlush
+            FlushPolicy::from_config_name("kInstantFlush"),
+            FlushPolicy::InstantFlush
         );
-        assert_eq!(FlushPolicy::kMiniBatchFlush.as_reference_name(), "MiniBatchFlush");
+        assert_eq!(FlushPolicy::MiniBatchFlush.as_config_name(), "MiniBatchFlush");
 
         let mut recover = PmemRecoverStats::default();
         recover.AddChunkStats(ChunkRecoverStats {
@@ -1312,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_specialized_allocator_aliases_share_common_allocator_surface() {
+    fn specialized_allocator_aliases_share_common_allocator_surface() {
         let mut je = JeAllocator::with_capacity(32);
         let ptr = je.Allocate(8).unwrap();
         assert!(je.Contains(ptr));
@@ -1334,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_je_allocator_enforces_capacity_and_tracks_stats() {
+    fn je_allocator_enforces_capacity_and_tracks_stats() {
         let mut allocator = JeAllocator::with_capacity(4 * 1024);
         let ptr = allocator.Allocate(1024).unwrap();
         assert!(allocator.Contains(ptr));
@@ -1357,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pool_allocator_reuses_fixed_objects_and_tracks_chunks() {
+    fn pool_allocator_reuses_fixed_objects_and_tracks_chunks() {
         let mut allocator = PoolBasedMemoryAllocatorDram::new(
             1 << 28,
             PoolBasedMemoryAllocatorBase::DEFAULT_MAX_THREAD_NUM,
@@ -1386,10 +1419,10 @@ mod tests {
     }
 
     #[test]
-    fn parity_pool_allocator_rebalance_exposes_global_free_list_size() {
+    fn pool_allocator_rebalance_exposes_global_free_list_size() {
         let mut allocator = PoolBasedMemoryAllocatorPMem::pmem(
             "/tmp",
-            FlushPolicy::kNoFlush,
+            FlushPolicy::NoFlush,
             1 << 28,
             PoolBasedMemoryAllocatorBase::DEFAULT_MAX_THREAD_NUM,
             PoolBasedMemoryAllocatorBase::DEFAULT_OBJECT_LEN,
@@ -1415,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_supports_insert_assign_find_and_erase() {
+    fn concurrent_hash_map_supports_insert_assign_find_and_erase() {
         let map = ConcurrentHashMap::<String, i32>::new(2, 4);
         assert!(map.Empty());
         assert_eq!(map.Size(), 0);
@@ -1447,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_honors_capacity_and_shared_clones() {
+    fn concurrent_hash_map_honors_capacity_and_shared_clones() {
         let map = ConcurrentHashMap::<u64, String>::new(1, 1);
         assert!(map.Insert(7, "seven".to_string()).unwrap());
         assert!(matches!(
@@ -1470,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_exposes_at_iterate_and_emplace_surface() {
+    fn concurrent_hash_map_exposes_at_iterate_and_emplace_surface() {
         let map = ConcurrentHashMap::<u64, u64>::new(2, 16);
         assert_eq!(map.At(&20), 0);
         assert_eq!(map.GetOrDefault(&20), 0);
@@ -1497,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_erases_by_entry_and_predicate() {
+    fn concurrent_hash_map_erases_by_entry_and_predicate() {
         let map = ConcurrentHashMap::<String, u64>::new(3, 0);
         assert!(map.Insert("live".to_string(), 10).unwrap());
         assert!(map.Insert("stale".to_string(), 20).unwrap());
@@ -1520,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_returns_iterator_style_insert_results() {
+    fn concurrent_hash_map_returns_iterator_style_insert_results() {
         let map = ConcurrentHashMap::<u64, u64>::new(2, 4);
         let first = map.InsertEntry(1, 10).unwrap();
         assert!(first.second);
@@ -1552,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_hash_map_erases_entries_by_snapshot_predicate() {
+    fn concurrent_hash_map_erases_entries_by_snapshot_predicate() {
         let map = ConcurrentHashMap::<u64, u64>::new(2, 0);
         for key in 0..10 {
             assert!(map.Insert(key, key).unwrap());
@@ -1566,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_hist_stats_reports_percentiles_average_max_and_reset() {
+    fn hist_stats_reports_percentiles_average_max_and_reset() {
         let mut stats = HistStats::with_bucket_size(8);
         for value in [1, 2, 2, 4, 9] {
             stats.Append(value);
@@ -1586,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_hist_stats_merge_preserves_large_latency_tail() {
+    fn hist_stats_merge_preserves_large_latency_tail() {
         let mut left = HistStats::with_bucket_size(4);
         let mut right = HistStats::with_bucket_size(4);
         left.Append(1);
@@ -1603,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_test_instance_helpers_target_exact_cache_tiers() {
+    fn test_instance_helpers_target_exact_cache_tiers() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
             dir.path(),
@@ -1632,7 +1665,7 @@ mod tests {
 
         cache
             .TEST_Insert(
-                CacheInstanceType::kDRAM,
+                CacheInstanceType::Dram,
                 memory_key.clone(),
                 b"dram".to_vec(),
                 b"dram".len(),
@@ -1640,7 +1673,7 @@ mod tests {
             .unwrap();
         cache
             .TEST_Insert(
-                CacheInstanceType::kPMEM,
+                CacheInstanceType::Pmem,
                 pmem_key.clone(),
                 b"pmem".to_vec(),
                 b"pmem".len(),
@@ -1648,7 +1681,7 @@ mod tests {
             .unwrap();
         cache
             .TEST_Insert(
-                CacheInstanceType::kSSD,
+                CacheInstanceType::Ssd,
                 ssd_key.clone(),
                 b"ssd".to_vec(),
                 b"ssd".len(),
@@ -1656,7 +1689,7 @@ mod tests {
             .unwrap();
 
         let memory_handle = cache
-            .TEST_Acquire(CacheInstanceType::kDRAM, &memory_key)
+            .TEST_Acquire(CacheInstanceType::Dram, &memory_key)
             .unwrap()
             .expect("memory handle");
         assert_eq!(memory_handle.tier(), CacheReadTier::Memory);
@@ -1664,7 +1697,7 @@ mod tests {
         cache.Release(memory_handle);
 
         let pmem_handle = cache
-            .TEST_Acquire(CacheInstanceType::kPMEM, &pmem_key)
+            .TEST_Acquire(CacheInstanceType::Pmem, &pmem_key)
             .unwrap()
             .expect("pmem handle");
         assert_eq!(pmem_handle.tier(), CacheReadTier::Pmem);
@@ -1675,7 +1708,7 @@ mod tests {
         assert_eq!(cache.stats().pinned_bytes, 0);
 
         let ssd_handle = cache
-            .TEST_Acquire(CacheInstanceType::kSSD, &ssd_key)
+            .TEST_Acquire(CacheInstanceType::Ssd, &ssd_key)
             .unwrap()
             .expect("ssd handle");
         assert_eq!(ssd_handle.tier(), CacheReadTier::Ssd);
@@ -1686,44 +1719,44 @@ mod tests {
         assert_eq!(cache.stats().pinned_bytes, 0);
 
         assert!(cache
-            .TEST_Acquire(CacheInstanceType::kPMEM, &memory_key)
+            .TEST_Acquire(CacheInstanceType::Pmem, &memory_key)
             .unwrap()
             .is_none());
         assert!(cache
-            .TEST_Acquire(CacheInstanceType::kDRAM, &pmem_key)
+            .TEST_Acquire(CacheInstanceType::Dram, &pmem_key)
             .unwrap()
             .is_none());
 
         cache
-            .TEST_Remove(CacheInstanceType::kPMEM, &pmem_key)
+            .TEST_Remove(CacheInstanceType::Pmem, &pmem_key)
             .unwrap();
         assert!(cache
-            .TEST_Acquire(CacheInstanceType::kPMEM, &pmem_key)
+            .TEST_Acquire(CacheInstanceType::Pmem, &pmem_key)
             .unwrap()
             .is_none());
         assert_eq!(cache.Lookup(&pmem_key).unwrap(), None);
 
         cache
-            .TEST_Remove(CacheInstanceType::kSSD, &ssd_key)
+            .TEST_Remove(CacheInstanceType::Ssd, &ssd_key)
             .unwrap();
         assert!(cache
-            .TEST_Acquire(CacheInstanceType::kSSD, &ssd_key)
+            .TEST_Acquire(CacheInstanceType::Ssd, &ssd_key)
             .unwrap()
             .is_none());
 
         assert!(matches!(
             cache.TEST_Insert(
-                CacheInstanceType::kUnified,
+                CacheInstanceType::Unified,
                 CacheKey::string(44, "bad"),
                 b"bad".to_vec(),
                 3,
             ),
-            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::Unified))
         ));
     }
 
     #[test]
-    fn parity_test_counter_and_path_helpers_match_unified_cache_surface() {
+    fn test_counter_and_path_helpers_match_unified_cache_surface() {
         let ssd_dir = tempfile::tempdir().unwrap();
         let pmem_dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCache(
@@ -1765,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_style_cache_traits_support_abstract_interface_consumers() {
+    fn style_cache_traits_support_abstract_interface_consumers() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
             dram_capacity: 64,
@@ -1785,7 +1818,7 @@ mod tests {
         assert!(cache_api.start_cache());
         assert_eq!(cache_api.capacity_cache(), 64);
         assert_eq!(
-            cache_api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            cache_api.capacity_for_instance_cache(CacheInstanceType::Dram),
             64
         );
         assert_eq!(cache_api.size_cache(), 0);
@@ -1797,10 +1830,10 @@ mod tests {
             Some(b"trait-value".to_vec())
         );
         assert!(cache_api.size_cache() > 0);
-        assert!(cache_api.used_cache(CacheInstanceType::kDRAM) > 0);
-        cache_api.set_capacity_for_instance_cache(CacheInstanceType::kDRAM, 8);
+        assert!(cache_api.used_cache(CacheInstanceType::Dram) > 0);
+        cache_api.set_capacity_for_instance_cache(CacheInstanceType::Dram, 8);
         assert_eq!(
-            cache_api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            cache_api.capacity_for_instance_cache(CacheInstanceType::Dram),
             8
         );
         cache_api.set_capacity_cache(4);
@@ -1820,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_style_builder_can_return_boxed_cache_interface() {
+    fn style_builder_can_return_boxed_cache_interface() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildCacheApi(CacheOptions {
             dram_capacity: 64,
@@ -1837,20 +1870,20 @@ mod tests {
 
         assert_eq!(cache.capacity_cache(), 64);
         assert_eq!(
-            cache.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            cache.capacity_for_instance_cache(CacheInstanceType::Dram),
             64
         );
         cache
             .insert_cache(key.clone(), b"boxed".to_vec(), b"boxed".len())
             .unwrap();
         assert_eq!(cache.lookup_cache(&key).unwrap(), Some(b"boxed".to_vec()));
-        assert!(cache.used_cache(CacheInstanceType::kDRAM) > 0);
+        assert!(cache.used_cache(CacheInstanceType::Dram) > 0);
         cache.reset_cache().unwrap();
         assert_eq!(cache.lookup_cache(&key).unwrap(), None);
     }
 
     #[test]
-    fn parity_style_builder_can_return_boxed_zero_copy_interface() {
+    fn style_builder_can_return_boxed_zero_copy_interface() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCacheApi(CacheOptions {
             dram_capacity: 64,
@@ -1876,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_style_zero_copy_trait_preserves_pin_lifetime() {
+    fn style_zero_copy_trait_preserves_pin_lifetime() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
             dram_capacity: 64,
@@ -1907,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pascal_case_handle_methods_clone_and_scoped_lookup_pin_safely() {
+    fn pascal_case_handle_methods_clone_and_scoped_lookup_pin_safely() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildZeroCopyCache(CacheOptions {
             dram_capacity: 32,
@@ -1982,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_tiered_insert_uses_value_size_for_dram_admission() {
+    fn tiered_insert_uses_value_size_for_dram_admission() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
             dir.path(),
@@ -2014,7 +2047,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_tiered_insert_pinned_uses_value_size_for_dram_handle() {
+    fn tiered_insert_pinned_uses_value_size_for_dram_handle() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
             dir.path(),
@@ -2055,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_options_builder_constructs_equivalent_cache() {
+    fn cache_options_builder_constructs_equivalent_cache() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::build_zero_copy_cache(CacheOptions {
             dram_capacity: 64,
@@ -2109,7 +2142,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_options_helpers_preserve_documented_policy_names() {
+    fn cache_options_helpers_preserve_documented_policy_names() {
         let dir = tempfile::tempdir().unwrap();
         let options = CacheOptions::new(32, 96, 256)
             .with_ssd_paths(vec![dir.path().to_path_buf()])
@@ -2122,31 +2155,31 @@ mod tests {
             .with_ssd_instance_only(false);
 
         assert_eq!(
-            CacheReplacementPolicy::from_reference_name("FIFO"),
+            CacheReplacementPolicy::from_config_name("FIFO"),
             CacheReplacementPolicy::Fifo
         );
         assert_eq!(
-            CacheReplacementPolicy::from_reference_name("SLRU"),
+            CacheReplacementPolicy::from_config_name("SLRU"),
             CacheReplacementPolicy::Slru
         );
         assert_eq!(
-            CacheDataPlacement::from_reference_name("SideBySide"),
+            CacheDataPlacement::from_config_name("SideBySide"),
             CacheDataPlacement::SideBySide
         );
         assert_eq!(
-            CacheDataPlacement::try_from_reference_name("kSideBySide").unwrap(),
+            CacheDataPlacement::try_from_config_name("kSideBySide").unwrap(),
             CacheDataPlacement::SideBySide
         );
         assert_eq!(
-            CacheDataPlacement::try_from_reference_name("Tiered").unwrap(),
+            CacheDataPlacement::try_from_config_name("Tiered").unwrap(),
             CacheDataPlacement::Tiered
         );
         assert_eq!(
-            DRAMPMEMDataPlacementType::try_from_reference_name("kTiered").unwrap(),
-            DRAMPMEMDataPlacementType::kTiered
+            DRAMPMEMDataPlacementType::try_from_config_name("kTiered").unwrap(),
+            DRAMPMEMDataPlacementType::Tiered
         );
         assert!(matches!(
-            CacheDataPlacement::try_from_reference_name("bad-placement"),
+            CacheDataPlacement::try_from_config_name("bad-placement"),
             Err(CacheError::InvalidConfig(_))
         ));
         assert_eq!(options.cache_dram_replacement_policy, "FIFO");
@@ -2176,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_tier_cache_rejects_invalid_placement_config() {
+    fn multi_tier_cache_rejects_invalid_placement_config() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiTierCache::try_new(
             32,
@@ -2228,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pascal_case_builder_factories_match_matrixcache_builder_names() {
+    fn pascal_case_builder_factories_match_matrixcache_builder_names() {
         let cache_dir = tempfile::tempdir().unwrap();
         let zero_copy_dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildCache(CacheOptions {
@@ -2271,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_options_zero_ssd_capacity_disables_ssd_tier() {
+    fn cache_options_zero_ssd_capacity_disables_ssd_tier() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::build_zero_copy_cache(CacheOptions {
             dram_capacity: 64,
@@ -2596,7 +2629,7 @@ mod tests {
         let cache = MultiLayerCache::with_options(options.clone());
         cache
             .test_insert(
-                CacheInstanceType::kPMEM,
+                CacheInstanceType::Pmem,
                 pmem_key.clone(),
                 b"pmem-value".to_vec(),
                 10,
@@ -2604,7 +2637,7 @@ mod tests {
             .unwrap();
         cache
             .test_insert(
-                CacheInstanceType::kSSD,
+                CacheInstanceType::Ssd,
                 ssd_key.clone(),
                 b"ssd-value".to_vec(),
                 9,
@@ -3081,38 +3114,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(64, dir.path());
 
-        assert_eq!(CacheInstanceType::kDRAM as u8, 0);
-        assert_eq!(CacheInstanceType::kPMEM as u8, 1);
-        assert_eq!(CacheInstanceType::kSSD as u8, 2);
-        assert_eq!(CacheInstanceType::kUnified as u8, 3);
-        assert_eq!(DRAMPMEMDataPlacementType::kSideBySide as u8, 0);
-        assert_eq!(DRAMPMEMDataPlacementType::kTiered as u8, 1);
-        assert_eq!(DRAMPMEMDataPlacementType::kMaxCode as u8, 2);
+        assert_eq!(CacheInstanceType::Dram as u8, 0);
+        assert_eq!(CacheInstanceType::Pmem as u8, 1);
+        assert_eq!(CacheInstanceType::Ssd as u8, 2);
+        assert_eq!(CacheInstanceType::Unified as u8, 3);
+        assert_eq!(DRAMPMEMDataPlacementType::SideBySide as u8, 0);
+        assert_eq!(DRAMPMEMDataPlacementType::Tiered as u8, 1);
+        assert_eq!(DRAMPMEMDataPlacementType::MaxCode as u8, 2);
         assert_eq!(
-            DRAMPMEMDataPlacementType::FromReferenceName("kSideBySide"),
-            DRAMPMEMDataPlacementType::kSideBySide
+            DRAMPMEMDataPlacementType::FromConfigName("kSideBySide"),
+            DRAMPMEMDataPlacementType::SideBySide
         );
         assert_eq!(
-            DRAMPMEMDataPlacementType::kTiered.AsCacheDataPlacement(),
+            DRAMPMEMDataPlacementType::Tiered.AsCacheDataPlacement(),
             CacheDataPlacement::Tiered
         );
 
         assert_eq!(cache.data_placement(), CacheDataPlacement::Tiered);
         assert_eq!(
             cache.GetDRAMPMEMDataPlacementType(),
-            DRAMPMEMDataPlacementType::kTiered
+            DRAMPMEMDataPlacementType::Tiered
         );
         cache.set_data_placement(CacheDataPlacement::SideBySide);
         cache.set_data_placement_threshold_bytes(32);
 
         assert_eq!(cache.data_placement(), CacheDataPlacement::SideBySide);
         assert_eq!(
-            cache.reference_data_placement_type(),
-            DRAMPMEMDataPlacementType::kSideBySide
+            cache.config_data_placement_type(),
+            DRAMPMEMDataPlacementType::SideBySide
         );
         assert_eq!(cache.data_placement_threshold_bytes(), 32);
 
-        cache.SetDRAMPMEMDataPlacementType(DRAMPMEMDataPlacementType::kTiered);
+        cache.SetDRAMPMEMDataPlacementType(DRAMPMEMDataPlacementType::Tiered);
         assert_eq!(cache.GetDataPlacementType(), CacheDataPlacement::Tiered);
     }
 
@@ -3257,43 +3290,43 @@ mod tests {
     }
 
     #[test]
-    fn parity_strict_replacement_policy_setter_is_pre_start_only() {
+    fn strict_replacement_policy_setter_is_pre_start_only() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(64, dir.path());
 
         assert!(matches!(
             cache.TrySetReplacementPolicyType(
-                CacheInstanceType::kDRAM,
+                CacheInstanceType::Dram,
                 CacheReplacementPolicy::Fifo
             ),
             Err(CacheError::AlreadyStarted)
         ));
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Dram),
             CacheReplacementPolicy::WeightedHotnessLru
         );
 
         cache.Stop();
         cache
-            .TrySetReplacementPolicyType(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo)
+            .TrySetReplacementPolicyType(CacheInstanceType::Dram, CacheReplacementPolicy::Fifo)
             .unwrap();
         cache
             .try_set_replacement_policy_for_tier(CacheTier::Pmem, CacheReplacementPolicy::Slru)
             .unwrap();
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Dram),
             CacheReplacementPolicy::Fifo
         );
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kPMEM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Pmem),
             CacheReplacementPolicy::Slru
         );
         assert!(matches!(
             cache.TrySetReplacementPolicyType(
-                CacheInstanceType::kUnified,
+                CacheInstanceType::Unified,
                 CacheReplacementPolicy::Fifo
             ),
-            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::Unified))
         ));
 
         assert!(cache.Start());
@@ -3351,27 +3384,27 @@ mod tests {
     }
 
     #[test]
-    fn access_record_type_matches_reference_codes_and_aliases() {
-        assert_eq!(CacheAccessRecordType::Put.reference_code(), 1);
-        assert_eq!(CacheAccessRecordType::Get.ReferenceCode(), 2);
-        assert_eq!(CacheAccessRecordType::Delete.reference_code(), 3);
+    fn access_record_type_matches_config_codes_and_aliases() {
+        assert_eq!(CacheAccessRecordType::Put.config_code(), 1);
+        assert_eq!(CacheAccessRecordType::Get.ConfigCode(), 2);
+        assert_eq!(CacheAccessRecordType::Delete.config_code(), 3);
         assert_eq!(CacheAccessRecordType::kPut, CacheAccessRecordType::Put);
         assert_eq!(AccessRecordType::kGet, CacheAccessRecordType::Get);
-        assert_eq!(AccessRecordType::kDelete.AsReferenceName(), "kDelete");
+        assert_eq!(AccessRecordType::kDelete.AsConfigName(), "kDelete");
         assert_eq!(AccessRecordType::kMaxCode, 4);
         assert_eq!(
-            AccessRecordType::from_reference_code(1),
+            AccessRecordType::from_config_code(1),
             Some(CacheAccessRecordType::Put)
         );
         assert_eq!(
-            AccessRecordType::FromReferenceCode(2),
+            AccessRecordType::FromConfigCode(2),
             Some(CacheAccessRecordType::Get)
         );
         assert_eq!(
-            AccessRecordType::from_reference_code(3),
+            AccessRecordType::from_config_code(3),
             Some(CacheAccessRecordType::Delete)
         );
-        assert_eq!(AccessRecordType::from_reference_code(4), None);
+        assert_eq!(AccessRecordType::from_config_code(4), None);
     }
 
     #[test]
@@ -3397,7 +3430,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_access_record_callback_aliases_register_and_deregister() {
+    fn access_record_callback_aliases_register_and_deregister() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(64, dir.path());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3496,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_eviction_handler_aliases_disable_and_reenable_callback_delivery() {
+    fn eviction_handler_aliases_disable_and_reenable_callback_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(8, dir.path());
         let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3532,18 +3565,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_dram_surface_puts_gets_peeks_deletes_and_resets() {
+    fn cache_instance_dram_surface_puts_gets_peeks_deletes_and_resets() {
         let mut instance = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
-        assert_eq!(instance.StorageEngineType(), StorageEngineType::kDRAM);
-        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::kDRAM);
+        assert_eq!(instance.StorageEngineType(), StorageEngineType::Dram);
+        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::Dram);
         assert_eq!(
             instance.TEST_GetStorageEngineType(),
-            StorageEngineType::kDRAM
+            StorageEngineType::Dram
         );
 
         instance.Start().unwrap();
@@ -3649,11 +3682,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_put_returning_buffer_matches_put_result_surface() {
+    fn cache_instance_put_returning_buffer_matches_put_result_surface() {
         let instance = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
 
@@ -3671,12 +3704,12 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_put_returning_buffer_reports_ssd_tier() {
+    fn cache_instance_put_returning_buffer_reports_ssd_tier() {
         let dir = tempfile::tempdir().unwrap();
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![dir.path().to_path_buf()],
         );
 
@@ -3693,12 +3726,12 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_pmem_surface_uses_exact_pmem_tier() {
+    fn cache_instance_pmem_surface_uses_exact_pmem_tier() {
         let dir = tempfile::tempdir().unwrap();
         let instance = CacheInstance::new(
             32,
-            ReplacementPolicyType::kSLRU,
-            StorageEngineType::kPMEM,
+            ReplacementPolicyType::Slru,
+            StorageEngineType::Pmem,
             vec![dir.path().to_path_buf()],
         );
 
@@ -3717,18 +3750,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_l1_cache_implement_pulls_dram_then_pmem_without_replacement_access() {
+    fn l1_cache_implement_pulls_dram_then_pmem_without_replacement_access() {
         let dram = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         let pmem_dir = tempfile::tempdir().unwrap();
         let pmem = CacheInstance::new(
             64,
-            ReplacementPolicyType::kSLRU,
-            StorageEngineType::kPMEM,
+            ReplacementPolicyType::Slru,
+            StorageEngineType::Pmem,
             vec![pmem_dir.path().to_path_buf()],
         );
         dram.Put("shared", b"dram-value".to_vec()).unwrap();
@@ -3756,11 +3789,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_l1_cache_implement_allows_absent_pmem_instance() {
+    fn l1_cache_implement_allows_absent_pmem_instance() {
         let dram = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         dram.Put("dram-only", b"value".to_vec()).unwrap();
@@ -3780,18 +3813,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_access_tail_and_write_match_arc_flow() {
+    fn l2_cache_policy_access_tail_and_write_match_arc_flow() {
         let dram = CacheInstance::new(
             128,
-            ReplacementPolicyType::kWeightedHotnessLru,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::WeightedHotnessLru,
+            StorageEngineType::Dram,
             vec![],
         );
         let l2_dir = tempfile::tempdir().unwrap();
         let l2 = CacheInstance::new(
             256,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![l2_dir.path().to_path_buf()],
         );
         dram.Put("cold-a", b"alpha".to_vec()).unwrap();
@@ -3841,18 +3874,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_eviction_queue_duplicate_and_overflow_paths() {
+    fn l2_cache_policy_eviction_queue_duplicate_and_overflow_paths() {
         let dram = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             vec![],
         );
         let l2_dir = tempfile::tempdir().unwrap();
         let l2 = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![l2_dir.path().to_path_buf()],
         );
         let l1 = L1CacheImplement::new(dram, None);
@@ -3916,14 +3949,14 @@ mod tests {
     ) -> L2CachePolicy {
         let dram = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             vec![],
         );
         let l2 = CacheInstance::new(
             256,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![l2_dir.to_path_buf()],
         );
         let l1 = L1CacheImplement::new(dram, None);
@@ -3933,7 +3966,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_access_buffering_modes_and_drop_on_full() {
+    fn l2_cache_policy_access_buffering_modes_and_drop_on_full() {
         let dir = tempfile::tempdir().unwrap();
         let mut policy = l2_test_policy(dir.path(), 8, 2, 8, 8);
         policy.Start();
@@ -3962,7 +3995,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_eviction_handler_is_off_by_default() {
+    fn l2_cache_policy_eviction_handler_is_off_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let mut policy = l2_test_policy(dir.path(), 8, 8, 8, 8);
         policy.Start();
@@ -3984,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_poll_paces_passes_by_interval() {
+    fn l2_cache_policy_poll_paces_passes_by_interval() {
         let dir = tempfile::tempdir().unwrap();
         let mut policy = l2_test_policy(dir.path(), 8, 8, 8, 8);
         policy.Start();
@@ -4019,18 +4052,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_factory_uses_reference_default_sizing() {
+    fn l2_cache_policy_factory_uses_config_default_sizing() {
         let dram = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             vec![],
         );
         let l2_dir = tempfile::tempdir().unwrap();
         let l2 = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![l2_dir.path().to_path_buf()],
         );
         let l1 = L1CacheImplement::new(dram, None);
@@ -4048,18 +4081,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_l2_cache_policy_factory_builds_started_policy_surface() {
+    fn l2_cache_policy_factory_builds_started_policy_surface() {
         let dram = CacheInstance::new(
             64,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             vec![],
         );
         let l2_dir = tempfile::tempdir().unwrap();
         let l2 = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![l2_dir.path().to_path_buf()],
         );
         let l1 = L1CacheImplement::new(dram, None);
@@ -4072,17 +4105,17 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_ssd_surface_recovers_persistent_index() {
+    fn cache_instance_ssd_surface_recovers_persistent_index() {
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![dir.path().to_path_buf()];
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kWeightedHotnessLru,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::WeightedHotnessLru,
+            StorageEngineType::Ssd,
             paths.clone(),
         );
-        assert_eq!(instance.StorageEngineType(), StorageEngineType::kSSD);
-        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::kSSD);
+        assert_eq!(instance.StorageEngineType(), StorageEngineType::Ssd);
+        assert_eq!(instance.TEST_GetStorageEngine(), StorageEngineType::Ssd);
         instance.Put("ssd-key", b"ssd-value".to_vec()).unwrap();
         assert_eq!(
             instance.Get("ssd-key").unwrap(),
@@ -4097,8 +4130,8 @@ mod tests {
 
         let restarted = CacheInstance::new(
             128,
-            ReplacementPolicyType::kWeightedHotnessLru,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::WeightedHotnessLru,
+            StorageEngineType::Ssd,
             paths,
         );
         let report = restarted.RecoverData().unwrap();
@@ -4110,12 +4143,12 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_ssd_put_bypass_storage_writes_value() {
+    fn cache_instance_ssd_put_bypass_storage_writes_value() {
         let dir = tempfile::tempdir().unwrap();
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![dir.path().to_path_buf()],
         );
 
@@ -4141,12 +4174,12 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_ssd_update_rewrites_guarded_block() {
+    fn cache_instance_ssd_update_rewrites_guarded_block() {
         let dir = tempfile::tempdir().unwrap();
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![dir.path().to_path_buf()],
         );
 
@@ -4190,11 +4223,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_eviction_and_metric_handlers_follow_status() {
+    fn cache_instance_eviction_and_metric_handlers_follow_status() {
         let instance = CacheInstance::new(
             8,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4230,7 +4263,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_buffer_exposes_key_data_size_and_set_key() {
+    fn cache_buffer_exposes_key_data_size_and_set_key() {
         let mut buffer = StringBuffer::string("hello");
         assert_eq!(buffer.Key(), "");
         buffer.SetKey("buffer-key");
@@ -4249,7 +4282,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_iobuf_buffer_owns_data_and_converts_to_cache_buffer() {
+    fn iobuf_buffer_owns_data_and_converts_to_cache_buffer() {
         let mut buffer = IOBufBuffer::new(b"iobuf-value".to_vec());
         assert_eq!(buffer.Key(), "");
         buffer.SetKey("iobuf-key");
@@ -4265,8 +4298,8 @@ mod tests {
 
         let instance = CacheInstance::new(
             128,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         let inserted = instance.PutBuffer(converted).unwrap();
@@ -4278,9 +4311,9 @@ mod tests {
     }
 
     #[test]
-    fn parity_raw_buffer_exposes_owned_data_reset_and_cache_buffer_conversion() {
+    fn raw_buffer_exposes_owned_data_reset_and_cache_buffer_conversion() {
         let mut raw =
-            RawBuffer::with_storage_engine(b"raw-value".to_vec(), StorageEngineType::kPMEM, true);
+            RawBuffer::with_storage_engine(b"raw-value".to_vec(), StorageEngineType::Pmem, true);
         assert_eq!(raw.Key(), "");
         raw.SetKey("raw-key");
         assert_eq!(raw.Key(), "raw-key");
@@ -4288,7 +4321,7 @@ mod tests {
         assert_eq!(raw.DataPtr(), raw.Data().as_ptr());
         assert_eq!(raw.Value(), b"raw-value");
         assert_eq!(raw.Size(), 9);
-        assert_eq!(raw.storage_engine(), Some(StorageEngineType::kPMEM));
+        assert_eq!(raw.storage_engine(), Some(StorageEngineType::Pmem));
         assert!(raw.async_delete());
 
         let converted: CacheBuffer = raw.into();
@@ -4308,7 +4341,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_string_view_buffer_tracks_key_and_size_without_holding_data() {
+    fn string_view_buffer_tracks_key_and_size_without_holding_data() {
         let mut view = StringViewBuffer::new(4096);
         assert_eq!(view.Key(), "");
         view.SetKey("ssd-view");
@@ -4324,11 +4357,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_accepts_raw_buffer_conversion_for_put_buffer() {
+    fn cache_instance_accepts_raw_buffer_conversion_for_put_buffer() {
         let instance = CacheInstance::new(
             32,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
         let mut raw = RawBuffer::new(b"raw-put".to_vec());
@@ -4344,11 +4377,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_instance_buffer_put_get_and_update_are_guarded() {
+    fn cache_instance_buffer_put_get_and_update_are_guarded() {
         let mut instance = CacheInstance::new(
             32,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kDRAM,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Dram,
             Vec::new(),
         );
 
@@ -4427,7 +4460,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_flexible_cache_wraps_configurable_cache_instance_for_strings() {
+    fn flexible_cache_wraps_configurable_cache_instance_for_strings() {
         let cache = MatrixCacheBuilder::BuildFlexibleCache(
             8,
             "fifo",
@@ -4436,8 +4469,8 @@ mod tests {
             Vec::<PathBuf>::new(),
         );
 
-        assert_eq!(cache.policy(), ReplacementPolicyType::kFIFO);
-        assert_eq!(cache.engine(), StorageEngineType::kDRAM);
+        assert_eq!(cache.policy(), ReplacementPolicyType::Fifo);
+        assert_eq!(cache.engine(), StorageEngineType::Dram);
         assert!(cache.Start());
         cache.Insert("first", "12345678".to_string(), 8).unwrap();
         assert_eq!(cache.Lookup("first").unwrap(), Some("12345678".to_string()));
@@ -4456,7 +4489,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_blockcache_facade_enforces_lifecycle_and_clears_ssd_paths() {
+    fn blockcache_facade_enforces_lifecycle_and_clears_ssd_paths() {
         let dir = tempfile::tempdir().unwrap();
         let ssd_path = dir.path().join("blockcache-ssd");
         fs::create_dir_all(&ssd_path).unwrap();
@@ -4492,7 +4525,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_flexible_cache_uses_selected_ssd_paths_and_recovers() {
+    fn flexible_cache_uses_selected_ssd_paths_and_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().to_string();
         let cache = MatrixCacheBuilder::BuildFlexibleCacheFromPathStrings(
@@ -4503,8 +4536,8 @@ mod tests {
             vec![path.clone()],
         );
 
-        assert_eq!(cache.policy(), ReplacementPolicyType::kWeightedHotnessLru);
-        assert_eq!(cache.engine(), StorageEngineType::kSSD);
+        assert_eq!(cache.policy(), ReplacementPolicyType::WeightedHotnessLru);
+        assert_eq!(cache.engine(), StorageEngineType::Ssd);
         assert_eq!(cache.paths(), &[PathBuf::from(&path)]);
         cache.Insert("ssd-key", "ssd-value".to_string(), 9).unwrap();
         assert_eq!(
@@ -4529,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_cache_instance_persists_and_recovers_from_configured_path() {
+    fn pmem_cache_instance_persists_and_recovers_from_configured_path() {
         let dir = tempfile::tempdir().unwrap();
         let pmem_path = dir.path().join("pmem-device");
         let paths = vec![pmem_path.to_string_lossy().to_string()];
@@ -4540,7 +4573,7 @@ mod tests {
             paths.clone(),
             Vec::<String>::new(),
         );
-        assert_eq!(cache.engine(), StorageEngineType::kPMEM);
+        assert_eq!(cache.engine(), StorageEngineType::Pmem);
         cache.Insert("pmem-a", "value-a".to_string(), 7).unwrap();
         cache.Insert("pmem-b", "value-b".to_string(), 7).unwrap();
         assert_eq!(cache.Lookup("pmem-a").unwrap(), Some("value-a".to_string()));
@@ -4591,14 +4624,14 @@ mod tests {
             .with_auto_recover_on_start(true);
         let cache = MultiLayerCache::try_with_options(options.clone()).unwrap();
         cache
-            .test_insert(CacheInstanceType::kPMEM, key.clone(), b"pmem".to_vec(), 4)
+            .test_insert(CacheInstanceType::Pmem, key.clone(), b"pmem".to_vec(), 4)
             .unwrap();
 
         let restarted = MultiLayerCache::try_with_options(options).unwrap();
         assert_eq!(restarted.peek_tier(&key), Some(CacheReadTier::Pmem));
         assert_eq!(
             restarted
-                .test_acquire(CacheInstanceType::kPMEM, &key)
+                .test_acquire(CacheInstanceType::Pmem, &key)
                 .unwrap()
                 .unwrap()
                 .value(),
@@ -4616,11 +4649,11 @@ mod tests {
         let key = CacheKey::string(7, "general-remove-pmem");
 
         cache
-            .test_insert(CacheInstanceType::kPMEM, key.clone(), b"pmem".to_vec(), 4)
+            .test_insert(CacheInstanceType::Pmem, key.clone(), b"pmem".to_vec(), 4)
             .unwrap();
         assert_eq!(
             cache
-                .test_acquire(CacheInstanceType::kPMEM, &key)
+                .test_acquire(CacheInstanceType::Pmem, &key)
                 .unwrap()
                 .unwrap()
                 .value(),
@@ -4633,13 +4666,13 @@ mod tests {
         let report = restarted.recover_pmem_index().unwrap();
         assert_eq!(report.recovered_files, 0);
         assert!(restarted
-            .test_acquire(CacheInstanceType::kPMEM, &key)
+            .test_acquire(CacheInstanceType::Pmem, &key)
             .unwrap()
             .is_none());
     }
 
     #[test]
-    fn parity_flexible_cache_multi_ssd_uses_all_paths_and_recovers() {
+    fn flexible_cache_multi_ssd_uses_all_paths_and_recovers() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let path_a = dir_a.path().to_string_lossy().to_string();
@@ -4653,7 +4686,7 @@ mod tests {
             paths.clone(),
         );
 
-        assert_eq!(cache.engine(), StorageEngineType::kMultiSSD);
+        assert_eq!(cache.engine(), StorageEngineType::MultiSsd);
         assert_eq!(
             cache.paths(),
             &[PathBuf::from(&path_a), PathBuf::from(&path_b)]
@@ -4720,7 +4753,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_tier_cache_wrapper_builds_unified_cache_from_constructor_knobs() {
+    fn multi_tier_cache_wrapper_builds_unified_cache_from_constructor_knobs() {
         let pmem_dir = tempfile::tempdir().unwrap();
         let ssd_dir = tempfile::tempdir().unwrap();
         let cache = MatrixCacheBuilder::BuildMultiTierCacheFromPathStrings(
@@ -4736,8 +4769,8 @@ mod tests {
             "rocksdb",
         );
 
-        assert_eq!(cache.policy(), ReplacementPolicyType::kFIFO);
-        assert_eq!(cache.ssd_storage_engine(), StorageEngineType::kSSD);
+        assert_eq!(cache.policy(), ReplacementPolicyType::Fifo);
+        assert_eq!(cache.ssd_storage_engine(), StorageEngineType::Ssd);
         assert!(!cache.eviction_enabled());
         assert_eq!(cache.options().dram_capacity, 16);
         assert_eq!(cache.options().pmem_capacity, 32);
@@ -4747,9 +4780,9 @@ mod tests {
             "SideBySide"
         );
         assert_eq!(cache.options().cache_dram_pmem_data_placement_threshold, 8);
-        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kDRAM), 16);
-        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kPMEM), 32);
-        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::kSSD), 128);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::Dram), 16);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::Pmem), 32);
+        assert_eq!(cache.inner().GetCapacity(CacheInstanceType::Ssd), 128);
         assert!(!cache.inner().EvictionHandlerEnabled());
 
         assert!(cache.Start());
@@ -5459,6 +5492,111 @@ mod tests {
         assert_eq!(remaining.iter().filter(|value| value.is_some()).count(), 2);
     }
 
+    /// Every tier's key order has to hold exactly the keys that tier holds.
+    ///
+    /// Victim selection reads the order rather than the tier map, so a key the
+    /// order has lost can never be evicted and a key it lists but the tier no
+    /// longer holds wastes a round of selection. Neither shows up as a wrong
+    /// answer until the cache is under pressure, so this checks the invariant
+    /// directly after a workload that exercises every path that edits it.
+    #[test]
+    fn tier_orders_hold_exactly_the_keys_their_tiers_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 512,
+            pmem_capacity: 512,
+            ssd_capacity: 4096,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+
+        let keys = (0..64)
+            .map(|index| CacheKey::string(0, &format!("order-invariant-{index:04}")))
+            .collect::<Vec<_>>();
+
+        // Fill past capacity so entries evict and demote between tiers.
+        for key in &keys {
+            cache.put(key.clone(), vec![b'z'; 16]).unwrap();
+        }
+        // Reads promote and refill, which rewrites tier membership.
+        for key in keys.iter().step_by(3) {
+            let _ = cache.get(key).unwrap();
+        }
+        // Explicit removals and an invalidation take their own paths.
+        for key in keys.iter().step_by(7) {
+            cache.remove(key).unwrap();
+        }
+        cache.invalidate(&keys[1]).unwrap();
+        cache.invalidate_memory_only(&keys[2]);
+        // A shrink evicts a batch in one pass.
+        cache.set_capacity_for_tier(CacheTier::Memory, 128);
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let order_keys = |order: &CacheKeyOrder| {
+            order.iter().cloned().collect::<std::collections::HashSet<_>>()
+        };
+        assert_eq!(
+            order_keys(&inner.memory_order),
+            inner.memory.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            "memory order and memory tier disagree"
+        );
+        assert_eq!(
+            order_keys(&inner.pmem_order),
+            inner.pmem.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            "pmem order and pmem tier disagree"
+        );
+        assert_eq!(
+            order_keys(&inner.disk_order),
+            inner.disk_index.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            "disk order and disk tier disagree"
+        );
+    }
+
+    /// First-in first-out eviction has to keep going until the tier is back
+    /// under its budget, however many entries that takes.
+    ///
+    /// Selection reads the tier's key order, so a victim that is taken but
+    /// left in that order gets picked again on the next round. The second pick
+    /// frees nothing, the loop reads that as no progress and stops, and the
+    /// tier is left over capacity with one entry removed instead of three.
+    #[test]
+    fn fifo_capacity_shrink_evicts_the_whole_overage_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        // Memory only: a victim with a tier below it is demoted rather than
+        // dropped, and would still read back.
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 40,
+            pmem_capacity: 0,
+            ssd_capacity: 0,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            cache_dram_replacement_policy: "FIFO".to_string(),
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+
+        let keys = (0..5)
+            .map(|index| CacheKey::string(0, &format!("fifo-shrink-{index}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.put(key.clone(), vec![b'x'; 8]).unwrap();
+        }
+        assert_eq!(cache.size_for_tier(CacheTier::Memory), 40);
+
+        // Room for two of the five entries, so three have to go at once.
+        cache.set_capacity_for_tier(CacheTier::Memory, 16);
+
+        assert!(
+            cache.size_for_tier(CacheTier::Memory) <= 16,
+            "tier left over capacity at {} bytes",
+            cache.size_for_tier(CacheTier::Memory)
+        );
+        let remaining = cache.get_batch(&keys).unwrap();
+        assert_eq!(remaining.iter().filter(|value| value.is_some()).count(), 2);
+        // First in, first out: the two survivors are the ones written last.
+        assert!(remaining[3].is_some() && remaining[4].is_some());
+    }
+
     // shared-corpus: storage_cache_refill;
     #[test]
     fn weighted_ssd_eviction_preserves_hot_entries() {
@@ -5827,7 +5965,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_handle_clone_with_cache_matches_reference_explicit_clone_semantics() {
+    fn pinned_handle_clone_with_cache_matches_config_explicit_clone_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(8, dir.path());
         let key = CacheKey::string(1, "clone");
@@ -5918,7 +6056,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_lookup_matches_reference_found_and_auto_release_semantics() {
+    fn scoped_lookup_matches_config_found_and_auto_release_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(16, dir.path());
         let key = CacheKey::string(1, "scoped-lookup");
@@ -6015,7 +6153,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_remove_keeps_removed_pinned_entry_counted_until_release() {
+    fn remove_keeps_removed_pinned_entry_counted_until_release() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(16, dir.path());
         let key = CacheKey::page_with_slot(1, 10, 0, 4, Some(7));
@@ -6362,7 +6500,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_base_lru_list_tracks_mru_and_tail_eviction() {
+    fn base_lru_list_tracks_mru_and_tail_eviction() {
         let mut list = BaseLRUList::new(2);
         list.Put("a".to_string());
         list.Put("b".to_string());
@@ -6379,7 +6517,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_ghost_lru_list_downgrades_data_to_ghost_tail() {
+    fn ghost_lru_list_downgrades_data_to_ghost_tail() {
         let mut list = GhostLRUList::new(1);
         list.Put("hot".to_string());
         list.Put("cold".to_string());
@@ -6396,7 +6534,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_arc_list_promotes_hits_and_keeps_bounded_data_size() {
+    fn arc_list_promotes_hits_and_keeps_bounded_data_size() {
         let mut arc = ArcList::new(2);
         arc.Put("a".to_string());
         arc.Put("b".to_string());
@@ -6418,7 +6556,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_arc_list_hit_on_fetch_data_promotes_to_active() {
+    fn arc_list_hit_on_fetch_data_promotes_to_active() {
         let mut arc = ArcList::new(4);
         arc.Put("a".to_string());
         assert_eq!(arc.GetFetchDataTail(8), vec!["a".to_string()]);
@@ -6432,7 +6570,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_arc_list_ghost_hits_adapt_the_fetch_active_split() {
+    fn arc_list_ghost_hits_adapt_the_fetch_active_split() {
         // Capacity 2 starts split evenly, one slot each side.
         let mut arc = ArcList::new(2);
         assert_eq!(arc.FetchCapacity(), 1);
@@ -6463,7 +6601,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_arc_list_drops_fetch_tail_outright_when_its_ghost_is_empty() {
+    fn arc_list_drops_fetch_tail_outright_when_its_ghost_is_empty() {
         let mut arc = ArcList::new(2);
         arc.Put("a".to_string());
         arc.Put("b".to_string());
@@ -6503,7 +6641,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_arc_exposes_active_and_fetch_tail_surface() {
+    fn replacement_arc_exposes_active_and_fetch_tail_surface() {
         let mut policy = ReplacementArc::new(2);
         assert!(!policy.is_initialized());
         policy.Init().unwrap();
@@ -6528,55 +6666,55 @@ mod tests {
     }
 
     #[test]
-    fn parity_storage_engine_type_preserves_codes_and_aliases() {
+    fn storage_engine_type_preserves_codes_and_aliases() {
         assert_eq!(
-            StorageEngineType::from_reference_name("kDRAMStorageEngine"),
-            StorageEngineType::kDRAM
+            StorageEngineType::from_config_name("kDRAMStorageEngine"),
+            StorageEngineType::Dram
         );
         assert_eq!(
-            StorageEngineType::from_reference_name("kSimpleStorageEngine"),
-            StorageEngineType::kSimple
+            StorageEngineType::from_config_name("kSimpleStorageEngine"),
+            StorageEngineType::Simple
         );
-        assert_eq!(StorageEngineType::kMultiSSD.ReferenceCode(), 4);
+        assert_eq!(StorageEngineType::MultiSsd.ConfigCode(), 4);
         assert_eq!(
-            StorageEngineType::kSimple.AsReferenceEnumName(),
+            StorageEngineType::Simple.AsConfigEnumName(),
             "kSimpleStorageEngine"
         );
         assert_eq!(
-            StorageEngineType::from_reference_name("rocksdb"),
-            StorageEngineType::kSSD
+            StorageEngineType::from_config_name("rocksdb"),
+            StorageEngineType::Ssd
         );
         assert_eq!(
-            StorageEngineType::from_reference_name("kSSDRocksDBStorageEngine"),
-            StorageEngineType::kSSD
+            StorageEngineType::from_config_name("kSSDRocksDBStorageEngine"),
+            StorageEngineType::Ssd
         );
-        assert_eq!(SSDEngineType::kRocksDB as u8, 0);
+        assert_eq!(SSDEngineType::RocksDb as u8, 0);
         assert_eq!(
-            SSDEngineType::FromReferenceName("rocksdb"),
-            SSDEngineType::kRocksDB
+            SSDEngineType::FromConfigName("rocksdb"),
+            SSDEngineType::RocksDb
         );
-        assert_eq!(SSDEngineType::kRocksDB.AsReferenceName(), "RocksDB");
-        assert_eq!(WriteBufferType::kUserDataBuf as u8, 0);
-        assert_eq!(WriteBufferType::kMetaDataBuf as u8, 1);
-        assert_eq!(WriteBufferType::kGCBuf as u8, 2);
-        assert_eq!(WriteBufferType::kCodecDataBuf as u8, 3);
-        assert_eq!(DataType::DATA as u8, 1);
-        assert_eq!(DataType::META_LOG as u8, 2);
-        assert_eq!(GCMode::LOSSY as u8, 1);
-        assert_eq!(GCMode::LOSSLESS as u8, 10);
-        assert_eq!(RecordStateType::kSoftDel as u8, 0x0);
-        assert_eq!(RecordStateType::kNormal as u8, 0x1);
-        assert_eq!(RecordStateType::kPinned as u8, 0x2);
-        assert_eq!(RecordStateType::kMaxCode as u8, 0xf);
+        assert_eq!(SSDEngineType::RocksDb.AsConfigName(), "RocksDB");
+        assert_eq!(WriteBufferType::UserDataBuf as u8, 0);
+        assert_eq!(WriteBufferType::MetaDataBuf as u8, 1);
+        assert_eq!(WriteBufferType::GcBuf as u8, 2);
+        assert_eq!(WriteBufferType::CodecDataBuf as u8, 3);
+        assert_eq!(DataType::Data as u8, 1);
+        assert_eq!(DataType::MetaLog as u8, 2);
+        assert_eq!(GCMode::Lossy as u8, 1);
+        assert_eq!(GCMode::Lossless as u8, 10);
+        assert_eq!(RecordStateType::SoftDel as u8, 0x0);
+        assert_eq!(RecordStateType::Normal as u8, 0x1);
+        assert_eq!(RecordStateType::Pinned as u8, 0x2);
+        assert_eq!(RecordStateType::MaxCode as u8, 0xf);
     }
 
     #[test]
-    fn parity_write_buffer_and_encoder_preserve_layout_size_semantics() {
-        let mut buffer = WriteBuffer::new(WriteBufferType::kUserDataBuf, 128);
+    fn write_buffer_and_encoder_preserve_layout_size_semantics() {
+        let mut buffer = WriteBuffer::new(WriteBufferType::UserDataBuf, 128);
         buffer.PushBack("a", b"one".to_vec());
         buffer.PushBack("bb", b"twotwo".to_vec());
         assert_eq!(buffer.Capacity(), 128);
-        assert_eq!(buffer.BufType(), WriteBufferType::kUserDataBuf);
+        assert_eq!(buffer.BufType(), WriteBufferType::UserDataBuf);
         assert_eq!(buffer.Count(), 2);
         assert_eq!(buffer.KeySize(), 3);
         assert_eq!(buffer.ValueSize(), 9);
@@ -6609,7 +6747,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_mem_storage_crc_is_castagnoli_and_covers_the_length_header() {
+    fn mem_storage_crc_is_castagnoli_and_covers_the_length_header() {
         // Pin the algorithm to its published check value rather than to
         // whatever this implementation happens to emit.
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
@@ -6643,13 +6781,13 @@ mod tests {
     }
 
     #[test]
-    fn parity_mem_storage_layout_round_trips_key_value_and_crc() {
+    fn mem_storage_layout_round_trips_key_value_and_crc() {
         let crc = MemStorage::ComputeCRC("layout-key", b"layout-value");
         let record = MemStorage::DoPutWithCRC("layout-key", b"layout-value", crc).unwrap();
 
         assert_eq!(MemStorage::GetKeyFromData(&record).unwrap(), "layout-key");
         let buffer =
-            MemStorage::CreateCacheBufferFromData(&record, StorageEngineType::kSimple, false)
+            MemStorage::CreateCacheBufferFromData(&record, StorageEngineType::Simple, false)
                 .unwrap();
         assert_eq!(buffer.Key(), "layout-key");
         assert_eq!(buffer.Data(), b"layout-value");
@@ -6657,7 +6795,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_mem_storage_allocator_handle_models_payload_pointer_and_delete() {
+    fn mem_storage_allocator_handle_models_payload_pointer_and_delete() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(256);
         let handle =
             MemStorage::DoPutToAllocator(&mut allocator, "alloc-key", b"alloc-value").unwrap();
@@ -6685,7 +6823,7 @@ mod tests {
         let buffer = MemStorage::CreateCacheBufferFromAllocatorData(
             &allocator,
             handle,
-            StorageEngineType::kSimple,
+            StorageEngineType::Simple,
             false,
         )
         .unwrap();
@@ -6701,7 +6839,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_mem_storage_allocator_path_rejects_corrupt_crc_before_write() {
+    fn mem_storage_allocator_path_rejects_corrupt_crc_before_write() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(256);
         let crc = MemStorage::ComputeCRC("alloc-key", b"alloc-value");
 
@@ -6716,7 +6854,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_mem_storage_allocator_surface_works_for_je_and_pool_allocators() {
+    fn mem_storage_allocator_surface_works_for_je_and_pool_allocators() {
         let mut je = JeAllocator::with_capacity(256);
         let je_handle = MemStorage::DoPutToAllocator(&mut je, "je-key", b"je-value").unwrap();
         assert_eq!(je_handle.PayloadOffset(), MemStorage::HEADER_BYTES);
@@ -6738,7 +6876,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_simple_storage_engine_lifecycle_put_peek_delete_and_recover() {
+    fn simple_storage_engine_lifecycle_put_peek_delete_and_recover() {
         #[derive(Default)]
         struct Collector {
             recovered: Vec<(String, Vec<u8>)>,
@@ -6752,7 +6890,7 @@ mod tests {
 
         let mut engine = StorageEngineSimple::with_capacity(1024);
         assert_eq!(engine.Capacity(), 1024);
-        assert_eq!(engine.StorageEngineType(), StorageEngineType::kSimple);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::Simple);
         engine.SetCapacity(2048);
         assert_eq!(engine.Capacity(), 2048);
         assert!(!engine.is_started());
@@ -6817,7 +6955,7 @@ mod tests {
 
         let mut engine = StorageEngineRocksDB::new(&db_path_str);
         assert_eq!(engine.Path(), db_path_str);
-        assert_eq!(engine.StorageEngineType(), StorageEngineType::kSSD);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::Ssd);
         assert_eq!(
             engine.SsdBackendName(),
             if cfg!(feature = "rocksdb-ssd") {
@@ -6912,7 +7050,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_storage_recover_callback_mock_tracks_last_key_and_count() {
+    fn storage_recover_callback_mock_tracks_last_key_and_count() {
         let mut engine = StorageEngineSimple::with_capacity(1024);
         assert!(engine.Start());
         engine.Put("first", b"111".to_vec()).unwrap();
@@ -6945,7 +7083,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_gc_copy_callback_mock_replaces_buffers_with_guarded_old_data() {
+    fn gc_copy_callback_mock_replaces_buffers_with_guarded_old_data() {
         let mut callback = GCCopyCallbackMock::new();
         let mut old = CacheBuffer::new(b"old-value".to_vec());
         old.SetKey("alpha");
@@ -6984,7 +7122,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_log_allocator_gc_listener_mock_updates_maps_and_frees_old_ptr() {
+    fn log_allocator_gc_listener_mock_updates_maps_and_frees_old_ptr() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
         let old_ptr = allocator.Allocate(8).unwrap();
         let new_ptr = allocator.Allocate(8).unwrap();
@@ -7016,7 +7154,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_recover_listener_dedupes_records_before_callback() {
+    fn pmem_recover_listener_dedupes_records_before_callback() {
         #[derive(Default)]
         struct Collector {
             recovered: Vec<(String, Vec<u8>)>,
@@ -7049,7 +7187,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_storage_test_hooks_put_to_numa_and_report_recover_stats() {
+    fn pmem_storage_test_hooks_put_to_numa_and_report_recover_stats() {
         let mut engine = StorageEnginePMem::with_capacity(1024);
         assert!(engine.Start());
         engine.TEST_JoinPmemWriteExecutor();
@@ -7068,12 +7206,12 @@ mod tests {
     }
 
     #[test]
-    fn parity_ssd_fifo_keeps_insertion_order_when_a_key_is_rewritten() {
+    fn ssd_fifo_keeps_insertion_order_when_a_key_is_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let instance = CacheInstance::new(
             520,
-            ReplacementPolicyType::kFIFO,
-            StorageEngineType::kSSD,
+            ReplacementPolicyType::Fifo,
+            StorageEngineType::Ssd,
             vec![dir.path().to_path_buf()],
         );
         instance.Start().unwrap();
@@ -7102,7 +7240,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_ssd_selects_the_device_with_the_shared_hash() {
+    fn multi_ssd_selects_the_device_with_the_shared_hash() {
         let dir = tempfile::tempdir().unwrap();
         let dev = |name: &str| dir.path().join(name).to_string_lossy().to_string();
         let paths = vec![dev("ssd-a"), dev("ssd-b"), dev("ssd-c")];
@@ -7134,7 +7272,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_ssd_requires_devices_and_hashes_keys_to_storage() {
+    fn multi_ssd_requires_devices_and_hashes_keys_to_storage() {
         let mut empty = StorageEngineMultiSSD::new(Vec::<String>::new(), 1024);
         assert!(!empty.Start());
         assert!(matches!(
@@ -7170,7 +7308,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_multi_ssd_recovers_resets_and_manages_devices() {
+    fn multi_ssd_recovers_resets_and_manages_devices() {
         struct Collector {
             recovered: Vec<(String, Vec<u8>)>,
         }
@@ -7184,7 +7322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dev = |name: &str| dir.path().join(name).to_string_lossy().to_string();
         let mut engine = StorageEngineMultiSSD::new(vec![dev("ssd-a"), dev("ssd-b")], 2048);
-        assert_eq!(engine.StorageEngineType(), StorageEngineType::kMultiSSD);
+        assert_eq!(engine.StorageEngineType(), StorageEngineType::MultiSsd);
         assert!(engine.Start());
         engine.Put("first", b"111".to_vec()).unwrap();
         engine.Put("second", b"222".to_vec()).unwrap();
@@ -7327,26 +7465,26 @@ mod tests {
     #[test]
     fn storage_config_storage_engine_type_conversions() {
         use StorageEngineType::*;
-        for ty in [kDRAM, kPMEM, kSSD, kSimple, kMultiSSD] {
+        for ty in [Dram, Pmem, Ssd, Simple, MultiSsd] {
             // code conversion round-trips, and every variant has a display name
-            assert_eq!(StorageEngineType::from_reference_code(ty.reference_code()), ty);
-            assert!(!ty.as_reference_name().is_empty());
+            assert_eq!(StorageEngineType::from_config_code(ty.config_code()), ty);
+            assert!(!ty.as_config_name().is_empty());
         }
         // recognized name spellings parse to the expected engine
-        assert_eq!(StorageEngineType::from_reference_name("ssd"), kSSD);
-        assert_eq!(StorageEngineType::from_reference_name("kRocksDB"), kSSD);
-        assert_eq!(StorageEngineType::from_reference_name("pmem"), kPMEM);
-        assert_eq!(StorageEngineType::from_reference_name("multi_ssd"), kMultiSSD);
-        assert_eq!(StorageEngineType::from_reference_name("simple"), kSimple);
-        assert_eq!(StorageEngineType::from_reference_name("dram"), kDRAM);
-        assert!(kSSD.is_ssd_like());
-        assert!(kMultiSSD.is_ssd_like());
-        assert!(!kDRAM.is_ssd_like());
-        assert_eq!(kPMEM.canonical_instance_type(), CacheInstanceType::kPMEM);
-        assert_eq!(kDRAM.canonical_instance_type(), CacheInstanceType::kDRAM);
+        assert_eq!(StorageEngineType::from_config_name("ssd"), Ssd);
+        assert_eq!(StorageEngineType::from_config_name("kRocksDB"), Ssd);
+        assert_eq!(StorageEngineType::from_config_name("pmem"), Pmem);
+        assert_eq!(StorageEngineType::from_config_name("multi_ssd"), MultiSsd);
+        assert_eq!(StorageEngineType::from_config_name("simple"), Simple);
+        assert_eq!(StorageEngineType::from_config_name("dram"), Dram);
+        assert!(Ssd.is_ssd_like());
+        assert!(MultiSsd.is_ssd_like());
+        assert!(!Dram.is_ssd_like());
+        assert_eq!(Pmem.canonical_instance_type(), CacheInstanceType::Pmem);
+        assert_eq!(Dram.canonical_instance_type(), CacheInstanceType::Dram);
         // unknown code and name fall back to the default engine
-        assert_eq!(StorageEngineType::from_reference_code(200), kDRAM);
-        assert_eq!(StorageEngineType::from_reference_name("not-a-real-engine"), kDRAM);
+        assert_eq!(StorageEngineType::from_config_code(200), Dram);
+        assert_eq!(StorageEngineType::from_config_name("not-a-real-engine"), Dram);
     }
 
     #[test]
@@ -7373,10 +7511,10 @@ mod tests {
         index.ScanIndexForRecover(|_key, _value| scanned += 1);
         assert!(scanned >= 1);
 
-        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        let mut wb = WriteBuffer::new(WriteBufferType::UserDataBuf, 1024);
         assert_eq!(wb.Capacity(), 1024);
         assert_eq!(wb.Count(), 0);
-        assert_eq!(wb.BufType(), WriteBufferType::kUserDataBuf);
+        assert_eq!(wb.BufType(), WriteBufferType::UserDataBuf);
         wb.PushBack("k1", b"v1".to_vec());
         wb.PushBack("k2", b"v22".to_vec());
         assert_eq!(wb.Count(), 2);
@@ -7390,16 +7528,16 @@ mod tests {
     #[test]
     fn rdma_utils_and_policy_conversions() {
         assert_eq!(
-            RdmaReplacementPolicyType::FIFO.as_replacement_policy_type(),
-            ReplacementPolicyType::kFIFO
+            RdmaReplacementPolicyType::Fifo.as_replacement_policy_type(),
+            ReplacementPolicyType::Fifo
         );
         assert_eq!(
-            RdmaReplacementPolicyType::LRU.as_replacement_policy_type(),
-            ReplacementPolicyType::kLRU
+            RdmaReplacementPolicyType::Lru.as_replacement_policy_type(),
+            ReplacementPolicyType::Lru
         );
         assert_eq!(
-            RdmaReplacementPolicyType::OTHER.as_replacement_policy_type(),
-            ReplacementPolicyType::kMaxCode
+            RdmaReplacementPolicyType::Other.as_replacement_policy_type(),
+            ReplacementPolicyType::MaxCode
         );
 
         let mut generator = RandomStringGenerator::new();
@@ -7419,44 +7557,44 @@ mod tests {
             CacheAccessRecordType::Get,
             CacheAccessRecordType::Delete,
         ] {
-            assert_eq!(CacheAccessRecordType::from_reference_code(ty.reference_code()), Some(ty));
+            assert_eq!(CacheAccessRecordType::from_config_code(ty.config_code()), Some(ty));
         }
-        assert_eq!(CacheAccessRecordType::from_reference_code(0), None);
+        assert_eq!(CacheAccessRecordType::from_config_code(0), None);
         assert_eq!(
-            CacheAccessRecordType::from_reference_code(CacheAccessRecordType::kMaxCode),
+            CacheAccessRecordType::from_config_code(CacheAccessRecordType::kMaxCode),
             None
         );
 
         // CacheDataPlacement name parsing (fallible)
         assert_eq!(
-            CacheDataPlacement::try_from_reference_name("SideBySide").unwrap(),
+            CacheDataPlacement::try_from_config_name("SideBySide").unwrap(),
             CacheDataPlacement::SideBySide
         );
         assert_eq!(
-            CacheDataPlacement::try_from_reference_name("Tiered").unwrap(),
+            CacheDataPlacement::try_from_config_name("Tiered").unwrap(),
             CacheDataPlacement::Tiered
         );
-        assert!(CacheDataPlacement::try_from_reference_name("nonsense").is_err());
+        assert!(CacheDataPlacement::try_from_config_name("nonsense").is_err());
 
         // DRAMPMEMDataPlacementType conversions to/from CacheDataPlacement and names
         assert_eq!(
             DRAMPMEMDataPlacementType::from_cache_data_placement(CacheDataPlacement::SideBySide),
-            DRAMPMEMDataPlacementType::kSideBySide
+            DRAMPMEMDataPlacementType::SideBySide
         );
         assert_eq!(
             DRAMPMEMDataPlacementType::from_cache_data_placement(CacheDataPlacement::Tiered),
-            DRAMPMEMDataPlacementType::kTiered
+            DRAMPMEMDataPlacementType::Tiered
         );
         assert_eq!(
-            DRAMPMEMDataPlacementType::kTiered.as_cache_data_placement(),
+            DRAMPMEMDataPlacementType::Tiered.as_cache_data_placement(),
             CacheDataPlacement::Tiered
         );
         for ty in [
-            DRAMPMEMDataPlacementType::kSideBySide,
-            DRAMPMEMDataPlacementType::kTiered,
-            DRAMPMEMDataPlacementType::kMaxCode,
+            DRAMPMEMDataPlacementType::SideBySide,
+            DRAMPMEMDataPlacementType::Tiered,
+            DRAMPMEMDataPlacementType::MaxCode,
         ] {
-            assert!(!ty.as_reference_name().is_empty());
+            assert!(!ty.as_config_name().is_empty());
         }
     }
 
@@ -7483,8 +7621,8 @@ mod tests {
         cache.put_memory_only(k("mem"), b"m".to_vec());
         assert_eq!(cache.get_memory(&k("mem")), Some(b"m".to_vec()));
 
-        assert!(cache.get_capacity(CacheInstanceType::kDRAM) > 0);
-        let _ = cache.get_used(CacheInstanceType::kDRAM);
+        assert!(cache.get_capacity(CacheInstanceType::Dram) > 0);
+        let _ = cache.get_used(CacheInstanceType::Dram);
     }
 
     #[test]
@@ -7510,8 +7648,8 @@ mod tests {
 
         // introspection is callable
         let _ = cache.used_space_for_tier(CacheTier::Memory);
-        let _ = cache.get_used(CacheInstanceType::kDRAM);
-        let _ = cache.get_replacement_policy_type(CacheInstanceType::kDRAM);
+        let _ = cache.get_used(CacheInstanceType::Dram);
+        let _ = cache.get_replacement_policy_type(CacheInstanceType::Dram);
         let _ = cache.replacement_policy_for_tier(CacheTier::Memory);
 
         cache.reset().unwrap();
@@ -7553,16 +7691,16 @@ mod tests {
         mgr.SetWriteEnabled(false);
         assert!(!mgr.WriteEnabled());
         mgr.Start();
-        let _ = mgr.put(("k1", b"v1".to_vec()), WriteBufferType::kUserDataBuf);
-        let _ = mgr.put(("k2", b"v2".to_vec()), WriteBufferType::kUserDataBuf);
-        let _ = mgr.buffered_count(WriteBufferType::kUserDataBuf);
+        let _ = mgr.put(("k1", b"v1".to_vec()), WriteBufferType::UserDataBuf);
+        let _ = mgr.put(("k2", b"v2".to_vec()), WriteBufferType::UserDataBuf);
+        let _ = mgr.buffered_count(WriteBufferType::UserDataBuf);
         let _ = mgr.FlushBuffers();
         let _ = mgr.flushed_records();
         mgr.Stop();
         let _ = BufferManager::new().capacity_per_buf();
 
         let mut mgr2 = BufferManager::with_config(1024, 0.5, 512);
-        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        let mut wb = WriteBuffer::new(WriteBufferType::UserDataBuf, 1024);
         wb.PushBack("x", b"y".to_vec());
         assert_eq!(mgr2.flush_buffer(wb), 1);
     }
@@ -7631,12 +7769,12 @@ mod tests {
         assert_eq!(decode_colored_ptr(mask_colored_ptr_size(0, 3)).0, 3);
         let _ = MaskColoredPtrLBA(0, 4);
         let _ = MaskColoredPtrMemoryAddress(0, 0x10);
-        let _ = MaskColoredPtrRecordState(0, RecordStateType::kNormal);
-        let _ = mask_colored_ptr_record_state(0, RecordStateType::kPinned);
+        let _ = MaskColoredPtrRecordState(0, RecordStateType::Normal);
+        let _ = mask_colored_ptr_record_state(0, RecordStateType::Pinned);
 
         // BufferEncoder size calculators
         let encoder = BufferEncoder::new(4096);
-        let mut wb = WriteBuffer::new(WriteBufferType::kUserDataBuf, 1024);
+        let mut wb = WriteBuffer::new(WriteBufferType::UserDataBuf, 1024);
         wb.PushBack("k", b"v".to_vec());
         let _ = encoder.calculate_encoded_data_size(&wb);
         let _ = encoder.calculate_encoded_oplog_size(&wb);
@@ -7708,8 +7846,8 @@ mod tests {
 
     #[test]
     fn rdma_storage_engine_ops() {
-        let mut engine = RdmaStorageEngine::new(RdmaStorageEngineType::DRAM, 1 << 20);
-        assert!(matches!(engine.storage_type(), RdmaStorageEngineType::DRAM));
+        let mut engine = RdmaStorageEngine::new(RdmaStorageEngineType::Dram, 1 << 20);
+        assert!(matches!(engine.storage_type(), RdmaStorageEngineType::Dram));
         assert_eq!(engine.capacity(), 1 << 20);
         assert_eq!(engine.used(), 0);
         let ptr = engine.Put(b"key", b"value").expect("rdma put allocates");
@@ -7811,7 +7949,7 @@ mod tests {
         let _ = MatrixCacheBuilder::build_concurrent_simple_lru_cache(1024);
         let _ = MatrixCacheBuilder::build_memcached_wrapper(1024);
 
-        // DRAM-only options avoid needing an on-disk SSD tier
+        // Dram-only options avoid needing an on-disk Ssd tier
         let opts = || CacheOptions::new(1 << 16, 0, 0);
         let cache = MatrixCacheBuilder::build_cache(opts());
         cache.put(CacheKey::string(0, "a"), b"1".to_vec()).unwrap();
@@ -7870,8 +8008,8 @@ mod tests {
             cache.release(h);
         }
 
-        cache.set_capacity_for_instance(CacheInstanceType::kDRAM, 2 << 20);
-        cache.set_replacement_policy_type(CacheInstanceType::kDRAM, CacheReplacementPolicy::Fifo);
+        cache.set_capacity_for_instance(CacheInstanceType::Dram, 2 << 20);
+        cache.set_replacement_policy_type(CacheInstanceType::Dram, CacheReplacementPolicy::Fifo);
         let policy = cache.production_tiering_policy();
         cache.update_production_tiering_policy(policy);
     }
@@ -7890,7 +8028,7 @@ mod tests {
         let mut table = RdmaHashTable::<Vec<u8>>::new(16);
         let key = b"hkey".to_vec();
         assert!(table.Get(&key).addr.is_none());
-        let _ = table.Put(key.clone(), 0x1000, 5, RdmaStorageEngineType::DRAM);
+        let _ = table.Put(key.clone(), 0x1000, 5, RdmaStorageEngineType::Dram);
         let _ = table.Get(&key);
         let _ = table.Del(&key);
         let _ = table.get_bucket(0);
@@ -7898,14 +8036,14 @@ mod tests {
     }
 
     #[test]
-    fn parity_alloc_utils_parse_allocate_persist_thread_ids_and_pmem_files() {
-        assert_eq!(ParseAllocatorType("Log"), AllocatorType::kLogBasedAllocator);
+    fn alloc_utils_parse_allocate_persist_thread_ids_and_pmem_files() {
+        assert_eq!(ParseAllocatorType("Log"), AllocatorType::LogBasedAllocator);
         assert_eq!(
             ParseAllocatorType("Pool"),
-            AllocatorType::kPoolBasedAllocator
+            AllocatorType::PoolBasedAllocator
         );
-        assert_eq!(ParseAllocatorType("Jemalloc"), AllocatorType::kJeAllocator);
-        assert_eq!(ParseAllocatorType("missing"), AllocatorType::kMaxCode);
+        assert_eq!(ParseAllocatorType("Jemalloc"), AllocatorType::JeAllocator);
+        assert_eq!(ParseAllocatorType("missing"), AllocatorType::MaxCode);
 
         let ptr = DramAllocateObject(4096, 4096).unwrap();
         assert_eq!(ptr % 4096, 0);
@@ -7951,7 +8089,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_simple_log_based_allocator_allocates_seals_frees_and_reports_stats() {
+    fn simple_log_based_allocator_allocates_seals_frees_and_reports_stats() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(16);
         let ptr = allocator.Allocate(8).unwrap();
 
@@ -7997,7 +8135,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_simple_log_based_allocator_supports_trait_consumers() {
+    fn simple_log_based_allocator_supports_trait_consumers() {
         fn allocate_and_seal<A: CacheAllocatorApi>(
             allocator: &mut A,
         ) -> Result<AllocatorPtr, CacheError> {
@@ -8019,7 +8157,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_storage_gc_controller_lifecycle_pause_and_force_gc_match_surface() {
+    fn storage_gc_controller_lifecycle_pause_and_force_gc_match_surface() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
         let ptr = allocator.Allocate(8).unwrap();
         allocator.write(ptr, b"gc-ready").unwrap();
@@ -8050,7 +8188,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_storage_gc_controller_poll_paces_collection_checks() {
+    fn storage_gc_controller_poll_paces_collection_checks() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
         let first = allocator.Allocate(8).unwrap();
         allocator.Free(first, 8).unwrap();
@@ -8094,7 +8232,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_storage_gc_controller_respects_enable_gate_and_manual_gc_job() {
+    fn storage_gc_controller_respects_enable_gate_and_manual_gc_job() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
         let ptr_a = allocator.Allocate(4).unwrap();
         let ptr_b = allocator.Allocate(4).unwrap();
@@ -8118,7 +8256,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_executor_reuses_common_and_gc_executors_and_runs_tasks() {
+    fn cache_executor_reuses_common_and_gc_executors_and_runs_tasks() {
         CacheExecutor::DestroyAllExecutors();
         CacheExecutor::Configure(CacheExecutorConfig {
             common_executor_num_threads: 3,
@@ -8148,7 +8286,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_executor_creates_pmem_numa_executors_and_destroy_resets() {
+    fn cache_executor_creates_pmem_numa_executors_and_destroy_resets() {
         CacheExecutor::DestroyAllExecutors();
         CacheExecutor::Configure(CacheExecutorConfig {
             common_executor_num_threads: 1,
@@ -8178,7 +8316,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_async_writer_runs_write_then_callback_and_tracks_counters() {
+    fn async_writer_runs_write_then_callback_and_tracks_counters() {
         let allocator = SimpleLogBasedMemoryAllocator::with_capacity(128);
         let mut writer = AsyncWriter::new(allocator);
 
@@ -8208,7 +8346,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_async_writer_preserves_addr_and_stop_rejects_new_writes() {
+    fn async_writer_preserves_addr_and_stop_rejects_new_writes() {
         let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(128);
         let existing = allocator.Allocate(4).unwrap();
         allocator.write(existing, b"seed").unwrap();
@@ -8251,13 +8389,13 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_dispatcher_round_robins_put_tasks_across_numa_writers() {
+    fn pmem_dispatcher_round_robins_put_tasks_across_numa_writers() {
         let mut dispatcher = PMemDispatcher::new(2, 128);
         assert!(dispatcher.Start());
         assert_eq!(dispatcher.numa_count(), 2);
         assert_eq!(
             dispatcher.allocator_type(),
-            AllocatorType::kLogBasedAllocator
+            AllocatorType::LogBasedAllocator
         );
 
         for (key, value) in [("first", b"one".to_vec()), ("second", b"two".to_vec())] {
@@ -8292,7 +8430,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_dispatcher_routes_addr_tasks_to_owner_numa() {
+    fn pmem_dispatcher_routes_addr_tasks_to_owner_numa() {
         let mut alloc0 = SimpleLogBasedMemoryAllocator::with_capacity_and_base(128, 1 << 48);
         let mut alloc1 = SimpleLogBasedMemoryAllocator::with_capacity_and_base(128, 2 << 48);
         let ptr0 = alloc0.Allocate(4).unwrap();
@@ -8327,7 +8465,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_pmem_dispatcher_supports_test_allocator_access_and_stop() {
+    fn pmem_dispatcher_supports_test_allocator_access_and_stop() {
         let mut dispatcher = PMemDispatcher::new(2, 128);
         dispatcher.Start();
 
@@ -8368,7 +8506,51 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_fifo_evicts_oldest_and_invokes_handler() {
+    fn replacement_policies_stay_usable_after_reset() {
+        // A successful reset empties the index; it does not retire the
+        // policy. Asserting only that the post-reset put reports no
+        // evictions would not catch a regression here, because a policy
+        // that silently discards the buffer reports no evictions too.
+        // Check the buffer actually landed.
+        let mut fifo = ReplacementFIFO::new(1 << 20);
+        fifo.Init().unwrap();
+        fifo.Put(test_buffer("before", b"1"));
+        assert!(fifo.GetUsedSpace() > 0);
+
+        fifo.Reset().unwrap();
+        assert_eq!(fifo.GetUsedSpace(), 0);
+        assert_eq!(fifo.GetItemNum(), 0);
+        assert!(fifo.Get("before").is_none());
+
+        assert!(fifo.Put(test_buffer("after", b"2")).is_empty());
+        assert_eq!(
+            fifo.Peek("after").map(|buffer| buffer.Data().to_vec()),
+            Some(b"2".to_vec()),
+            "a reset fifo must still accept buffers"
+        );
+        assert!(fifo.GetUsedSpace() > 0);
+
+        let mut slru = ReplacementSLRU::new(1 << 20);
+        slru.Init().unwrap();
+        slru.Put(test_buffer("before", b"1"));
+        assert!(slru.GetUsedSpace() > 0);
+
+        slru.Reset().unwrap();
+        assert_eq!(slru.GetUsedSpace(), 0);
+        assert_eq!(slru.GetItemNum(), 0);
+        assert!(slru.Get("before").is_none());
+
+        assert!(slru.Put(test_buffer("after", b"2")).is_empty());
+        assert_eq!(
+            slru.Peek("after").map(|buffer| buffer.Data().to_vec()),
+            Some(b"2".to_vec()),
+            "a reset slru must still accept buffers"
+        );
+        assert!(slru.GetUsedSpace() > 0);
+    }
+
+    #[test]
+    fn replacement_fifo_evicts_oldest_and_invokes_handler() {
         let mut fifo = ReplacementFIFO::new(5);
         fifo.Init().unwrap();
         let evicted_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8393,7 +8575,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_fifo_update_guards_raw_data_and_preserves_order() {
+    fn replacement_fifo_update_guards_raw_data_and_preserves_order() {
         let mut fifo = ReplacementFIFO::new(32);
         fifo.Init().unwrap();
         fifo.Put(test_buffer("guarded", b"old"));
@@ -8413,7 +8595,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_fifo_overwrite_keeps_original_queue_position() {
+    fn replacement_fifo_overwrite_keeps_original_queue_position() {
         let mut fifo = ReplacementFIFO::new(6);
         fifo.Init().unwrap();
         // Three 2-byte entries exactly fill the policy.
@@ -8440,7 +8622,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_fifo_delete_leaves_no_queue_tombstone() {
+    fn replacement_fifo_delete_leaves_no_queue_tombstone() {
         let mut fifo = ReplacementFIFO::new(1 << 12);
         fifo.Init().unwrap();
         for index in 0..256 {
@@ -8466,7 +8648,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_get_records_access_without_reordering() {
+    fn replacement_slru_get_records_access_without_reordering() {
         let mut slru = ReplacementSLRU::with_num_segments(100, 1);
         slru.Init().unwrap();
         slru.TEST_ConfigLRUMaintainer(false);
@@ -8532,7 +8714,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_tracks_hot_warm_cold_and_fetch_flags() {
+    fn replacement_slru_tracks_hot_warm_cold_and_fetch_flags() {
         let mut slru = ReplacementSLRU::new(6);
         slru.Init().unwrap();
         slru.TEST_ConfigLRUMaintainer(false);
@@ -8555,7 +8737,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_update_delete_and_capacity_shrink() {
+    fn replacement_slru_update_delete_and_capacity_shrink() {
         let mut slru = ReplacementSLRU::new(32);
         slru.Init().unwrap();
         slru.Put(test_buffer("x", b"old"));
@@ -8577,7 +8759,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_resolves_segment_count_from_capacity_and_request() {
+    fn replacement_slru_resolves_segment_count_from_capacity_and_request() {
         // A capacity smaller than the segment count collapses to one segment,
         // otherwise every segment would get a zero byte budget.
         assert_eq!(ReplacementSLRU::new(6).num_segments(), 1);
@@ -8603,7 +8785,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_shards_keys_and_bounds_each_segment() {
+    fn replacement_slru_shards_keys_and_bounds_each_segment() {
         let mut slru = ReplacementSLRU::new(1 << 16);
         slru.Init().unwrap();
         assert_eq!(slru.num_segments(), SLRU_DEFAULT_NUM_SEGMENTS);
@@ -8647,7 +8829,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_accounting_survives_overwrite_delete_and_reuse() {
+    fn replacement_slru_accounting_survives_overwrite_delete_and_reuse() {
         let mut slru = ReplacementSLRU::with_num_segments(1 << 14, 4);
         slru.Init().unwrap();
 
@@ -8690,7 +8872,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_maintainer_promotes_active_and_demotes_untouched() {
+    fn replacement_slru_maintainer_promotes_active_and_demotes_untouched() {
         let mut slru = ReplacementSLRU::with_num_segments(100, 1);
         slru.Init().unwrap();
         slru.TEST_ConfigLRUMaintainer(false);
@@ -8744,7 +8926,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_replacement_slru_maintainer_evicts_cold_tail_over_segment_budget() {
+    fn replacement_slru_maintainer_evicts_cold_tail_over_segment_budget() {
         let mut slru = ReplacementSLRU::with_num_segments(40, 1);
         slru.Init().unwrap();
         // Give hot and warm no share of the budget, so every insert is demoted
@@ -8786,7 +8968,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_slru_matches_the_single_threaded_segment_layout() {
+    fn concurrent_slru_matches_the_single_threaded_segment_layout() {
         let concurrent = ConcurrentReplacementSLRU::with_num_segments(1 << 16, 256);
         let single = ReplacementSLRU::with_num_segments(1 << 16, 256);
         assert_eq!(concurrent.num_segments(), single.num_segments());
@@ -8805,7 +8987,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_slru_serves_threads_through_per_segment_locks() {
+    fn concurrent_slru_serves_threads_through_per_segment_locks() {
         let policy = ConcurrentReplacementSLRU::with_num_segments(1 << 16, 64);
         policy.Init().unwrap();
 
@@ -8844,7 +9026,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_slru_reports_evictions_from_every_segment() {
+    fn concurrent_slru_reports_evictions_from_every_segment() {
         let policy = ConcurrentReplacementSLRU::with_num_segments(256, 4);
         policy.Init().unwrap();
         let evicted = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8867,7 +9049,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_concurrent_slru_round_trips_values_and_maintainer_passes() {
+    fn concurrent_slru_round_trips_values_and_maintainer_passes() {
         let policy = ConcurrentReplacementSLRU::with_num_segments(1 << 14, 8);
         policy.Init().unwrap();
         policy.Put(test_buffer("round-trip", b"value"));
@@ -8919,7 +9101,7 @@ mod tests {
 
         // A hit moves the key to the back and never duplicates it, which is
         // what a plain deque needs a full rescan to guarantee.
-        assert!(order.touch(&order_key(0)));
+        assert!(order.move_to_back(&order_key(0)));
         assert_eq!(order.back(), Some(&order_key(0)));
         assert_eq!(order.len(), 4);
         assert_eq!(
@@ -8928,14 +9110,14 @@ mod tests {
         );
 
         // Touching the key that is already most recent is a no-op.
-        assert!(order.touch(&order_key(0)));
+        assert!(order.move_to_back(&order_key(0)));
         assert_eq!(
             order_keys(&order),
             vec![order_key(1), order_key(2), order_key(3), order_key(0)]
         );
 
         // Touching an absent key reports it and changes nothing.
-        assert!(!order.touch(&order_key(99)));
+        assert!(!order.move_to_back(&order_key(99)));
         assert_eq!(order.len(), 4);
 
         // Eviction takes the least recently used first.
@@ -8984,6 +9166,44 @@ mod tests {
 
         let empty = CacheKeyOrder::new();
         assert_eq!(empty.iter_rev().count(), 0);
+    }
+
+    #[test]
+    fn zero_copy_lru_keeps_counting_removed_but_pinned_bytes() {
+        let cache = ZeroCopySimpleLRUCache::new(4 * 64);
+        let key = CacheKey::string(0, "pinned-entry");
+        let handle = cache
+            .InsertPinned(key.clone(), vec![118u8; 32], 64)
+            .unwrap()
+            .expect("pinned handle");
+        assert_eq!(cache.Size(), 64);
+
+        // The entry leaves the index, but a handle still holds the value, so
+        // those bytes are still resident and must keep counting. Releasing
+        // them here would let the cache admit data it has no room for.
+        cache.Remove(&key).unwrap();
+        assert!(cache.Lookup(&key).unwrap().is_none());
+        assert_eq!(
+            cache.Size(),
+            64,
+            "a removed entry that is still pinned must stay accounted"
+        );
+
+        // Dropping the last pin is what actually frees the space.
+        cache.Release(handle);
+        assert_eq!(cache.Size(), 0);
+    }
+
+    #[test]
+    fn zero_copy_lru_frees_removed_bytes_when_no_handle_holds_them() {
+        let cache = ZeroCopySimpleLRUCache::new(4 * 64);
+        let key = CacheKey::string(0, "unpinned-entry");
+        cache.Insert(key.clone(), vec![118u8; 32], 64).unwrap();
+        assert_eq!(cache.Size(), 64);
+
+        // Nothing holds this one, so removal frees it immediately.
+        cache.Remove(&key).unwrap();
+        assert_eq!(cache.Size(), 0);
     }
 
     #[test]
@@ -9052,9 +9272,9 @@ mod tests {
                             deque.retain(|candidate| candidate != &key);
                             deque.push_back(key.clone());
                         }
-                        assert!(order.touch(&key));
+                        assert!(order.move_to_back(&key));
                     } else {
-                        assert!(!order.touch(&key));
+                        assert!(!order.move_to_back(&key));
                     }
                 }
                 3 => {
@@ -9096,7 +9316,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_hash_uint64_matches_matrixcache_vectors() {
+    fn hash_uint64_matches_matrixcache_vectors() {
         assert_eq!(hash_uint64(0), 0x5b03_af84_387a_42c6);
         assert_eq!(hash_uint64(1), 0xa13a_3e40_1240_2345);
         assert_eq!(hash_uint64(2), 0xcd41_43fa_e38a_71fe);
@@ -9106,7 +9326,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_murmur_hash2_matches_matrixcache_vectors() {
+    fn murmur_hash2_matches_matrixcache_vectors() {
         assert_eq!(mur_mur_hash2(b""), 0xca88_1466);
         assert_eq!(mur_mur_hash2(b"a"), 0xe94e_6ebd);
         assert_eq!(mur_mur_hash2(b"abc"), 0x6d5e_3568);
@@ -9131,7 +9351,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_tools_utils_random_and_hashed_key_helpers_match_surface() {
+    fn tools_utils_random_and_hashed_key_helpers_match_surface() {
         assert_eq!(xxh32_with_seed(b"", 0), 0x02cc_5d05);
         assert_eq!(xxh32_with_seed(b"hello", 0), 0xfb00_77f9);
 
@@ -9157,7 +9377,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_round_up_matches_align_util_macro_semantics() {
+    fn round_up_matches_align_util_macro_semantics() {
         assert_eq!(round_up(0, 8), 0);
         assert_eq!(round_up(1, 8), 8);
         assert_eq!(round_up(8, 8), 8);
@@ -9168,7 +9388,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_numa_info_exposes_stable_single_node_topology() {
+    fn numa_info_exposes_stable_single_node_topology() {
         NumaInfo::Init();
         assert!(NumaInfo::GetNumAllCores() >= 1);
         assert!(NumaInfo::GetNumOnlineCores() >= NumaInfo::GetNumAllCores());
@@ -9190,8 +9410,8 @@ mod tests {
         assert_eq!(cache.shard_count(), 4);
         assert_eq!(cache.capacity_for_tier(CacheTier::Memory), 96);
         assert_eq!(cache.CapacityForTier(CacheTier::Ssd), 4096);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kDRAM), 96);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 4096);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Dram), 96);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Ssd), 4096);
         let config_cache = MatrixCacheBuilder::build_sharded_cache(CacheOptions::new(32, 32, 0), 2);
         assert!(config_cache.stop());
         config_cache
@@ -9231,8 +9451,8 @@ mod tests {
         assert!(latency.put_count >= keys.len() as u64);
         assert!(latency.get_count >= keys.len() as u64);
         assert!(latency.histogram_ready);
-        assert!(cache.GetUsed(CacheInstanceType::kDRAM) > 0);
-        assert!(cache.GetUsed(CacheInstanceType::kSSD) > 0);
+        assert!(cache.GetUsed(CacheInstanceType::Dram) > 0);
+        assert!(cache.GetUsed(CacheInstanceType::Ssd) > 0);
 
         let repeated = keys[3].clone();
         let other = keys[7].clone();
@@ -9262,9 +9482,9 @@ mod tests {
             cache.ReplacementPolicyForTier(CacheTier::Memory),
             CacheReplacementPolicy::WeightedHotnessLru
         );
-        cache.SetReplacementPolicyType(CacheInstanceType::kSSD, CacheReplacementPolicy::Fifo);
+        cache.SetReplacementPolicyType(CacheInstanceType::Ssd, CacheReplacementPolicy::Fifo);
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kSSD),
+            cache.GetReplacementPolicyType(CacheInstanceType::Ssd),
             CacheReplacementPolicy::Fifo
         );
         assert_eq!(
@@ -9279,33 +9499,33 @@ mod tests {
         let eviction = cache.EvictionReport();
         assert!(eviction.memory_capacity_evictions > 0);
         assert!(eviction.memory_slot_evictions > 0);
-        cache.SetCapacityForInstance(CacheInstanceType::kSSD, 1024);
-        assert_eq!(cache.GetCapacity(CacheInstanceType::kSSD), 1024);
+        cache.SetCapacityForInstance(CacheInstanceType::Ssd, 1024);
+        assert_eq!(cache.GetCapacity(CacheInstanceType::Ssd), 1024);
 
         cache.SetReplacementPolicyForTier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
         assert_eq!(
-            cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            cache.GetReplacementPolicyType(CacheInstanceType::Dram),
             CacheReplacementPolicy::Fifo
         );
         let running_cache = MatrixCacheBuilder::build_sharded_cache(CacheOptions::new(32, 0, 0), 2);
         running_cache.start().unwrap();
         assert!(matches!(
             running_cache.TrySetReplacementPolicyType(
-                CacheInstanceType::kDRAM,
+                CacheInstanceType::Dram,
                 CacheReplacementPolicy::Fifo,
             ),
             Err(CacheError::AlreadyStarted)
         ));
         assert_eq!(
-            running_cache.GetReplacementPolicyType(CacheInstanceType::kDRAM),
+            running_cache.GetReplacementPolicyType(CacheInstanceType::Dram),
             CacheReplacementPolicy::WeightedHotnessLru
         );
         assert!(matches!(
             cache.TrySetReplacementPolicyType(
-                CacheInstanceType::kUnified,
+                CacheInstanceType::Unified,
                 CacheReplacementPolicy::Fifo,
             ),
-            Err(CacheError::UnsupportedInstance(CacheInstanceType::kUnified))
+            Err(CacheError::UnsupportedInstance(CacheInstanceType::Unified))
         ));
         assert!(matches!(
             cache.TrySetReplacementPolicyForTier(CacheTier::Reject, CacheReplacementPolicy::Fifo),
@@ -9318,11 +9538,11 @@ mod tests {
             2,
         );
         assert_eq!(
-            api.capacity_for_instance_cache(CacheInstanceType::kDRAM),
+            api.capacity_for_instance_cache(CacheInstanceType::Dram),
             64
         );
         assert_eq!(
-            api.capacity_for_instance_cache(CacheInstanceType::kSSD),
+            api.capacity_for_instance_cache(CacheInstanceType::Ssd),
             1024
         );
         let trait_key = CacheKey::string(7, "trait-key");
@@ -9332,9 +9552,9 @@ mod tests {
             api.lookup_cache(&trait_key).unwrap().unwrap(),
             b"trait-value".to_vec()
         );
-        assert!(api.used_cache(CacheInstanceType::kDRAM) > 0);
-        api.set_capacity_for_instance_cache(CacheInstanceType::kDRAM, 8);
-        assert_eq!(api.capacity_for_instance_cache(CacheInstanceType::kDRAM), 8);
+        assert!(api.used_cache(CacheInstanceType::Dram) > 0);
+        api.set_capacity_for_instance_cache(CacheInstanceType::Dram, 8);
+        assert_eq!(api.capacity_for_instance_cache(CacheInstanceType::Dram), 8);
         api.reset_cache().unwrap();
         assert_eq!(api.lookup_cache(&trait_key).unwrap(), None);
 
@@ -9504,7 +9724,7 @@ mod tests {
 
         cache
             .test_insert(
-                CacheInstanceType::kPMEM,
+                CacheInstanceType::Pmem,
                 acquired.clone(),
                 b"pmem".to_vec(),
                 4,
