@@ -5,7 +5,7 @@
 //!
 //! Every policy keeps its keys in intrusive doubly-linked lists over a shared
 //! node arena, so a lookup or a delete unlinks an entry in constant time rather
-//! than rescanning a list of keys. The segmented LRU additionally partitions
+//! than rescanning a list of keys. The segmented Lru additionally partitions
 //! its index and lists into segments, each with its own byte budget, so
 //! eviction only ever walks a segment-local list.
 //!

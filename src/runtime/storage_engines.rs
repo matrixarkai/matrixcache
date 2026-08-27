@@ -81,7 +81,7 @@ impl CacheOptions {
     }
 
     pub fn with_replacement_policy(mut self, policy: CacheReplacementPolicy) -> Self {
-        let name = policy.as_reference_name().to_string();
+        let name = policy.as_config_name().to_string();
         self.cache_dram_replacement_policy = name.clone();
         self.cache_pmem_replacement_policy = name.clone();
         self.cache_ssd_replacement_policy = name;
@@ -93,7 +93,7 @@ impl CacheOptions {
         tier: CacheTier,
         policy: CacheReplacementPolicy,
     ) -> Self {
-        let name = policy.as_reference_name().to_string();
+        let name = policy.as_config_name().to_string();
         match tier {
             CacheTier::Memory => self.cache_dram_replacement_policy = name,
             CacheTier::Pmem => self.cache_pmem_replacement_policy = name,
@@ -108,12 +108,12 @@ impl CacheOptions {
         placement: CacheDataPlacement,
         threshold: usize,
     ) -> Self {
-        self.cache_dram_pmem_data_placement_type = placement.as_reference_name().to_string();
+        self.cache_dram_pmem_data_placement_type = placement.as_config_name().to_string();
         self.cache_dram_pmem_data_placement_threshold = threshold;
         self
     }
 
-    pub fn with_reference_dram_pmem_data_placement(
+    pub fn with_config_dram_pmem_data_placement(
         self,
         placement: DRAMPMEMDataPlacementType,
         threshold: usize,
@@ -127,7 +127,7 @@ impl CacheOptions {
         placement: DRAMPMEMDataPlacementType,
         threshold: usize,
     ) -> Self {
-        self.with_reference_dram_pmem_data_placement(placement, threshold)
+        self.with_config_dram_pmem_data_placement(placement, threshold)
     }
 
     pub fn with_metric_id_prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -171,7 +171,7 @@ impl CacheOptions {
             memory_capacity_bytes: self.dram_capacity,
             pmem_capacity_bytes: self.pmem_capacity,
             ssd_capacity_bytes: self.ssd_capacity,
-            data_placement: CacheDataPlacement::from_reference_name(
+            data_placement: CacheDataPlacement::from_config_name(
                 &self.cache_dram_pmem_data_placement_type,
             ),
             data_placement_threshold_bytes: self.cache_dram_pmem_data_placement_threshold,
@@ -1401,7 +1401,7 @@ impl PmemAllocatorRecoverListenerImpl {
                 continue;
             };
             let buffer =
-                MemStorage::create_cache_buffer_from_data(record, StorageEngineType::kPMEM, true)?;
+                MemStorage::create_cache_buffer_from_data(record, StorageEngineType::Pmem, true)?;
             callback.on_recover_data(&key, buffer);
             valid_records = valid_records.saturating_add(1);
         }
@@ -1464,7 +1464,7 @@ impl StorageEngineSimple {
     }
 
     fn buffer_from_record(&self, record: &[u8]) -> Result<CacheBuffer, CacheError> {
-        MemStorage::create_cache_buffer_from_data(record, StorageEngineType::kSimple, false)
+        MemStorage::create_cache_buffer_from_data(record, StorageEngineType::Simple, false)
     }
 
     pub fn test_get_num_delete_completed_count(&self) -> u32 {
@@ -1634,7 +1634,7 @@ impl StorageEngineApi for StorageEngineSimple {
     }
 
     fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::kSimple
+        StorageEngineType::Simple
     }
 }
 
@@ -2389,7 +2389,7 @@ impl StorageEngineApi for StorageEngineRocksDB {
     }
 
     fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::kSSD
+        StorageEngineType::Ssd
     }
 }
 
@@ -2475,7 +2475,7 @@ pub struct StorageEngineMultiSSD {
 
 impl StorageEngineMultiSSD {
     pub fn new(paths: impl IntoIterator<Item = String>, capacity: u64) -> Self {
-        Self::with_type(paths, capacity, StorageEngineType::kSSD)
+        Self::with_type(paths, capacity, StorageEngineType::Ssd)
     }
 
     pub fn with_paths(paths: impl IntoIterator<Item = PathBuf>, capacity: u64) -> Self {
@@ -2757,7 +2757,7 @@ impl StorageEngineApi for StorageEngineMultiSSD {
     }
 
     fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::kMultiSSD
+        StorageEngineType::MultiSsd
     }
 }
 
@@ -3036,7 +3036,7 @@ impl PMemDispatcher {
             })
             .collect();
         Self {
-            alloc_type: AllocatorType::kLogBasedAllocator,
+            alloc_type: AllocatorType::LogBasedAllocator,
             writers,
             current_numa: 0,
             stopped: true,
@@ -3046,7 +3046,7 @@ impl PMemDispatcher {
     pub fn from_allocators(allocators: Vec<SimpleLogBasedMemoryAllocator>) -> Self {
         let writers = allocators.into_iter().map(AsyncWriter::new).collect();
         Self {
-            alloc_type: AllocatorType::kLogBasedAllocator,
+            alloc_type: AllocatorType::LogBasedAllocator,
             writers,
             current_numa: 0,
             stopped: true,

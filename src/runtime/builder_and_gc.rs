@@ -689,7 +689,7 @@ impl CacheInner {
             }
         }
         self.pmem.clear();
-        self.pmem_fifo_order.clear();
+        self.pmem_order.clear();
         self.pmem_bytes = 0;
         for (key, expected_len) in live {
             report.scanned_files = report.scanned_files.saturating_add(1);
@@ -761,7 +761,7 @@ impl CacheInner {
                 });
             }
             self.disk_index = recovered_index;
-            self.disk_fifo_order = recovered_order.into_iter().collect();
+            self.disk_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             self.stats.disk_bytes = recovered_bytes;
             Ok(report)
@@ -836,7 +836,7 @@ impl CacheInner {
             }
 
             self.disk_index = recovered_index;
-            self.disk_fifo_order = recovered_order.into_iter().collect();
+            self.disk_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             self.stats.disk_bytes = recovered_bytes;
             Ok(report)
@@ -904,28 +904,52 @@ impl CacheInner {
 
     fn record_hit_metadata(&mut self, key: &CacheKey, block_bytes: usize) {
         self.access_epoch = self.access_epoch.saturating_add(1);
-        let block_kind = infer_block_kind(key);
-        let entry = self.metadata.entry(key.clone()).or_insert(CacheEntryMeta {
-            block_kind,
-            routing_slot: extract_routing_slot(key),
-            hotness: initial_hotness(block_kind, block_bytes),
-            hits: 0,
-            last_access_epoch: 0,
-            admission_reason: CacheAdmissionReason::MemoryOnly,
-        });
-        entry.hits = entry.hits.saturating_add(1);
-        let before = entry.hotness;
-        entry.hotness = entry.hotness.saturating_add(1);
-        entry.last_access_epoch = self.access_epoch;
-        if before < self.tiering_policy.memory_hotness_threshold
-            && entry.hotness >= self.tiering_policy.memory_hotness_threshold
-        {
+        let epoch = self.access_epoch;
+        let threshold = self.tiering_policy.memory_hotness_threshold;
+
+        // The hit path runs for every read, so it must not pay for the miss
+        // path. Looking the entry up first keeps the key clone, the block-kind
+        // inference and the routing-slot extraction on the branch that
+        // actually needs them; going through `entry()` did all of that on
+        // every hit and then discarded it.
+        let crossed_threshold = if let Some(entry) = self.metadata.get_mut(key) {
+            entry.hits = entry.hits.saturating_add(1);
+            let before = entry.hotness;
+            entry.hotness = entry.hotness.saturating_add(1);
+            entry.last_access_epoch = epoch;
+            before < threshold && entry.hotness >= threshold
+        } else {
+            let block_kind = infer_block_kind(key);
+            let before = initial_hotness(block_kind, block_bytes);
+            let hotness = before.saturating_add(1);
+            self.metadata.insert(
+                key.clone(),
+                CacheEntryMeta {
+                    block_kind,
+                    routing_slot: extract_routing_slot(key),
+                    hotness,
+                    hits: 1,
+                    last_access_epoch: epoch,
+                    admission_reason: CacheAdmissionReason::MemoryOnly,
+                },
+            );
+            before < threshold && hotness >= threshold
+        };
+
+        if crossed_threshold {
             self.stats.hotness_promotions = self.stats.hotness_promotions.saturating_add(1);
         }
     }
 
     fn record_hit(&mut self, key: &CacheKey, block_bytes: usize) {
         self.record_hit_metadata(key, block_bytes);
+        // Move the entry to the back of each tier's access order. Victim
+        // selection reads the front of that order, so without this an entry
+        // written early stays at the front however often it is read, and is
+        // offered up for eviction on every pass.
+        self.memory_order.touch_access(key);
+        self.pmem_order.touch_access(key);
+        self.disk_order.touch_access(key);
     }
 
     fn put_memory(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
@@ -941,7 +965,7 @@ impl CacheInner {
         if let Some(old) = self.memory.insert(key.clone(), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
         } else {
-            self.memory_fifo_order.push_back_if_absent(key);
+            self.memory_order.push_back_if_absent(key);
         }
         self.memory_bytes += value.len();
         self.evict_memory_to_capacity_since(eviction_started);
@@ -977,7 +1001,7 @@ impl CacheInner {
         if let Some(old) = self.pmem.insert(key.clone(), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
-            self.pmem_fifo_order.push_back_if_absent(key);
+            self.pmem_order.push_back_if_absent(key);
         }
         self.pmem_bytes = self.pmem_bytes.saturating_add(value.len());
         self.evict_pmem_to_capacity_since(eviction_started);
@@ -1021,7 +1045,7 @@ impl CacheInner {
             return false;
         }
         self.disk_index.insert(key.clone(), block_len as u64);
-        self.disk_fifo_order.push_back_if_absent(key.clone());
+        self.disk_order.push_back_if_absent(key.clone());
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
@@ -1079,7 +1103,6 @@ impl CacheInner {
     }
 
     fn evict_memory_to_capacity_since(&mut self, eviction_started: Instant) {
-        let mut victim_keys = Vec::new();
         while self.memory_bytes > self.memory_capacity_bytes {
             let before = self.memory_bytes;
             let Some((victim, reason, pinned_skips)) = self.select_memory_eviction_victim() else {
@@ -1091,11 +1114,14 @@ impl CacheInner {
                 .stats
                 .eviction_pinned_skips
                 .saturating_add(pinned_skips);
+            // Drop the victim from the order as it is taken. Selection reads
+            // that order, so leaving it until after the loop lets the next
+            // round pick the same key, whose bytes are already gone.
+            self.memory_order.remove(&victim);
             let Some(old_value) = self.memory.remove(&victim) else {
-                victim_keys.push(victim);
-                if self.memory_bytes == before {
-                    break;
-                }
+                // A key the order still listed but the tier no longer holds.
+                // It is gone from the order now, so the next round makes
+                // progress rather than picking it again.
                 continue;
             };
             self.memory_bytes = self.memory_bytes.saturating_sub(old_value.len());
@@ -1111,23 +1137,16 @@ impl CacheInner {
             {
                 self.metadata.remove(&victim);
             }
-            victim_keys.push(victim);
             self.record_eviction_latency(eviction_started);
             if self.memory_bytes == before {
                 break;
             }
-        }
-        if !victim_keys.is_empty() {
-            let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-            self.memory_fifo_order
-                .retain(|candidate| !victim_key_set.contains(candidate));
         }
         self.stats.memory_bytes = self.memory_bytes as u64;
         self.refresh_pin_stats();
     }
 
     fn evict_pmem_to_capacity_since(&mut self, eviction_started: Instant) {
-        let mut victim_keys = Vec::new();
         while self.pmem_bytes > self.pmem_capacity_bytes {
             let before = self.pmem_bytes;
             let Some((victim, _reason, pinned_skips)) = self.select_pmem_eviction_victim() else {
@@ -1139,11 +1158,14 @@ impl CacheInner {
                 .stats
                 .pmem_eviction_pinned_skips
                 .saturating_add(pinned_skips);
+            // Drop the victim from the order as it is taken. Selection reads
+            // that order, so leaving it until after the loop lets the next
+            // round pick the same key, whose bytes are already gone.
+            self.pmem_order.remove(&victim);
             let Some(old_value) = self.pmem.remove(&victim) else {
-                victim_keys.push(victim);
-                if self.pmem_bytes == before {
-                    break;
-                }
+                // A key the order still listed but the tier no longer holds.
+                // It is gone from the order now, so the next round makes
+                // progress rather than picking it again.
                 continue;
             };
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old_value.len());
@@ -1158,16 +1180,10 @@ impl CacheInner {
             {
                 self.metadata.remove(&victim);
             }
-            victim_keys.push(victim);
             self.record_eviction_latency(eviction_started);
             if self.pmem_bytes == before {
                 break;
             }
-        }
-        if !victim_keys.is_empty() {
-            let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-            self.pmem_fifo_order
-                .retain(|candidate| !victim_key_set.contains(candidate));
         }
         self.stats.pmem_bytes = self.pmem_bytes as u64;
         self.refresh_pin_stats();
@@ -1197,7 +1213,7 @@ impl CacheInner {
             // Drop the victim from the order as it is taken. Selection reads
             // that order, so leaving it until after the loop lets the next
             // round pick the same key, whose bytes are already gone.
-            self.disk_fifo_order.remove(&victim);
+            self.disk_order.remove(&victim);
             self.record_eviction(CacheTier::Ssd, victim.clone(), evicted_value.clone());
             self.ssd_bytes = self.ssd_bytes.saturating_sub(removed_bytes);
             self.stats.ssd_evictions = self.stats.ssd_evictions.saturating_add(1);
@@ -1218,9 +1234,6 @@ impl CacheInner {
             self.stats.disk_bytes = self.ssd_bytes;
             return;
         }
-        let victim_key_set = victim_keys.iter().cloned().collect::<HashSet<_>>();
-        self.disk_fifo_order
-            .retain(|candidate| !victim_key_set.contains(candidate));
         let _ = self.delete_ssd_blocks(&victim_keys);
         for key in &victim_keys {
             let _ = self.append_disk_manifest_delete(key);
@@ -1231,11 +1244,12 @@ impl CacheInner {
     fn select_memory_eviction_victim(&mut self) -> Option<(CacheKey, EvictionReason, u64)> {
         match self.memory_replacement_policy {
             CacheReplacementPolicy::Fifo => {
-                self.select_fifo_eviction_victim(&self.memory_fifo_order)
+                self.select_fifo_eviction_victim(&self.memory_order)
             }
             CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let keys = self.memory.keys().cloned().collect::<Vec<_>>();
-                self.select_eviction_victim(keys)
+                let picked = self.select_windowed_eviction_victim(&self.memory_order);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
             }
         }
     }
@@ -1243,11 +1257,12 @@ impl CacheInner {
     fn select_pmem_eviction_victim(&mut self) -> Option<(CacheKey, EvictionReason, u64)> {
         match self.pmem_replacement_policy {
             CacheReplacementPolicy::Fifo => {
-                self.select_fifo_eviction_victim(&self.pmem_fifo_order)
+                self.select_fifo_eviction_victim(&self.pmem_order)
             }
             CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let keys = self.pmem.keys().cloned().collect::<Vec<_>>();
-                self.select_eviction_victim(keys)
+                let picked = self.select_windowed_eviction_victim(&self.pmem_order);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
             }
         }
     }
@@ -1255,11 +1270,12 @@ impl CacheInner {
     fn select_ssd_eviction_victim(&mut self) -> Option<(CacheKey, EvictionReason, u64)> {
         match self.ssd_replacement_policy {
             CacheReplacementPolicy::Fifo => {
-                self.select_fifo_eviction_victim(&self.disk_fifo_order)
+                self.select_fifo_eviction_victim(&self.disk_order)
             }
             CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let keys = self.disk_index.keys().cloned().collect::<Vec<_>>();
-                self.select_eviction_victim(keys)
+                let picked = self.select_windowed_eviction_victim(&self.disk_order);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
             }
         }
     }
@@ -1279,29 +1295,60 @@ impl CacheInner {
         None
     }
 
-    fn select_eviction_victim<I>(&mut self, keys: I) -> Option<(CacheKey, EvictionReason, u64)>
-    where
-        I: IntoIterator<Item = CacheKey>,
-    {
-        let mut pinned_skips = 0u64;
-        let mut groups: HashMap<String, SlotEvictionGroup> = HashMap::new();
-        for key in keys {
-            if self.pinned.contains_key(&key) {
-                pinned_skips = pinned_skips.saturating_add(1);
-                continue;
-            }
-            let score = self.eviction_score(&key);
-            let group_key = self.eviction_group_key(&key);
-            groups
-                .entry(group_key)
-                .and_modify(|group| group.observe(key.clone(), score))
-                .or_insert_with(|| SlotEvictionGroup::new(key, score));
+    /// Weigh a bounded window of `order`, least recently accessed first.
+    ///
+    /// Falls back to the whole tier when the window turns up nothing
+    /// evictable, so a run of pinned entries at the front of the order cannot
+    /// stall eviction while unpinned entries sit further back. A tier holding
+    /// no more than the window weighs everything either way, so its victim is
+    /// exactly the one it would have picked before the window existed.
+    fn select_windowed_eviction_victim(&self, order: &CacheKeyOrder) -> PickedEvictionVictim {
+        let windowed =
+            self.select_eviction_victim(order.iter_access().take(EVICTION_CANDIDATE_WINDOW));
+        if windowed.victim.is_some() || order.len() <= EVICTION_CANDIDATE_WINDOW {
+            return windowed;
         }
+        let full = self.select_eviction_victim(order.iter_access());
+        PickedEvictionVictim {
+            victim: full.victim,
+            groups_weighed: windowed
+                .groups_weighed
+                .saturating_add(full.groups_weighed),
+        }
+    }
+
+    fn record_sampled_groups(&mut self, groups: usize) {
         self.stats.eviction_sampled_groups = self
             .stats
             .eviction_sampled_groups
-            .saturating_add(groups.len() as u64);
-        groups
+            .saturating_add(groups as u64);
+    }
+
+    /// Weigh `keys` and return the coldest group's coldest member.
+    ///
+    /// Borrows the keys rather than taking them by value: the caller passes the
+    /// tier's own map keys straight in, so a selection no longer starts by
+    /// cloning every key in the tier.
+    fn select_eviction_victim<'a, I>(&self, keys: I) -> PickedEvictionVictim
+    where
+        I: IntoIterator<Item = &'a CacheKey>,
+    {
+        let mut pinned_skips = 0u64;
+        let mut groups: HashMap<EvictionGroupKey<'a>, SlotEvictionGroup> = HashMap::new();
+        for key in keys {
+            if self.pinned.contains_key(key) {
+                pinned_skips = pinned_skips.saturating_add(1);
+                continue;
+            }
+            let score = self.eviction_score(key);
+            let group_key = self.eviction_group_key(key);
+            groups
+                .entry(group_key)
+                .and_modify(|group| group.observe(key, score))
+                .or_insert_with(|| SlotEvictionGroup::new(key, score));
+        }
+        let group_count = groups.len();
+        let victim = groups
             .into_values()
             .min_by(|left, right| {
                 left.group_score
@@ -1315,7 +1362,11 @@ impl CacheInner {
                     eviction_reason_for(group.victim_score),
                     pinned_skips,
                 )
-            })
+            });
+        PickedEvictionVictim {
+            victim,
+            groups_weighed: group_count,
+        }
     }
 
     fn eviction_score(&self, key: &CacheKey) -> EvictionScore {
@@ -1348,10 +1399,11 @@ impl CacheInner {
         let incoming_group = request
             .routing_slot
             .or_else(|| extract_routing_slot(key))
-            .map(|slot| format!("slot:{slot}"))
-            .unwrap_or_else(|| format!("object:{}:{}", key.namespace, key.record_key));
-        self.disk_index
-            .keys()
+            .map(EvictionGroupKey::Slot)
+            .unwrap_or(EvictionGroupKey::Object(&key.namespace, &key.record_key));
+        self.disk_order
+            .iter()
+            .take(EVICTION_CANDIDATE_WINDOW)
             .filter(|candidate| self.eviction_group_key(candidate) != incoming_group)
             .map(|candidate| self.eviction_score(candidate))
             .min()
@@ -1359,13 +1411,13 @@ impl CacheInner {
             .unwrap_or(false)
     }
 
-    fn eviction_group_key(&self, key: &CacheKey) -> String {
+    fn eviction_group_key<'a>(&self, key: &'a CacheKey) -> EvictionGroupKey<'a> {
         self.metadata
             .get(key)
             .and_then(|meta| meta.routing_slot)
             .or_else(|| extract_routing_slot(key))
-            .map(|slot| format!("slot:{slot}"))
-            .unwrap_or_else(|| format!("object:{}:{}", key.namespace, key.record_key))
+            .map(EvictionGroupKey::Slot)
+            .unwrap_or(EvictionGroupKey::Object(&key.namespace, &key.record_key))
     }
 
     fn record_memory_eviction_reason(&mut self, reason: EvictionReason) {
@@ -1452,7 +1504,7 @@ impl CacheInner {
                 removed_pinned_bytes = removed_pinned_bytes.max(value.len());
                 self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
             }
-            self.memory_fifo_order.remove(key);
+            self.memory_order.remove(key);
             if remove_disk {
                 let disk_bytes = self.disk_index.remove(key).unwrap_or_default();
                 removed_pinned_bytes = removed_pinned_bytes.max(
@@ -1479,7 +1531,7 @@ impl CacheInner {
             if remove_disk {
                 let _ = self.persist_pmem_delete(key);
             }
-            self.pmem_fifo_order.remove(key);
+            self.pmem_order.remove(key);
             self.metadata.remove(key);
             if key_pinned && removed_pinned_bytes > 0 {
                 self.pinned_removed_bytes
@@ -1493,11 +1545,11 @@ impl CacheInner {
         if remove_disk {
             match key_set.as_ref() {
                 Some(key_set) => {
-                    self.disk_fifo_order
+                    self.disk_order
                         .retain(|candidate| !key_set.contains(candidate));
                 }
                 None => {
-                    self.disk_fifo_order
+                    self.disk_order
                         .retain(|candidate| !keys.contains(candidate));
                 }
             }
@@ -1515,9 +1567,9 @@ impl CacheInner {
         self.pmem.clear();
         self.clear_pmem_persistence()?;
         self.disk_index.clear();
-        self.disk_fifo_order.clear();
-        self.memory_fifo_order.clear();
-        self.pmem_fifo_order.clear();
+        self.disk_order.clear();
+        self.memory_order.clear();
+        self.pmem_order.clear();
         self.pinned.clear();
         self.pinned_handle_bytes.clear();
         self.pinned_removed_bytes.clear();
@@ -1625,7 +1677,11 @@ impl CacheInner {
     }
 
     fn record_get_latency(&mut self, started: Instant) {
-        let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let micros = elapsed_micros(started);
+        self.record_get_latency_micros(micros);
+    }
+
+    fn record_get_latency_micros(&mut self, micros: u64) {
         self.stats.get_latency_samples = self.stats.get_latency_samples.saturating_add(1);
         self.stats.get_latency_total_micros =
             self.stats.get_latency_total_micros.saturating_add(micros);
@@ -1661,7 +1717,11 @@ impl CacheInner {
     }
 
     fn record_read_through_latency(&mut self, started: Instant) {
-        let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let micros = elapsed_micros(started);
+        self.record_read_through_latency_micros(micros);
+    }
+
+    fn record_read_through_latency_micros(&mut self, micros: u64) {
         observe_latency_bucket(
             micros,
             &mut self.stats.read_through_latency_samples,
@@ -1781,6 +1841,16 @@ fn infer_block_kind(key: &CacheKey) -> CacheBlockKind {
     }
 }
 
+/// How many candidates victim selection weighs before it settles.
+///
+/// Selection used to weigh every resident entry, so a cache sitting at
+/// capacity paid a cost proportional to how much it held on every single
+/// write. Weighing a bounded window of the oldest-resident entries instead
+/// keeps that cost flat as the cache grows. The window is wider than the
+/// working set of a small cache, so those keep weighing everything and choose
+/// exactly what they chose before.
+const EVICTION_CANDIDATE_WINDOW: usize = 512;
+
 fn eviction_reason_for(score: EvictionScore) -> EvictionReason {
     if score.hotness == 0 {
         EvictionReason::Cold
@@ -1872,4 +1942,9 @@ fn unique_temp_path(kind: &str) -> PathBuf {
         "temporalstore-rust-{kind}-{}-{nanos}-{counter}",
         std::process::id()
     ))
+}
+
+/// Microseconds since , saturating rather than wrapping.
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }

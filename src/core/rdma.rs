@@ -92,25 +92,35 @@ pub const CRC_LEN: usize = RDMA_CRC_LEN;
 pub const FAIL_ALLOC: i32 = RDMA_FAIL_ALLOC;
 #[allow(non_upper_case_globals)]
 pub const CRC_MISMATCH: i32 = RDMA_CRC_MISMATCH;
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RdmaStorageEngineType {
     #[default]
-    DRAM = 0,
-    PMEM = 1,
-    SSD = 2,
-    INVALID = 3,
+    #[serde(alias = "DRAM")]
+    Dram = 0,
+    #[serde(alias = "PMEM")]
+    Pmem = 1,
+    #[serde(alias = "SSD")]
+    Ssd = 2,
+    #[serde(alias = "INVALID")]
+    Invalid = 3,
+}
+
+#[allow(non_upper_case_globals)]
+impl RdmaStorageEngineType {
+    pub const DRAM: Self = Self::Dram;
+    pub const PMEM: Self = Self::Pmem;
+    pub const SSD: Self = Self::Ssd;
+    pub const INVALID: Self = Self::Invalid;
 }
 
 impl RdmaStorageEngineType {
     pub fn from_code(code: u8) -> Self {
         match code {
-            0 => Self::DRAM,
-            1 => Self::PMEM,
-            2 => Self::SSD,
-            _ => Self::INVALID,
+            0 => Self::Dram,
+            1 => Self::Pmem,
+            2 => Self::Ssd,
+            _ => Self::Invalid,
         }
     }
 
@@ -731,7 +741,7 @@ where
                 continue;
             }
             let entry = &self.entries[pos];
-            let signature_match = if entry.get_storage_engine_type() == RdmaStorageEngineType::SSD {
+            let signature_match = if entry.get_storage_engine_type() == RdmaStorageEngineType::Ssd {
                 &entry.signature == sig128
             } else {
                 &entry.get_signature_96b() == sig96
@@ -802,7 +812,7 @@ where
             return RdmaHashTableGet {
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::INVALID,
+                storage_type: RdmaStorageEngineType::Invalid,
             };
         }
         let entry = &bucket.entries[pos as usize];
@@ -836,7 +846,7 @@ where
                 status: RDMA_BUCKET_LOCKED,
                 old_addr: None,
                 old_len: 0,
-                old_type: RdmaStorageEngineType::INVALID,
+                old_type: RdmaStorageEngineType::Invalid,
             };
         }
         let sig96 = signature_96(&key, bucket_pos as u64);
@@ -845,7 +855,7 @@ where
         let block_size = kv_size.saturating_add(RDMA_DATA_HEADER + RDMA_CRC_LEN);
         let mut old_addr = None;
         let mut old_len = 0;
-        let mut old_type = RdmaStorageEngineType::INVALID;
+        let mut old_type = RdmaStorageEngineType::Invalid;
         let pos = if existing >= 0 {
             let pos = existing as usize;
             let old = &bucket.entries[pos];
@@ -867,7 +877,7 @@ where
         };
 
         let entry = &mut bucket.entries[pos];
-        if storage_type == RdmaStorageEngineType::SSD {
+        if storage_type == RdmaStorageEngineType::Ssd {
             entry.set_signature_128(sig128);
         } else {
             entry.set_signature_96(sig96);
@@ -903,7 +913,7 @@ where
                 status: RDMA_BUCKET_LOCKED,
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::INVALID,
+                storage_type: RdmaStorageEngineType::Invalid,
             };
         }
         let sig96 = signature_96(key, bucket_pos as u64);
@@ -915,7 +925,7 @@ where
                 status: RDMA_NOT_FOUND,
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::INVALID,
+                storage_type: RdmaStorageEngineType::Invalid,
             };
         }
         let entry = bucket.entries[pos as usize].clone();
@@ -1045,10 +1055,10 @@ pub struct RdmaStorageEngine {
 impl RdmaStorageEngine {
     pub fn new(storage_type: RdmaStorageEngineType, capacity: usize) -> Self {
         let base = match storage_type {
-            RdmaStorageEngineType::DRAM => 0x0100_0000,
-            RdmaStorageEngineType::PMEM => 0x0200_0000,
-            RdmaStorageEngineType::SSD => 0x0300_0000,
-            RdmaStorageEngineType::INVALID => 0x0400_0000,
+            RdmaStorageEngineType::Dram => 0x0100_0000,
+            RdmaStorageEngineType::Pmem => 0x0200_0000,
+            RdmaStorageEngineType::Ssd => 0x0300_0000,
+            RdmaStorageEngineType::Invalid => 0x0400_0000,
         };
         Self {
             storage_type,
@@ -1160,7 +1170,7 @@ pub struct RdmaStorageEngineDram {
 impl RdmaStorageEngineDram {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::DRAM, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Dram, capacity),
         }
     }
 
@@ -1225,7 +1235,7 @@ pub struct RdmaStorageEnginePMem {
 impl RdmaStorageEnginePMem {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::PMEM, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Pmem, capacity),
         }
     }
 
@@ -1300,7 +1310,7 @@ pub struct RdmaStorageEngineSSD {
 impl RdmaStorageEngineSSD {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::SSD, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Ssd, capacity),
         }
     }
 
@@ -1361,18 +1371,28 @@ impl RdmaStorageEngineSSD {
 #[derive(Default)]
 pub enum RdmaReplacementPolicyType {
     #[default]
-    FIFO = 0,
-    LRU = 1,
-    OTHER = 2,
+    #[serde(alias = "FIFO")]
+    Fifo = 0,
+    #[serde(alias = "LRU")]
+    Lru = 1,
+    #[serde(alias = "OTHER")]
+    Other = 2,
+}
+
+#[allow(non_upper_case_globals)]
+impl RdmaReplacementPolicyType {
+    pub const FIFO: Self = Self::Fifo;
+    pub const LRU: Self = Self::Lru;
+    pub const OTHER: Self = Self::Other;
 }
 
 
 impl RdmaReplacementPolicyType {
     pub fn as_replacement_policy_type(self) -> ReplacementPolicyType {
         match self {
-            Self::FIFO => ReplacementPolicyType::kFIFO,
-            Self::LRU => ReplacementPolicyType::kLRU,
-            Self::OTHER => ReplacementPolicyType::kMaxCode,
+            Self::Fifo => ReplacementPolicyType::Fifo,
+            Self::Lru => ReplacementPolicyType::Lru,
+            Self::Other => ReplacementPolicyType::MaxCode,
         }
     }
 }
@@ -1403,7 +1423,7 @@ impl RDMACache {
     }
 
     pub fn with_dram_capacity(dram_capacity: usize) -> Self {
-        Self::new(dram_capacity, 0, 0, RdmaReplacementPolicyType::FIFO)
+        Self::new(dram_capacity, 0, 0, RdmaReplacementPolicyType::Fifo)
     }
 
     pub fn lookup(&self, key: &[u8], response: &mut RDMAResponse) -> i32 {
@@ -1413,22 +1433,22 @@ impl RDMACache {
             return RDMA_NOT_FOUND;
         };
         match index.storage_type {
-            RdmaStorageEngineType::DRAM => {
+            RdmaStorageEngineType::Dram => {
                 self.dram_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::PMEM => {
+            RdmaStorageEngineType::Pmem => {
                 self.pmem_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::SSD => {
+            RdmaStorageEngineType::Ssd => {
                 self.ssd_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::INVALID => RDMA_NOT_FOUND,
+            RdmaStorageEngineType::Invalid => RDMA_NOT_FOUND,
         }
     }
 
@@ -1438,7 +1458,7 @@ impl RDMACache {
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> i32 {
-        self.insert_to_storage(RdmaStorageEngineType::DRAM, key, value)
+        self.insert_to_storage(RdmaStorageEngineType::Dram, key, value)
     }
 
     #[allow(non_snake_case)]
@@ -1503,19 +1523,19 @@ impl RDMACache {
 
     pub fn get_capacity(&self, storage_type: RdmaStorageEngineType) -> usize {
         match storage_type {
-            RdmaStorageEngineType::DRAM => self
+            RdmaStorageEngineType::Dram => self
                 .dram_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::PMEM => self
+            RdmaStorageEngineType::Pmem => self
                 .pmem_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::SSD => self
+            RdmaStorageEngineType::Ssd => self
                 .ssd_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::INVALID => 0,
+            RdmaStorageEngineType::Invalid => 0,
         }
     }
 
@@ -1526,16 +1546,16 @@ impl RDMACache {
 
     pub fn init_storage_engine(&mut self, storage_type: RdmaStorageEngineType, capacity: usize) {
         match storage_type {
-            RdmaStorageEngineType::DRAM => {
+            RdmaStorageEngineType::Dram => {
                 self.dram_engine = Some(RdmaStorageEngineDram::new(capacity));
             }
-            RdmaStorageEngineType::PMEM => {
+            RdmaStorageEngineType::Pmem => {
                 self.pmem_engine = Some(RdmaStorageEnginePMem::new(capacity));
             }
-            RdmaStorageEngineType::SSD => {
+            RdmaStorageEngineType::Ssd => {
                 self.ssd_engine = Some(RdmaStorageEngineSSD::new(capacity));
             }
-            RdmaStorageEngineType::INVALID => {}
+            RdmaStorageEngineType::Invalid => {}
         }
     }
 
@@ -1571,14 +1591,14 @@ impl RDMACache {
         storage_type: RdmaStorageEngineType,
     ) -> Option<(usize, usize, usize)> {
         match storage_type {
-            RdmaStorageEngineType::DRAM => {
+            RdmaStorageEngineType::Dram => {
                 self.dram_engine.as_ref().map(RdmaStorageEngineDram::stats)
             }
-            RdmaStorageEngineType::PMEM => {
+            RdmaStorageEngineType::Pmem => {
                 self.pmem_engine.as_ref().map(RdmaStorageEnginePMem::stats)
             }
-            RdmaStorageEngineType::SSD => self.ssd_engine.as_ref().map(RdmaStorageEngineSSD::stats),
-            RdmaStorageEngineType::INVALID => None,
+            RdmaStorageEngineType::Ssd => self.ssd_engine.as_ref().map(RdmaStorageEngineSSD::stats),
+            RdmaStorageEngineType::Invalid => None,
         }
     }
 
@@ -1589,10 +1609,10 @@ impl RDMACache {
         value: &[u8],
     ) -> Option<AllocatorPtr> {
         match storage_type {
-            RdmaStorageEngineType::DRAM => self.dram_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::PMEM => self.pmem_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::SSD => self.ssd_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::INVALID => None,
+            RdmaStorageEngineType::Dram => self.dram_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineType::Pmem => self.pmem_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineType::Ssd => self.ssd_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineType::Invalid => None,
         }
     }
 
@@ -1603,19 +1623,19 @@ impl RDMACache {
         len: usize,
     ) -> i32 {
         match storage_type {
-            RdmaStorageEngineType::DRAM => self
+            RdmaStorageEngineType::Dram => self
                 .dram_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::PMEM => self
+            RdmaStorageEngineType::Pmem => self
                 .pmem_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::SSD => self
+            RdmaStorageEngineType::Ssd => self
                 .ssd_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::INVALID => RDMA_NOT_FOUND,
+            RdmaStorageEngineType::Invalid => RDMA_NOT_FOUND,
         }
     }
 }

@@ -12,84 +12,144 @@ pub struct CacheRecoverReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheTier {
     Memory,
+    #[serde(alias = "kPMEM")]
     Pmem,
+    #[serde(alias = "kSSD")]
     Ssd,
     Reject,
 }
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CacheInstanceType {
-    kDRAM = 0,
-    kPMEM = 1,
-    kSSD = 2,
-    kUnified = 3,
+    #[serde(alias = "kDRAM")]
+    Dram = 0,
+    #[serde(alias = "kPMEM")]
+    Pmem = 1,
+    #[serde(alias = "kSSD")]
+    Ssd = 2,
+    #[serde(alias = "kUnified")]
+    Unified = 3,
+}
+
+#[allow(non_upper_case_globals)]
+impl CacheInstanceType {
+    pub const kDRAM: Self = Self::Dram;
+    pub const kPMEM: Self = Self::Pmem;
+    pub const kSSD: Self = Self::Ssd;
+    pub const kUnified: Self = Self::Unified;
 }
 
 impl CacheInstanceType {
     fn as_tier(self) -> Option<CacheTier> {
         match self {
-            CacheInstanceType::kDRAM => Some(CacheTier::Memory),
-            CacheInstanceType::kPMEM => Some(CacheTier::Pmem),
-            CacheInstanceType::kSSD => Some(CacheTier::Ssd),
-            CacheInstanceType::kUnified => None,
+            CacheInstanceType::Dram => Some(CacheTier::Memory),
+            CacheInstanceType::Pmem => Some(CacheTier::Pmem),
+            CacheInstanceType::Ssd => Some(CacheTier::Ssd),
+            CacheInstanceType::Unified => None,
         }
     }
 }
-
-#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageEngineType {
-    kDRAM,
-    kPMEM,
-    kSSD,
-    kSimple,
-    kMultiSSD,
+    #[serde(alias = "kDRAM")]
+    Dram,
+    #[serde(alias = "kPMEM")]
+    Pmem,
+    #[serde(alias = "kSSD")]
+    Ssd,
+    #[serde(alias = "kSimple")]
+    Simple,
+    #[serde(alias = "kMultiSSD")]
+    MultiSsd,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+impl StorageEngineType {
+    pub const kDRAM: Self = Self::Dram;
+    pub const kPMEM: Self = Self::Pmem;
+    pub const kSSD: Self = Self::Ssd;
+    pub const kSimple: Self = Self::Simple;
+    pub const kMultiSSD: Self = Self::MultiSsd;
+}
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SSDEngineType {
-    /// Supported Rust SSD engine.
-    kRocksDB = 0,
+    /// Supported Rust Ssd engine.
+    #[serde(alias = "kRocksDB")]
+    RocksDb = 0,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+impl SSDEngineType {
+    pub const kRocksDB: Self = Self::RocksDb;
+}
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WriteBufferType {
-    kUserDataBuf = 0,
-    kMetaDataBuf = 1,
-    kGCBuf = 2,
-    kCodecDataBuf = 3,
+    #[serde(alias = "kUserDataBuf")]
+    UserDataBuf = 0,
+    #[serde(alias = "kMetaDataBuf")]
+    MetaDataBuf = 1,
+    #[serde(alias = "kGCBuf")]
+    GcBuf = 2,
+    #[serde(alias = "kCodecDataBuf")]
+    CodecDataBuf = 3,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+impl WriteBufferType {
+    pub const kUserDataBuf: Self = Self::UserDataBuf;
+    pub const kMetaDataBuf: Self = Self::MetaDataBuf;
+    pub const kGCBuf: Self = Self::GcBuf;
+    pub const kCodecDataBuf: Self = Self::CodecDataBuf;
+}
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataType {
-    DATA = 1,
-    META_LOG = 2,
+    #[serde(alias = "DATA")]
+    Data = 1,
+    #[serde(alias = "META_LOG")]
+    MetaLog = 2,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+impl DataType {
+    pub const DATA: Self = Self::Data;
+    pub const META_LOG: Self = Self::MetaLog;
+}
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GCMode {
-    LOSSY = 1,
-    LOSSLESS = 10,
+    #[serde(alias = "LOSSY")]
+    Lossy = 1,
+    #[serde(alias = "LOSSLESS")]
+    Lossless = 10,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+impl GCMode {
+    pub const LOSSY: Self = Self::Lossy;
+    pub const LOSSLESS: Self = Self::Lossless;
+}
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecordStateType {
-    kSoftDel = 0x0,
-    kNormal = 0x1,
-    kPinned = 0x2,
-    kMaxCode = 0xf,
+    #[serde(alias = "kSoftDel")]
+    SoftDel = 0x0,
+    #[serde(alias = "kNormal")]
+    Normal = 0x1,
+    #[serde(alias = "kPinned")]
+    Pinned = 0x2,
+    #[serde(alias = "kMaxCode")]
+    MaxCode = 0xf,
+}
+
+#[allow(non_upper_case_globals)]
+impl RecordStateType {
+    pub const kSoftDel: Self = Self::SoftDel;
+    pub const kNormal: Self = Self::Normal;
+    pub const kPinned: Self = Self::Pinned;
+    pub const kMaxCode: Self = Self::MaxCode;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,8 +215,8 @@ impl SsdIndex {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
         let value = entries.get_mut(key)?;
         if let SsdIndexValue::Memory { state, .. } = value {
-            if *state == RecordStateType::kSoftDel {
-                *state = RecordStateType::kNormal;
+            if *state == RecordStateType::SoftDel {
+                *state = RecordStateType::Normal;
             }
         }
         Some(value.clone())
@@ -165,8 +225,8 @@ impl SsdIndex {
     pub fn unpin(&self, key: &str) {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
         if let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) {
-            if *state == RecordStateType::kPinned {
-                *state = RecordStateType::kNormal;
+            if *state == RecordStateType::Pinned {
+                *state = RecordStateType::Normal;
             }
         }
     }
@@ -176,18 +236,18 @@ impl SsdIndex {
         let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) else {
             return false;
         };
-        if *state == RecordStateType::kPinned {
+        if *state == RecordStateType::Pinned {
             return false;
         }
-        *state = RecordStateType::kPinned;
+        *state = RecordStateType::Pinned;
         true
     }
 
     pub fn soft_delete(&self, key: &str) {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
         if let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) {
-            if *state != RecordStateType::kPinned {
-                *state = RecordStateType::kSoftDel;
+            if *state != RecordStateType::Pinned {
+                *state = RecordStateType::SoftDel;
             }
         }
     }
@@ -417,7 +477,7 @@ impl WriteBuffer {
 
 impl Default for WriteBuffer {
     fn default() -> Self {
-        Self::new(WriteBufferType::kUserDataBuf, 10_485_760)
+        Self::new(WriteBufferType::UserDataBuf, 10_485_760)
     }
 }
 
@@ -522,7 +582,7 @@ pub fn mask_colored_ptr_size(old_colored_ptr: u64, size: u32) -> u64 {
 }
 
 pub fn mask_colored_ptr_record_state(old_colored_ptr: u64, state: RecordStateType) -> u64 {
-    old_colored_ptr | ((state as u64) & (RecordStateType::kMaxCode as u64))
+    old_colored_ptr | ((state as u64) & (RecordStateType::MaxCode as u64))
 }
 
 #[allow(non_snake_case)]
@@ -718,7 +778,7 @@ impl BufferEncoder {
             let record_size = Self::DATA_FIXED_PART_SIZE.saturating_add(value_len);
             let record_units = aligned_to(record_size, self.align_size) / self.align_size as u32;
             let mut colored_ptr = 0;
-            colored_ptr = mask_colored_ptr_record_state(colored_ptr, RecordStateType::kSoftDel);
+            colored_ptr = mask_colored_ptr_record_state(colored_ptr, RecordStateType::SoftDel);
             colored_ptr = mask_colored_ptr_lba(colored_ptr, batch_begin_offset);
             colored_ptr = mask_colored_ptr_size(colored_ptr, record_units);
             update_entry_cb(&record.key, SsdIndexValue::SsdColoredPtr(colored_ptr));
@@ -978,44 +1038,44 @@ impl BufferManager {
 }
 
 impl SSDEngineType {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("rocksdb")
             || value.eq_ignore_ascii_case("rocks_db")
             || value.eq_ignore_ascii_case("kRocksDB")
             || value.eq_ignore_ascii_case("kSSDRocksDBStorageEngine")
         {
-            Self::kRocksDB
+            Self::RocksDb
         } else {
-            Self::kRocksDB
+            Self::RocksDb
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kRocksDB => "RocksDB",
+            Self::RocksDb => "RocksDB",
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn FromReferenceName(value: &str) -> Self {
-        Self::from_reference_name(value)
+    pub fn FromConfigName(value: &str) -> Self {
+        Self::from_config_name(value)
     }
 
     #[allow(non_snake_case)]
-    pub fn AsReferenceName(self) -> &'static str {
-        self.as_reference_name()
+    pub fn AsConfigName(self) -> &'static str {
+        self.as_config_name()
     }
 }
 
 impl StorageEngineType {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("pmem")
             || value.eq_ignore_ascii_case("persistent_memory")
             || value.eq_ignore_ascii_case("persistent-memory")
             || value.eq_ignore_ascii_case("kPMEMStorageEngine")
             || value.eq_ignore_ascii_case("kPMEM")
         {
-            Self::kPMEM
+            Self::Pmem
         } else if value.eq_ignore_ascii_case("ssd")
             || value.eq_ignore_ascii_case("rocksdb")
             || value.eq_ignore_ascii_case("rocks_db")
@@ -1023,76 +1083,76 @@ impl StorageEngineType {
             || value.eq_ignore_ascii_case("kSSDRocksDBStorageEngine")
             || value.eq_ignore_ascii_case("kSSD")
         {
-            Self::kSSD
+            Self::Ssd
         } else if value.eq_ignore_ascii_case("simple")
             || value.eq_ignore_ascii_case("simple_storage")
             || value.eq_ignore_ascii_case("kSimpleStorageEngine")
         {
-            Self::kSimple
+            Self::Simple
         } else if value.eq_ignore_ascii_case("multi_ssd")
             || value.eq_ignore_ascii_case("multi-ssd")
             || value.eq_ignore_ascii_case("kMultiSSDStorageEngine")
         {
-            Self::kMultiSSD
+            Self::MultiSsd
         } else if value.eq_ignore_ascii_case("dram")
             || value.eq_ignore_ascii_case("kDRAM")
             || value.eq_ignore_ascii_case("kDRAMStorageEngine")
         {
-            Self::kDRAM
+            Self::Dram
         } else {
-            Self::kDRAM
+            Self::Dram
         }
     }
 
-    pub fn from_reference_code(value: u8) -> Self {
+    pub fn from_config_code(value: u8) -> Self {
         match value {
-            1 => Self::kPMEM,
-            2 => Self::kSSD,
-            3 => Self::kSimple,
-            4 => Self::kMultiSSD,
-            _ => Self::kDRAM,
+            1 => Self::Pmem,
+            2 => Self::Ssd,
+            3 => Self::Simple,
+            4 => Self::MultiSsd,
+            _ => Self::Dram,
         }
     }
 
-    pub fn reference_code(self) -> u8 {
+    pub fn config_code(self) -> u8 {
         match self {
-            Self::kDRAM => 0,
-            Self::kPMEM => 1,
-            Self::kSSD => 2,
-            Self::kSimple => 3,
-            Self::kMultiSSD => 4,
+            Self::Dram => 0,
+            Self::Pmem => 1,
+            Self::Ssd => 2,
+            Self::Simple => 3,
+            Self::MultiSsd => 4,
         }
     }
 
     pub fn is_ssd_like(self) -> bool {
-        matches!(self, Self::kSSD | Self::kMultiSSD)
+        matches!(self, Self::Ssd | Self::MultiSsd)
     }
 
     pub fn canonical_instance_type(self) -> CacheInstanceType {
         match self {
-            Self::kDRAM | Self::kSimple => CacheInstanceType::kDRAM,
-            Self::kPMEM => CacheInstanceType::kPMEM,
-            Self::kSSD | Self::kMultiSSD => CacheInstanceType::kSSD,
+            Self::Dram | Self::Simple => CacheInstanceType::Dram,
+            Self::Pmem => CacheInstanceType::Pmem,
+            Self::Ssd | Self::MultiSsd => CacheInstanceType::Ssd,
         }
     }
 
-    pub fn as_reference_enum_name(self) -> &'static str {
+    pub fn as_config_enum_name(self) -> &'static str {
         match self {
-            Self::kDRAM => "kDRAMStorageEngine",
-            Self::kPMEM => "kPMEMStorageEngine",
-            Self::kSSD => "kSSDRocksDBStorageEngine",
-            Self::kSimple => "kSimpleStorageEngine",
-            Self::kMultiSSD => "kMultiSSDStorageEngine",
+            Self::Dram => "kDRAMStorageEngine",
+            Self::Pmem => "kPMEMStorageEngine",
+            Self::Ssd => "kSSDRocksDBStorageEngine",
+            Self::Simple => "kSimpleStorageEngine",
+            Self::MultiSsd => "kMultiSSDStorageEngine",
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kDRAM => "DRAM",
-            Self::kPMEM => "PMEM",
-            Self::kSSD => "SSD",
-            Self::kSimple => "Simple",
-            Self::kMultiSSD => "MultiSSD",
+            Self::Dram => "DRAM",
+            Self::Pmem => "PMEM",
+            Self::Ssd => "SSD",
+            Self::Simple => "Simple",
+            Self::MultiSsd => "MultiSSD",
         }
     }
 
@@ -1101,13 +1161,13 @@ impl StorageEngineType {
     }
 
     #[allow(non_snake_case)]
-    pub fn FromReferenceCode(value: u8) -> Self {
-        Self::from_reference_code(value)
+    pub fn FromConfigCode(value: u8) -> Self {
+        Self::from_config_code(value)
     }
 
     #[allow(non_snake_case)]
-    pub fn ReferenceCode(self) -> u8 {
-        self.reference_code()
+    pub fn ConfigCode(self) -> u8 {
+        self.config_code()
     }
 
     #[allow(non_snake_case)]
@@ -1116,73 +1176,87 @@ impl StorageEngineType {
     }
 
     #[allow(non_snake_case)]
-    pub fn AsReferenceEnumName(self) -> &'static str {
-        self.as_reference_enum_name()
+    pub fn AsConfigEnumName(self) -> &'static str {
+        self.as_config_enum_name()
     }
 
     #[allow(non_snake_case)]
-    pub fn AsReferenceName(self) -> &'static str {
-        self.as_reference_name()
+    pub fn AsConfigName(self) -> &'static str {
+        self.as_config_name()
     }
 }
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReplacementPolicyType {
-    kFIFO = 0,
-    kLRU = 1,
-    kSLRU = 2,
-    kWeightedHotnessLru = 3,
-    kMaxCode = 4,
+    #[serde(alias = "kFIFO")]
+    Fifo = 0,
+    #[serde(alias = "kLRU")]
+    Lru = 1,
+    #[serde(alias = "kSLRU")]
+    Slru = 2,
+    #[serde(alias = "kWeightedHotnessLru")]
+    WeightedHotnessLru = 3,
+    #[serde(alias = "kMaxCode")]
+    MaxCode = 4,
+}
+
+#[allow(non_upper_case_globals)]
+impl ReplacementPolicyType {
+    pub const kFIFO: Self = Self::Fifo;
+    pub const kLRU: Self = Self::Lru;
+    pub const kSLRU: Self = Self::Slru;
+    pub const kWeightedHotnessLru: Self = Self::WeightedHotnessLru;
+    pub const kMaxCode: Self = Self::MaxCode;
 }
 
 impl ReplacementPolicyType {
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("fifo") || value.eq_ignore_ascii_case("kFIFO") {
-            Self::kFIFO
+            Self::Fifo
         } else if value.eq_ignore_ascii_case("slru") || value.eq_ignore_ascii_case("kSLRU") {
-            Self::kSLRU
+            Self::Slru
         } else if value.eq_ignore_ascii_case("lru") || value.eq_ignore_ascii_case("kLRU") {
-            Self::kLRU
+            Self::Lru
         } else if value.eq_ignore_ascii_case("kMaxCode") {
-            Self::kMaxCode
+            Self::MaxCode
         } else {
-            Self::kWeightedHotnessLru
+            Self::WeightedHotnessLru
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kFIFO => "FIFO",
-            Self::kSLRU => "SLRU",
-            Self::kLRU => "LRU",
-            Self::kWeightedHotnessLru => "WeightedHotnessLru",
-            Self::kMaxCode => "MaxCode",
+            Self::Fifo => "FIFO",
+            Self::Slru => "SLRU",
+            Self::Lru => "LRU",
+            Self::WeightedHotnessLru => "WeightedHotnessLru",
+            Self::MaxCode => "MaxCode",
         }
     }
 
     fn as_cache_policy(self) -> CacheReplacementPolicy {
         match self {
-            ReplacementPolicyType::kFIFO => CacheReplacementPolicy::Fifo,
-            ReplacementPolicyType::kSLRU => CacheReplacementPolicy::Slru,
-            ReplacementPolicyType::kLRU => CacheReplacementPolicy::WeightedHotnessLru,
-            ReplacementPolicyType::kWeightedHotnessLru => {
+            ReplacementPolicyType::Fifo => CacheReplacementPolicy::Fifo,
+            ReplacementPolicyType::Slru => CacheReplacementPolicy::Slru,
+            ReplacementPolicyType::Lru => CacheReplacementPolicy::WeightedHotnessLru,
+            ReplacementPolicyType::WeightedHotnessLru => {
                 CacheReplacementPolicy::WeightedHotnessLru
             }
-            ReplacementPolicyType::kMaxCode => CacheReplacementPolicy::WeightedHotnessLru,
+            ReplacementPolicyType::MaxCode => CacheReplacementPolicy::WeightedHotnessLru,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheDataPlacement {
+    #[serde(alias = "kSideBySide")]
     SideBySide,
+    #[serde(alias = "kTiered")]
     Tiered,
 }
 
 impl CacheDataPlacement {
-    pub fn try_from_reference_name(value: &str) -> Result<Self, CacheError> {
+    pub fn try_from_config_name(value: &str) -> Result<Self, CacheError> {
         if value.eq_ignore_ascii_case("sidebyside")
             || value.eq_ignore_ascii_case("side_by_side")
             || value.eq_ignore_ascii_case("side-by-side")
@@ -1202,7 +1276,7 @@ impl CacheDataPlacement {
         }
     }
 
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("sidebyside")
             || value.eq_ignore_ascii_case("side_by_side")
             || value.eq_ignore_ascii_case("side-by-side")
@@ -1213,75 +1287,83 @@ impl CacheDataPlacement {
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
             Self::SideBySide => "SideBySide",
             Self::Tiered => "Tiered",
         }
     }
 }
-
-#[allow(non_camel_case_types)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DRAMPMEMDataPlacementType {
-    kSideBySide = 0,
-    kTiered = 1,
-    kMaxCode = 2,
+    #[serde(alias = "kSideBySide")]
+    SideBySide = 0,
+    #[serde(alias = "kTiered")]
+    Tiered = 1,
+    #[serde(alias = "kMaxCode")]
+    MaxCode = 2,
+}
+
+#[allow(non_upper_case_globals)]
+impl DRAMPMEMDataPlacementType {
+    pub const kSideBySide: Self = Self::SideBySide;
+    pub const kTiered: Self = Self::Tiered;
+    pub const kMaxCode: Self = Self::MaxCode;
 }
 
 impl DRAMPMEMDataPlacementType {
-    pub fn try_from_reference_name(value: &str) -> Result<Self, CacheError> {
-        Ok(match CacheDataPlacement::try_from_reference_name(value)? {
-            CacheDataPlacement::SideBySide => Self::kSideBySide,
-            CacheDataPlacement::Tiered => Self::kTiered,
+    pub fn try_from_config_name(value: &str) -> Result<Self, CacheError> {
+        Ok(match CacheDataPlacement::try_from_config_name(value)? {
+            CacheDataPlacement::SideBySide => Self::SideBySide,
+            CacheDataPlacement::Tiered => Self::Tiered,
         })
     }
 
-    pub fn from_reference_name(value: &str) -> Self {
+    pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("sidebyside")
             || value.eq_ignore_ascii_case("side_by_side")
             || value.eq_ignore_ascii_case("side-by-side")
             || value.eq_ignore_ascii_case("kSideBySide")
         {
-            Self::kSideBySide
+            Self::SideBySide
         } else if value.eq_ignore_ascii_case("kMaxCode") {
-            Self::kMaxCode
+            Self::MaxCode
         } else {
-            Self::kTiered
+            Self::Tiered
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
-            Self::kSideBySide => "SideBySide",
-            Self::kTiered => "Tiered",
-            Self::kMaxCode => "MaxCode",
+            Self::SideBySide => "SideBySide",
+            Self::Tiered => "Tiered",
+            Self::MaxCode => "MaxCode",
         }
     }
 
     pub fn as_cache_data_placement(self) -> CacheDataPlacement {
         match self {
-            Self::kSideBySide => CacheDataPlacement::SideBySide,
-            Self::kTiered | Self::kMaxCode => CacheDataPlacement::Tiered,
+            Self::SideBySide => CacheDataPlacement::SideBySide,
+            Self::Tiered | Self::MaxCode => CacheDataPlacement::Tiered,
         }
     }
 
     pub fn from_cache_data_placement(placement: CacheDataPlacement) -> Self {
         match placement {
-            CacheDataPlacement::SideBySide => Self::kSideBySide,
-            CacheDataPlacement::Tiered => Self::kTiered,
+            CacheDataPlacement::SideBySide => Self::SideBySide,
+            CacheDataPlacement::Tiered => Self::Tiered,
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn FromReferenceName(value: &str) -> Self {
-        Self::from_reference_name(value)
+    pub fn FromConfigName(value: &str) -> Self {
+        Self::from_config_name(value)
     }
 
     #[allow(non_snake_case)]
-    pub fn AsReferenceName(self) -> &'static str {
-        self.as_reference_name()
+    pub fn AsConfigName(self) -> &'static str {
+        self.as_config_name()
     }
 
     #[allow(non_snake_case)]
@@ -1320,8 +1402,11 @@ pub enum CacheAdmissionReason {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheAccessRecordType {
+    #[serde(alias = "kPut")]
     Put = 1,
+    #[serde(alias = "kGet")]
     Get = 2,
+    #[serde(alias = "kDelete")]
     Delete = 3,
 }
 
@@ -1332,11 +1417,11 @@ impl CacheAccessRecordType {
     pub const kDelete: Self = Self::Delete;
     pub const kMaxCode: u8 = 4;
 
-    pub fn reference_code(self) -> u8 {
+    pub fn config_code(self) -> u8 {
         self as u8
     }
 
-    pub fn from_reference_code(code: u8) -> Option<Self> {
+    pub fn from_config_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Put),
             2 => Some(Self::Get),
@@ -1345,7 +1430,7 @@ impl CacheAccessRecordType {
         }
     }
 
-    pub fn as_reference_name(self) -> &'static str {
+    pub fn as_config_name(self) -> &'static str {
         match self {
             Self::Put => "kPut",
             Self::Get => "kGet",
@@ -1354,18 +1439,18 @@ impl CacheAccessRecordType {
     }
 
     #[allow(non_snake_case)]
-    pub fn ReferenceCode(self) -> u8 {
-        self.reference_code()
+    pub fn ConfigCode(self) -> u8 {
+        self.config_code()
     }
 
     #[allow(non_snake_case)]
-    pub fn FromReferenceCode(code: u8) -> Option<Self> {
-        Self::from_reference_code(code)
+    pub fn FromConfigCode(code: u8) -> Option<Self> {
+        Self::from_config_code(code)
     }
 
     #[allow(non_snake_case)]
-    pub fn AsReferenceName(self) -> &'static str {
-        self.as_reference_name()
+    pub fn AsConfigName(self) -> &'static str {
+        self.as_config_name()
     }
 }
 

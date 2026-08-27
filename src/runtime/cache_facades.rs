@@ -197,15 +197,15 @@ impl CacheInstance {
             .cloned()
             .unwrap_or_else(|| unique_temp_path("cache-instance"));
         let mut options = match storage_type {
-            StorageEngineType::kDRAM | StorageEngineType::kSimple => {
+            StorageEngineType::Dram | StorageEngineType::Simple => {
                 CacheOptions::new(capacity, 0, 0)
             }
-            StorageEngineType::kPMEM => CacheOptions::new(0, capacity, 0),
-            StorageEngineType::kSSD | StorageEngineType::kMultiSSD => {
+            StorageEngineType::Pmem => CacheOptions::new(0, capacity, 0),
+            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
                 CacheOptions::new(0, 0, capacity).with_ssd_instance_only(true)
             }
         };
-        let ssd_paths = if matches!(storage_type, StorageEngineType::kSSD | StorageEngineType::kMultiSSD)
+        let ssd_paths = if matches!(storage_type, StorageEngineType::Ssd | StorageEngineType::MultiSsd)
             && !paths.is_empty()
         {
             paths.clone()
@@ -216,7 +216,7 @@ impl CacheInstance {
             instance_type.as_tier().expect("storage-backed instance"),
             replacement_type.as_cache_policy(),
         );
-        if matches!(storage_type, StorageEngineType::kPMEM) {
+        if matches!(storage_type, StorageEngineType::Pmem) {
             options = options.with_pmem_paths(paths);
         }
 
@@ -478,8 +478,8 @@ impl CacheInstance {
 
     pub fn recover_data(&self) -> Result<CacheRecoverReport, CacheError> {
         match self.storage_type {
-            StorageEngineType::kPMEM => self.cache.recover_pmem_index(),
-            StorageEngineType::kSSD | StorageEngineType::kMultiSSD => self.cache.recover_disk_index(),
+            StorageEngineType::Pmem => self.cache.recover_pmem_index(),
+            StorageEngineType::Ssd | StorageEngineType::MultiSsd => self.cache.recover_disk_index(),
             _ => Ok(CacheRecoverReport::default()),
         }
     }
@@ -533,12 +533,12 @@ impl CacheInstance {
 
     pub fn get_allocator_type(&self) -> AllocatorType {
         match self.storage_type {
-            StorageEngineType::kDRAM | StorageEngineType::kSimple => {
-                AllocatorType::kPoolBasedAllocator
+            StorageEngineType::Dram | StorageEngineType::Simple => {
+                AllocatorType::PoolBasedAllocator
             }
-            StorageEngineType::kPMEM => AllocatorType::kLogBasedAllocator,
-            StorageEngineType::kSSD | StorageEngineType::kMultiSSD => {
-                AllocatorType::kLogBasedAllocator
+            StorageEngineType::Pmem => AllocatorType::LogBasedAllocator,
+            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
+                AllocatorType::LogBasedAllocator
             }
         }
     }
@@ -1631,7 +1631,10 @@ impl SimpleLRUCache {
 
     #[allow(non_snake_case)]
     pub fn Size(&self) -> usize {
-        self.inner.lock().expect("simple lru lock poisoned").size
+        self.inner
+            .lock()
+            .expect("simple lru lock poisoned")
+            .current_size()
     }
 }
 
@@ -1756,7 +1759,10 @@ impl ZeroCopySimpleLRUCache {
 
     #[allow(non_snake_case)]
     pub fn Size(&self) -> usize {
-        self.inner.lock().expect("simple lru lock poisoned").size
+        self.inner
+            .lock()
+            .expect("simple lru lock poisoned")
+            .current_size()
     }
 
     #[allow(non_snake_case)]
@@ -1893,6 +1899,13 @@ struct SimpleLruInner {
     size: usize,
     order: CacheKeyOrder,
     entries: HashMap<CacheKey, SimpleLruEntry>,
+    /// Entries removed while a handle still pinned them.
+    ///
+    /// Their bytes are still resident, so they keep counting towards the
+    /// cache size until the last pin is released. Dropping them from the
+    /// accounting at removal would let the cache admit data it has no room
+    /// for.
+    pinned_removed: Vec<SimpleLruEntry>,
 }
 
 impl SimpleLruInner {
@@ -1906,6 +1919,7 @@ impl SimpleLruInner {
             size: 0,
             order: CacheKeyOrder::new(),
             entries: HashMap::new(),
+            pinned_removed: Vec::new(),
         }
     }
 
@@ -1914,6 +1928,7 @@ impl SimpleLruInner {
         if size > self.capacity {
             return false;
         }
+        self.reap_pinned_removed();
         self.remove(&key);
         self.size += size;
         self.order.push_front(key.clone());
@@ -1930,15 +1945,46 @@ impl SimpleLruInner {
 
     fn remove(&mut self, key: &CacheKey) {
         if let Some(entry) = self.entries.remove(key) {
-            self.size = self.size.saturating_sub(entry.size);
             self.order.remove(key);
+            self.retire(entry);
         }
     }
 
     fn remove_all(&mut self) {
-        self.entries.clear();
+        let retired = self.entries.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
+        for entry in retired {
+            self.retire(entry);
+        }
         self.order.clear();
-        self.size = 0;
+    }
+
+    /// Drop an entry from the index, keeping its bytes counted while a handle
+    /// still holds the value.
+    fn retire(&mut self, entry: SimpleLruEntry) {
+        if Arc::strong_count(&entry.value) > 1 {
+            self.pinned_removed.push(entry);
+        } else {
+            self.size = self.size.saturating_sub(entry.size);
+        }
+    }
+
+    /// Release the bytes of any removed entry whose last pin has now dropped.
+    fn reap_pinned_removed(&mut self) {
+        let mut released = 0usize;
+        self.pinned_removed.retain(|entry| {
+            if Arc::strong_count(&entry.value) > 1 {
+                return true;
+            }
+            released = released.saturating_add(entry.size);
+            false
+        });
+        self.size = self.size.saturating_sub(released);
+    }
+
+    /// Current size, after accounting for pins released since the last call.
+    fn current_size(&mut self) -> usize {
+        self.reap_pinned_removed();
+        self.size
     }
 
     fn set_capacity(&mut self, capacity: usize) {
@@ -1957,6 +2003,7 @@ impl SimpleLruInner {
     }
 
     fn evict_unpinned(&mut self) {
+        self.reap_pinned_removed();
         while self.size > self.capacity {
             // Walk from the least recently used end and stop at the first
             // entry nobody is holding. Scanning forward for the last match
@@ -2342,14 +2389,14 @@ impl FlexibleCache {
         pmem_paths: impl IntoIterator<Item = PathBuf>,
         ssd_paths: impl IntoIterator<Item = PathBuf>,
     ) -> Self {
-        let policy = ReplacementPolicyType::from_reference_name(policy.as_ref());
-        let engine = StorageEngineType::from_reference_name(engine.as_ref());
+        let policy = ReplacementPolicyType::from_config_name(policy.as_ref());
+        let engine = StorageEngineType::from_config_name(engine.as_ref());
         let paths = match engine {
-            StorageEngineType::kPMEM => pmem_paths.into_iter().collect::<Vec<_>>(),
-            StorageEngineType::kSSD | StorageEngineType::kMultiSSD => {
+            StorageEngineType::Pmem => pmem_paths.into_iter().collect::<Vec<_>>(),
+            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
                 ssd_paths.into_iter().collect::<Vec<_>>()
             }
-            StorageEngineType::kDRAM | StorageEngineType::kSimple => Vec::new(),
+            StorageEngineType::Dram | StorageEngineType::Simple => Vec::new(),
         };
         Self {
             instance: CacheInstance::new(capacity, policy, engine, paths.clone()),
@@ -2677,11 +2724,11 @@ impl MultiTierCache {
         side_by_side_dram_pmem_placement_threshold: usize,
         ssd_storage_engine: impl AsRef<str>,
     ) -> Result<Self, CacheError> {
-        let policy_type = ReplacementPolicyType::from_reference_name(policy.as_ref());
+        let policy_type = ReplacementPolicyType::from_config_name(policy.as_ref());
         let replacement_policy = policy_type.as_cache_policy();
-        let ssd_storage_engine = StorageEngineType::from_reference_name(ssd_storage_engine.as_ref());
+        let ssd_storage_engine = StorageEngineType::from_config_name(ssd_storage_engine.as_ref());
         let data_placement =
-            CacheDataPlacement::try_from_reference_name(dram_pmem_data_placement_type.as_ref())?;
+            CacheDataPlacement::try_from_config_name(dram_pmem_data_placement_type.as_ref())?;
         let options = CacheOptions::new(dram_capacity, pmem_capacity, ssd_capacity)
             .with_pmem_paths(pmem_paths)
             .with_ssd_paths(ssd_paths)
@@ -2826,9 +2873,9 @@ impl MultiTierCache {
             "matrixcache_stats metrics={} comments={} policy={} ssd_engine={} placement={} eviction_enabled={} memory_bytes={} pmem_bytes={} disk_bytes={} pinned_entries={} pinned_bytes={} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_admission_rejections={} async_writeback_queue_depth={} async_writeback_queue_bytes={} writeback_backpressure_events={}",
             metrics.as_ref(),
             comments.as_ref(),
-            self.policy.as_reference_name(),
-            self.ssd_storage_engine.as_reference_name(),
-            self.cache.production_tiering_policy().data_placement.as_reference_name(),
+            self.policy.as_config_name(),
+            self.ssd_storage_engine.as_config_name(),
+            self.cache.production_tiering_policy().data_placement.as_config_name(),
             self.eviction_enabled(),
             stats.memory_bytes,
             stats.pmem_bytes,
@@ -2977,6 +3024,8 @@ struct CacheOrderNode {
     key: CacheKey,
     prev: u32,
     next: u32,
+    access_prev: u32,
+    access_next: u32,
 }
 
 /// Recency ordering over cache keys, from least recently used at the front to
@@ -2997,6 +3046,8 @@ pub struct CacheKeyOrder {
     index: HashMap<CacheKey, u32>,
     head: u32,
     tail: u32,
+    access_head: u32,
+    access_tail: u32,
 }
 
 impl Default for CacheKeyOrder {
@@ -3013,6 +3064,8 @@ impl CacheKeyOrder {
             index: HashMap::new(),
             head: CACHE_ORDER_NIL,
             tail: CACHE_ORDER_NIL,
+            access_head: CACHE_ORDER_NIL,
+            access_tail: CACHE_ORDER_NIL,
         }
     }
 
@@ -3049,10 +3102,13 @@ impl CacheKeyOrder {
         if let Some(&node) = self.index.get(&key) {
             self.unlink(node);
             self.link_back(node);
+            self.unlink_access(node);
+            self.link_access_back(node);
             return;
         }
         let node = self.alloc(key.clone());
         self.link_back(node);
+        self.link_access_back(node);
         self.index.insert(key, node);
     }
 
@@ -3068,6 +3124,7 @@ impl CacheKeyOrder {
         }
         let node = self.alloc(key.clone());
         self.link_back(node);
+        self.link_access_back(node);
         self.index.insert(key, node);
     }
 
@@ -3076,16 +3133,22 @@ impl CacheKeyOrder {
         if let Some(&node) = self.index.get(&key) {
             self.unlink(node);
             self.link_front(node);
+            self.unlink_access(node);
+            self.link_access_front(node);
             return;
         }
         let node = self.alloc(key.clone());
         self.link_front(node);
+        self.link_access_front(node);
         self.index.insert(key, node);
     }
 
-    /// Record a hit: move `key` to the back if it is present. Returns whether
-    /// the key was there.
-    pub fn touch(&mut self, key: &CacheKey) -> bool {
+    /// Move `key` to the back of the insertion order if it is present.
+    /// Returns whether the key was there.
+    ///
+    /// This is not how a hit is recorded — a hit must leave the insertion
+    /// order alone, which is what `touch_access` is for.
+    pub fn move_to_back(&mut self, key: &CacheKey) -> bool {
         let Some(&node) = self.index.get(key) else {
             return false;
         };
@@ -3097,12 +3160,33 @@ impl CacheKeyOrder {
         true
     }
 
+    /// Record an access: move `key` to the back of the access order, leaving
+    /// the insertion order alone. Returns whether the key was there.
+    ///
+    /// The two orders answer different questions. Eviction that only ever
+    /// looks at the front of a list needs the front to hold entries nobody
+    /// wants; insertion order never moves an entry no matter how often it is
+    /// read, so a popular entry written early sits at the front forever and is
+    /// offered up on every pass.
+    pub fn touch_access(&mut self, key: &CacheKey) -> bool {
+        let Some(&node) = self.index.get(key) else {
+            return false;
+        };
+        if node == self.access_tail {
+            return true;
+        }
+        self.unlink_access(node);
+        self.link_access_back(node);
+        true
+    }
+
     /// Remove `key`, returning whether it was present.
     pub fn remove(&mut self, key: &CacheKey) -> bool {
         let Some(node) = self.index.remove(key) else {
             return false;
         };
         self.unlink(node);
+        self.unlink_access(node);
         self.release(node);
         true
     }
@@ -3115,6 +3199,7 @@ impl CacheKeyOrder {
         let node = self.head;
         let key = self.nodes[node as usize].key.clone();
         self.unlink(node);
+        self.unlink_access(node);
         self.index.remove(&key);
         self.release(node);
         Some(key)
@@ -3132,6 +3217,7 @@ impl CacheKeyOrder {
                 let key = self.nodes[cursor as usize].key.clone();
                 self.index.remove(&key);
                 self.unlink(cursor);
+                self.unlink_access(cursor);
                 self.release(cursor);
             }
             cursor = next;
@@ -3144,6 +3230,8 @@ impl CacheKeyOrder {
         self.index.clear();
         self.head = CACHE_ORDER_NIL;
         self.tail = CACHE_ORDER_NIL;
+        self.access_head = CACHE_ORDER_NIL;
+        self.access_tail = CACHE_ORDER_NIL;
     }
 
     /// Iterate from most to least recently used.
@@ -3162,18 +3250,30 @@ impl CacheKeyOrder {
         }
     }
 
+    /// Iterate the access order, least recently accessed first.
+    pub fn iter_access(&self) -> CacheKeyOrderAccessIter<'_> {
+        CacheKeyOrderAccessIter {
+            order: self,
+            cursor: self.access_head,
+        }
+    }
+
     fn alloc(&mut self, key: CacheKey) -> u32 {
         if let Some(index) = self.free.pop() {
             let node = &mut self.nodes[index as usize];
             node.key = key;
             node.prev = CACHE_ORDER_NIL;
             node.next = CACHE_ORDER_NIL;
+            node.access_prev = CACHE_ORDER_NIL;
+            node.access_next = CACHE_ORDER_NIL;
             return index;
         }
         self.nodes.push(CacheOrderNode {
             key,
             prev: CACHE_ORDER_NIL,
             next: CACHE_ORDER_NIL,
+            access_prev: CACHE_ORDER_NIL,
+            access_next: CACHE_ORDER_NIL,
         });
         (self.nodes.len() - 1) as u32
     }
@@ -3204,6 +3304,47 @@ impl CacheKeyOrder {
             self.nodes[old_head as usize].prev = node;
         }
         self.head = node;
+    }
+
+    fn link_access_back(&mut self, node: u32) {
+        let old_tail = self.access_tail;
+        self.nodes[node as usize].access_prev = old_tail;
+        self.nodes[node as usize].access_next = CACHE_ORDER_NIL;
+        if old_tail == CACHE_ORDER_NIL {
+            self.access_head = node;
+        } else {
+            self.nodes[old_tail as usize].access_next = node;
+        }
+        self.access_tail = node;
+    }
+
+    fn link_access_front(&mut self, node: u32) {
+        let old_head = self.access_head;
+        self.nodes[node as usize].access_next = old_head;
+        self.nodes[node as usize].access_prev = CACHE_ORDER_NIL;
+        if old_head == CACHE_ORDER_NIL {
+            self.access_tail = node;
+        } else {
+            self.nodes[old_head as usize].access_prev = node;
+        }
+        self.access_head = node;
+    }
+
+    fn unlink_access(&mut self, node: u32) {
+        let prev = self.nodes[node as usize].access_prev;
+        let next = self.nodes[node as usize].access_next;
+        if prev == CACHE_ORDER_NIL {
+            self.access_head = next;
+        } else {
+            self.nodes[prev as usize].access_next = next;
+        }
+        if next == CACHE_ORDER_NIL {
+            self.access_tail = prev;
+        } else {
+            self.nodes[next as usize].access_prev = prev;
+        }
+        self.nodes[node as usize].access_prev = CACHE_ORDER_NIL;
+        self.nodes[node as usize].access_next = CACHE_ORDER_NIL;
     }
 
     fn unlink(&mut self, node: u32) {
@@ -3242,6 +3383,24 @@ pub struct CacheKeyOrderIter<'a> {
 pub struct CacheKeyOrderRevIter<'a> {
     order: &'a CacheKeyOrder,
     cursor: u32,
+}
+
+pub struct CacheKeyOrderAccessIter<'a> {
+    order: &'a CacheKeyOrder,
+    cursor: u32,
+}
+
+impl<'a> Iterator for CacheKeyOrderAccessIter<'a> {
+    type Item = &'a CacheKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == CACHE_ORDER_NIL {
+            return None;
+        }
+        let node = &self.order.nodes[self.cursor as usize];
+        self.cursor = node.access_next;
+        Some(&node.key)
+    }
 }
 
 impl<'a> Iterator for CacheKeyOrderRevIter<'a> {
