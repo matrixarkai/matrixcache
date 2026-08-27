@@ -1889,7 +1889,7 @@ fn encode_manifest_field(value: &str) -> String {
 }
 
 fn decode_manifest_field(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
