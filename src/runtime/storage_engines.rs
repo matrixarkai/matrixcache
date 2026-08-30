@@ -1793,13 +1793,38 @@ impl StorageEngineRocksDB {
         Self::new(db_path)
     }
 
+    /// Memtable size for the SSD tier, in MiB. Default 64, matching the previous constant.
+    ///
+    /// RocksDB preallocates the write-ahead log to hold a full memtable flush, so this figure is
+    /// also a floor on the DB's on-disk size -- paid whether or not anything is cached. Measured
+    /// on a TemporalStore block cache holding 0.32 MB of content: the WAL file reported 331,697
+    /// bytes of data against 73,822,208 bytes allocated, and the cache directory was 74.5 MB, of
+    /// which 74.1 MB was preallocated air. For a small or short-lived cache that fixed overhead
+    /// dwarfs the data.
+    ///
+    /// Left at 64 MiB by default so existing deployments are unchanged; a deployment that knows
+    /// its cache is small can set `MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB` lower and get the disk
+    /// back. Smaller memtables flush more often, so this trades write amplification against that
+    /// fixed cost -- which is the right trade only when the cache is small relative to 64 MiB.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub(crate) fn rocksdb_write_buffer_bytes() -> usize {
+        const DEFAULT_MB: usize = 64;
+        std::env::var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .unwrap_or(DEFAULT_MB)
+            * 1024
+            * 1024
+    }
+
     #[cfg(feature = "rocksdb-ssd")]
     fn rocksdb_options() -> rocksdb::Options {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.increase_parallelism(4);
         options.optimize_for_point_lookup(64);
-        options.set_write_buffer_size(64 * 1024 * 1024);
+        options.set_write_buffer_size(Self::rocksdb_write_buffer_bytes());
         options.set_max_write_buffer_number(4);
         options.set_level_zero_file_num_compaction_trigger(16);
         options.set_level_zero_slowdown_writes_trigger(24);

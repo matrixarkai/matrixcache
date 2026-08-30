@@ -3,6 +3,39 @@
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rocksdb-ssd")]
+    #[test]
+    fn rocksdb_write_buffer_size_is_configurable() {
+        // RocksDB preallocates its write-ahead log to hold a full memtable flush, so the write
+        // buffer is a floor on the DB's on-disk size -- paid whether or not anything is cached.
+        // Measured on a TemporalStore block cache holding 0.32 MB of content: the WAL file
+        // reported 331,697 bytes of data against 73,822,208 bytes allocated, and the cache
+        // directory was 74.5 MB, of which 74.1 MB was preallocated air.
+        std::env::remove_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB");
+        assert_eq!(
+            crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
+            64 * 1024 * 1024,
+            "the default must stay 64 MiB so existing deployments are unchanged"
+        );
+
+        std::env::set_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB", "8");
+        assert_eq!(
+            crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
+            8 * 1024 * 1024
+        );
+
+        // Garbage and zero fall back rather than configuring a degenerate DB.
+        for bad in ["0", "", "abc", "-4"] {
+            std::env::set_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB", bad);
+            assert_eq!(
+                crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
+                64 * 1024 * 1024,
+                "{bad:?} should fall back to the default"
+            );
+        }
+        std::env::remove_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB");
+    }
+
     use super::*;
 
     #[test]
