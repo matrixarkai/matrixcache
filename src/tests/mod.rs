@@ -15341,3 +15341,49 @@ mod tests {
     }
 
 }
+
+
+/// Every page cache key shape, byte for byte.
+///
+/// These strings are hashed and compared against keys already written -- to a running cache and to
+/// disk -- so a changed byte is a silent miss rather than a failure: the cache stops finding what it
+/// stored and nothing complains. Building them directly instead of through `format!` saves two
+/// allocations per key on every get and put, which is only safe if the bytes do not move. So pin the
+/// bytes, not the behaviour, and cover each shape the constructors can produce.
+#[test]
+fn page_cache_keys_keep_their_exact_bytes() {
+    let plain = CacheKey::page(1, 8, 8192, 512);
+    assert_eq!(plain.namespace, "page");
+    assert_eq!(plain.record_key, "segment-00000000000000000008");
+    assert_eq!(plain.selector, "8192:512");
+
+    let with_slot = CacheKey::page_with_slot(1, 8, 8192, 512, Some(3));
+    assert_eq!(with_slot.record_key, "segment-00000000000000000008");
+    assert_eq!(with_slot.selector, "slot-3:8192:512");
+
+    let without_slot = CacheKey::page_with_slot(1, 8, 8192, 512, None);
+    assert_eq!(without_slot.selector, "8192:512");
+    assert_eq!(
+        without_slot, plain,
+        "no routing slot has to be the same key `page` builds, or one writer's pages become \
+         unreadable to the other"
+    );
+
+    let slot_and_generation = CacheKey::page_with_slot_generation(1, 8, 8192, 512, Some(3), Some(7));
+    assert_eq!(slot_and_generation.selector, "slot-3:gen-7:8192:512");
+
+    let generation_only = CacheKey::page_with_slot_generation(1, 8, 8192, 512, None, Some(7));
+    assert_eq!(generation_only.selector, "gen-7:8192:512");
+
+    // A large segment id still pads to twenty digits, and one that overflows the padding is not
+    // truncated -- both are what the format string did.
+    assert_eq!(
+        CacheKey::page(1, 12_345_678_901_234_567_890, 0, 1).record_key,
+        "segment-12345678901234567890"
+    );
+    assert_eq!(CacheKey::page(1, 0, 0, 1).record_key, "segment-00000000000000000000");
+
+    // Distinct inputs stay distinct: the by-hand builder joins fields with the same separators, so
+    // two different pages cannot collapse onto one key.
+    assert_ne!(CacheKey::page(1, 8, 81, 92).selector, CacheKey::page(1, 8, 8192, 0).selector);
+}
