@@ -9,7 +9,7 @@ published `0.x` release.
 
 Please report suspected vulnerabilities **privately** via GitHub Security Advisories
 — use **"Report a vulnerability"** at
-<https://github.com/bjmeetsfo/MatrixCache/security/advisories/new> — rather than
+<https://github.com/matrixarkai/MatrixCache/security/advisories/new> — rather than
 opening a public issue or pull request.
 
 Include, if possible:

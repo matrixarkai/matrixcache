@@ -9,7 +9,7 @@ pub struct NumaTopology {
     max_num_numa_nodes: usize,
     core_to_numa_node: Vec<usize>,
     numa_node_to_cores: Vec<Vec<usize>>,
-    numa_node_core_idx: Vec<usize>,
+    numa_node_core_index: Vec<usize>,
 }
 
 impl NumaTopology {
@@ -20,14 +20,14 @@ impl NumaTopology {
             .max(1);
         let core_to_numa_node = vec![0; cores];
         let numa_node_to_cores = vec![(0..cores).collect::<Vec<_>>()];
-        let numa_node_core_idx = (0..cores).collect::<Vec<_>>();
+        let numa_node_core_index = (0..cores).collect::<Vec<_>>();
         Self {
             num_cores: cores,
             max_num_cores: cores,
             max_num_numa_nodes: 1,
             core_to_numa_node,
             numa_node_to_cores,
-            numa_node_core_idx,
+            numa_node_core_index,
         }
     }
 }
@@ -44,19 +44,19 @@ impl NumaInfo {
         let _ = numa_topology();
     }
 
-    pub fn get_num_all_cores() -> usize {
+    pub fn num_all_cores() -> usize {
         numa_topology().num_cores
     }
 
-    pub fn get_num_online_cores() -> usize {
+    pub fn num_online_cores() -> usize {
         numa_topology().max_num_cores
     }
 
-    pub fn get_current_cpu_core() -> usize {
+    pub fn current_cpu_core() -> usize {
         0
     }
 
-    pub fn get_max_num_numa_nodes() -> usize {
+    pub fn max_num_numa_nodes() -> usize {
         numa_topology().max_num_numa_nodes
     }
 
@@ -77,16 +77,16 @@ impl NumaInfo {
         Self::get_cpu_cores_of_numa_node(Self::get_numa_node_of_cpu_core(core))
     }
 
-    pub fn get_numa_node_core_idx(core: usize) -> usize {
+    pub fn get_numa_node_core_index(core: usize) -> usize {
         numa_topology()
-            .numa_node_core_idx
+            .numa_node_core_index
             .get(core)
             .copied()
             .unwrap_or(0)
     }
 
     pub fn bind_thread_to_cpu_core(core: usize) -> Result<(), CacheError> {
-        if core < Self::get_num_online_cores() {
+        if core < Self::num_online_cores() {
             Ok(())
         } else {
             Err(CacheError::CorruptBlock(format!(
@@ -102,22 +102,22 @@ impl NumaInfo {
 
     #[allow(non_snake_case)]
     pub fn GetNumAllCores() -> usize {
-        Self::get_num_all_cores()
+        Self::num_all_cores()
     }
 
     #[allow(non_snake_case)]
     pub fn GetNumOnlineCores() -> usize {
-        Self::get_num_online_cores()
+        Self::num_online_cores()
     }
 
     #[allow(non_snake_case)]
     pub fn GetCurrentCpuCore() -> usize {
-        Self::get_current_cpu_core()
+        Self::current_cpu_core()
     }
 
     #[allow(non_snake_case)]
     pub fn GetMaxNumNumaNodes() -> usize {
-        Self::get_max_num_numa_nodes()
+        Self::max_num_numa_nodes()
     }
 
     #[allow(non_snake_case)]
@@ -137,7 +137,7 @@ impl NumaInfo {
 
     #[allow(non_snake_case)]
     pub fn GetNumaNodeCoreIdx(core: usize) -> usize {
-        Self::get_numa_node_core_idx(core)
+        Self::get_numa_node_core_index(core)
     }
 
     #[allow(non_snake_case)]
@@ -146,6 +146,32 @@ impl NumaInfo {
     }
 }
 
+/// A key, in the four parts this cache indexes by.
+///
+/// `shard_id` selects the shard, and `namespace`, `record_key` and `selector`
+/// identify the value within it. The constructors build the common shapes --
+/// [`CacheKey::string`] for a plain key, [`CacheKey::page`] and
+/// [`CacheKey::page_with_slot`] for paged records, [`CacheKey::feature_query`]
+/// and [`CacheKey::set_members`] for the query forms.
+///
+/// Not to be confused with `PolicyKey`, which is the plain `String` the
+/// replacement policies index by. The two are not interchangeable.
+///
+/// # Examples
+///
+/// ```
+/// use matrixcache::CacheKey;
+///
+/// let plain = CacheKey::string(0, "greeting");
+/// assert_eq!(plain, CacheKey::string(0, "greeting"));
+///
+/// // The same record key in a different shard is a different key.
+/// assert_ne!(plain, CacheKey::string(1, "greeting"));
+///
+/// // Paged records carry their segment, offset and length.
+/// let page = CacheKey::page(0, 7, 4096, 512);
+/// assert_ne!(page, plain);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     pub shard_id: ShardId,
@@ -274,6 +300,15 @@ pub struct ConcurrentHashMapInsertResult<K, V> {
     pub second: bool,
 }
 
+/// A map that serialises each operation behind a single lock.
+///
+/// Every method takes the internal `RwLock`, so an individual insert, lookup or
+/// erase is atomic. A *sequence* of them is not — see
+/// [`map_trylock`](Self::map_trylock), which despite its name cannot give you
+/// one.
+///
+/// This is a `std::HashMap` behind a lock rather than a port of the reference's
+/// vendored striped map, which is deliberately not carried over.
 #[derive(Debug, Clone)]
 pub struct ConcurrentHashMap<K, V> {
     inner: Arc<RwLock<HashMap<K, V>>>,
@@ -535,12 +570,34 @@ where
         removed
     }
 
+    /// Always returns `true`, and takes no lock.
+    ///
+    /// **This is not a lock and must not be used as one.** It exists to keep the
+    /// shape of the reference's per-key locking API, which this crate does not
+    /// port — the map serialises each operation internally instead, so there is
+    /// no per-key lock to acquire.
+    ///
+    /// The danger is that it looks like it works. Guarding a read-modify-write
+    /// with it:
+    ///
+    /// ```ignore
+    /// if map.map_trylock(&key) {          // always true
+    ///     let value = map.get(&key);      // another thread may interleave here
+    ///     map.insert(key, value + 1);     // ...and this update can be lost
+    ///     map.map_unlock(&key);           // no-op
+    /// }
+    /// ```
+    ///
+    /// compiles, runs, and provides no exclusion whatsoever. For a sequence that
+    /// must be atomic, hold your own lock around the map.
     pub fn map_trylock(&self, _key: &K) -> bool {
         true
     }
 
+    /// Does nothing. See [`map_trylock`](Self::map_trylock).
     pub fn map_lock(&self, _key: &K) {}
 
+    /// Does nothing. See [`map_trylock`](Self::map_trylock).
     pub fn map_unlock(&self, _key: &K) {}
 
     #[allow(non_snake_case)]
@@ -884,6 +941,13 @@ impl Default for HistStats {
     }
 }
 
+/// Counters for one cache, sampled rather than live.
+///
+/// Hits are split by the tier that served them, so `memory_hits`, `pmem_hits`
+/// and `disk_hits` sum to the total hit count and `misses` is separate. The
+/// `*_fills` count entries written *into* a tier and the `*_evictions` count
+/// entries dropped from one, which is what makes a promotion visible: it appears
+/// as a fill in the upper tier without a corresponding miss.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheStats {
     pub memory_hits: u64,
@@ -926,10 +990,56 @@ pub struct CacheStats {
     pub ssd_eviction_pinned_skips: u64,
     #[serde(default)]
     pub ssd_oversize_rejections: u64,
+    /// Bytes handed to the SSD tier's store, counting every physical write:
+    /// admissions, reclaim rewrites and recovery alike. This is the number
+    /// that wears the drive.
+    pub ssd_bytes_written: u64,
+    /// Admissions the write budget turned away to stay inside its target rate.
+    pub ssd_write_budget_rejections: u64,
+    /// Share of keys the write budget is currently admitting, out of 10000.
+    /// Sits at 10000 when no target is set.
+    pub ssd_write_budget_share: u64,
+    /// Bytes per second the SSD write budget measured over its last window.
+    /// Zero when no budget is set, or before a window has closed.
+    pub ssd_write_budget_observed_bytes_per_sec: u64,
+    /// Bytes per second the SSD write budget is aiming at. Zero when uncapped.
+    pub ssd_write_budget_target_bytes_per_sec: u64,
+    /// Copies dropped from a tier because a newer write for the same key was
+    /// admitted to a different one. A rising count is ordinary for a hot key
+    /// being rewritten; it is not an eviction.
+    pub stale_tier_copies_dropped: u64,
+    /// Demotions declined because the entry had already expired, and writing
+    /// it to a slower tier would have spent a write on a value no read can be
+    /// given.
+    pub expired_demotions_skipped: u64,
+    /// Reads that found an entry which had passed its time to live. Counted as
+    /// misses too, because that is what the caller was served.
+    pub expired_reads: u64,
+    /// Entries removed for having passed their time to live, by a read that
+    /// found one or by a sweep.
+    pub expired_removals: u64,
+    /// Evictions that took an entry which had already expired. These are free:
+    /// the entry could not have been served again anyway, so a rising share
+    /// here means eviction is reclaiming without costing future hits.
+    pub eviction_expired: u64,
+    /// Reclaims of an expired entry whose durable copy could not be deleted.
+    ///
+    /// The entry is gone from memory either way, so a read will not serve it
+    /// now — but the copy left on the device is what a restart recovers, and
+    /// it comes back without the metadata that carried its life. Any value
+    /// above zero means expiry is not actually reclaiming, and the error that
+    /// says so is otherwise discarded.
+    pub expired_delete_failures: u64,
     #[serde(default)]
     pub ssd_write_through_admissions: u64,
     #[serde(default)]
     pub hotness_promotions: u64,
+    /// Hits that had to take the cache exclusively to move their entry in the
+    /// access orders. The rest were served entirely under the shared lock, so
+    /// this against the hit counts is how much of the read path is actually
+    /// concurrent.
+    #[serde(default)]
+    pub access_order_refreshes: u64,
     #[serde(default)]
     pub refill_failures: u64,
     #[serde(default)]

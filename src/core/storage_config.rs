@@ -9,6 +9,12 @@ pub struct CacheRecoverReport {
     pub skipped_files: u64,
 }
 
+/// Where a value was placed, or that it was not placed at all.
+///
+/// `Reject` is not a tier. It is the admission policy declining the value, and
+/// operations that need a real destination answer it with
+/// [`CacheError::UnsupportedTier`]. For where a *read* was served from, which
+/// has no such case, see [`CacheReadTier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheTier {
     Memory,
@@ -18,9 +24,14 @@ pub enum CacheTier {
     Ssd,
     Reject,
 }
+/// What a single cache instance is backed by.
+///
+/// `Unified` is not a fourth medium alongside the others -- it spans them. An
+/// instance created as `Unified` is therefore not confined to one tier, which
+/// matters when reasoning about anything that assumes a single backing store.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CacheInstanceType {
+pub enum CacheInstanceKind {
     #[serde(alias = "kDRAM")]
     Dram = 0,
     #[serde(alias = "kPMEM")]
@@ -32,25 +43,31 @@ pub enum CacheInstanceType {
 }
 
 #[allow(non_upper_case_globals)]
-impl CacheInstanceType {
+impl CacheInstanceKind {
     pub const kDRAM: Self = Self::Dram;
     pub const kPMEM: Self = Self::Pmem;
     pub const kSSD: Self = Self::Ssd;
     pub const kUnified: Self = Self::Unified;
 }
 
-impl CacheInstanceType {
+impl CacheInstanceKind {
     fn as_tier(self) -> Option<CacheTier> {
         match self {
-            CacheInstanceType::Dram => Some(CacheTier::Memory),
-            CacheInstanceType::Pmem => Some(CacheTier::Pmem),
-            CacheInstanceType::Ssd => Some(CacheTier::Ssd),
-            CacheInstanceType::Unified => None,
+            CacheInstanceKind::Dram => Some(CacheTier::Memory),
+            CacheInstanceKind::Pmem => Some(CacheTier::Pmem),
+            CacheInstanceKind::Ssd => Some(CacheTier::Ssd),
+            CacheInstanceKind::Unified => None,
         }
     }
 }
+/// Which storage engine backs a tier.
+///
+/// `Ssd` is RocksDB, the default (see [`SsdEngineKind`]). `Simple` is the
+/// file-backed store used when the `rocksdb-ssd` feature is turned off; it is
+/// meant for lightweight local diagnostics rather than production. `MultiSsd`
+/// spreads records over several device paths, choosing one by hashing the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum StorageEngineType {
+pub enum StorageEngineKind {
     #[serde(alias = "kDRAM")]
     Dram,
     #[serde(alias = "kPMEM")]
@@ -64,28 +81,39 @@ pub enum StorageEngineType {
 }
 
 #[allow(non_upper_case_globals)]
-impl StorageEngineType {
+impl StorageEngineKind {
     pub const kDRAM: Self = Self::Dram;
     pub const kPMEM: Self = Self::Pmem;
     pub const kSSD: Self = Self::Ssd;
     pub const kSimple: Self = Self::Simple;
     pub const kMultiSSD: Self = Self::MultiSsd;
 }
+/// Which key-value engine backs the SSD tier.
+///
+/// RocksDB is the only one. Kept as an enum so a configuration file can name it
+/// and so a second engine could be added without changing the shape of the
+/// options, but nothing in this crate branches on the value today.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SSDEngineType {
+pub enum SsdEngineKind {
     /// Supported Rust Ssd engine.
     #[serde(alias = "kRocksDB")]
     RocksDb = 0,
 }
 
 #[allow(non_upper_case_globals)]
-impl SSDEngineType {
+impl SsdEngineKind {
     pub const kRocksDB: Self = Self::RocksDb;
 }
+/// Which staging buffer a record is written into.
+///
+/// `BufferManager` keeps one buffer per variant and flushes them independently,
+/// so the split determines what gets written together: user data, metadata,
+/// records rewritten by collection, and codec output are each batched apart from
+/// the others.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum WriteBufferType {
+pub enum WriteBufferKind {
     #[serde(alias = "kUserDataBuf")]
     UserDataBuf = 0,
     #[serde(alias = "kMetaDataBuf")]
@@ -97,43 +125,60 @@ pub enum WriteBufferType {
 }
 
 #[allow(non_upper_case_globals)]
-impl WriteBufferType {
+impl WriteBufferKind {
     pub const kUserDataBuf: Self = Self::UserDataBuf;
     pub const kMetaDataBuf: Self = Self::MetaDataBuf;
     pub const kGCBuf: Self = Self::GcBuf;
     pub const kCodecDataBuf: Self = Self::CodecDataBuf;
 }
+/// Whether a stored record is payload or part of the metadata log.
+///
+/// Declared vocabulary: the crate serialises and compares it, but nothing here
+/// branches on it. It exists so a configuration or an external tool can name the
+/// distinction.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DataType {
+pub enum DataKind {
     #[serde(alias = "DATA")]
     Data = 1,
     #[serde(alias = "META_LOG")]
     MetaLog = 2,
 }
 
-#[allow(non_upper_case_globals)]
-impl DataType {
+impl DataKind {
     pub const DATA: Self = Self::Data;
     pub const META_LOG: Self = Self::MetaLog;
 }
+/// Whether collection is permitted to lose data to make progress.
+///
+/// Declared vocabulary: nothing in this crate reads it. The collector that
+/// exists sweeps tombstones and relocates what is still referenced, which is the
+/// `Lossless` behaviour, but it does so unconditionally rather than by
+/// consulting this.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum GCMode {
+pub enum GcMode {
     #[serde(alias = "LOSSY")]
     Lossy = 1,
     #[serde(alias = "LOSSLESS")]
     Lossless = 10,
 }
 
-#[allow(non_upper_case_globals)]
-impl GCMode {
+impl GcMode {
     pub const LOSSY: Self = Self::Lossy;
     pub const LOSSLESS: Self = Self::Lossless;
 }
+/// The state bits carried by a stored record.
+///
+/// `SoftDel` marks a record removed but not yet reclaimed, so a read must treat
+/// it as absent while collection still sees it.
+///
+/// `MaxCode` is not a state. Its value `0xf` is the mask for the state field
+/// packed into a colored pointer, so it is used as `state as u64 &
+/// RecordState::MaxCode as u64` rather than compared against.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RecordStateType {
+pub enum RecordState {
     #[serde(alias = "kSoftDel")]
     SoftDel = 0x0,
     #[serde(alias = "kNormal")]
@@ -145,33 +190,50 @@ pub enum RecordStateType {
 }
 
 #[allow(non_upper_case_globals)]
-impl RecordStateType {
+impl RecordState {
     pub const kSoftDel: Self = Self::SoftDel;
     pub const kNormal: Self = Self::Normal;
     pub const kPinned: Self = Self::Pinned;
     pub const kMaxCode: Self = Self::MaxCode;
 }
 
+/// What the SSD index holds for a key.
+///
+/// Either a colored pointer -- an address on the SSD tier with the record's
+/// [`RecordState`] packed into its low bits -- or the value itself, still
+/// resident in memory and not yet written down. `state` answers `None` for the
+/// pointer form because the state lives inside the packed word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SsdIndexValue {
     SsdColoredPtr(u64),
     Memory {
         value: Vec<u8>,
-        state: RecordStateType,
+        state: RecordState,
     },
 }
 
 impl SsdIndexValue {
-    pub fn state(&self) -> Option<RecordStateType> {
+    /// The record's state.
+    ///
+    /// A record on the device carries its state in the low bits of its packed
+    /// pointer, so this reports one for both shapes. Reporting `None` for device
+    /// records made every state operation below silently skip them.
+    pub fn state(&self) -> Option<RecordState> {
         match self {
-            Self::SsdColoredPtr(_) => None,
+            Self::SsdColoredPtr(ptr) => Some(decode_colored_ptr_record_state(*ptr)),
             Self::Memory { state, .. } => Some(*state),
         }
     }
 
-    pub fn with_state(self, state: RecordStateType) -> Self {
+    /// The same record in a different state.
+    ///
+    /// The state field is cleared before the new value is written: setting it by
+    /// OR alone cannot move a record back to `SoftDel`, whose encoding is zero.
+    pub fn with_state(self, state: RecordState) -> Self {
         match self {
-            Self::SsdColoredPtr(ptr) => Self::SsdColoredPtr(ptr),
+            Self::SsdColoredPtr(ptr) => Self::SsdColoredPtr(
+                mask_colored_ptr_record_state(ptr & !SSD_RECORD_STATE_FLAGS, state),
+            ),
             Self::Memory { value, .. } => Self::Memory { value, state },
         }
     }
@@ -182,7 +244,6 @@ pub struct SsdIndex {
     entries: Arc<RwLock<HashMap<String, SsdIndexValue>>>,
 }
 
-pub type Index = SsdIndex;
 
 impl SsdIndex {
     pub fn new() -> Self {
@@ -194,11 +255,13 @@ impl SsdIndex {
         let Some(current) = entries.get(key).cloned() else {
             return false;
         };
-        let value = match (current.state(), value) {
-            (Some(state), SsdIndexValue::Memory { value, .. }) => {
-                SsdIndexValue::Memory { value, state }
-            }
-            (_, value) => value,
+        // An update repoints a record; it does not restate it. The state comes
+        // from the entry already here, whichever shape the new value lands in --
+        // otherwise moving a record to the device would silently adopt whatever
+        // state the fresh pointer happened to carry.
+        let value = match current.state() {
+            Some(state) => value.with_state(state),
+            None => value,
         };
         entries.insert(key.to_string(), value);
         true
@@ -213,48 +276,50 @@ impl SsdIndex {
 
     pub fn get(&self, key: &str) -> Option<SsdIndexValue> {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
-        let value = entries.get_mut(key)?;
-        if let SsdIndexValue::Memory { state, .. } = value {
-            if *state == RecordStateType::SoftDel {
-                *state = RecordStateType::Normal;
-            }
+        let value = entries.get(key)?.clone();
+        if value.state() == Some(RecordState::SoftDel) {
+            let promoted = value.with_state(RecordState::Normal);
+            entries.insert(key.to_string(), promoted.clone());
+            return Some(promoted);
         }
-        Some(value.clone())
+        Some(value)
     }
 
     pub fn unpin(&self, key: &str) {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
-        if let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) {
-            if *state == RecordStateType::Pinned {
-                *state = RecordStateType::Normal;
-            }
+        let Some(value) = entries.get(key).cloned() else {
+            return;
+        };
+        if value.state() == Some(RecordState::Pinned) {
+            entries.insert(key.to_string(), value.with_state(RecordState::Normal));
         }
     }
 
     pub fn pin(&self, key: &str) -> bool {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
-        let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) else {
+        let Some(value) = entries.get(key).cloned() else {
             return false;
         };
-        if *state == RecordStateType::Pinned {
+        if value.state() == Some(RecordState::Pinned) {
             return false;
         }
-        *state = RecordStateType::Pinned;
+        entries.insert(key.to_string(), value.with_state(RecordState::Pinned));
         true
     }
 
     pub fn soft_delete(&self, key: &str) {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
-        if let Some(SsdIndexValue::Memory { state, .. }) = entries.get_mut(key) {
-            if *state != RecordStateType::Pinned {
-                *state = RecordStateType::SoftDel;
-            }
+        let Some(value) = entries.get(key).cloned() else {
+            return;
+        };
+        if value.state() != Some(RecordState::Pinned) {
+            entries.insert(key.to_string(), value.with_state(RecordState::SoftDel));
         }
     }
 
     pub fn delete_if<F>(&self, key: &str, pred: F) -> bool
     where
-        F: FnOnce(RecordStateType) -> bool,
+        F: FnOnce(RecordState) -> bool,
     {
         let mut entries = self.entries.write().expect("ssd index lock poisoned");
         let state = entries.get(key).and_then(SsdIndexValue::state);
@@ -309,7 +374,7 @@ impl SsdIndex {
     #[allow(non_snake_case)]
     pub fn DeleteIf<F>(&self, key: &str, pred: F) -> bool
     where
-        F: FnOnce(RecordStateType) -> bool,
+        F: FnOnce(RecordState) -> bool,
     {
         self.delete_if(key, pred)
     }
@@ -335,7 +400,7 @@ impl IndexUpdater {
 
     pub fn delete_if<F>(&self, key: &str, pred: F) -> bool
     where
-        F: FnOnce(RecordStateType) -> bool,
+        F: FnOnce(RecordState) -> bool,
     {
         self.index.delete_if(key, pred)
     }
@@ -351,7 +416,7 @@ impl IndexUpdater {
     #[allow(non_snake_case)]
     pub fn DeleteIf<F>(&self, key: &str, pred: F) -> bool
     where
-        F: FnOnce(RecordStateType) -> bool,
+        F: FnOnce(RecordState) -> bool,
     {
         self.delete_if(key, pred)
     }
@@ -375,13 +440,13 @@ pub struct WriteBufferRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteBuffer {
-    buf_type: WriteBufferType,
+    buf_type: WriteBufferKind,
     capacity: u32,
     records: Vec<WriteBufferRecord>,
 }
 
 impl WriteBuffer {
-    pub fn new(buf_type: WriteBufferType, capacity: u32) -> Self {
+    pub fn new(buf_type: WriteBufferKind, capacity: u32) -> Self {
         Self {
             buf_type,
             capacity,
@@ -408,7 +473,7 @@ impl WriteBuffer {
         self.records.len().min(u32::MAX as usize) as u32
     }
 
-    pub fn buf_type(&self) -> WriteBufferType {
+    pub fn buf_type(&self) -> WriteBufferKind {
         self.buf_type
     }
 
@@ -455,7 +520,7 @@ impl WriteBuffer {
     }
 
     #[allow(non_snake_case)]
-    pub fn BufType(&self) -> WriteBufferType {
+    pub fn BufType(&self) -> WriteBufferKind {
         self.buf_type()
     }
 
@@ -477,7 +542,7 @@ impl WriteBuffer {
 
 impl Default for WriteBuffer {
     fn default() -> Self {
-        Self::new(WriteBufferType::UserDataBuf, 10_485_760)
+        Self::new(WriteBufferKind::UserDataBuf, 10_485_760)
     }
 }
 
@@ -581,8 +646,22 @@ pub fn mask_colored_ptr_size(old_colored_ptr: u64, size: u32) -> u64 {
     old_colored_ptr | (((size as u64) & 0xfff) << 7)
 }
 
-pub fn mask_colored_ptr_record_state(old_colored_ptr: u64, state: RecordStateType) -> u64 {
-    old_colored_ptr | ((state as u64) & (RecordStateType::MaxCode as u64))
+pub fn mask_colored_ptr_record_state(old_colored_ptr: u64, state: RecordState) -> u64 {
+    old_colored_ptr | ((state as u64) & (RecordState::MaxCode as u64))
+}
+
+/// Reads a record state back out of a packed pointer.
+///
+/// The field is four bits wide and three of its sixteen values are named; an
+/// unnamed one reads as `Normal`, because a record that exists is more usefully
+/// treated as live than as corrupt.
+pub fn decode_colored_ptr_record_state(colored_ptr: u64) -> RecordState {
+    match colored_ptr & SSD_RECORD_STATE_FLAGS {
+        0x0 => RecordState::SoftDel,
+        0x2 => RecordState::Pinned,
+        0xf => RecordState::MaxCode,
+        _ => RecordState::Normal,
+    }
 }
 
 #[allow(non_snake_case)]
@@ -671,7 +750,7 @@ pub fn MaskColoredPtrSize(old_colored_ptr: u64, size: u32) -> u64 {
 }
 
 #[allow(non_snake_case)]
-pub fn MaskColoredPtrRecordState(old_colored_ptr: u64, state: RecordStateType) -> u64 {
+pub fn MaskColoredPtrRecordState(old_colored_ptr: u64, state: RecordState) -> u64 {
     mask_colored_ptr_record_state(old_colored_ptr, state)
 }
 
@@ -710,7 +789,7 @@ impl BufferEncoder {
         self.align_size
     }
 
-    pub fn get_xxh_seed(&self) -> u64 {
+    pub fn xxh_seed(&self) -> u64 {
         self.xxh_seed
     }
 
@@ -764,7 +843,7 @@ impl BufferEncoder {
     pub fn serialize_oplog<F>(
         &self,
         records: &[WriteBufferRecord],
-        mut update_entry_cb: F,
+        mut update_entry_callback: F,
         mut batch_begin_offset: u64,
         oplog_size: u32,
     ) -> Vec<u8>
@@ -778,10 +857,10 @@ impl BufferEncoder {
             let record_size = Self::DATA_FIXED_PART_SIZE.saturating_add(value_len);
             let record_units = aligned_to(record_size, self.align_size) / self.align_size as u32;
             let mut colored_ptr = 0;
-            colored_ptr = mask_colored_ptr_record_state(colored_ptr, RecordStateType::SoftDel);
+            colored_ptr = mask_colored_ptr_record_state(colored_ptr, RecordState::SoftDel);
             colored_ptr = mask_colored_ptr_lba(colored_ptr, batch_begin_offset);
             colored_ptr = mask_colored_ptr_size(colored_ptr, record_units);
-            update_entry_cb(&record.key, SsdIndexValue::SsdColoredPtr(colored_ptr));
+            update_entry_callback(&record.key, SsdIndexValue::SsdColoredPtr(colored_ptr));
 
             let entry_start = encoded.len();
             encoded.resize(entry_start + 16, 0);
@@ -848,14 +927,14 @@ impl BufferEncoder {
     pub fn SerializeOplog<F>(
         &self,
         records: &[WriteBufferRecord],
-        update_entry_cb: F,
+        update_entry_callback: F,
         batch_begin_offset: u64,
         oplog_size: u32,
     ) -> Vec<u8>
     where
         F: FnMut(&str, SsdIndexValue) -> bool,
     {
-        self.serialize_oplog(records, update_entry_cb, batch_begin_offset, oplog_size)
+        self.serialize_oplog(records, update_entry_callback, batch_begin_offset, oplog_size)
     }
 
     #[allow(non_snake_case)]
@@ -865,14 +944,14 @@ impl BufferEncoder {
 
     #[allow(non_snake_case)]
     pub fn GetXXHSeed(&self) -> u64 {
-        self.get_xxh_seed()
+        self.xxh_seed()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BufferManager {
     write_enabled: bool,
-    buffers: HashMap<WriteBufferType, Vec<WriteBufferRecord>>,
+    buffers: HashMap<WriteBufferKind, Vec<WriteBufferRecord>>,
     flushed: Vec<WriteBufferRecord>,
     capacity_per_buf: u32,
     flush_threshold: f64,
@@ -909,7 +988,7 @@ impl BufferManager {
     pub fn put(
         &mut self,
         value: (impl Into<String>, impl Into<Vec<u8>>),
-        buffer_type: WriteBufferType,
+        buffer_type: WriteBufferKind,
     ) -> Result<(), CacheError> {
         if !self.write_enabled {
             return Err(CacheError::Stopped);
@@ -967,7 +1046,7 @@ impl BufferManager {
         )
     }
 
-    pub fn buffered_count(&self, buffer_type: WriteBufferType) -> usize {
+    pub fn buffered_count(&self, buffer_type: WriteBufferKind) -> usize {
         self.buffers.get(&buffer_type).map_or(0, Vec::len)
     }
 
@@ -991,7 +1070,7 @@ impl BufferManager {
     pub fn Put(
         &mut self,
         value: (impl Into<String>, impl Into<Vec<u8>>),
-        buffer_type: WriteBufferType,
+        buffer_type: WriteBufferKind,
     ) -> Result<(), CacheError> {
         self.put(value, buffer_type)
     }
@@ -1037,7 +1116,7 @@ impl BufferManager {
     }
 }
 
-impl SSDEngineType {
+impl SsdEngineKind {
     pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("rocksdb")
             || value.eq_ignore_ascii_case("rocks_db")
@@ -1067,7 +1146,7 @@ impl SSDEngineType {
     }
 }
 
-impl StorageEngineType {
+impl StorageEngineKind {
     pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("pmem")
             || value.eq_ignore_ascii_case("persistent_memory")
@@ -1128,11 +1207,11 @@ impl StorageEngineType {
         matches!(self, Self::Ssd | Self::MultiSsd)
     }
 
-    pub fn canonical_instance_type(self) -> CacheInstanceType {
+    pub fn canonical_instance_type(self) -> CacheInstanceKind {
         match self {
-            Self::Dram | Self::Simple => CacheInstanceType::Dram,
-            Self::Pmem => CacheInstanceType::Pmem,
-            Self::Ssd | Self::MultiSsd => CacheInstanceType::Ssd,
+            Self::Dram | Self::Simple => CacheInstanceKind::Dram,
+            Self::Pmem => CacheInstanceKind::Pmem,
+            Self::Ssd | Self::MultiSsd => CacheInstanceKind::Ssd,
         }
     }
 
@@ -1156,7 +1235,7 @@ impl StorageEngineType {
         }
     }
 
-    fn as_instance_type(self) -> CacheInstanceType {
+    fn as_instance_type(self) -> CacheInstanceKind {
         self.canonical_instance_type()
     }
 
@@ -1185,9 +1264,18 @@ impl StorageEngineType {
         self.as_config_name()
     }
 }
+/// The replacement policy named by a configuration value.
+///
+/// Wider than [`CacheReplacementPolicy`], which is what the crate implements:
+/// `Lru` and the `MaxCode` sentinel both map onto `WeightedHotnessLru`. Accept
+/// this at a configuration boundary and convert inward; match on
+/// [`CacheReplacementPolicy`] when deciding behaviour.
+///
+/// `MaxCode` marks the end of the numeric range rather than naming a policy --
+/// a C-style sentinel kept so serialized codes stay stable.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ReplacementPolicyType {
+pub enum ReplacementPolicyKind {
     #[serde(alias = "kFIFO")]
     Fifo = 0,
     #[serde(alias = "kLRU")]
@@ -1201,7 +1289,7 @@ pub enum ReplacementPolicyType {
 }
 
 #[allow(non_upper_case_globals)]
-impl ReplacementPolicyType {
+impl ReplacementPolicyKind {
     pub const kFIFO: Self = Self::Fifo;
     pub const kLRU: Self = Self::Lru;
     pub const kSLRU: Self = Self::Slru;
@@ -1209,7 +1297,7 @@ impl ReplacementPolicyType {
     pub const kMaxCode: Self = Self::MaxCode;
 }
 
-impl ReplacementPolicyType {
+impl ReplacementPolicyKind {
     pub fn from_config_name(value: &str) -> Self {
         if value.eq_ignore_ascii_case("fifo") || value.eq_ignore_ascii_case("kFIFO") {
             Self::Fifo
@@ -1236,17 +1324,25 @@ impl ReplacementPolicyType {
 
     fn as_cache_policy(self) -> CacheReplacementPolicy {
         match self {
-            ReplacementPolicyType::Fifo => CacheReplacementPolicy::Fifo,
-            ReplacementPolicyType::Slru => CacheReplacementPolicy::Slru,
-            ReplacementPolicyType::Lru => CacheReplacementPolicy::WeightedHotnessLru,
-            ReplacementPolicyType::WeightedHotnessLru => {
+            ReplacementPolicyKind::Fifo => CacheReplacementPolicy::Fifo,
+            ReplacementPolicyKind::Slru => CacheReplacementPolicy::Slru,
+            ReplacementPolicyKind::Lru => CacheReplacementPolicy::WeightedHotnessLru,
+            ReplacementPolicyKind::WeightedHotnessLru => {
                 CacheReplacementPolicy::WeightedHotnessLru
             }
-            ReplacementPolicyType::MaxCode => CacheReplacementPolicy::WeightedHotnessLru,
+            ReplacementPolicyKind::MaxCode => CacheReplacementPolicy::WeightedHotnessLru,
         }
     }
 }
 
+/// How a value is divided between the DRAM and persistent-memory tiers.
+///
+/// `SideBySide` treats them as two independent pools, each holding whatever it
+/// admits; `Tiered` treats DRAM as the front of a single hierarchy that falls
+/// through to PMEM. This changes what `size` and `capacity` mean: side-by-side
+/// adds the two tiers together, tiered takes the larger of them.
+///
+/// `Tiered` is the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheDataPlacement {
     #[serde(alias = "kSideBySide")]
@@ -1294,9 +1390,17 @@ impl CacheDataPlacement {
         }
     }
 }
+/// The configuration-facing form of [`CacheDataPlacement`].
+///
+/// The same choice between side-by-side and tiered, plus a `MaxCode` sentinel
+/// marking the end of the numeric range. Converts both ways with `From`;
+/// `MaxCode` collapses to `Tiered` on the way in, since it names no placement.
+///
+/// Accept this where a configuration value arrives and convert to
+/// [`CacheDataPlacement`] before deciding anything.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DRAMPMEMDataPlacementType {
+pub enum DramPmemDataPlacement {
     #[serde(alias = "kSideBySide")]
     SideBySide = 0,
     #[serde(alias = "kTiered")]
@@ -1306,13 +1410,13 @@ pub enum DRAMPMEMDataPlacementType {
 }
 
 #[allow(non_upper_case_globals)]
-impl DRAMPMEMDataPlacementType {
+impl DramPmemDataPlacement {
     pub const kSideBySide: Self = Self::SideBySide;
     pub const kTiered: Self = Self::Tiered;
     pub const kMaxCode: Self = Self::MaxCode;
 }
 
-impl DRAMPMEMDataPlacementType {
+impl DramPmemDataPlacement {
     pub fn try_from_config_name(value: &str) -> Result<Self, CacheError> {
         Ok(match CacheDataPlacement::try_from_config_name(value)? {
             CacheDataPlacement::SideBySide => Self::SideBySide,
@@ -1372,13 +1476,13 @@ impl DRAMPMEMDataPlacementType {
     }
 }
 
-impl From<DRAMPMEMDataPlacementType> for CacheDataPlacement {
-    fn from(value: DRAMPMEMDataPlacementType) -> Self {
+impl From<DramPmemDataPlacement> for CacheDataPlacement {
+    fn from(value: DramPmemDataPlacement) -> Self {
         value.as_cache_data_placement()
     }
 }
 
-impl From<CacheDataPlacement> for DRAMPMEMDataPlacementType {
+impl From<CacheDataPlacement> for DramPmemDataPlacement {
     fn from(value: CacheDataPlacement) -> Self {
         Self::from_cache_data_placement(value)
     }
@@ -1388,6 +1492,14 @@ fn default_cache_data_placement() -> CacheDataPlacement {
     CacheDataPlacement::Tiered
 }
 
+/// Why the admission policy placed a value where it did.
+///
+/// Returned alongside the chosen [`CacheTier`] so a caller can tell a hot-path
+/// admission from a fallback. `Oversize` is the only one that accompanies
+/// `CacheTier::Reject`: the value did not fit anywhere. `MemoryOnly` is the
+/// unconditional fallthrough at the end of the chain -- nothing above it
+/// matched, so the value goes to memory alone, with neither the persistent nor
+/// the SSD tier admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheAdmissionReason {
     HotPage,
@@ -1399,9 +1511,13 @@ pub enum CacheAdmissionReason {
     MemoryOnly,
 }
 
+/// Which operation an access record describes.
+///
+/// Only these three are recorded. Note that `RemoveAll` does not produce
+/// records -- clearing a cache is not reported as a `Delete` per entry.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CacheAccessRecordType {
+pub enum CacheAccessRecordKind {
     #[serde(alias = "kPut")]
     Put = 1,
     #[serde(alias = "kGet")]
@@ -1411,7 +1527,7 @@ pub enum CacheAccessRecordType {
 }
 
 #[allow(non_upper_case_globals)]
-impl CacheAccessRecordType {
+impl CacheAccessRecordKind {
     pub const kPut: Self = Self::Put;
     pub const kGet: Self = Self::Get;
     pub const kDelete: Self = Self::Delete;
@@ -1456,11 +1572,11 @@ impl CacheAccessRecordType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheAccessRecord {
-    pub record_type: CacheAccessRecordType,
+    pub record_type: CacheAccessRecordKind,
     pub key: CacheKey,
 }
 
-pub type AccessRecordType = CacheAccessRecordType;
+pub type AccessRecordKind = CacheAccessRecordKind;
 
 #[derive(Clone)]
 struct CacheAccessRecordCallback {
@@ -1488,11 +1604,28 @@ impl CacheAccessRecordCallback {
     }
 }
 
+/// Why an entry left the cache, as told to an eviction handler.
+///
+/// A handler cannot work this out from the record alone, and the two cases
+/// want opposite treatment: a value evicted to make room is the entry's
+/// current contents and is worth writing somewhere slower, while an expired
+/// one is stale and must not be. A handler that only releases a resource
+/// wants both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheRemovalCause {
+    /// Taken to make room. The value was still within its life.
+    Evicted,
+    /// Dropped for having passed its time to live. The value is stale.
+    Expired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEvictionRecord {
     pub tier: CacheTier,
     pub key: CacheKey,
     pub value: Vec<u8>,
+    /// Why the entry left. See [`CacheRemovalCause`].
+    pub cause: CacheRemovalCause,
 }
 
 #[derive(Clone)]
@@ -1552,6 +1685,11 @@ impl CacheEvictionMetricCallback {
     }
 }
 
+/// What kind of block a cached record holds.
+///
+/// Inferred from the key when an entry is first admitted, and used by the
+/// hotness scoring, so it influences which entries survive eviction rather than
+/// merely labelling them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheBlockKind {
     Page,
@@ -1616,6 +1754,10 @@ impl Default for CacheTieringPolicy {
 }
 
 fn default_ssd_write_through() -> bool {
+    true
+}
+
+fn default_ssd_block_durability() -> bool {
     true
 }
 

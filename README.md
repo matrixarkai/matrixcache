@@ -1,6 +1,6 @@
 # MatrixCache
 
-[![CI](https://github.com/bjmeetsfo/MatrixCache/actions/workflows/ci.yml/badge.svg)](https://github.com/bjmeetsfo/MatrixCache/actions/workflows/ci.yml)
+[![CI](https://github.com/matrixarkai/MatrixCache/actions/workflows/ci.yml/badge.svg)](https://github.com/matrixarkai/MatrixCache/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 
@@ -41,19 +41,18 @@ sudo apt-get install -y build-essential pkg-config libssl-dev clang libclang-dev
 cargo build
 cargo test
 cargo test --no-default-features       # file-backed compatibility store
-cargo run --release --example rocksdb_parity_bench -- 5000
+cargo run --release --example rocksdb_backend_bench -- 5000
 ```
 
-The `rocksdb_parity_bench` example drives the multi-tier cache against the
+The `rocksdb_backend_bench` example drives the multi-tier cache against the
 RocksDB SSD backend and prints a JSON report (backend, tier evictions, resident
 hot key count, cold SSD refills, pressure and replacement-soak status) that is
 useful as local performance/behavior evidence.
 
 ## Minimum Supported Rust Version
 
-MSRV is **1.88**, set by the RocksDB backend that the default features build. Without
-default features the crate itself needs far less, but the number quoted here is the one that
-matters for a default `cargo build`.
+MSRV is **1.88**, set by the `rocksdb` dependency behind the default
+`rocksdb-ssd` feature.
 
 ## Contributing, security, and license
 

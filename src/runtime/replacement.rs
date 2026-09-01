@@ -123,6 +123,12 @@ fn latency_bucket_count(
         .saturating_add(gt_10ms)
 }
 
+/// How values are encoded before they are stored.
+///
+/// **The default is `Zstd { level: 1 }`, not `None`.** Either way the codec
+/// applies only to values of at least `min_compress_bytes`; smaller values are
+/// stored raw, and a value that fails to compress is also stored raw rather
+/// than growing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheCompression {
     None,
@@ -231,6 +237,27 @@ pub struct CacheLatencyMetricsReport {
     pub histogram_ready: bool,
 }
 
+/// The replacement policies this crate actually implements.
+///
+/// Distinct from [`ReplacementPolicyKind`], which is the wider vocabulary a
+/// configuration file may use. Converting from that one is lossy on purpose:
+/// its `Lru` and its `MaxCode` sentinel both arrive here as
+/// `WeightedHotnessLru`, because plain LRU is not implemented separately.
+///
+/// Defaults to `WeightedHotnessLru`.
+/// Which entry a tier gives up when it needs room.
+///
+/// `Slru` selects the same eviction as `WeightedHotnessLru` on a
+/// [`MultiLayerCache`] tier: the two share a branch in every tier's victim
+/// selection, and a scan-resistance run gives them identical hit rates and
+/// identical eviction counts at every insertion point. The segmented policy
+/// itself exists, as [`ReplacementSlru`], but nothing connects it to tier
+/// eviction yet.
+///
+/// It is kept as a distinct value rather than removed, because a
+/// configuration naming it should keep working; [`CacheOptions::validate`]
+/// reports that it resolves to the weighted policy, so asking for it is not
+/// silently answered with something else.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheReplacementPolicy {
     Fifo,
@@ -240,14 +267,45 @@ pub enum CacheReplacementPolicy {
 }
 
 impl CacheReplacementPolicy {
-    pub fn from_config_name(value: &str) -> Self {
+    /// The policy this name asks for, or `None` if no policy has it.
+    ///
+    /// The only list of names. [`Self::from_config_name`] is written in terms
+    /// of this one, so a name cannot be accepted by a check and then resolve
+    /// to something else -- which is the failure that matters, because it is
+    /// silent.
+    pub fn try_from_config_name(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("fifo") {
-            Self::Fifo
+            Some(Self::Fifo)
         } else if value.eq_ignore_ascii_case("slru") {
-            Self::Slru
+            Some(Self::Slru)
+        } else if value.eq_ignore_ascii_case("weightedhotnesslru")
+            // Plain LRU is not a separate policy here; the weighted one is
+            // what a configuration asking for LRU gets, and has always got.
+            // Named rather than left to the fallback, so asking for it is not
+            // reported as a name nobody recognises.
+            || value.eq_ignore_ascii_case("lru")
+        {
+            Some(Self::WeightedHotnessLru)
         } else {
-            Self::WeightedHotnessLru
+            None
         }
+    }
+
+    /// Every name a configuration may use, for saying so in an error.
+    pub fn config_names() -> Vec<&'static str> {
+        [Self::Fifo, Self::Slru, Self::WeightedHotnessLru]
+            .into_iter()
+            .map(Self::as_config_name)
+            .collect()
+    }
+
+    /// The policy this name asks for, falling back to the default.
+    ///
+    /// Kept infallible because a cache built from a configuration file should
+    /// start rather than refuse. [`CacheOptions::validate`] is what says the
+    /// name was not recognised.
+    pub fn from_config_name(value: &str) -> Self {
+        Self::try_from_config_name(value).unwrap_or_default()
     }
 
     pub fn as_config_name(self) -> &'static str {
@@ -259,7 +317,7 @@ impl CacheReplacementPolicy {
     }
 }
 
-pub type CacheKeyType = String;
+pub type PolicyKey = String;
 
 /// Sentinel for "no node" in the intrusive key lists below.
 const KEY_LIST_NIL: u32 = u32::MAX;
@@ -269,7 +327,7 @@ const KEY_LIST_NIL: u32 = u32::MAX;
 /// the owning index.
 #[derive(Debug, Clone)]
 struct KeyListNode {
-    key: CacheKeyType,
+    key: PolicyKey,
     prev: u32,
     next: u32,
 }
@@ -412,7 +470,7 @@ impl KeyArena {
     }
 
     /// Collect up to `size` keys walking from the tail toward the head.
-    fn collect_from_tail(&self, list: &KeyList, size: usize) -> Vec<CacheKeyType> {
+    fn collect_from_tail(&self, list: &KeyList, size: usize) -> Vec<PolicyKey> {
         let mut collected = Vec::new();
         let mut cursor = list.tail;
         while cursor != KEY_LIST_NIL && collected.len() < size {
@@ -424,14 +482,14 @@ impl KeyArena {
 }
 
 #[derive(Debug, Clone)]
-pub struct BaseLRUList {
+pub struct BaseLruList {
     capacity: usize,
     arena: KeyArena,
     list: KeyList,
-    index: HashMap<CacheKeyType, u32>,
+    index: HashMap<PolicyKey, u32>,
 }
 
-impl BaseLRUList {
+impl BaseLruList {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -453,7 +511,7 @@ impl BaseLRUList {
         self.index.len()
     }
 
-    pub fn put(&mut self, key: CacheKeyType) {
+    pub fn put(&mut self, key: PolicyKey) {
         if let Some(&node) = self.index.get(&key) {
             self.arena.unlink(&mut self.list, node);
             self.arena.link_front(&mut self.list, node);
@@ -482,11 +540,11 @@ impl BaseLRUList {
         true
     }
 
-    pub fn get_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.arena.collect_from_tail(&self.list, size)
     }
 
-    pub fn evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict(&mut self) -> Vec<PolicyKey> {
         let mut evicted = Vec::new();
         while self.index.len() > self.capacity {
             let popped = self.evict_one();
@@ -498,7 +556,7 @@ impl BaseLRUList {
         evicted
     }
 
-    pub fn evict_one(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict_one(&mut self) -> Vec<PolicyKey> {
         let Some(node) = self.list.back() else {
             return Vec::new();
         };
@@ -517,7 +575,7 @@ impl BaseLRUList {
 }
 
 #[allow(non_snake_case)]
-impl BaseLRUList {
+impl BaseLruList {
     pub fn SetCapacity(&mut self, capacity: usize) {
         self.set_capacity(capacity);
     }
@@ -530,7 +588,7 @@ impl BaseLRUList {
         self.size()
     }
 
-    pub fn Put(&mut self, key: CacheKeyType) {
+    pub fn Put(&mut self, key: PolicyKey) {
         self.put(key);
     }
 
@@ -542,15 +600,15 @@ impl BaseLRUList {
         self.delete(key)
     }
 
-    pub fn GetTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_tail(size)
     }
 
-    pub fn Evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn Evict(&mut self) -> Vec<PolicyKey> {
         self.evict()
     }
 
-    pub fn EvictOne(&mut self) -> Vec<CacheKeyType> {
+    pub fn EvictOne(&mut self) -> Vec<PolicyKey> {
         self.evict_one()
     }
 
@@ -559,29 +617,29 @@ impl BaseLRUList {
     }
 }
 
-impl Default for BaseLRUList {
+impl Default for BaseLruList {
     fn default() -> Self {
         Self::new(0)
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GhostLRUPopResult {
-    pub item: CacheKeyType,
+pub struct GhostLruPopResult {
+    pub item: PolicyKey,
     pub is_ghost: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct GhostLRUList {
-    data_list: BaseLRUList,
-    ghost_list: BaseLRUList,
+pub struct GhostLruList {
+    data_list: BaseLruList,
+    ghost_list: BaseLruList,
 }
 
-impl GhostLRUList {
+impl GhostLruList {
     pub fn new(capacity: usize) -> Self {
         Self {
-            data_list: BaseLRUList::new(capacity),
-            ghost_list: BaseLRUList::new(capacity),
+            data_list: BaseLruList::new(capacity),
+            ghost_list: BaseLruList::new(capacity),
         }
     }
 
@@ -610,11 +668,11 @@ impl GhostLRUList {
         self.size().saturating_add(self.ghost_size())
     }
 
-    pub fn put(&mut self, key: CacheKeyType) {
+    pub fn put(&mut self, key: PolicyKey) {
         self.data_list.put(key);
     }
 
-    pub fn put_ghost(&mut self, key: CacheKeyType) {
+    pub fn put_ghost(&mut self, key: PolicyKey) {
         self.ghost_list.put(key);
     }
 
@@ -638,41 +696,41 @@ impl GhostLRUList {
         }
     }
 
-    pub fn evict_one_data(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict_one_data(&mut self) -> Vec<PolicyKey> {
         self.data_list.evict_one()
     }
 
-    pub fn evict_one_ghost(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict_one_ghost(&mut self) -> Vec<PolicyKey> {
         self.ghost_list.evict_one()
     }
 
-    pub fn get_data_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_data_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.data_list.get_tail(size)
     }
 
-    pub fn get_ghost_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_ghost_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.ghost_list.get_tail(size)
     }
 
-    pub fn evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict(&mut self) -> Vec<PolicyKey> {
         self.ghost_list.evict();
         self.data_list.evict()
     }
 
-    pub fn pop(&mut self, key: &str) -> GhostLRUPopResult {
+    pub fn pop(&mut self, key: &str) -> GhostLruPopResult {
         if self.data_list.delete(key) {
-            return GhostLRUPopResult {
+            return GhostLruPopResult {
                 item: key.to_string(),
                 is_ghost: false,
             };
         }
         if self.ghost_list.delete(key) {
-            return GhostLRUPopResult {
+            return GhostLruPopResult {
                 item: key.to_string(),
                 is_ghost: true,
             };
         }
-        GhostLRUPopResult::default()
+        GhostLruPopResult::default()
     }
 
     pub fn reset(&mut self) {
@@ -682,7 +740,7 @@ impl GhostLRUList {
 }
 
 #[allow(non_snake_case)]
-impl GhostLRUList {
+impl GhostLruList {
     pub fn SetCapacity(&mut self, capacity: usize) {
         self.set_capacity(capacity);
     }
@@ -707,11 +765,11 @@ impl GhostLRUList {
         self.total_size()
     }
 
-    pub fn Put(&mut self, key: CacheKeyType) {
+    pub fn Put(&mut self, key: PolicyKey) {
         self.put(key);
     }
 
-    pub fn PutGhost(&mut self, key: CacheKeyType) {
+    pub fn PutGhost(&mut self, key: PolicyKey) {
         self.put_ghost(key);
     }
 
@@ -727,27 +785,27 @@ impl GhostLRUList {
         self.downgrade();
     }
 
-    pub fn EvictOneData(&mut self) -> Vec<CacheKeyType> {
+    pub fn EvictOneData(&mut self) -> Vec<PolicyKey> {
         self.evict_one_data()
     }
 
-    pub fn EvictOneGhost(&mut self) -> Vec<CacheKeyType> {
+    pub fn EvictOneGhost(&mut self) -> Vec<PolicyKey> {
         self.evict_one_ghost()
     }
 
-    pub fn GetDataTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetDataTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_data_tail(size)
     }
 
-    pub fn GetGhostTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetGhostTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_ghost_tail(size)
     }
 
-    pub fn Evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn Evict(&mut self) -> Vec<PolicyKey> {
         self.evict()
     }
 
-    pub fn Pop(&mut self, key: &str) -> GhostLRUPopResult {
+    pub fn Pop(&mut self, key: &str) -> GhostLruPopResult {
         self.pop(key)
     }
 
@@ -758,7 +816,7 @@ impl GhostLRUList {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArcPopResult {
-    pub item: CacheKeyType,
+    pub item: PolicyKey,
     pub is_active: bool,
     pub is_ghost: bool,
 }
@@ -766,16 +824,16 @@ pub struct ArcPopResult {
 #[derive(Debug, Clone)]
 pub struct ArcList {
     capacity: usize,
-    fetch_list: GhostLRUList,
-    active_list: GhostLRUList,
+    fetch_list: GhostLruList,
+    active_list: GhostLruList,
 }
 
 impl ArcList {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            fetch_list: GhostLRUList::new(capacity / 2),
-            active_list: GhostLRUList::new(capacity.saturating_sub(capacity / 2)),
+            fetch_list: GhostLruList::new(capacity / 2),
+            active_list: GhostLruList::new(capacity.saturating_sub(capacity / 2)),
         }
     }
 
@@ -820,7 +878,7 @@ impl ArcList {
         self.active_list.reset();
     }
 
-    pub fn put(&mut self, key: CacheKeyType) {
+    pub fn put(&mut self, key: PolicyKey) {
         self.access(key);
     }
 
@@ -828,7 +886,7 @@ impl ArcList {
         self.access(key.to_string())
     }
 
-    pub fn evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn evict(&mut self) -> Vec<PolicyKey> {
         let mut evicted = self.fetch_list.evict();
         evicted.extend(self.active_list.evict());
         evicted
@@ -838,23 +896,23 @@ impl ArcList {
         self.fetch_list.delete(key) || self.active_list.delete(key)
     }
 
-    pub fn get_active_data_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_active_data_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.active_list.get_data_tail(size)
     }
 
-    pub fn get_fetch_data_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_fetch_data_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.fetch_list.get_data_tail(size)
     }
 
-    pub fn get_active_ghost_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_active_ghost_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.active_list.get_ghost_tail(size)
     }
 
-    pub fn get_fetch_ghost_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_fetch_ghost_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.fetch_list.get_ghost_tail(size)
     }
 
-    fn access(&mut self, key: CacheKeyType) -> bool {
+    fn access(&mut self, key: PolicyKey) -> bool {
         let result = self.pop(&key);
         if result.item.is_empty() {
             if self.fetch_list.total_size() >= self.capacity() {
@@ -973,7 +1031,7 @@ impl ArcList {
         self.reset();
     }
 
-    pub fn Put(&mut self, key: CacheKeyType) {
+    pub fn Put(&mut self, key: PolicyKey) {
         self.put(key);
     }
 
@@ -981,7 +1039,7 @@ impl ArcList {
         self.get(key)
     }
 
-    pub fn Evict(&mut self) -> Vec<CacheKeyType> {
+    pub fn Evict(&mut self) -> Vec<PolicyKey> {
         self.evict()
     }
 
@@ -989,19 +1047,19 @@ impl ArcList {
         self.delete(key)
     }
 
-    pub fn GetActiveDataTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetActiveDataTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_active_data_tail(size)
     }
 
-    pub fn GetFetchDataTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetFetchDataTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_fetch_data_tail(size)
     }
 
-    pub fn GetActiveGhostTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetActiveGhostTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_active_ghost_tail(size)
     }
 
-    pub fn GetFetchGhostTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetFetchGhostTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_fetch_ghost_tail(size)
     }
 }
@@ -1035,6 +1093,17 @@ impl ReplacementArc {
     /// another `init()` before it will accept keys. That asymmetry is
     /// intentional and load-bearing for callers that drive the adaptive
     /// lists directly; do not "harmonize" it away.
+    /// Clear every tracked key and mark the policy uninitialized.
+    ///
+    /// Clearing the flag matches the reference, whose `Reset` clears it for this
+    /// policy and *not* for [`ReplacementSlru`] or [`ReplacementFifo`]. The
+    /// asymmetry is deliberate; do not harmonize it away.
+    ///
+    /// Note what it does **not** mean here. Unlike those two, this policy's
+    /// [`put`](Self::put), [`get`](Self::get) and [`delete`](Self::delete) never
+    /// consult the flag, so an "uninitialized" `ReplacementArc` keeps working
+    /// normally. [`is_initialized`](Self::is_initialized) reports lifecycle
+    /// state on this policy, not whether a `put` will land.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         self.initialized = false;
         self.arc_list.reset();
@@ -1054,7 +1123,7 @@ impl ReplacementArc {
         self.initialized
     }
 
-    pub fn put(&mut self, key: CacheKeyType) {
+    pub fn put(&mut self, key: PolicyKey) {
         if !key.is_empty() {
             self.arc_list.put(key);
         }
@@ -1068,11 +1137,11 @@ impl ReplacementArc {
         self.arc_list.delete(key)
     }
 
-    pub fn get_active_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_active_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.arc_list.get_active_data_tail(size)
     }
 
-    pub fn get_fetch_tail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn get_fetch_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.arc_list.get_fetch_data_tail(size)
     }
 }
@@ -1095,7 +1164,7 @@ impl ReplacementArc {
         self.set_item_capacity(new_item_capacity);
     }
 
-    pub fn Put(&mut self, key: CacheKeyType) {
+    pub fn Put(&mut self, key: PolicyKey) {
         self.put(key);
     }
 
@@ -1107,11 +1176,11 @@ impl ReplacementArc {
         self.delete(key)
     }
 
-    pub fn GetActiveTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetActiveTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_active_tail(size)
     }
 
-    pub fn GetFetchTail(&self, size: usize) -> Vec<CacheKeyType> {
+    pub fn GetFetchTail(&self, size: usize) -> Vec<PolicyKey> {
         self.get_fetch_tail(size)
     }
 }
@@ -1170,7 +1239,7 @@ impl ReplacementPolicyBase {
         Ok(())
     }
 
-    pub fn get_capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.capacity
     }
 
@@ -1179,11 +1248,11 @@ impl ReplacementPolicyBase {
         self.capacity = capacity;
     }
 
-    pub fn get_used_space(&self) -> usize {
+    pub fn used_space(&self) -> usize {
         self.used
     }
 
-    pub fn get_free_space(&self) -> usize {
+    pub fn free_space(&self) -> usize {
         self.capacity.saturating_sub(self.used)
     }
 
@@ -1203,7 +1272,7 @@ impl ReplacementPolicyBase {
     }
 
     pub fn GetCapacity(&self) -> usize {
-        self.get_capacity()
+        self.capacity()
     }
 
     pub fn SetCapacity(&mut self, capacity: usize) {
@@ -1211,11 +1280,11 @@ impl ReplacementPolicyBase {
     }
 
     pub fn GetUsedSpace(&self) -> usize {
-        self.get_used_space()
+        self.used_space()
     }
 
     pub fn GetFreeSpace(&self) -> usize {
-        self.get_free_space()
+        self.free_space()
     }
 }
 
@@ -1227,7 +1296,7 @@ struct FifoEntry {
     node: u32,
 }
 
-pub struct ReplacementFIFO {
+pub struct ReplacementFifo {
     base: ReplacementPolicyBase,
     index: HashMap<String, FifoEntry>,
     arena: KeyArena,
@@ -1235,7 +1304,7 @@ pub struct ReplacementFIFO {
     mem_eviction_func: Option<MemEvictionHandler>,
 }
 
-impl ReplacementFIFO {
+impl ReplacementFifo {
     pub fn new(capacity: usize) -> Self {
         Self {
             base: ReplacementPolicyBase::new(capacity),
@@ -1271,6 +1340,12 @@ impl ReplacementFIFO {
     /// Overwriting a key that is already tracked keeps its original queue
     /// position: first-in-first-out orders by when a key first entered the
     /// cache, not by when it was last written. Only the byte accounting moves.
+    /// # Lifecycle
+    ///
+    /// A policy from `new` is **not initialized**, and an uninitialized policy
+    /// discards what it is given: this returns an empty vector and the buffer is
+    /// dropped, with no error. Call [`init`](Self::init) first.
+    /// `is_initialized` on the policy base is the only way to tell.
     pub fn put(&mut self, buffer: CacheBuffer) -> Vec<CacheBuffer> {
         if !self.base.initialized {
             return Vec::new();
@@ -1342,8 +1417,8 @@ impl ReplacementFIFO {
         Some(entry.buffer)
     }
 
-    pub fn get_capacity(&self) -> usize {
-        self.base.get_capacity()
+    pub fn capacity(&self) -> usize {
+        self.base.capacity()
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {
@@ -1351,19 +1426,19 @@ impl ReplacementFIFO {
         let _ = self.evict_to_capacity();
     }
 
-    pub fn get_used_space(&self) -> usize {
-        self.base.get_used_space()
+    pub fn used_space(&self) -> usize {
+        self.base.used_space()
     }
 
-    pub fn get_free_space(&self) -> usize {
-        self.base.get_free_space()
+    pub fn free_space(&self) -> usize {
+        self.base.free_space()
     }
 
-    pub fn get_item_num(&self) -> usize {
+    pub fn item_count(&self) -> usize {
         self.index.len()
     }
 
-    /// Entries currently queued. Equal to [`ReplacementFIFO::get_item_num`];
+    /// Entries currently queued. Equal to [`ReplacementFifo::item_count`];
     /// the queue holds no tombstones for deleted keys.
     pub fn queue_len(&self) -> usize {
         self.queue.len
@@ -1402,7 +1477,7 @@ impl ReplacementFIFO {
 }
 
 #[allow(non_snake_case)]
-impl ReplacementFIFO {
+impl ReplacementFifo {
     pub fn Init(&mut self) -> Result<(), CacheError> {
         self.init()
     }
@@ -1437,7 +1512,7 @@ impl ReplacementFIFO {
     }
 
     pub fn GetCapacity(&self) -> usize {
-        self.get_capacity()
+        self.capacity()
     }
 
     pub fn SetCapacity(&mut self, capacity: usize) {
@@ -1445,15 +1520,15 @@ impl ReplacementFIFO {
     }
 
     pub fn GetUsedSpace(&self) -> usize {
-        self.get_used_space()
+        self.used_space()
     }
 
     pub fn GetFreeSpace(&self) -> usize {
-        self.get_free_space()
+        self.free_space()
     }
 
     pub fn GetItemNum(&self) -> usize {
-        self.get_item_num()
+        self.item_count()
     }
 
     pub fn RegisterMemEvictionHandler<F>(&mut self, func: F)
@@ -1537,7 +1612,7 @@ enum SlruMaintainerStep {
 
 /// Segmented Lru replacement policy.
 ///
-/// The cache is hash-partitioned into [`ReplacementSLRU::num_segments`] shards,
+/// The cache is hash-partitioned into [`ReplacementSlru::num_segments`] shards,
 /// each holding an independent hot/warm/cold Lru triple with its own byte
 /// budget of `capacity / num_segments`. Inserts, lookups and eviction only ever
 /// touch the shard owning the key, so eviction scans a small shard-local list
@@ -1549,10 +1624,10 @@ enum SlruMaintainerStep {
 /// [`SLRU_DEFAULT_WARM_LRU_PCT`]), demoting entries that were not touched twice
 /// and promoting the ones that were. Because this policy is driven through
 /// `&mut self` rather than by its own thread, the maintainer runs as an
-/// explicit pass: [`ReplacementSLRU::run_lru_maintainer_pass`] sweeps every
+/// explicit pass: [`ReplacementSlru::run_lru_maintainer_pass`] sweeps every
 /// shard, and each `put` maintains just the shard it touched. Passes are
-/// disabled by [`ReplacementSLRU::test_config_lru_maintainer`].
-pub struct ReplacementSLRU {
+/// disabled by [`ReplacementSlru::test_config_lru_maintainer`].
+pub struct ReplacementSlru {
     base: ReplacementPolicyBase,
     index: HashMap<String, SlruEntry>,
     segments: Vec<SlruSegment>,
@@ -1565,7 +1640,7 @@ pub struct ReplacementSLRU {
     mem_eviction_func: Option<MemEvictionHandler>,
 }
 
-impl ReplacementSLRU {
+impl ReplacementSlru {
     pub fn new(capacity: usize) -> Self {
         Self::with_num_segments(capacity, SLRU_DEFAULT_NUM_SEGMENTS)
     }
@@ -1602,7 +1677,7 @@ impl ReplacementSLRU {
     ///
     /// As with the other policies, a successful reset leaves this one
     /// initialized and ready to accept buffers again; see the note on
-    /// `ReplacementFIFO::reset`.
+    /// `ReplacementFifo::reset`.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         self.index.clear();
         for segment in &mut self.segments {
@@ -1616,6 +1691,12 @@ impl ReplacementSLRU {
         Ok(())
     }
 
+    /// # Lifecycle
+    ///
+    /// A policy from `new` is **not initialized**, and an uninitialized policy
+    /// discards what it is given: this returns an empty vector and the buffer is
+    /// dropped, with no error. Call [`init`](Self::init) first.
+    /// `is_initialized` on the policy base is the only way to tell.
     pub fn put(&mut self, buffer: CacheBuffer) -> Vec<CacheBuffer> {
         if !self.base.initialized {
             return Vec::new();
@@ -1708,8 +1789,8 @@ impl ReplacementSLRU {
         Some(entry.buffer)
     }
 
-    pub fn get_capacity(&self) -> usize {
-        self.base.get_capacity()
+    pub fn capacity(&self) -> usize {
+        self.base.capacity()
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {
@@ -1721,15 +1802,15 @@ impl ReplacementSLRU {
         }
     }
 
-    pub fn get_used_space(&self) -> usize {
+    pub fn used_space(&self) -> usize {
         self.segments.iter().map(|segment| segment.used).sum()
     }
 
-    pub fn get_free_space(&self) -> usize {
-        self.get_capacity().saturating_sub(self.get_used_space())
+    pub fn free_space(&self) -> usize {
+        self.capacity().saturating_sub(self.used_space())
     }
 
-    pub fn get_item_num(&self) -> usize {
+    pub fn item_count(&self) -> usize {
         self.index.len()
     }
 
@@ -1761,7 +1842,7 @@ impl ReplacementSLRU {
     }
 
     /// Entry count of one hot/warm/cold list of one shard.
-    pub fn list_item_num(&self, segment_id: usize, lru: u16) -> usize {
+    pub fn list_item_count(&self, segment_id: usize, lru: u16) -> usize {
         self.segments
             .get(segment_id)
             .and_then(|segment| segment.lists.get(lru as usize))
@@ -1842,7 +1923,7 @@ impl ReplacementSLRU {
     }
 
     fn update_segment_byte_limit(&mut self) {
-        self.bytes_each_segment = self.base.get_capacity() / self.num_segments;
+        self.bytes_each_segment = self.base.capacity() / self.num_segments;
     }
 
     fn alloc_node(&mut self, key: &str) -> u32 {
@@ -2158,7 +2239,7 @@ impl ReplacementSLRU {
 }
 
 #[allow(non_snake_case)]
-impl ReplacementSLRU {
+impl ReplacementSlru {
     pub fn Init(&mut self) -> Result<(), CacheError> {
         self.init()
     }
@@ -2193,7 +2274,7 @@ impl ReplacementSLRU {
     }
 
     pub fn GetCapacity(&self) -> usize {
-        self.get_capacity()
+        self.capacity()
     }
 
     pub fn SetCapacity(&mut self, capacity: usize) {
@@ -2201,15 +2282,15 @@ impl ReplacementSLRU {
     }
 
     pub fn GetUsedSpace(&self) -> usize {
-        self.get_used_space()
+        self.used_space()
     }
 
     pub fn GetFreeSpace(&self) -> usize {
-        self.get_free_space()
+        self.free_space()
     }
 
     pub fn GetItemNum(&self) -> usize {
-        self.get_item_num()
+        self.item_count()
     }
 
     pub fn GetSegmentUsedSize(&self, segment_id: usize) -> usize {
@@ -2263,26 +2344,26 @@ impl ReplacementSLRU {
 /// A segmented Lru that can be shared across threads, holding one lock per
 /// segment instead of one lock over the whole policy.
 ///
-/// [`ReplacementSLRU`] partitions its lists into segments, but it is driven
+/// [`ReplacementSlru`] partitions its lists into segments, but it is driven
 /// through `&mut self`, so a caller that shares it has to wrap the whole policy
 /// in one lock and the partitioning buys nothing under concurrency. This type
 /// keeps the same partitioning and gives each segment its own lock, so
 /// operations on keys that hash to different segments do not wait on each
-/// other. Each segment is an independent [`ReplacementSLRU`] holding
+/// other. Each segment is an independent [`ReplacementSlru`] holding
 /// `capacity / num_segments` bytes in a single internal segment, which is the
 /// same layout, just reached through a per-segment lock.
 ///
 /// The trade-off is unchanged from the single-threaded form: hash partitioning
 /// is slightly less hit-rate-optimal than one global list, because a segment
 /// can evict an entry that is globally warmer than one another segment keeps.
-pub struct ConcurrentReplacementSLRU {
-    segments: Vec<Mutex<ReplacementSLRU>>,
+pub struct ConcurrentReplacementSlru {
+    segments: Vec<Mutex<ReplacementSlru>>,
     num_segments: usize,
     capacity: usize,
     bytes_each_segment: usize,
 }
 
-impl ConcurrentReplacementSLRU {
+impl ConcurrentReplacementSlru {
     pub fn new(capacity: usize) -> Self {
         Self::with_num_segments(capacity, SLRU_DEFAULT_NUM_SEGMENTS)
     }
@@ -2297,7 +2378,7 @@ impl ConcurrentReplacementSLRU {
         for _ in 0..num_segments {
             // Each segment is a whole policy holding one internal segment, so
             // its byte budget is exactly this segment share.
-            segments.push(Mutex::new(ReplacementSLRU::with_num_segments(
+            segments.push(Mutex::new(ReplacementSlru::with_num_segments(
                 bytes_each_segment,
                 1,
             )));
@@ -2364,25 +2445,25 @@ impl ConcurrentReplacementSLRU {
         evicted
     }
 
-    pub fn get_capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    pub fn get_used_space(&self) -> usize {
+    pub fn used_space(&self) -> usize {
         self.segments
             .iter()
-            .map(|segment| self.lock(segment).get_used_space())
+            .map(|segment| self.lock(segment).used_space())
             .sum()
     }
 
-    pub fn get_free_space(&self) -> usize {
-        self.capacity.saturating_sub(self.get_used_space())
+    pub fn free_space(&self) -> usize {
+        self.capacity.saturating_sub(self.used_space())
     }
 
-    pub fn get_item_num(&self) -> usize {
+    pub fn item_count(&self) -> usize {
         self.segments
             .iter()
-            .map(|segment| self.lock(segment).get_item_num())
+            .map(|segment| self.lock(segment).item_count())
             .sum()
     }
 
@@ -2397,14 +2478,14 @@ impl ConcurrentReplacementSLRU {
     pub fn segment_used_size(&self, segment_id: usize) -> usize {
         self.segments
             .get(segment_id)
-            .map(|segment| self.lock(segment).get_used_space())
+            .map(|segment| self.lock(segment).used_space())
             .unwrap_or(0)
     }
 
-    pub fn segment_item_num(&self, segment_id: usize) -> usize {
+    pub fn segment_item_count(&self, segment_id: usize) -> usize {
         self.segments
             .get(segment_id)
-            .map(|segment| self.lock(segment).get_item_num())
+            .map(|segment| self.lock(segment).item_count())
             .unwrap_or(0)
     }
 
@@ -2455,13 +2536,13 @@ impl ConcurrentReplacementSLRU {
     /// would leave that segment inconsistent. Recovering the guard keeps the
     /// remaining segments usable rather than cascading the panic across every
     /// caller.
-    fn lock<'a>(&self, segment: &'a Mutex<ReplacementSLRU>) -> std::sync::MutexGuard<'a, ReplacementSLRU> {
+    fn lock<'a>(&self, segment: &'a Mutex<ReplacementSlru>) -> std::sync::MutexGuard<'a, ReplacementSlru> {
         segment.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 #[allow(non_snake_case)]
-impl ConcurrentReplacementSLRU {
+impl ConcurrentReplacementSlru {
     pub fn Init(&self) -> Result<(), CacheError> {
         self.init()
     }
@@ -2487,19 +2568,19 @@ impl ConcurrentReplacementSLRU {
     }
 
     pub fn GetCapacity(&self) -> usize {
-        self.get_capacity()
+        self.capacity()
     }
 
     pub fn GetUsedSpace(&self) -> usize {
-        self.get_used_space()
+        self.used_space()
     }
 
     pub fn GetFreeSpace(&self) -> usize {
-        self.get_free_space()
+        self.free_space()
     }
 
     pub fn GetItemNum(&self) -> usize {
-        self.get_item_num()
+        self.item_count()
     }
 
     pub fn GetSegmentUsedSize(&self, segment_id: usize) -> usize {

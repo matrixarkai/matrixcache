@@ -8,6 +8,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The public API has been renamed extensively, and no caller has to change a
+  line.** Every previous spelling still resolves — they are collected as
+  re-exports in `src/core/legacy_names.rs`, so `ReplacementSLRU`,
+  `StorageEngineRocksDB`, `AllocatorPtr`, `MemcachedWrapper` and the rest keep
+  compiling and keep naming what they always named. What changed is the spelling
+  the crate itself uses.
+
+  - *Acronyms are spelled as ordinary words in type names.* `ReplacementSLRU` ->
+    `ReplacementSlru`, `StorageEngineRocksDB` -> `StorageEngineRocksDb`,
+    `GCMode` -> `GcMode`, and 27 others. `clippy::upper_case_acronyms` is now
+    `warn`, so this cannot drift back.
+  - *Enums that classify something use `Kind`, not `Type`.* `CacheInstanceType`
+    -> `CacheInstanceKind`, `StorageEngineType` -> `StorageEngineKind` and nine
+    more, matching the `CacheBlockKind` that was already right. Two dropped the
+    suffix instead of swapping it, because the noun already carried the meaning:
+    `RecordStateType` -> `RecordState` and `DramPmemDataPlacementType` ->
+    `DramPmemDataPlacement`. Separately, `CacheKeyType` -> `PolicyKey`: it was
+    never the type of a `CacheKey`, but the `String` the replacement policies
+    index by.
+  - *Enum variants are ordinary Rust names* — 38 across thirteen enums. The
+    C-style spellings remain as `pub const kPut: Self = Self::Put` aliases, and
+    the configuration *strings* are unchanged.
+  - *The `Ptr` aliases are gone.* The crate sets `unsafe_code = "forbid"` and
+    cannot dereference anything. `AllocatorPtr` was a `usize` used as a key into
+    a region registry and is now `AllocatorAddress`, documented as such;
+    `ExecutorSharedPtr` is `SharedCacheExecutor`; `RawBufferPtr`,
+    `StringBufferPtr`, `StringViewBufferPtr` and `Index` were aliases of a type
+    to itself, or unreferenced.
+  - *Accessors that take no arguments have lost their `get_` prefix*, following
+    Rust's API guidelines: `get_capacity()` -> `capacity()`, 46 in all. The 45
+    `get_*` functions that take something to look up by — `get_batch(keys)`,
+    `get_tail(size)`, `get_with_tier(key)` — keep it.
+  - *`SimpleLruCache` and `ZeroCopySimpleLruCache` have a snake_case API.* They
+    were callable only as `Insert`, `Lookup`, `SetCapacity` and so on; those
+    spellings now forward to `insert`, `lookup`, `set_capacity` and the rest.
+  - *Trait names agree on a suffix.* `L1CacheInterface` -> `L1CacheApi` and
+    `LogBasedAllocatorGcEventListenerApi` -> `LogBasedAllocatorGcEventListener`,
+    leaving `Api` for a component's interface and `Callback`/`Listener` for
+    something the crate calls back into. `L1CacheImplement` -> `DramPmemL1Cache`.
+  - *`MemcachedWrapper` -> `InProcessMemcachedCache`.* There is no memcached
+    dependency in the crate and it wraps nothing: it serves that API shape in
+    process, deliberately without a daemon.
+  - *Counts say `_count`.* `item_num` -> `item_count` and ten others, because
+    `item_num` reads as an ordinal. A `num_` *prefix* is unambiguous and is
+    unchanged, as is `_len`.
+  - *Conversions to and from configuration are named for what they do* —
+    `config_name`, `config_code`, `config_enum_name` — rather than for what the
+    code was once compared against.
+
+  **Serialised forms are unchanged.** `ChunkMeta::ref_cnt` and
+  `PoolChunkMeta::num_alloc_objects` became `ref_count` and
+  `num_allocated_objects` in Rust, but both carry `#[serde(rename)]`, so the
+  emitted JSON keys are byte-identical to before.
+
+- **Choosing an eviction victim no longer costs time proportional to how much the
+  tier holds.** Selection weighs at most 512 candidates taken from the tier's key
+  order, falling back to the whole tier when every windowed candidate is pinned,
+  so pinned entries cannot stall eviction. A tier no larger than the window still
+  weighs everything and picks what it always picked; above it, the victim is the
+  best of the window rather than the best overall. Previously every resident key
+  was cloned into a `Vec` and grouped under a rendered `String` on nearly every
+  write at capacity — 84 ms at 32k entries. Grouping on a borrowed key also stops
+  two keys being grouped together when a record key contains a colon, which the
+  rendered string could not tell apart.
+
 - **`L2CachePolicy` buffers access records again instead of applying them on
   the calling path.** `set_async_on_access` picks between the two modes.
   Buffering keeps the caller off the migration-order update path at the cost of

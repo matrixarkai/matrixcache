@@ -163,12 +163,20 @@ impl BlockCache {
 type CacheInstanceEvictionCallback = Arc<dyn Fn(CacheEvictionRecord) + Send + Sync + 'static>;
 type CacheInstanceEvictionMetricCallback = Arc<dyn Fn(usize) + Send + Sync + 'static>;
 
+/// One tier's worth of cache, with its own replacement policy and storage engine.
+///
+/// Where [`MultiLayerCache`] manages every tier together, a `CacheInstance` is a
+/// single [`CacheInstanceKind`] -- except `Unified`, which spans them. It is the
+/// building block the string-valued facades are made of.
+///
+/// Implements [`L1CacheApi`], and also [`RecoverDataCallback`] and
+/// [`GcCopyCallback`] so it can receive its own recovery and collection events.
 #[derive(Clone)]
 pub struct CacheInstance {
     cache: MultiLayerCache,
-    instance_type: CacheInstanceType,
-    replacement_type: ReplacementPolicyType,
-    storage_type: StorageEngineType,
+    instance_type: CacheInstanceKind,
+    replacement_type: ReplacementPolicyKind,
+    storage_type: StorageEngineKind,
     eviction_callback: Arc<RwLock<Option<CacheInstanceEvictionCallback>>>,
     eviction_metric_callback: Arc<RwLock<Option<CacheInstanceEvictionMetricCallback>>>,
 }
@@ -187,8 +195,8 @@ impl std::fmt::Debug for CacheInstance {
 impl CacheInstance {
     pub fn new(
         capacity: usize,
-        replacement_type: ReplacementPolicyType,
-        storage_type: StorageEngineType,
+        replacement_type: ReplacementPolicyKind,
+        storage_type: StorageEngineKind,
         paths: Vec<PathBuf>,
     ) -> Self {
         let instance_type = storage_type.as_instance_type();
@@ -197,15 +205,15 @@ impl CacheInstance {
             .cloned()
             .unwrap_or_else(|| unique_temp_path("cache-instance"));
         let mut options = match storage_type {
-            StorageEngineType::Dram | StorageEngineType::Simple => {
+            StorageEngineKind::Dram | StorageEngineKind::Simple => {
                 CacheOptions::new(capacity, 0, 0)
             }
-            StorageEngineType::Pmem => CacheOptions::new(0, capacity, 0),
-            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
+            StorageEngineKind::Pmem => CacheOptions::new(0, capacity, 0),
+            StorageEngineKind::Ssd | StorageEngineKind::MultiSsd => {
                 CacheOptions::new(0, 0, capacity).with_ssd_instance_only(true)
             }
         };
-        let ssd_paths = if matches!(storage_type, StorageEngineType::Ssd | StorageEngineType::MultiSsd)
+        let ssd_paths = if matches!(storage_type, StorageEngineKind::Ssd | StorageEngineKind::MultiSsd)
             && !paths.is_empty()
         {
             paths.clone()
@@ -216,7 +224,7 @@ impl CacheInstance {
             instance_type.as_tier().expect("storage-backed instance"),
             replacement_type.as_cache_policy(),
         );
-        if matches!(storage_type, StorageEngineType::Pmem) {
+        if matches!(storage_type, StorageEngineKind::Pmem) {
             options = options.with_pmem_paths(paths);
         }
 
@@ -232,8 +240,8 @@ impl CacheInstance {
 
     pub fn from_path_strings(
         capacity: usize,
-        replacement_type: ReplacementPolicyType,
-        storage_type: StorageEngineType,
+        replacement_type: ReplacementPolicyKind,
+        storage_type: StorageEngineKind,
         paths: impl IntoIterator<Item = String>,
     ) -> Self {
         Self::new(
@@ -478,8 +486,8 @@ impl CacheInstance {
 
     pub fn recover_data(&self) -> Result<CacheRecoverReport, CacheError> {
         match self.storage_type {
-            StorageEngineType::Pmem => self.cache.recover_pmem_index(),
-            StorageEngineType::Ssd | StorageEngineType::MultiSsd => self.cache.recover_disk_index(),
+            StorageEngineKind::Pmem => self.cache.recover_pmem_index(),
+            StorageEngineKind::Ssd | StorageEngineKind::MultiSsd => self.cache.recover_disk_index(),
             _ => Ok(CacheRecoverReport::default()),
         }
     }
@@ -510,11 +518,11 @@ impl CacheInstance {
         self.cache.set_eviction_handler_enabled(status);
     }
 
-    pub fn get_eviction_handler_status(&self) -> bool {
+    pub fn eviction_handler_status(&self) -> bool {
         self.cache.eviction_handler_enabled()
     }
 
-    pub fn get_capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.cache.get_capacity(self.instance_type)
     }
 
@@ -523,35 +531,35 @@ impl CacheInstance {
             .set_capacity_for_instance(self.instance_type, capacity);
     }
 
-    pub fn get_used_space(&self) -> usize {
+    pub fn used_space(&self) -> usize {
         self.cache.used_space_for_tier(self.tier())
     }
 
-    pub fn get_item_num(&self) -> usize {
+    pub fn item_count(&self) -> usize {
         self.cache.item_count_for_tier(self.tier())
     }
 
-    pub fn get_allocator_type(&self) -> AllocatorType {
+    pub fn allocator_type(&self) -> AllocatorKind {
         match self.storage_type {
-            StorageEngineType::Dram | StorageEngineType::Simple => {
-                AllocatorType::PoolBasedAllocator
+            StorageEngineKind::Dram | StorageEngineKind::Simple => {
+                AllocatorKind::PoolBasedAllocator
             }
-            StorageEngineType::Pmem => AllocatorType::LogBasedAllocator,
-            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
-                AllocatorType::LogBasedAllocator
+            StorageEngineKind::Pmem => AllocatorKind::LogBasedAllocator,
+            StorageEngineKind::Ssd | StorageEngineKind::MultiSsd => {
+                AllocatorKind::LogBasedAllocator
             }
         }
     }
 
-    pub fn storage_engine_type(&self) -> StorageEngineType {
+    pub fn storage_engine_type(&self) -> StorageEngineKind {
         self.storage_type
     }
 
-    pub fn test_get_storage_engine(&self) -> StorageEngineType {
+    pub fn test_storage_engine(&self) -> StorageEngineKind {
         self.storage_engine_type()
     }
 
-    pub fn get_allocator_stats(&self) -> AllocatorStats {
+    pub fn allocator_stats(&self) -> AllocatorStats {
         self.cache.allocator_stats_for_tier(self.tier())
     }
 
@@ -727,12 +735,12 @@ impl CacheInstance {
 
     #[allow(non_snake_case)]
     pub fn GetEvictionHandlerStatus(&self) -> bool {
-        self.get_eviction_handler_status()
+        self.eviction_handler_status()
     }
 
     #[allow(non_snake_case)]
     pub fn GetCapacity(&self) -> usize {
-        self.get_capacity()
+        self.capacity()
     }
 
     #[allow(non_snake_case)]
@@ -742,37 +750,37 @@ impl CacheInstance {
 
     #[allow(non_snake_case)]
     pub fn GetUsedSpace(&self) -> usize {
-        self.get_used_space()
+        self.used_space()
     }
 
     #[allow(non_snake_case)]
     pub fn GetItemNum(&self) -> usize {
-        self.get_item_num()
+        self.item_count()
     }
 
     #[allow(non_snake_case)]
-    pub fn GetAllocatorType(&self) -> AllocatorType {
-        self.get_allocator_type()
+    pub fn GetAllocatorType(&self) -> AllocatorKind {
+        self.allocator_type()
     }
 
     #[allow(non_snake_case)]
-    pub fn StorageEngineType(&self) -> StorageEngineType {
+    pub fn StorageEngineType(&self) -> StorageEngineKind {
         self.storage_engine_type()
     }
 
     #[allow(non_snake_case)]
-    pub fn TEST_GetStorageEngine(&self) -> StorageEngineType {
-        self.test_get_storage_engine()
+    pub fn TEST_GetStorageEngine(&self) -> StorageEngineKind {
+        self.test_storage_engine()
     }
 
     #[allow(non_snake_case)]
-    pub fn TEST_GetStorageEngineType(&self) -> StorageEngineType {
-        self.test_get_storage_engine()
+    pub fn TEST_GetStorageEngineType(&self) -> StorageEngineKind {
+        self.test_storage_engine()
     }
 
     #[allow(non_snake_case)]
     pub fn GetAllocatorStats(&self) -> AllocatorStats {
-        self.get_allocator_stats()
+        self.allocator_stats()
     }
 
     #[allow(non_snake_case)]
@@ -828,7 +836,7 @@ impl CacheInstance {
     }
 }
 
-impl GCCopyCallback for CacheInstance {
+impl GcCopyCallback for CacheInstance {
     fn update(
         &mut self,
         key: &str,
@@ -845,7 +853,7 @@ impl RecoverDataCallback for CacheInstance {
     }
 }
 
-impl L1CacheInterface for CacheInstance {
+impl L1CacheApi for CacheInstance {
     fn get_bypass_replacement_policy_buffer(
         &self,
         key: &str,
@@ -854,7 +862,16 @@ impl L1CacheInterface for CacheInstance {
     }
 }
 
-pub trait L1CacheInterface {
+/// A read that deliberately does not count as an access.
+///
+/// `get_bypass_replacement_policy_buffer` returns an entry without telling the
+/// replacement policy it was touched, so it cannot promote the entry or delay
+/// its eviction. Use it for inspection; use the ordinary read path for anything
+/// that should affect what survives.
+///
+/// Implemented by [`CacheInstance`] and by [`DramPmemL1Cache`], which searches a
+/// DRAM instance and then an optional persistent one.
+pub trait L1CacheApi {
     fn get_bypass_replacement_policy_buffer(
         &self,
         key: &str,
@@ -867,13 +884,13 @@ pub trait L1CacheInterface {
 }
 
 #[derive(Debug, Clone)]
-pub struct L1CacheImplement {
+pub struct DramPmemL1Cache {
     dram_instance: CacheInstance,
     pmem_instance: Option<CacheInstance>,
     l2_pulls: Arc<RwLock<u64>>,
 }
 
-impl L1CacheImplement {
+impl DramPmemL1Cache {
     pub fn new(dram_instance: CacheInstance, pmem_instance: Option<CacheInstance>) -> Self {
         Self {
             dram_instance,
@@ -899,7 +916,7 @@ impl L1CacheImplement {
     }
 }
 
-impl L1CacheInterface for L1CacheImplement {
+impl L1CacheApi for DramPmemL1Cache {
     fn get_bypass_replacement_policy_buffer(
         &self,
         key: &str,
@@ -952,7 +969,7 @@ pub const L2_DEFAULT_ASYNC_ON_ACCESS: bool = true;
 pub const L2_DEFAULT_USE_EVICTION_HANDLER: bool = false;
 
 pub struct L2CachePolicy {
-    l1_cache: L1CacheImplement,
+    l1_cache: DramPmemL1Cache,
     l2_cache: CacheInstance,
     arc_policy: ReplacementArc,
     tail_batch_size: usize,
@@ -965,7 +982,7 @@ pub struct L2CachePolicy {
     last_tail_pass: Option<Instant>,
     last_write_pass: Option<Instant>,
     access_drop_count: u64,
-    access_queue: VecDeque<(AccessRecordType, String)>,
+    access_queue: VecDeque<(AccessRecordKind, String)>,
     write_buffer_queue: VecDeque<CacheBuffer>,
     access_buffer_capacity: usize,
     write_buffer_capacity: usize,
@@ -984,7 +1001,7 @@ pub struct L2CachePolicy {
 
 impl L2CachePolicy {
     pub fn new(
-        l1_cache: L1CacheImplement,
+        l1_cache: DramPmemL1Cache,
         l2_cache: CacheInstance,
         arc_policy: ReplacementArc,
         access_buffer_capacity: usize,
@@ -1119,7 +1136,7 @@ impl L2CachePolicy {
         }
     }
 
-    pub fn on_access(&mut self, record_type: AccessRecordType, key: &str) {
+    pub fn on_access(&mut self, record_type: AccessRecordKind, key: &str) {
         if self.stopped {
             return;
         }
@@ -1150,13 +1167,13 @@ impl L2CachePolicy {
         self.remove_l2_policy_func = Some(Arc::new(func));
     }
 
-    fn do_access(&mut self, record_type: AccessRecordType, key: String) {
+    fn do_access(&mut self, record_type: AccessRecordKind, key: String) {
         match record_type {
-            AccessRecordType::Put => self.arc_policy.Put(key),
-            AccessRecordType::Get => {
+            AccessRecordKind::Put => self.arc_policy.Put(key),
+            AccessRecordKind::Get => {
                 self.arc_policy.Get(&key);
             }
-            AccessRecordType::Delete => {
+            AccessRecordKind::Delete => {
                 self.arc_policy.Delete(&key);
             }
         }
@@ -1334,7 +1351,7 @@ impl L2CachePolicy {
     }
 
     #[allow(non_snake_case)]
-    pub fn OnAccess(&mut self, record_type: AccessRecordType, key: &str) {
+    pub fn OnAccess(&mut self, record_type: AccessRecordKind, key: &str) {
         self.on_access(record_type, key);
     }
 
@@ -1371,7 +1388,7 @@ pub struct L2CachePolicyFactory;
 
 impl L2CachePolicyFactory {
     pub fn create_l2_cache_policy(
-        l1_cache: L1CacheImplement,
+        l1_cache: DramPmemL1Cache,
         l2_cache: CacheInstance,
     ) -> L2CachePolicy {
         let mut arc_policy = ReplacementArc::new(L2_DEFAULT_MAX_ARC_CACHE_ITEMS);
@@ -1388,7 +1405,7 @@ impl L2CachePolicyFactory {
 
     #[allow(non_snake_case)]
     pub fn CreateL2CachePolicy(
-        l1_cache: L1CacheImplement,
+        l1_cache: DramPmemL1Cache,
         l2_cache: CacheInstance,
     ) -> L2CachePolicy {
         Self::create_l2_cache_policy(l1_cache, l2_cache)
@@ -1454,7 +1471,7 @@ impl CacheApi for MultiLayerCache {
         self.capacity()
     }
 
-    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_capacity(instance_type)
     }
 
@@ -1464,7 +1481,7 @@ impl CacheApi for MultiLayerCache {
 
     fn set_capacity_for_instance_cache(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         capacity: usize,
     ) {
         self.set_capacity_for_instance(instance_type, capacity);
@@ -1474,7 +1491,7 @@ impl CacheApi for MultiLayerCache {
         self.size()
     }
 
-    fn used_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn used_cache(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_used(instance_type)
     }
 }
@@ -1544,30 +1561,49 @@ fn new_memory_only_lru_cache(capacity: usize, name: &str) -> MultiLayerCache {
     )
 }
 
+/// A plain in-memory LRU cache over [`CacheKey`] and `Vec<u8>`.
+///
+/// No tiers, no persistence, no admission policy -- a capacity and a recency
+/// order. Values are copied out on lookup; for borrowed reads use
+/// [`ZeroCopySimpleLruCache`].
+///
+/// An entry larger than the whole capacity is rejected silently rather than
+/// evicting everything to make room.
+///
+/// # Examples
+///
+/// ```
+/// use matrixcache::{CacheKey, SimpleLruCache};
+///
+/// let cache = SimpleLruCache::new(64);
+/// let key = CacheKey::string(0, "greeting");
+///
+/// cache.insert(key.clone(), b"hello".to_vec(), 5)?;
+/// assert_eq!(cache.lookup(&key)?, Some(b"hello".to_vec()));
+/// assert_eq!(cache.size(), 5);
+/// # Ok::<(), matrixcache::CacheError>(())
+/// ```
 #[derive(Debug, Clone)]
-pub struct SimpleLRUCache {
+pub struct SimpleLruCache {
     inner: Arc<Mutex<SimpleLruInner>>,
 }
 
-impl SimpleLRUCache {
+impl SimpleLruCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SimpleLruInner::new(capacity))),
         }
     }
 
-    #[allow(non_snake_case)]
-    pub fn Start(&self) -> bool {
+    pub fn start(&self) -> bool {
         true
     }
 
-    #[allow(non_snake_case)]
-    pub fn Stop(&self) -> bool {
+    pub fn stop(&self) -> bool {
         true
     }
 
-    #[allow(non_snake_case)]
-    pub fn Insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
+    pub fn insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
         self.inner.lock().expect("simple lru lock poisoned").insert(
             key,
             Arc::<[u8]>::from(value),
@@ -1577,7 +1613,7 @@ impl SimpleLRUCache {
     }
 
     pub fn insert_default_size(&self, key: CacheKey, value: Vec<u8>) -> Result<(), CacheError> {
-        self.Insert(key, value, 1)
+        self.insert(key, value, 1)
     }
 
     #[allow(non_snake_case)]
@@ -1585,8 +1621,7 @@ impl SimpleLRUCache {
         self.insert_default_size(key, value)
     }
 
-    #[allow(non_snake_case)]
-    pub fn Lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+    pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         Ok(self
             .inner
             .lock()
@@ -1595,8 +1630,7 @@ impl SimpleLRUCache {
             .map(|value| value.to_vec()))
     }
 
-    #[allow(non_snake_case)]
-    pub fn Remove(&self, key: &CacheKey) -> Result<(), CacheError> {
+    pub fn remove(&self, key: &CacheKey) -> Result<(), CacheError> {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
@@ -1604,8 +1638,7 @@ impl SimpleLRUCache {
         Ok(())
     }
 
-    #[allow(non_snake_case)]
-    pub fn RemoveAll(&self) -> Result<(), CacheError> {
+    pub fn remove_all(&self) -> Result<(), CacheError> {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
@@ -1613,99 +1646,168 @@ impl SimpleLRUCache {
         Ok(())
     }
 
-    #[allow(non_snake_case)]
-    pub fn Capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .capacity
     }
 
-    #[allow(non_snake_case)]
-    pub fn SetCapacity(&self, capacity: usize) {
+    pub fn set_capacity(&self, capacity: usize) {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .set_capacity(capacity);
     }
 
-    #[allow(non_snake_case)]
-    pub fn Size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .current_size()
     }
+
+    // Pre-existing spellings, kept compiling. Each forwards to the method above
+    // it; none of them carries an implementation any more.
+
+    #[allow(non_snake_case)]
+    pub fn Start(&self) -> bool {
+        self.start()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Stop(&self) -> bool {
+        self.stop()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
+        self.insert(key, value, size)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+        self.lookup(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Remove(&self, key: &CacheKey) -> Result<(), CacheError> {
+        self.remove(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn RemoveAll(&self) -> Result<(), CacheError> {
+        self.remove_all()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SetCapacity(&self, capacity: usize) {
+        self.set_capacity(capacity);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Size(&self) -> usize {
+        self.size()
+    }
 }
 
-impl CacheApi for SimpleLRUCache {
+
+impl CacheApi for SimpleLruCache {
     fn start_cache(&self) -> bool {
-        self.Start()
+        self.start()
     }
 
     fn stop_cache(&self) -> bool {
-        self.Stop()
+        self.stop()
     }
 
     fn insert_cache(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
-        self.Insert(key, value, size)
+        self.insert(key, value, size)
     }
 
     fn lookup_cache(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
-        self.Lookup(key)
+        self.lookup(key)
     }
 
     fn remove_cache(&self, key: &CacheKey) -> Result<(), CacheError> {
-        self.Remove(key)
+        self.remove(key)
     }
 
     fn remove_all_cache(&self) -> Result<(), CacheError> {
-        self.RemoveAll()
+        self.remove_all()
     }
 
     fn capacity_cache(&self) -> usize {
-        self.Capacity()
+        self.capacity()
     }
 
     fn set_capacity_cache(&self, capacity: usize) {
-        self.SetCapacity(capacity);
+        self.set_capacity(capacity);
     }
 
     fn size_cache(&self) -> usize {
-        self.Size()
+        self.size()
     }
 }
 
+/// [`SimpleLruCache`] with pinned reads.
+///
+/// The same LRU behaviour, plus `acquire`/`release` and `insert_pinned` from
+/// [`ZeroCopyCacheApi`], which hand back the stored bytes instead of copying
+/// them.
+///
+/// Pinning changes eviction here in a way it does not on the plain cache: a
+/// pinned entry cannot be evicted, so a cache whose entries are all held can
+/// grow past its capacity.
+///
+/// # Examples
+///
+/// Acquiring borrows the stored bytes; releasing gives the pin back.
+///
+/// ```
+/// use matrixcache::{CacheKey, ZeroCopySimpleLruCache};
+///
+/// let cache = ZeroCopySimpleLruCache::new(1024);
+/// let key = CacheKey::string(0, "greeting");
+/// cache.insert(key.clone(), b"hello".to_vec(), 5)?;
+///
+/// let handle = cache.acquire(&key)?.expect("just inserted");
+/// assert_eq!(handle.as_slice(), b"hello");
+/// cache.release(handle);
+/// # Ok::<(), matrixcache::CacheError>(())
+/// ```
 #[derive(Debug, Clone)]
-pub struct ZeroCopySimpleLRUCache {
+pub struct ZeroCopySimpleLruCache {
     inner: Arc<Mutex<SimpleLruInner>>,
 }
 
-impl ZeroCopySimpleLRUCache {
+impl ZeroCopySimpleLruCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SimpleLruInner::new(capacity))),
         }
     }
 
-    #[allow(non_snake_case)]
-    pub fn Start(&self) -> bool {
+    pub fn start(&self) -> bool {
         true
     }
 
-    #[allow(non_snake_case)]
-    pub fn Stop(&self) -> bool {
+    pub fn stop(&self) -> bool {
         true
     }
 
-    #[allow(non_snake_case)]
-    pub fn Insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
-        let _ = self.InsertPinned(key, value, size)?;
+    pub fn insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
+        let _ = self.insert_pinned(key, value, size)?;
         Ok(())
     }
 
     pub fn insert_default_size(&self, key: CacheKey, value: Vec<u8>) -> Result<(), CacheError> {
-        self.Insert(key, value, 1)
+        self.insert(key, value, 1)
     }
 
     #[allow(non_snake_case)]
@@ -1713,8 +1815,7 @@ impl ZeroCopySimpleLRUCache {
         self.insert_default_size(key, value)
     }
 
-    #[allow(non_snake_case)]
-    pub fn Lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+    pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         Ok(self
             .inner
             .lock()
@@ -1723,8 +1824,7 @@ impl ZeroCopySimpleLRUCache {
             .map(|value| value.to_vec()))
     }
 
-    #[allow(non_snake_case)]
-    pub fn Remove(&self, key: &CacheKey) -> Result<(), CacheError> {
+    pub fn remove(&self, key: &CacheKey) -> Result<(), CacheError> {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
@@ -1732,8 +1832,7 @@ impl ZeroCopySimpleLRUCache {
         Ok(())
     }
 
-    #[allow(non_snake_case)]
-    pub fn RemoveAll(&self) -> Result<(), CacheError> {
+    pub fn remove_all(&self) -> Result<(), CacheError> {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
@@ -1741,32 +1840,28 @@ impl ZeroCopySimpleLRUCache {
         Ok(())
     }
 
-    #[allow(non_snake_case)]
-    pub fn Capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .capacity
     }
 
-    #[allow(non_snake_case)]
-    pub fn SetCapacity(&self, capacity: usize) {
+    pub fn set_capacity(&self, capacity: usize) {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .set_capacity(capacity);
     }
 
-    #[allow(non_snake_case)]
-    pub fn Size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.inner
             .lock()
             .expect("simple lru lock poisoned")
             .current_size()
     }
 
-    #[allow(non_snake_case)]
-    pub fn Acquire(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError> {
+    pub fn acquire(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError> {
         Ok(self
             .inner
             .lock()
@@ -1779,8 +1874,7 @@ impl ZeroCopySimpleLRUCache {
             }))
     }
 
-    #[allow(non_snake_case)]
-    pub fn Release(&self, handle: CachePinnedHandle) {
+    pub fn release(&self, handle: CachePinnedHandle) {
         drop(handle);
         self.inner
             .lock()
@@ -1788,8 +1882,7 @@ impl ZeroCopySimpleLRUCache {
             .evict_unpinned();
     }
 
-    #[allow(non_snake_case)]
-    pub fn InsertPinned(
+    pub fn insert_pinned(
         &self,
         key: CacheKey,
         value: Vec<u8>,
@@ -1817,7 +1910,7 @@ impl ZeroCopySimpleLRUCache {
         key: CacheKey,
         value: Vec<u8>,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
-        self.InsertPinned(key, value, 1)
+        self.insert_pinned(key, value, 1)
     }
 
     #[allow(non_snake_case)]
@@ -1828,53 +1921,122 @@ impl ZeroCopySimpleLRUCache {
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
         self.insert_pinned_default_size(key, value)
     }
+
+    // Pre-existing spellings, kept compiling. Each forwards to the method above
+    // it; none of them carries an implementation any more.
+
+    #[allow(non_snake_case)]
+    pub fn Start(&self) -> bool {
+        self.start()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Stop(&self) -> bool {
+        self.stop()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
+        self.insert(key, value, size)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+        self.lookup(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Remove(&self, key: &CacheKey) -> Result<(), CacheError> {
+        self.remove(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn RemoveAll(&self) -> Result<(), CacheError> {
+        self.remove_all()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SetCapacity(&self, capacity: usize) {
+        self.set_capacity(capacity);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Size(&self) -> usize {
+        self.size()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Acquire(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError> {
+        self.acquire(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Release(&self, handle: CachePinnedHandle) {
+        self.release(handle);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn InsertPinned(
+        &self,
+        key: CacheKey,
+        value: Vec<u8>,
+        size: usize,
+    ) -> Result<Option<CachePinnedHandle>, CacheError> {
+        self.insert_pinned(key, value, size)
+    }
 }
 
-impl CacheApi for ZeroCopySimpleLRUCache {
+
+impl CacheApi for ZeroCopySimpleLruCache {
     fn start_cache(&self) -> bool {
-        self.Start()
+        self.start()
     }
 
     fn stop_cache(&self) -> bool {
-        self.Stop()
+        self.stop()
     }
 
     fn insert_cache(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
-        self.Insert(key, value, size)
+        self.insert(key, value, size)
     }
 
     fn lookup_cache(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
-        self.Lookup(key)
+        self.lookup(key)
     }
 
     fn remove_cache(&self, key: &CacheKey) -> Result<(), CacheError> {
-        self.Remove(key)
+        self.remove(key)
     }
 
     fn remove_all_cache(&self) -> Result<(), CacheError> {
-        self.RemoveAll()
+        self.remove_all()
     }
 
     fn capacity_cache(&self) -> usize {
-        self.Capacity()
+        self.capacity()
     }
 
     fn set_capacity_cache(&self, capacity: usize) {
-        self.SetCapacity(capacity);
+        self.set_capacity(capacity);
     }
 
     fn size_cache(&self) -> usize {
-        self.Size()
+        self.size()
     }
 }
 
-impl ZeroCopyCacheApi for ZeroCopySimpleLRUCache {
+impl ZeroCopyCacheApi for ZeroCopySimpleLruCache {
     fn acquire_cache(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError> {
-        self.Acquire(key)
+        self.acquire(key)
     }
 
     fn release_cache(&self, handle: CachePinnedHandle) {
-        self.Release(handle);
+        self.release(handle);
     }
 
     fn insert_pinned_cache(
@@ -1883,7 +2045,7 @@ impl ZeroCopyCacheApi for ZeroCopySimpleLRUCache {
         value: Vec<u8>,
         size: usize,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
-        self.InsertPinned(key, value, size)
+        self.insert_pinned(key, value, size)
     }
 }
 
@@ -2029,13 +2191,17 @@ impl SimpleLruInner {
     }
 }
 
+/// A `String`-valued LRU cache backed by a [`MultiLayerCache`] shard.
+///
+/// Implements [`StringCacheApi`]. Despite the name it is not a variant of
+/// [`SimpleLruCache`] -- it delegates to the multi-tier cache, which is what
+/// makes it safe to share.
 #[derive(Debug, Clone)]
 pub struct ConcurrentSimpleLruCache {
     cache: MultiLayerCache,
     shard_id: ShardId,
 }
 
-pub type ConcurrentSimpleLRUCache = ConcurrentSimpleLruCache;
 
 impl ConcurrentSimpleLruCache {
     pub fn new(capacity: usize) -> Self {
@@ -2156,8 +2322,13 @@ impl StringCacheApi for ConcurrentSimpleLruCache {
     }
 }
 
+/// A `String`-valued cache offering a memcached-shaped surface, in process.
+///
+/// There is no memcached here and no daemon: storage is an in-process map, and
+/// `client` hands back a synthetic id so code written against a client pool
+/// compiles unchanged. Implements [`StringCacheApi`].
 #[derive(Debug, Clone)]
-pub struct MemcachedWrapper {
+pub struct InProcessMemcachedCache {
     capacity: Arc<RwLock<usize>>,
     started: Arc<RwLock<bool>>,
     entries: Arc<RwLock<HashMap<String, String>>>,
@@ -2165,7 +2336,7 @@ pub struct MemcachedWrapper {
     reset_clients_count: Arc<RwLock<u64>>,
 }
 
-impl MemcachedWrapper {
+impl InProcessMemcachedCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: Arc::new(RwLock::new(capacity)),
@@ -2176,7 +2347,7 @@ impl MemcachedWrapper {
         }
     }
 
-    pub fn get_client(&self) -> usize {
+    pub fn client(&self) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::thread::current().id().hash(&mut hasher);
         hasher.finish() as usize
@@ -2266,13 +2437,13 @@ impl MemcachedWrapper {
     }
 }
 
-impl Drop for MemcachedWrapper {
+impl Drop for InProcessMemcachedCache {
     fn drop(&mut self) {
         self.reset_clients();
     }
 }
 
-impl StringCacheApi for MemcachedWrapper {
+impl StringCacheApi for InProcessMemcachedCache {
     fn start_string_cache(&self) -> bool {
         *self
             .started
@@ -2373,11 +2544,20 @@ impl StringCacheApi for MemcachedWrapper {
     }
 }
 
+/// A `String`-valued cache whose policy, engine and paths are chosen by name.
+///
+/// Wraps one [`CacheInstance`] configured from strings rather than typed
+/// options, which is what "flexible" refers to. It keeps the resolved
+/// [`ReplacementPolicyKind`], [`StorageEngineKind`] and paths so a caller can
+/// see what the names became.
+///
+/// Note this is not confined to a single tier: an instance built as
+/// [`CacheInstanceKind::Unified`] spans all of them.
 #[derive(Debug, Clone)]
 pub struct FlexibleCache {
     instance: CacheInstance,
-    policy: ReplacementPolicyType,
-    engine: StorageEngineType,
+    policy: ReplacementPolicyKind,
+    engine: StorageEngineKind,
     paths: Vec<PathBuf>,
 }
 
@@ -2389,14 +2569,14 @@ impl FlexibleCache {
         pmem_paths: impl IntoIterator<Item = PathBuf>,
         ssd_paths: impl IntoIterator<Item = PathBuf>,
     ) -> Self {
-        let policy = ReplacementPolicyType::from_config_name(policy.as_ref());
-        let engine = StorageEngineType::from_config_name(engine.as_ref());
+        let policy = ReplacementPolicyKind::from_config_name(policy.as_ref());
+        let engine = StorageEngineKind::from_config_name(engine.as_ref());
         let paths = match engine {
-            StorageEngineType::Pmem => pmem_paths.into_iter().collect::<Vec<_>>(),
-            StorageEngineType::Ssd | StorageEngineType::MultiSsd => {
+            StorageEngineKind::Pmem => pmem_paths.into_iter().collect::<Vec<_>>(),
+            StorageEngineKind::Ssd | StorageEngineKind::MultiSsd => {
                 ssd_paths.into_iter().collect::<Vec<_>>()
             }
-            StorageEngineType::Dram | StorageEngineType::Simple => Vec::new(),
+            StorageEngineKind::Dram | StorageEngineKind::Simple => Vec::new(),
         };
         Self {
             instance: CacheInstance::new(capacity, policy, engine, paths.clone()),
@@ -2426,11 +2606,11 @@ impl FlexibleCache {
         &self.instance
     }
 
-    pub fn policy(&self) -> ReplacementPolicyType {
+    pub fn policy(&self) -> ReplacementPolicyKind {
         self.policy
     }
 
-    pub fn engine(&self) -> StorageEngineType {
+    pub fn engine(&self) -> StorageEngineKind {
         self.engine
     }
 
@@ -2552,6 +2732,10 @@ impl StringCacheApi for FlexibleCache {
     }
 }
 
+/// A minimal `String`-valued view of a [`MultiLayerCache`] shard.
+///
+/// [`MultiTierCache`] without the configuration it was built from -- just the
+/// [`StringCacheApi`] surface over one shard.
 #[derive(Debug, Clone)]
 pub struct MultiTierStringCache {
     cache: MultiLayerCache,
@@ -2672,12 +2856,19 @@ impl StringCacheApi for MultiTierStringCache {
     }
 }
 
+/// A `String`-valued cache over every tier, built from [`CacheOptions`].
+///
+/// The fullest of the string facades: it keeps the options it was built from and
+/// exposes the policy, storage engine and eviction setting it resolved them to,
+/// along with the latency and statistics summaries.
+///
+/// Implements [`StringCacheApi`].
 #[derive(Debug, Clone)]
 pub struct MultiTierCache {
     cache: MultiLayerCache,
     options: CacheOptions,
-    policy: ReplacementPolicyType,
-    ssd_storage_engine: StorageEngineType,
+    policy: ReplacementPolicyKind,
+    ssd_storage_engine: StorageEngineKind,
     enable_eviction: bool,
     shard_id: ShardId,
 }
@@ -2724,9 +2915,9 @@ impl MultiTierCache {
         side_by_side_dram_pmem_placement_threshold: usize,
         ssd_storage_engine: impl AsRef<str>,
     ) -> Result<Self, CacheError> {
-        let policy_type = ReplacementPolicyType::from_config_name(policy.as_ref());
+        let policy_type = ReplacementPolicyKind::from_config_name(policy.as_ref());
         let replacement_policy = policy_type.as_cache_policy();
-        let ssd_storage_engine = StorageEngineType::from_config_name(ssd_storage_engine.as_ref());
+        let ssd_storage_engine = StorageEngineKind::from_config_name(ssd_storage_engine.as_ref());
         let data_placement =
             CacheDataPlacement::try_from_config_name(dram_pmem_data_placement_type.as_ref())?;
         let options = CacheOptions::new(dram_capacity, pmem_capacity, ssd_capacity)
@@ -2802,8 +2993,8 @@ impl MultiTierCache {
 
     pub fn from_options(
         options: CacheOptions,
-        policy: ReplacementPolicyType,
-        ssd_storage_engine: StorageEngineType,
+        policy: ReplacementPolicyKind,
+        ssd_storage_engine: StorageEngineKind,
         enable_eviction: bool,
     ) -> Self {
         let cache = MatrixCacheBuilder::build_zero_copy_cache(options.clone());
@@ -2826,11 +3017,11 @@ impl MultiTierCache {
         &self.options
     }
 
-    pub fn policy(&self) -> ReplacementPolicyType {
+    pub fn policy(&self) -> ReplacementPolicyKind {
         self.policy
     }
 
-    pub fn ssd_storage_engine(&self) -> StorageEngineType {
+    pub fn ssd_storage_engine(&self) -> StorageEngineKind {
         self.ssd_storage_engine
     }
 
@@ -3026,6 +3217,11 @@ struct CacheOrderNode {
     next: u32,
     access_prev: u32,
     access_next: u32,
+    /// Whether this node sits strictly between the eviction end and the
+    /// insertion point. Carried here because the alternative -- walking to find
+    /// out -- is `len() >> spec` steps, and `touch_access` would pay it on
+    /// every hit.
+    access_cold: bool,
 }
 
 /// Recency ordering over cache keys, from least recently used at the front to
@@ -3048,6 +3244,17 @@ pub struct CacheKeyOrder {
     tail: u32,
     access_head: u32,
     access_tail: u32,
+    /// The node a new entry is linked in front of, on the eviction side.
+    /// `CACHE_ORDER_NIL` means new entries go to the most-recently-used end,
+    /// which is the behaviour when the spec is zero.
+    access_insert: u32,
+    /// How many entries sit between `access_head` and `access_insert` -- the
+    /// ones that would be evicted before a newly inserted entry. CacheLib
+    /// calls this the tail size; the orientation here is reversed.
+    access_cold: usize,
+    /// New entries are placed with `len() >> spec` entries closer to eviction
+    /// than themselves. Zero puts them at the most-recently-used end.
+    insertion_spec: u8,
 }
 
 impl Default for CacheKeyOrder {
@@ -3066,7 +3273,32 @@ impl CacheKeyOrder {
             tail: CACHE_ORDER_NIL,
             access_head: CACHE_ORDER_NIL,
             access_tail: CACHE_ORDER_NIL,
+            access_insert: CACHE_ORDER_NIL,
+            access_cold: 0,
+            insertion_spec: 0,
         }
+    }
+
+    /// Sets where a new entry is placed in the access order.
+    ///
+    /// Zero -- the default -- puts it at the most-recently-used end, so it has
+    /// the whole order to traverse before it can be evicted. One puts it
+    /// halfway down, two a quarter of the way from the eviction end, and so on:
+    /// `len() >> spec` entries will be evicted before it.
+    ///
+    /// Non-zero is scan resistance. An entry read once and never again is then
+    /// evicted from where it was put, instead of walking the whole order and
+    /// pushing everything genuinely hot ahead of it.
+    ///
+    /// This is CacheLib's `lruInsertionPointSpec`.
+    pub fn set_insertion_spec(&mut self, spec: u8) {
+        self.insertion_spec = spec;
+        self.rebalance_insertion_point();
+    }
+
+    /// Where new entries are currently placed.
+    pub fn insertion_spec(&self) -> u8 {
+        self.insertion_spec
     }
 
     pub fn len(&self) -> usize {
@@ -3124,8 +3356,15 @@ impl CacheKeyOrder {
         }
         let node = self.alloc(key.clone());
         self.link_back(node);
-        self.link_access_back(node);
+        // Index first: the insertion point is balanced against `len()`, and
+        // linking before the index knows about this node leaves it balancing
+        // against a list one entry short -- which puts every new entry one
+        // place nearer eviction than the spec asks for.
         self.index.insert(key, node);
+        // Insertion order goes to the back regardless; the access order
+        // honours the insertion spec, because this is a new entry and that is
+        // exactly the case the spec governs.
+        self.link_access_insert(node);
     }
 
     /// Insert `key` as least recently used, or move it there if already present.
@@ -3169,6 +3408,12 @@ impl CacheKeyOrder {
     /// read, so a popular entry written early sits at the front forever and is
     /// offered up on every pass.
     pub fn touch_access(&mut self, key: &CacheKey) -> bool {
+        // Hashing a CacheKey means hashing three Strings, and a read touches
+        // the access order of every tier. An order holding nothing cannot
+        // match, so check that before paying for the hash.
+        if self.index.is_empty() {
+            return false;
+        }
         let Some(&node) = self.index.get(key) else {
             return false;
         };
@@ -3232,6 +3477,8 @@ impl CacheKeyOrder {
         self.tail = CACHE_ORDER_NIL;
         self.access_head = CACHE_ORDER_NIL;
         self.access_tail = CACHE_ORDER_NIL;
+        self.access_insert = CACHE_ORDER_NIL;
+        self.access_cold = 0;
     }
 
     /// Iterate from most to least recently used.
@@ -3266,6 +3513,7 @@ impl CacheKeyOrder {
             node.next = CACHE_ORDER_NIL;
             node.access_prev = CACHE_ORDER_NIL;
             node.access_next = CACHE_ORDER_NIL;
+            node.access_cold = false;
             return index;
         }
         self.nodes.push(CacheOrderNode {
@@ -3274,6 +3522,7 @@ impl CacheKeyOrder {
             next: CACHE_ORDER_NIL,
             access_prev: CACHE_ORDER_NIL,
             access_next: CACHE_ORDER_NIL,
+            access_cold: false,
         });
         (self.nodes.len() - 1) as u32
     }
@@ -3306,6 +3555,138 @@ impl CacheKeyOrder {
         self.head = node;
     }
 
+    /// Links a newly-inserted node according to the insertion spec.
+    ///
+    /// Only new entries go through here. A hit still moves its entry all the
+    /// way to the most-recently-used end -- the point of the insertion spec is
+    /// where something *starts*, not where a hit puts it.
+    /// Verifies the access list's internal invariants.
+    ///
+    /// Returns a description of the first violation found, so a failing test
+    /// says what is wrong rather than only that something is. Walks the list,
+    /// so it is a debugging aid rather than something to call on a hot path.
+    ///
+    /// The invariants: the forward and backward walks visit the same nodes in
+    /// the same order and agree with `len()`; and when an insertion spec is
+    /// set, the insertion point is a member of the list and `access_cold` is
+    /// exactly its distance from the eviction end.
+    pub fn check_access_invariants(&self) -> Result<(), String> {
+        let mut forward = Vec::new();
+        let mut cursor = self.access_head;
+        while cursor != CACHE_ORDER_NIL {
+            forward.push(cursor);
+            if forward.len() > self.nodes.len() + 1 {
+                return Err("access list cycles".to_string());
+            }
+            cursor = self.nodes[cursor as usize].access_next;
+        }
+        if forward.len() != self.len() {
+            return Err(format!(
+                "access list holds {} nodes, index holds {}",
+                forward.len(),
+                self.len()
+            ));
+        }
+
+        let mut backward = Vec::new();
+        cursor = self.access_tail;
+        while cursor != CACHE_ORDER_NIL {
+            backward.push(cursor);
+            if backward.len() > self.nodes.len() + 1 {
+                return Err("access list cycles backwards".to_string());
+            }
+            cursor = self.nodes[cursor as usize].access_prev;
+        }
+        backward.reverse();
+        if backward != forward {
+            return Err("forward and backward walks disagree".to_string());
+        }
+
+        if self.insertion_spec != 0 && !forward.is_empty() {
+            let position = forward
+                .iter()
+                .position(|node| *node == self.access_insert)
+                .ok_or_else(|| "insertion point is not in the access list".to_string())?;
+            if position != self.access_cold {
+                return Err(format!(
+                    "cold count is {} but the insertion point sits at {}",
+                    self.access_cold, position
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn link_access_insert(&mut self, node: u32) {
+        if self.insertion_spec == 0 || self.access_insert == CACHE_ORDER_NIL {
+            self.link_access_back(node);
+            self.rebalance_insertion_point();
+            return;
+        }
+        let successor = self.access_insert;
+        let predecessor = self.nodes[successor as usize].access_prev;
+        self.nodes[node as usize].access_prev = predecessor;
+        self.nodes[node as usize].access_next = successor;
+        self.nodes[successor as usize].access_prev = node;
+        if predecessor == CACHE_ORDER_NIL {
+            self.access_head = node;
+        } else {
+            self.nodes[predecessor as usize].access_next = node;
+        }
+        // The new node lands strictly on the eviction side of the point, so it
+        // is cold and the point is now one step further from the eviction end.
+        self.nodes[node as usize].access_cold = true;
+        self.access_cold += 1;
+        self.rebalance_insertion_point();
+    }
+
+    /// Moves the insertion point until `access_cold` matches `len() >> spec`.
+    ///
+    /// Called after every change to the access list, and moves the point by at
+    /// most a step or two each time, because the list changes by one entry at a
+    /// time. Walking it here rather than recomputing from scratch is what keeps
+    /// insertion O(1).
+    fn rebalance_insertion_point(&mut self) {
+        if self.insertion_spec == 0 {
+            self.access_insert = CACHE_ORDER_NIL;
+            self.access_cold = 0;
+            return;
+        }
+        let target = self.len() >> self.insertion_spec;
+        if self.access_head == CACHE_ORDER_NIL {
+            self.access_insert = CACHE_ORDER_NIL;
+            self.access_cold = 0;
+            return;
+        }
+        if self.access_insert == CACHE_ORDER_NIL {
+            self.access_insert = self.access_head;
+            self.access_cold = 0;
+        }
+        // Toward the most-recently-used end while too few entries are cold.
+        // The node the point leaves behind becomes cold.
+        while self.access_cold < target {
+            let next = self.nodes[self.access_insert as usize].access_next;
+            if next == CACHE_ORDER_NIL {
+                break;
+            }
+            self.nodes[self.access_insert as usize].access_cold = true;
+            self.access_insert = next;
+            self.access_cold += 1;
+        }
+        // And back toward the eviction end while too many are. The node it
+        // lands on was cold and is now the point itself, so it stops being.
+        while self.access_cold > target {
+            let prev = self.nodes[self.access_insert as usize].access_prev;
+            if prev == CACHE_ORDER_NIL {
+                break;
+            }
+            self.access_insert = prev;
+            self.nodes[prev as usize].access_cold = false;
+            self.access_cold -= 1;
+        }
+        self.nodes[self.access_insert as usize].access_cold = false;
+    }
+
     fn link_access_back(&mut self, node: u32) {
         let old_tail = self.access_tail;
         self.nodes[node as usize].access_prev = old_tail;
@@ -3331,6 +3712,36 @@ impl CacheKeyOrder {
     }
 
     fn unlink_access(&mut self, node: u32) {
+        // Keep the insertion point off the node about to leave, and keep the
+        // cold count honest about which side of it the node was on.
+        if self.insertion_spec != 0 && self.access_insert != CACHE_ORDER_NIL {
+            if node == self.access_insert {
+                // Hand the point to the neighbour towards the hot end; if there
+                // is none, fall back towards the eviction end, which loses one
+                // cold entry with it.
+                let next = self.nodes[node as usize].access_next;
+                if next != CACHE_ORDER_NIL {
+                    self.access_insert = next;
+                    self.nodes[next as usize].access_cold = false;
+                } else {
+                    let prev = self.nodes[node as usize].access_prev;
+                    self.access_insert = prev;
+                    if prev != CACHE_ORDER_NIL {
+                        self.nodes[prev as usize].access_cold = false;
+                        self.access_cold = self.access_cold.saturating_sub(1);
+                    } else {
+                        self.access_cold = 0;
+                    }
+                }
+            } else if self.nodes[node as usize].access_cold {
+                self.access_cold = self.access_cold.saturating_sub(1);
+            }
+        }
+        self.nodes[node as usize].access_cold = false;
+        self.unlink_access_inner(node)
+    }
+
+    fn unlink_access_inner(&mut self, node: u32) {
         let prev = self.nodes[node as usize].access_prev;
         let next = self.nodes[node as usize].access_next;
         if prev == CACHE_ORDER_NIL {

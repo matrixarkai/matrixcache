@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+/// The byte-valued cache interface, implemented by every cache in this crate.
+///
+/// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
+/// [`SimpleLruCache`] and [`ZeroCopySimpleLruCache`], so a caller can hold any
+/// of them behind `dyn CacheApi`.
+///
+/// **Every method carries a `_cache` suffix on purpose.** Implementors also have
+/// inherent methods with the bare names -- `SimpleLruCache::insert`,
+/// `MultiLayerCache::size` -- and without the suffix a call would be ambiguous
+/// between the two. [`StringCacheApi`] uses `_string` for the same reason, which
+/// is what lets one type implement both.
 pub trait CacheApi {
     fn start_cache(&self) -> bool;
     fn stop_cache(&self) -> bool;
@@ -69,28 +80,37 @@ pub trait CacheApi {
         self.remove_all_cache()
     }
     fn capacity_cache(&self) -> usize;
-    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type {
-            CacheInstanceType::Unified => self.capacity_cache(),
+            CacheInstanceKind::Unified => self.capacity_cache(),
             _ => self.capacity_cache(),
         }
     }
     fn set_capacity_cache(&self, capacity: usize);
-    fn set_capacity_for_instance_cache(&self, instance_type: CacheInstanceType, capacity: usize) {
+    fn set_capacity_for_instance_cache(&self, instance_type: CacheInstanceKind, capacity: usize) {
         match instance_type {
-            CacheInstanceType::Unified => self.set_capacity_cache(capacity),
+            CacheInstanceKind::Unified => self.set_capacity_cache(capacity),
             _ => self.set_capacity_cache(capacity),
         }
     }
     fn size_cache(&self) -> usize;
-    fn used_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn used_cache(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type {
-            CacheInstanceType::Unified => self.size_cache(),
+            CacheInstanceKind::Unified => self.size_cache(),
             _ => self.size_cache(),
         }
     }
 }
 
+/// Reads that hand back a pinned handle instead of a copy.
+///
+/// Extends [`CacheApi`] for the caches that can lend their stored bytes:
+/// [`MultiLayerCache`], [`ShardedMultiLayerCache`] and
+/// [`ZeroCopySimpleLruCache`].
+///
+/// A handle acquired here holds the entry resident, so it must be released --
+/// bytes behind a live handle are still counted by `size`, and an entry removed
+/// while pinned is retired rather than freed until the last handle drops.
 pub trait ZeroCopyCacheApi: CacheApi {
     fn acquire_cache(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError>;
     fn acquire_batch_cache(
@@ -138,6 +158,15 @@ pub trait ZeroCopyCacheApi: CacheApi {
     }
 }
 
+/// The `String`-valued cache interface.
+///
+/// The counterpart to [`CacheApi`] for the facades that store strings rather
+/// than bytes: [`ConcurrentSimpleLruCache`], [`FlexibleCache`],
+/// [`InProcessMemcachedCache`], [`MultiTierCache`] and [`MultiTierStringCache`].
+///
+/// The `_string` suffix on every method exists for the same reason as
+/// `CacheApi`'s `_cache`: it keeps these from colliding with the implementors'
+/// inherent methods, and with each other on a type that implements both.
 pub trait StringCacheApi {
     fn start_string_cache(&self) -> bool;
     fn stop_string_cache(&self) -> bool;
@@ -173,35 +202,36 @@ pub struct CacheWritebackSubmitReport {
 }
 
 #[derive(Debug, Clone)]
-struct SlotEvictionGroup {
+struct SlotEvictionGroup<'a> {
     group_score: EvictionScore,
-    victim: CacheKey,
+    victim: &'a CacheKey,
     victim_score: EvictionScore,
 }
 
-impl SlotEvictionGroup {
-    fn new(victim: &CacheKey, score: EvictionScore) -> Self {
+impl<'a> SlotEvictionGroup<'a> {
+    fn new(victim: &'a CacheKey, score: EvictionScore) -> Self {
         Self {
             group_score: score,
-            victim: victim.clone(),
+            victim,
             victim_score: score,
         }
     }
 
     /// Fold one more member into the group.
     ///
-    /// The key is borrowed and only cloned when it actually takes over as the
-    /// group's victim. Taking it by value cloned every key in the tier on
-    /// every eviction, and all but one of those clones was discarded.
-    fn observe(&mut self, key: &CacheKey, score: EvictionScore) {
+    /// Nothing here owns a key. Entries without a routing slot each stand alone
+    /// as their own group, so every candidate starts one -- cloning on the way
+    /// in cloned the whole window on every eviction, and all but one of those
+    /// clones was thrown away. The winner is cloned once, by the caller.
+    fn observe(&mut self, key: &'a CacheKey, score: EvictionScore) {
         self.group_score.hotness = self.group_score.hotness.max(score.hotness);
         self.group_score.hits = self.group_score.hits.saturating_add(score.hits);
         self.group_score.last_access_epoch = self
             .group_score
             .last_access_epoch
             .max(score.last_access_epoch);
-        if score < self.victim_score || (score == self.victim_score && *key < self.victim) {
-            self.victim = key.clone();
+        if score < self.victim_score || (score == self.victim_score && key < self.victim) {
+            self.victim = key;
             self.victim_score = score;
         }
     }
@@ -229,10 +259,55 @@ struct PickedEvictionVictim {
     groups_weighed: usize,
 }
 
+/// The multi-tier cache: a DRAM tier, a persistent-memory-like resident tier and
+/// an SSD tier, with admission control, cross-tier eviction and read-through
+/// refill.
+///
+/// Construct it with [`MultiLayerCache::new`] for a memory tier plus a directory
+/// for the SSD tier, or with [`MultiLayerCache::with_options`] for anything more
+/// than that. Implements [`CacheApi`] and [`ZeroCopyCacheApi`].
+///
+/// # Concurrency
+///
+/// **Reads take the write lock.** A hit updates statistics, hotness metadata and
+/// two latency histograms on the way out, so concurrent readers serialise
+/// against each other and throughput *falls* as threads are added.
+///
+/// If more than one thread will read this cache, use
+/// [`ShardedMultiLayerCache`], which has the same API and does not have the
+/// problem. `examples/cache_scaling_bench.rs` measures both.
+///
+/// # Examples
+///
+/// ```
+/// use matrixcache::{CacheKey, MultiLayerCache};
+///
+/// let dir = tempfile::tempdir()?;
+/// let cache = MultiLayerCache::new(1 << 20, dir.path());
+///
+/// let key = CacheKey::string(0, "greeting");
+/// cache.put(key.clone(), b"hello".to_vec())?;
+/// assert_eq!(cache.get(&key)?, Some(b"hello".to_vec()));
+///
+/// cache.remove(&key)?;
+/// assert_eq!(cache.get(&key)?, None);
+/// # Ok::<(), matrixcache::CacheError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct MultiLayerCache {
     inner: Arc<RwLock<CacheInner>>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
+    /// Whether an access-record callback is registered.
+    ///
+    /// Duplicated out of `CacheInner` so the check that begins every get, put
+    /// and delete does not have to take the cache lock to make it.
+    access_record_registered: Arc<AtomicBool>,
+    /// Whether either eviction callback is registered.
+    ///
+    /// The pending-eviction queues are only ever non-empty while one is, so
+    /// this says whether there can be anything to drain -- which lets the
+    /// drain after every put and delete skip taking the lock exclusively.
+    eviction_callbacks_registered: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -245,6 +320,12 @@ struct CacheAsyncWritebackWorker {
 struct CacheInner {
     started: bool,
     auto_recover_on_start: bool,
+    /// Whether an SSD block write also survives a machine crash. See
+    /// [`CacheOptions::ssd_block_durability`].
+    ssd_block_durability: bool,
+    /// Whether a persistent-tier write also survives a machine crash. See
+    /// [`CacheOptions::pmem_block_durability`].
+    pmem_block_durability: bool,
     memory_capacity_bytes: usize,
     memory_bytes: usize,
     pmem_capacity_bytes: usize,
@@ -254,19 +335,68 @@ struct CacheInner {
     disk_dir: PathBuf,
     pmem_paths: Vec<PathBuf>,
     ssd_store: SsdTierStore,
+    ssd_write_budget: SsdWriteBudget,
+    /// Time to live applied to entries that do not ask for their own, in
+    /// milliseconds. Zero means entries do not expire.
+    default_ttl_millis: u64,
+    /// Whether any entry has ever been given a time to live.
+    ///
+    /// The incremental sweep below is worth nothing to a cache that does not
+    /// use expiry, and this is what keeps it costing nothing: one bool test on
+    /// the write path, and the sweep is never entered.
+    ttl_in_use: bool,
     tiering_policy: CacheTieringPolicy,
     block_options: CacheBlockOptions,
     memory: HashMap<CacheKey, Arc<[u8]>>,
     pmem: HashMap<CacheKey, Arc<[u8]>>,
     disk_index: HashMap<CacheKey, u64>,
     disk_order: CacheKeyOrder,
-    pinned: HashMap<CacheKey, u64>,
-    pinned_handle_bytes: HashMap<CacheKey, usize>,
-    pinned_removed_bytes: HashMap<CacheKey, usize>,
+    /// Everything about which entries are pinned, behind its own lock.
+    ///
+    /// It used to be three maps and two counters directly on the cache, which
+    /// meant taking a pinned handle needed the cache **exclusively** -- and so
+    /// did giving one back. Every reader serialised against every other twice
+    /// per zero-copy read, and it showed: `acquire` did not scale at all and
+    /// went backwards past two threads, while `get` scaled, leaving the
+    /// zero-copy read about eighteen times slower than the copying one it
+    /// exists to beat.
+    ///
+    /// Behind its own lock, a read takes the cache **shared** and holds this
+    /// only for the counter update. The model this crate follows goes further
+    /// and keeps the refcount on the item itself; this is the same idea with
+    /// the accounting kept where it already was.
+    ///
+    /// **Lock order is cache, then pins, always.** It can only be reached
+    /// through a borrow of the cache, so nothing can take it the other way
+    /// round.
+    pins: Vec<Mutex<CachePinState>>,
     memory_order: CacheKeyOrder,
     pmem_order: CacheKeyOrder,
     async_writeback_queue: VecDeque<CacheWritebackJob>,
-    async_writeback_positions: HashMap<CacheKey, usize>,
+    /// Key to the sequence number of its queued job.
+    ///
+    /// A sequence number, not an index: popping from the front of the queue
+    /// would shift every index, and re-deriving them meant rebuilding this
+    /// whole map on every drain. The current index is `sequence - head`.
+    async_writeback_positions: HashMap<CacheKey, u64>,
+    /// How many write-back jobs have ever been popped.
+    async_writeback_head: u64,
+    /// The floor for the refresh window, in milliseconds. Zero always moves the
+    /// entry.
+    ///
+    /// Moving an entry needs the cache exclusively, so this is what decides
+    /// whether a hit can be served under the shared lock. See
+    /// [`DEFAULT_LRU_REFRESH`].
+    lru_refresh_floor_millis: u64,
+    /// Scales the window by the age of the oldest entry. Zero disables the
+    /// adaptation and pins the window to the floor, which is the default.
+    lru_refresh_ratio: f64,
+    /// The window actually in force: the floor, or the scaled value when
+    /// adaptation is on. Relaxed -- it is a heuristic, and a reader that sees
+    /// the previous interval's value simply uses that.
+    lru_refresh_effective_millis: AtomicU64,
+    /// When the adaptation is next due to be recomputed.
+    next_reconfigure_millis: AtomicU64,
     async_writeback_queue_bytes: u64,
     max_async_writeback_queue: usize,
     access_record_callback: Option<CacheAccessRecordCallback>,
@@ -280,18 +410,342 @@ struct CacheInner {
     pmem_replacement_policy: CacheReplacementPolicy,
     ssd_replacement_policy: CacheReplacementPolicy,
     metadata: HashMap<CacheKey, CacheEntryMeta>,
-    access_epoch: u64,
+    /// How often keys have been asked for recently, including keys that are
+    /// not resident. Consulted at admission; see `admission_filter_enabled`.
+    access_frequency: FrequencySketch,
+    /// Whether a candidate colder than the entry it would evict is declined.
+    /// Off by default: it changes what the cache keeps.
+    admission_filter_enabled: bool,
+    /// Read-path statistics, updated through `&self` so a read can count
+    /// itself while holding the cache lock shared.
+    read_counters: ReadPathCounters,
     stats: CacheStats,
 }
 
+/// A latency histogram that can be updated through a shared reference.
+///
+/// The read path records into these while holding the cache lock shared, so
+/// two readers no longer take turns to count themselves.
+///
+/// These counters wrap where the `u64` fields they replace saturated. At a
+/// billion samples a second that is a little under six hundred years, so the
+/// difference is theoretical.
+#[derive(Debug, Default)]
+struct AtomicLatencyHistogram {
+    total_micros: AtomicU64,
+    max_micros: AtomicU64,
+    le_10us: AtomicU64,
+    le_100us: AtomicU64,
+    le_1ms: AtomicU64,
+    le_10ms: AtomicU64,
+    gt_10ms: AtomicU64,
+}
+
+impl AtomicLatencyHistogram {
+    /// Counts the sample in its bucket, and nothing else.
+    ///
+    /// There is no separate sample counter: `samples()` adds the buckets up,
+    /// which is the same number, one atomic write cheaper per sample.
+    fn observe(&self, micros: u64) {
+        let bucket = if micros <= 10 {
+            &self.le_10us
+        } else if micros <= 100 {
+            &self.le_100us
+        } else if micros <= 1_000 {
+            &self.le_1ms
+        } else if micros <= 10_000 {
+            &self.le_10ms
+        } else {
+            &self.gt_10ms
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// As `observe`, and also keeps a running total and maximum.
+    ///
+    /// Only the get histogram publishes those two, so only it pays for them.
+    /// The maximum is read before it is written: after the first few samples
+    /// almost none are a new maximum, and a load is much cheaper than an
+    /// unconditional read-modify-write.
+    fn observe_with_total(&self, micros: u64) {
+        self.observe(micros);
+        self.total_micros.fetch_add(micros, Ordering::Relaxed);
+        if micros > self.max_micros.load(Ordering::Relaxed) {
+            self.max_micros.fetch_max(micros, Ordering::Relaxed);
+        }
+    }
+
+    fn samples(&self) -> u64 {
+        self.le_10us.load(Ordering::Relaxed)
+            + self.le_100us.load(Ordering::Relaxed)
+            + self.le_1ms.load(Ordering::Relaxed)
+            + self.le_10ms.load(Ordering::Relaxed)
+            + self.gt_10ms.load(Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.total_micros,
+            &self.max_micros,
+            &self.le_10us,
+            &self.le_100us,
+            &self.le_1ms,
+            &self.le_10ms,
+            &self.gt_10ms,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The statistics a read updates, held so that a read does not need the cache
+/// exclusively in order to account for itself.
+///
+/// Everything here is folded into the public `CacheStats` by
+/// `MultiLayerCache::stats()`. Relaxed ordering is right for all of it: these
+/// are counters read for reporting, and nothing branches on one of them to
+/// decide whether some other write is visible.
+#[derive(Debug, Default)]
+struct ReadPathCounters {
+    memory_hits: AtomicU64,
+    pmem_hits: AtomicU64,
+    disk_hits: AtomicU64,
+    misses: AtomicU64,
+    hotness_promotions: AtomicU64,
+    access_order_refreshes: AtomicU64,
+    get_latency: AtomicLatencyHistogram,
+    read_through_latency: AtomicLatencyHistogram,
+    refill_latency: AtomicLatencyHistogram,
+}
+
+impl ReadPathCounters {
+    fn reset(&self) {
+        self.memory_hits.store(0, Ordering::Relaxed);
+        self.pmem_hits.store(0, Ordering::Relaxed);
+        self.disk_hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.hotness_promotions.store(0, Ordering::Relaxed);
+        self.access_order_refreshes.store(0, Ordering::Relaxed);
+        self.get_latency.reset();
+        self.read_through_latency.reset();
+        self.refill_latency.reset();
+    }
+}
+
+/// How recently an entry must have been read for a hit to leave it where it is.
+///
+/// A hit updates its entry's counters, which is atomic, and moves the entry to
+/// the back of each tier's access order, which is not -- that needs the cache
+/// exclusively. This setting decides how often the second happens: an entry
+/// read again within this window keeps its place.
+///
+/// Zero moves it on every hit, which keeps the order exact and makes every read
+/// take the cache exclusively. That is the wrong default for a cache, and it is
+/// what CacheLib concluded too -- `lruRefreshTime` defaults to sixty seconds
+/// there rather than zero.
+///
+/// This was an access *count* until it became a duration. The count had two
+/// faults a duration does not: it needed a process-wide counter bumped by every
+/// hit on every thread, which is a contended cache line; and its units meant
+/// that with N threads the counter advanced N times faster, so the effective
+/// window shrank as concurrency rose.
+/// Measured trade, so it is not re-litigated from first principles.
+///
+/// Lowering this raises the hit rate and lowers read throughput, and both ends
+/// have been measured on `eviction_bench` with a working set four times the
+/// cache and 80% of reads on a hot half-cache:
+///
+/// ```text
+///   window   promotions   hit rate @4096   what it costs
+///    500ms       54,743           78.99%   the default
+///        0      327,947           81.99%   6x the promotions, and a promotion
+///                                          is the one thing on the read path
+///                                          that takes the cache exclusively
+/// ```
+///
+/// Three points of hit rate for six times the exclusive-lock escalations is
+/// what makes the read path scale roughly ninefold from one thread to eight.
+/// Turning this down recovers the points and gives that back, which is a
+/// trade worth making deliberately rather than by accident.
+const DEFAULT_LRU_REFRESH: Duration = Duration::from_millis(500);
+
+/// One hit in this many is recorded into the admission sketch.
+///
+/// Recording every hit measured ~26ns against a ~226ns read, which is too much
+/// to spend on a path a dozen changes have gone into making cheap. Sixteen
+/// brings it under 1% of a read, and the comparison it feeds only needs to rank
+/// keys against each other, not count them.
+const HIT_SAMPLE_INTERVAL: u64 = 16;
+
+/// How often the coarse clock is republished.
+///
+/// This is the resolution of every recency decision the read path makes, so it
+/// wants to be well below the refresh window. It is also a thread wake-up, so
+/// it wants not to be tiny. 10ms against a default window of 500ms gives fifty
+/// steps, which is far finer than the decision needs.
+/// The longest the adaptive window may grow to.
+///
+/// CacheLib caps at 900 seconds against a 60-second default -- fifteen times.
+/// The same proportion against our 500ms floor is 7.5 seconds; 10 is the round
+/// number above it. The cap exists because `oldestElementAge` is unbounded: a
+/// cache holding one entry that nobody evicts would otherwise grow the window
+/// without limit and stop maintaining its order entirely.
+const LRU_REFRESH_CAP: Duration = Duration::from_secs(10);
+
+/// How often the adaptive window is recomputed.
+///
+/// CacheLib defaults this to zero, which recomputes on every access -- cheap
+/// there because the check is one comparison and the work behind it reads a
+/// single tail node. Ours reads a tail node and a hash entry, so it is spaced
+/// out rather than run per hit.
+const LRU_RECONFIGURE_INTERVAL: Duration = Duration::from_secs(1);
+
+const COARSE_CLOCK_TICK: Duration = Duration::from_millis(10);
+
+/// Milliseconds since the first read of the clock, republished by a background
+/// thread.
+///
+/// The read path stamps every hit with this, so it is read by every thread on
+/// every hit and must be nearly free. `Instant::now()` is not: it measured
+/// 225ns at one thread and 368ns at eight on this platform, where
+/// `clock_gettime` is not served from the vDSO. A relaxed load of an
+/// `AtomicU64` that one thread writes and everyone reads measured 0.45ns and
+/// 0.52ns for the same cases -- flat, because the line stays in Shared state
+/// rather than being taken exclusively by each writer in turn.
+///
+/// That is the whole reason this is not simply a clock call.
+struct CoarseClock {
+    millis: AtomicU64,
+}
+
+impl CoarseClock {
+    fn shared() -> &'static CoarseClock {
+        static CLOCK: OnceLock<CoarseClock> = OnceLock::new();
+        CLOCK.get_or_init(|| {
+            let clock = CoarseClock {
+                millis: AtomicU64::new(0),
+            };
+            let started = Instant::now();
+            // The published value is read through a `&'static`, so the ticker
+            // can hold one too and needs no `Arc`. It runs for the life of the
+            // process, which is the life of the value it publishes.
+            std::thread::Builder::new()
+                .name("matrixcache-clock".to_string())
+                .spawn(move || loop {
+                    let now = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    CoarseClock::shared().millis.store(now, Ordering::Relaxed);
+                    std::thread::sleep(COARSE_CLOCK_TICK);
+                })
+                .expect("spawn coarse clock");
+            clock
+        })
+    }
+
+    /// Milliseconds since the clock started. Monotonic, resolution
+    /// [`COARSE_CLOCK_TICK`].
+    fn now_millis() -> u64 {
+        Self::shared().millis.load(Ordering::Relaxed)
+    }
+}
+
+/// What a hit still needs the cache exclusively for, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitOutcome {
+    /// Fully accounted for under the shared lock. The common case.
+    Accounted,
+    /// Accounted for, but the entry has not been read in long enough that it
+    /// needs moving in the tier access orders.
+    NeedsAccessOrderRefresh,
+    /// The key has no metadata, which only an exclusive borrow can insert.
+    NeedsMetadata,
+}
+
+/// How many independent pin locks there are.
+///
+/// One lock for every pinned key made taking a handle scale no better than the
+/// exclusive cache lock it replaced -- it just moved which lock everyone
+/// queued on. Striping by key lets handles on different keys be taken at the
+/// same time, which is the case that matters: readers pinning the same key at
+/// the same instant are rare, readers pinning different keys are the workload.
+const PIN_STRIPES: usize = 16;
+
+/// Which entries are pinned, and what their handles are worth.
+///
+/// The counters live here rather than in `stats` because they are only ever
+/// touched under this lock, and a counter kept somewhere else would need the
+/// cache exclusively to update -- which is the thing this exists to avoid.
+/// What is known about one pinned key.
+///
+/// One entry rather than three maps keyed the same way. Three maps have to be
+/// kept agreeing about which keys exist, and they were not: dropping a pin
+/// during an invalidation removed the count and the removed-bytes and left the
+/// handle-bytes behind, while the memory-only invalidation next to it removed
+/// all three. Neither is now possible to write.
+///
+/// It also halves the hashing on the pin path -- one lookup to take a handle
+/// instead of two, one to give it back instead of up to four -- which is the
+/// path a zero-copy read crosses twice.
+#[derive(Debug, Default)]
+struct PinnedEntry {
+    /// How many handles are outstanding.
+    handles: u64,
+    /// The largest size seen for this key, for the pinned-bytes figure.
+    handle_bytes: usize,
+    /// Set when the key has been removed from its tier while still held.
+    removed_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct CachePinState {
+    entries: HashMap<CacheKey, PinnedEntry>,
+    pin_operations: u64,
+    unpin_operations: u64,
+    /// Reads answered with a handle rather than a copy. Kept here because it
+    /// is counted at the moment a pin is taken, under this lock, and a counter
+    /// anywhere else would need the cache exclusively to update.
+    zero_copy_handle_hits: u64,
+}
+
+/// Per-entry bookkeeping.
+///
+/// The three counters a read updates are atomic so that a hit can account for
+/// itself through a shared borrow of the map, rather than needing the cache
+/// exclusively. That costs `Copy` and `Clone`, which nothing relied on: every
+/// reader of this struct already took it by reference.
+#[derive(Debug)]
 struct CacheEntryMeta {
     block_kind: CacheBlockKind,
     routing_slot: Option<u32>,
-    hotness: u32,
-    hits: u64,
-    last_access_epoch: u64,
+    hotness: AtomicU32,
+    hits: AtomicU64,
+    last_access_epoch: AtomicU64,
     admission_reason: CacheAdmissionReason,
+    /// Coarse-clock millisecond at which this entry stops being servable.
+    ///
+    /// Zero means it never does, which is what an entry gets unless a time to
+    /// live was asked for. Stored rather than a `Duration` so the check on the
+    /// read path is one relaxed load and one comparison.
+    expires_at_millis: AtomicU64,
+}
+
+impl CacheEntryMeta {
+    /// Whether this entry has passed its time to live as of `now_millis`.
+    fn is_expired(&self, now_millis: u64) -> bool {
+        let expires_at = self.expires_at_millis.load(Ordering::Relaxed);
+        expires_at != 0 && now_millis >= expires_at
+    }
+
+    /// Stamp an expiry `ttl_millis` from now, or clear it when zero.
+    fn set_ttl(&self, ttl_millis: u64, now_millis: u64) {
+        let expires_at = if ttl_millis == 0 {
+            0
+        } else {
+            // Saturating, so a caller asking for a century does not wrap into
+            // an entry that is already expired.
+            now_millis.saturating_add(ttl_millis).max(1)
+        };
+        self.expires_at_millis.store(expires_at, Ordering::Relaxed);
+    }
 }
 struct StagedSsdBatchWrite {
     key: CacheKey,
@@ -304,8 +758,8 @@ struct StagedSsdBatchWrite {
 
 #[derive(Debug, Clone)]
 enum SsdTierStore {
-    Single(StorageEngineRocksDB),
-    Multi(StorageEngineMultiSSD),
+    Single(StorageEngineRocksDb),
+    Multi(StorageEngineMultiSsd),
 }
 
 impl SsdTierStore {
@@ -321,9 +775,9 @@ impl SsdTierStore {
                 .collect::<Vec<_>>()
         };
         if paths.len() > 1 {
-            Self::Multi(StorageEngineMultiSSD::with_paths(paths, capacity))
+            Self::Multi(StorageEngineMultiSsd::with_paths(paths, capacity))
         } else {
-            let mut storage = StorageEngineRocksDB::new(
+            let mut storage = StorageEngineRocksDb::new(
                 paths
                     .into_iter()
                     .next()
@@ -602,7 +1056,26 @@ impl MultiLayerCache {
         }
     }
 
+    /// Build a cache, refusing a configuration it cannot honour.
+    ///
+    /// Only the critical findings refuse: a cache with no capacity anywhere,
+    /// or a durable tier pointed at a temporary directory that will not
+    /// survive a restart. Warnings do not, because a cache that starts and
+    /// tells you about a redundant path is more useful than one that will not
+    /// start. [`CacheOptions::validate`] returns all of them.
+    ///
+    /// [`Self::with_options`] stays infallible and unchanged.
     pub fn try_with_options(options: CacheOptions) -> Result<Self, CacheError> {
+        let refusals = options.critical_findings();
+        if !refusals.is_empty() {
+            return Err(CacheError::InvalidConfig(
+                refusals
+                    .into_iter()
+                    .map(|finding| format!("{}: {}", finding.field, finding.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
         let auto_recover_on_start = options.auto_recover_on_start;
         let cache = Self::build_with_options(options);
         if auto_recover_on_start {
@@ -618,6 +1091,7 @@ impl MultiLayerCache {
             options.tiering_policy(),
             options.block_options,
         );
+        cache.set_ssd_write_budget_bytes_per_sec(options.ssd_write_bytes_per_sec);
         cache.set_replacement_policy_for_tier(
             CacheTier::Memory,
             CacheReplacementPolicy::from_config_name(&options.cache_dram_replacement_policy),
@@ -633,6 +1107,16 @@ impl MultiLayerCache {
         cache.set_ssd_instance_only(options.cache_ssd_instance_only);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
+        cache
+            .inner
+            .write()
+            .expect("cache lock poisoned")
+            .ssd_block_durability = options.ssd_block_durability;
+        cache
+            .inner
+            .write()
+            .expect("cache lock poisoned")
+            .pmem_block_durability = options.pmem_block_durability;
         cache
     }
 
@@ -659,6 +1143,8 @@ impl MultiLayerCache {
             inner: Arc::new(RwLock::new(CacheInner {
                 started: true,
                 auto_recover_on_start: false,
+                ssd_block_durability: true,
+                pmem_block_durability: false,
                 memory_capacity_bytes: tiering_policy.memory_capacity_bytes,
                 memory_bytes: 0,
                 pmem_capacity_bytes: tiering_policy.pmem_capacity_bytes,
@@ -668,19 +1154,29 @@ impl MultiLayerCache {
                 disk_dir,
                 pmem_paths: Vec::new(),
                 ssd_store,
+                ssd_write_budget: SsdWriteBudget::unlimited(),
+                default_ttl_millis: 0,
+                ttl_in_use: false,
                 tiering_policy,
                 block_options,
                 memory: HashMap::new(),
                 pmem: HashMap::new(),
                 disk_index: HashMap::new(),
                 disk_order: CacheKeyOrder::new(),
-                pinned: HashMap::new(),
-                pinned_handle_bytes: HashMap::new(),
-                pinned_removed_bytes: HashMap::new(),
+                pins: (0..PIN_STRIPES)
+                    .map(|_| Mutex::new(CachePinState::default()))
+                    .collect(),
                 memory_order: CacheKeyOrder::new(),
                 pmem_order: CacheKeyOrder::new(),
                 async_writeback_queue: VecDeque::new(),
                 async_writeback_positions: HashMap::new(),
+                async_writeback_head: 0,
+                lru_refresh_floor_millis: DEFAULT_LRU_REFRESH.as_millis() as u64,
+                lru_refresh_ratio: 0.0,
+                lru_refresh_effective_millis: AtomicU64::new(
+                    DEFAULT_LRU_REFRESH.as_millis() as u64,
+                ),
+                next_reconfigure_millis: AtomicU64::new(0),
                 async_writeback_queue_bytes: 0,
                 max_async_writeback_queue: 1024,
                 access_record_callback: None,
@@ -694,10 +1190,20 @@ impl MultiLayerCache {
                 pmem_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 ssd_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 metadata: HashMap::new(),
-                access_epoch: 0,
+                // Sized from the configured memory capacity, assuming values
+                // on the order of 64 bytes. The estimate only has to rank keys
+                // against each other, so being out by a factor either way costs
+                // accuracy rather than correctness.
+                access_frequency: FrequencySketch::with_capacity(
+                    (tiering_policy.memory_capacity_bytes / 64).max(1),
+                ),
+                admission_filter_enabled: false,
+                read_counters: ReadPathCounters::default(),
                 stats: CacheStats::default(),
             })),
             async_writeback_worker: Arc::new(Mutex::new(None)),
+            access_record_registered: Arc::new(AtomicBool::new(false)),
+            eviction_callbacks_registered: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -781,11 +1287,107 @@ impl MultiLayerCache {
         }
     }
 
-    pub fn get_capacity(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn get_capacity(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type.as_tier() {
             Some(tier) => self.capacity_for_tier(tier),
             None => self.capacity(),
         }
+    }
+
+    /// Write `value` under `key` and give it `ttl` to live.
+    ///
+    /// After `ttl` the entry stops being servable: a read finds nothing and the
+    /// entry is dropped. A `ttl` of zero means it never expires, which is what
+    /// an ordinary [`put`](Self::put) gives unless a default has been set.
+    ///
+    /// Rewriting a key restarts its life, which is what putting it again means.
+    pub fn put_with_ttl(
+        &self,
+        key: CacheKey,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.put(key.clone(), value)?;
+        let ttl_millis = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        if ttl_millis > 0 {
+            self.inner.write().expect("cache lock poisoned").ttl_in_use = true;
+        }
+        let inner = self.inner.read().expect("cache lock poisoned");
+        if let Some(meta) = inner.metadata.get(&key) {
+            meta.set_ttl(ttl_millis, CoarseClock::now_millis());
+        }
+        Ok(())
+    }
+
+    /// Time to live given to entries that do not ask for their own.
+    ///
+    /// Zero, the default, means entries do not expire. Applies to entries
+    /// written after it is set; it does not reach back over what is already
+    /// resident.
+    pub fn set_default_ttl(&self, ttl: Duration) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.default_ttl_millis = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        if inner.default_ttl_millis > 0 {
+            inner.ttl_in_use = true;
+        }
+    }
+
+    pub fn default_ttl(&self) -> Duration {
+        Duration::from_millis(
+            self.inner
+                .read()
+                .expect("cache lock poisoned")
+                .default_ttl_millis,
+        )
+    }
+
+    /// Drop every entry that has passed its time to live, and say how many.
+    ///
+    /// Expiry is otherwise noticed only by a read, so a key written with a life
+    /// and never read again would hold its memory until something evicted it.
+    /// Call this on a timer if that matters; it walks the resident set, so how
+    /// often is a decision about how much scanning to spend.
+    pub fn purge_expired(&self) -> usize {
+        let now_millis = CoarseClock::now_millis();
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let expired: Vec<CacheKey> = inner
+            .metadata
+            .iter()
+            .filter(|(_, meta)| meta.is_expired(now_millis))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired {
+            inner.remove_expired_entry(key);
+        }
+        expired.len()
+    }
+
+    /// Cap how fast the SSD tier is allowed to absorb writes, in bytes per
+    /// second. Zero, the default, means no cap.
+    ///
+    /// Flash wears out by being written to, so a cache that is expected to
+    /// outlive a warranty needs a rate it can sustain rather than the rate its
+    /// workload happens to offer. Above the cap, admissions are turned away by
+    /// key rather than by size, so large entries keep their share of a tight
+    /// budget instead of being crowded out by small ones.
+    ///
+    /// Reclaim and recovery writes are counted against the budget but never
+    /// refused by it: they are work the cache has already committed to.
+    pub fn set_ssd_write_budget_bytes_per_sec(&self, bytes_per_sec: u64) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner
+            .ssd_write_budget
+            .set_target_bytes_per_sec(bytes_per_sec);
+        inner.refresh_ssd_write_budget_stats();
+    }
+
+    /// The SSD write cap in bytes per second, or zero when uncapped.
+    pub fn ssd_write_budget_bytes_per_sec(&self) -> u64 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .ssd_write_budget
+            .target_bytes_per_sec()
     }
 
     pub fn set_capacity_for_tier(&self, tier: CacheTier, capacity_bytes: usize) {
@@ -808,15 +1410,13 @@ impl MultiLayerCache {
             }
             CacheTier::Reject => {}
         }
-        inner.refresh_usage_stats();
-        inner.refresh_pin_stats();
         drop(inner);
         self.drain_eviction_records();
     }
 
     pub fn set_capacity_for_instance(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         capacity_bytes: usize,
     ) {
         match instance_type.as_tier() {
@@ -858,8 +1458,6 @@ impl MultiLayerCache {
         inner.evict_memory_to_capacity();
         inner.evict_pmem_to_capacity();
         inner.evict_ssd_to_capacity();
-        inner.refresh_usage_stats();
-        inner.refresh_pin_stats();
         drop(inner);
         self.drain_eviction_records();
     }
@@ -930,7 +1528,7 @@ impl MultiLayerCache {
         }
     }
 
-    pub fn get_used(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn get_used(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type.as_tier() {
             Some(tier) => self.used_space_for_tier(tier),
             None => self.size(),
@@ -959,7 +1557,7 @@ impl MultiLayerCache {
 
     pub fn get_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
     ) -> CacheReplacementPolicy {
         match instance_type.as_tier() {
             Some(tier) => self.replacement_policy_for_tier(tier),
@@ -997,7 +1595,7 @@ impl MultiLayerCache {
 
     pub fn set_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) {
         if let Some(tier) = instance_type.as_tier() {
@@ -1007,7 +1605,7 @@ impl MultiLayerCache {
 
     pub fn try_set_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) -> Result<(), CacheError> {
         let Some(tier) = instance_type.as_tier() else {
@@ -1032,11 +1630,153 @@ impl MultiLayerCache {
     {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.access_record_callback = Some(CacheAccessRecordCallback::new(callback));
+        self.access_record_registered.store(true, Ordering::Relaxed);
     }
 
     pub fn clear_access_record_callback(&self) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.access_record_callback = None;
+        self.access_record_registered.store(false, Ordering::Relaxed);
+    }
+
+    /// How recently an entry must have been read for a hit to leave it where
+    /// it is in the tier access orders, in accesses.
+    ///
+    /// A hit normally moves the entry to the back of every tier's access order
+    /// so victim selection does not offer it up. That move is the reason a read
+    /// needs the cache lock exclusively. An entry read within the last
+    /// `distance` accesses is already within `distance` places of the newest
+    /// end, so moving it again changes little -- this is the trade CacheLib
+    /// makes with `lruRefreshTime`, stated in accesses instead of seconds
+    /// because position is what actually matters.
+    ///
+    /// Zero, the default, always moves the entry: eviction order stays exactly
+    /// as precise as it is today. Larger values make eviction order
+    /// approximate in exchange for skipping the move on repeat reads.
+    /// Sets how recently an entry must have been read for a hit to leave it
+    /// in place. `Duration::ZERO` moves it on every hit.
+    ///
+    /// Sub-millisecond values round down to zero, and the clock behind this is
+    /// republished on a 10ms tick, so windows below that are not meaningfully
+    /// distinguishable from one another.
+    pub fn set_lru_refresh_time(&self, window: Duration) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let millis = window.as_millis().min(u128::from(u64::MAX)) as u64;
+        inner.lru_refresh_floor_millis = millis;
+        // Take effect now rather than at the next reconfigure, so that setting
+        // the window and immediately reading it back agrees.
+        inner
+            .lru_refresh_effective_millis
+            .store(millis, Ordering::Relaxed);
+        inner.next_reconfigure_millis.store(0, Ordering::Relaxed);
+    }
+
+    /// Scales the refresh window by the age of the oldest resident entry.
+    ///
+    /// Zero, the default, pins the window to whatever
+    /// [`Self::set_lru_refresh_time`] set. A positive ratio makes the window a
+    /// fraction of how long entries actually survive, so a cache whose entries
+    /// live a long time skips more promotions and one with fast turnover keeps
+    /// its ordering accurate. Clamped below by the floor and above by ten
+    /// seconds.
+    ///
+    /// This is CacheLib's `lruRefreshRatio`, which likewise defaults to zero.
+    pub fn set_lru_refresh_ratio(&self, ratio: f64) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.lru_refresh_ratio = if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            0.0
+        };
+        inner.next_reconfigure_millis.store(0, Ordering::Relaxed);
+    }
+
+    /// Declines a candidate that has been asked for less often than the entry
+    /// it would evict.
+    ///
+    /// Off by default, because it changes what the cache keeps rather than only
+    /// how fast it keeps it.
+    ///
+    /// The cache otherwise admits everything, so a key read once evicts one read
+    /// a hundred times. With this on, a newcomer is compared against the entry
+    /// the replacement policy has already picked as coldest, using a frequency
+    /// sketch that remembers keys after they have been evicted. A rejected key
+    /// is still recorded, so it is admitted once it has been asked for often
+    /// enough to deserve it.
+    ///
+    /// This is CacheLib's `MMTinyLFU` admission, which compares the same two
+    /// frequencies.
+    pub fn set_admission_filter_enabled(&self, enabled: bool) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.admission_filter_enabled = enabled;
+    }
+
+    /// Whether the admission filter is on.
+    pub fn admission_filter_enabled(&self) -> bool {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .admission_filter_enabled
+    }
+
+    /// Sets where a newly admitted entry is placed in the memory tier's
+    /// recency order.
+    ///
+    /// Zero -- the default -- places it at the most-recently-used end, so it
+    /// has the whole order to traverse before eviction can reach it. One places
+    /// it halfway down and two a quarter of the way from the eviction end:
+    /// `resident >> spec` entries will be evicted before it.
+    ///
+    /// Non-zero buys scan resistance. A burst of keys read once and never again
+    /// currently walks the entire resident set through the hottest position,
+    /// pushing everything genuinely hot toward eviction ahead of it. Placing new
+    /// entries part-way down means such a key is evicted from where it was put,
+    /// while one that is read again is promoted to the hot end and keeps full
+    /// protection.
+    ///
+    /// This is CacheLib's `lruInsertionPointSpec`.
+    pub fn set_insertion_point_spec(&self, spec: u8) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.memory_order.set_insertion_spec(spec);
+    }
+
+    /// The spec set by [`Self::set_insertion_point_spec`].
+    pub fn insertion_point_spec(&self) -> u8 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .memory_order
+            .insertion_spec()
+    }
+
+    /// The ratio set by [`Self::set_lru_refresh_ratio`].
+    pub fn lru_refresh_ratio(&self) -> f64 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .lru_refresh_ratio
+    }
+
+    /// The window currently in force, which differs from
+    /// [`Self::lru_refresh_time`] only when adaptation is enabled.
+    pub fn effective_lru_refresh_time(&self) -> Duration {
+        Duration::from_millis(
+            self.inner
+                .read()
+                .expect("cache lock poisoned")
+                .lru_refresh_effective_millis
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// The window set by [`Self::set_lru_refresh_time`].
+    pub fn lru_refresh_time(&self) -> Duration {
+        Duration::from_millis(
+            self.inner
+                .read()
+                .expect("cache lock poisoned")
+                .lru_refresh_floor_millis,
+        )
     }
 
     pub fn register_eviction_callback<F>(&self, callback: F)
@@ -1045,12 +1785,20 @@ impl MultiLayerCache {
     {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.eviction_callback = Some(CacheEvictionCallback::new(callback));
+        self.eviction_callbacks_registered.store(
+            inner.eviction_callback.is_some() || inner.eviction_metric_callback.is_some(),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn clear_eviction_callback(&self) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.eviction_callback = None;
         inner.pending_eviction_records.clear();
+        self.eviction_callbacks_registered.store(
+            inner.eviction_callback.is_some() || inner.eviction_metric_callback.is_some(),
+            Ordering::Relaxed,
+        );
     }
 
     /// Register a callback receiving the number of entries evicted from a tier.
@@ -1064,12 +1812,20 @@ impl MultiLayerCache {
     {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.eviction_metric_callback = Some(CacheEvictionMetricCallback::new(callback));
+        self.eviction_callbacks_registered.store(
+            inner.eviction_callback.is_some() || inner.eviction_metric_callback.is_some(),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn clear_eviction_metric_callback(&self) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.eviction_metric_callback = None;
         inner.pending_eviction_metric_tiers.clear();
+        self.eviction_callbacks_registered.store(
+            inner.eviction_callback.is_some() || inner.eviction_metric_callback.is_some(),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn set_eviction_handler_enabled(&self, enabled: bool) {
@@ -1087,7 +1843,12 @@ impl MultiLayerCache {
             .eviction_handler_enabled
     }
 
-    fn emit_access_record(&self, record_type: CacheAccessRecordType, key: &CacheKey) {
+    fn emit_access_record(&self, record_type: CacheAccessRecordKind, key: &CacheKey) {
+        // Every get, put and delete starts here. Reading one bit is cheaper
+        // than taking the cache lock to learn the same thing.
+        if !self.access_record_registered.load(Ordering::Relaxed) {
+            return;
+        }
         let callback = {
             self.inner
                 .read()
@@ -1104,6 +1865,12 @@ impl MultiLayerCache {
     }
 
     fn drain_eviction_records(&self) {
+        // Nothing can be queued unless a callback is registered, so this is the
+        // whole answer on the common path -- and it costs one relaxed load
+        // instead of an exclusive acquisition of the cache lock.
+        if !self.eviction_callbacks_registered.load(Ordering::Relaxed) {
+            return;
+        }
         let (callback, records, metric_callback, metric_tiers) = {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             let callback = inner.eviction_callback.clone();
@@ -1163,8 +1930,25 @@ impl MultiLayerCache {
         self.peek_tier(key).is_some()
     }
 
+    /// Which tier would answer for this key, if anything would.
+    ///
+    /// An entry past its time to live is reported as absent, because that is
+    /// what every read of it returns. Saying it is resident and then refusing
+    /// to serve it is the contradiction, not the refusal: a caller asks this
+    /// to decide whether it needs to fetch from somewhere slower, and a `true`
+    /// that is followed by a `None` sends it away empty.
     pub fn peek_tier(&self, key: &CacheKey) -> Option<CacheReadTier> {
         let inner = self.inner.read().expect("cache lock poisoned");
+        // A stopped cache serves nothing, so it holds nothing worth reporting.
+        // `get` on the same key returns `Stopped`, and saying an entry is
+        // resident while every read of it refuses is the contradiction this
+        // avoids -- the same one an expired entry would cause.
+        if !inner.started {
+            return None;
+        }
+        if inner.entry_expired(key, CoarseClock::now_millis()) {
+            return None;
+        }
         if inner.memory.contains_key(key) {
             return Some(CacheReadTier::Memory);
         }
@@ -1190,6 +1974,14 @@ impl MultiLayerCache {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
+            }
+            // Refused, not reclaimed. This path is documented as leaving the
+            // cache alone -- that is what "no promotion" means -- and it holds
+            // the cache shared, so dropping the entry would mean escalating.
+            // The sweep, eviction and `get` all reclaim it; none of them is
+            // needed for the caller to be told the truth now.
+            if inner.entry_expired(key, CoarseClock::now_millis()) {
+                return Ok(None);
             }
             if let Some(value) = inner.memory.get(key).cloned() {
                 return Ok(Some(CacheReadResult {
@@ -1249,44 +2041,133 @@ impl MultiLayerCache {
     }
 
     pub fn get_with_tier(&self, key: &CacheKey) -> Result<Option<CacheReadResult>, CacheError> {
-        self.emit_access_record(CacheAccessRecordType::Get, key);
+        self.emit_access_record(CacheAccessRecordKind::Get, key);
         let started = Instant::now();
-        {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
+        // Look first under a shared lock. Values are stored as `Arc<[u8]>`, so
+        // a hit here costs a reference bump, and a miss releases the lock
+        // having touched nothing -- where before it took the cache
+        // exclusively to discover the key was absent.
+        let now_millis = CoarseClock::now_millis();
+        let expired;
+        let probe = {
+            let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if !inner.ssd_instance_only {
-                if let Some(value) = inner.memory.get(key).cloned() {
-                    inner.stats.memory_hits += 1;
-                    inner.record_hit(key, value.len());
+            // Checked under the same shared lock as the lookup, so an entry
+            // cannot be judged live and then read after it expired. The check
+            // is one relaxed load against a clock a background thread
+            // publishes, which is why it can sit on the hit path at all.
+            expired = inner.entry_expired(key, now_millis);
+            if inner.ssd_instance_only || expired {
+                None
+            } else {
+                inner
+                    .memory
+                    .get(key)
+                    .cloned()
+                    .map(|value| (value, CacheReadTier::Memory))
+                    .or_else(|| {
+                        inner
+                            .pmem
+                            .get(key)
+                            .cloned()
+                            .map(|value| (value, CacheReadTier::Pmem))
+                    })
+            }
+        };
+
+        // Expiry is noticed lazily, on the read that would have been served.
+        // Dropping it here keeps the memory back without a sweep having to run,
+        // and the caller is told what it would have been told had the entry
+        // never been written.
+        if expired {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            // Re-check: another reader may have dropped it already, or the key
+            // may have been rewritten with a fresh life since the probe.
+            if inner.entry_expired(key, now_millis) {
+                inner.remove_expired_entry(key);
+                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                // Misses are counted with the read-path atomics, which
+                //  reads in preference to the struct field.
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(None);
+        }
+
+        if let Some((value, tier)) = probe {
+            // The copy that turns the shared buffer into the returned `Vec` is
+            // the expensive part of a hit, and it is done here with no lock
+            // held at all. It used to run inside the exclusive section, so
+            // concurrent readers copied one at a time.
+            let decoded = value.to_vec();
+
+            // An entry can be evicted between the probe and the lock taken
+            // here. What was read above was resident when it was read, so it
+            // is still a hit and is still returned; only the per-entry
+            // bookkeeping is conditional on it still being there. Recording a
+            // hit for an entry eviction has removed would reinsert metadata
+            // that nothing removes again.
+            if matches!(tier, CacheReadTier::Memory) {
+                let outcome = {
+                    let inner = self.inner.read().expect("cache lock poisoned");
+                    inner
+                        .read_counters
+                        .memory_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    let outcome = if inner.memory.contains_key(key) {
+                        inner.record_hit_shared(key)
+                    } else {
+                        HitOutcome::Accounted
+                    };
                     // One interval, two histograms: read the clock once.
                     let micros = elapsed_micros(started);
                     inner.record_get_latency_micros(micros);
                     inner.record_read_through_latency_micros(micros);
-                    return Ok(Some(CacheReadResult {
-                        value: value.to_vec(),
-                        tier: CacheReadTier::Memory,
-                    }));
-                }
-                if let Some(value) = inner.pmem.get(key).cloned() {
-                    inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
-                    inner.record_hit(key, value.len());
-                    let decoded = value.to_vec();
-                    if !inner.put_memory(key.clone(), decoded.clone()) {
-                        inner.stats.refill_failures += 1;
+                    outcome
+                };
+                // Only these two cases need the cache exclusively, and a hit
+                // on a recently-read entry is neither.
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => {
+                        // No residency check: `touch_access` looks the key up
+                        // in each order's own index and returns false when it
+                        // is absent, so an entry evicted since the probe is
+                        // already handled and cannot be resurrected here.
+                        let mut inner = self.inner.write().expect("cache lock poisoned");
+                        inner.refresh_access_order(key);
                     }
-                    inner.record_get_latency(started);
-                    inner.record_read_through_latency(started);
-                    inner.record_refill_latency(started);
-                    drop(inner);
-                    self.drain_eviction_records();
-                    return Ok(Some(CacheReadResult {
-                        value: decoded,
-                        tier: CacheReadTier::Pmem,
-                    }));
+                    HitOutcome::NeedsMetadata => {
+                        let mut inner = self.inner.write().expect("cache lock poisoned");
+                        if inner.memory.contains_key(key) {
+                            inner.record_hit(key, decoded.len());
+                        }
+                    }
                 }
+                return Ok(Some(CacheReadResult {
+                    value: decoded,
+                    tier: CacheReadTier::Memory,
+                }));
             }
+
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+            if inner.pmem.contains_key(key) {
+                inner.record_hit(key, decoded.len());
+            }
+            if !inner.put_memory(key.clone(), decoded.clone()) {
+                inner.stats.refill_failures += 1;
+            }
+            inner.record_get_latency(started);
+            inner.record_read_through_latency(started);
+            inner.record_refill_latency(started);
+            drop(inner);
+            self.drain_eviction_records();
+            return Ok(Some(CacheReadResult {
+                value: decoded,
+                tier: CacheReadTier::Pmem,
+            }));
         }
 
         let refill_started = Instant::now();
@@ -1298,7 +2179,7 @@ impl MultiLayerCache {
             Some(block) => {
                 let decoded = decode_cache_block(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                inner.stats.disk_hits += 1;
+                inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 if is_encoded_compressed_block(&block) {
                     inner.stats.compressed_hits += 1;
                 }
@@ -1318,8 +2199,12 @@ impl MultiLayerCache {
                 }))
             }
             None => {
-                let mut inner = self.inner.write().expect("cache lock poisoned");
-                inner.stats.misses += 1;
+                // Nothing here mutates the cache: a miss counts itself and
+                // records two latency samples, all through atomics. Taking the
+                // lock shared lets concurrent misses do that at the same time
+                // instead of queueing.
+                let inner = self.inner.read().expect("cache lock poisoned");
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 Ok(None)
@@ -1329,38 +2214,140 @@ impl MultiLayerCache {
 
     pub fn get_batch(&self, keys: &[CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         for key in keys {
-            self.emit_access_record(CacheAccessRecordType::Get, key);
+            self.emit_access_record(CacheAccessRecordKind::Get, key);
         }
 
         let mut results = vec![None; keys.len()];
         let mut ssd_candidates = Vec::new();
         let mut needs_eviction_drain = false;
+        // One clock read for the batch. `get` reads it once per call for the
+        // same reason: the published value moves in milliseconds, and an entry
+        // judged live at the top of a batch cannot expire far enough through
+        // it to matter.
+        let now_millis = CoarseClock::now_millis();
+
+        // The memory hits are served under a *shared* lock, the way a single
+        // `get` serves them, and the way the model this follows never takes a
+        // container exclusively merely to look something up.
+        //
+        // This path used to hold the cache exclusively for the whole batch,
+        // which serialised every reader against every other for as long as a
+        // batch took. It cost what that predicts: parity with a plain loop of
+        // `get` at one thread, and about a third of it at two and above -- a
+        // batch API slower than the loop it exists to replace.
+        //
+        // Only what genuinely needs the cache exclusively is deferred: entries
+        // past their time to live, entries whose access order needs moving,
+        // entries with no metadata yet, and everything below the memory tier.
+        let mut deferred: Vec<(usize, &CacheKey, Instant)> = Vec::new();
+        let mut memory_hits: Vec<(usize, &CacheKey, Arc<[u8]>, Instant)> = Vec::new();
         {
-            let mut disk_touches = Vec::new();
-            let mut inner = self.inner.write().expect("cache lock poisoned");
+            let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
             for (index, key) in keys.iter().enumerate() {
                 let started = Instant::now();
+                // Checked under the same shared lock as the lookup, so an
+                // entry cannot be judged live and then read after it expired.
+                if inner.entry_expired(key, now_millis) || inner.ssd_instance_only {
+                    deferred.push((index, key, started));
+                    continue;
+                }
+                match inner.memory.get(key).cloned() {
+                    Some(value) => memory_hits.push((index, key, value, started)),
+                    None => deferred.push((index, key, started)),
+                }
+            }
+        }
+
+        // The copy that turns the shared buffer into the returned `Vec` is the
+        // expensive part of a hit, and it is done here with no lock held.
+        let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
+        if !memory_hits.is_empty() {
+            let decoded: Vec<Vec<u8>> = memory_hits
+                .iter()
+                .map(|(_, _, value, _)| value.to_vec())
+                .collect();
+            {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                for ((index, key, _, started), value) in memory_hits.iter().zip(decoded.iter()) {
+                    inner
+                        .read_counters
+                        .memory_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    // An entry can be evicted between the probe and here. What
+                    // was read was resident when it was read, so it is still a
+                    // hit; only the per-entry bookkeeping is conditional.
+                    let outcome = if inner.memory.contains_key(key) {
+                        inner.record_hit_shared(key)
+                    } else {
+                        HitOutcome::Accounted
+                    };
+                    if !matches!(outcome, HitOutcome::Accounted) {
+                        needs_exclusive.push((key, outcome, value.len()));
+                    }
+                    // One interval, two histograms: read the clock once.
+                    let micros = elapsed_micros(*started);
+                    inner.record_get_latency_micros(micros);
+                    inner.record_read_through_latency_micros(micros);
+                    let _ = index;
+                }
+            }
+            for ((index, _, _, _), value) in memory_hits.iter().zip(decoded) {
+                results[*index] = Some(value);
+            }
+        }
+
+        // One exclusive acquisition for the whole batch's leftovers, rather
+        // than one per key.
+        if !needs_exclusive.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (key, outcome, len) in needs_exclusive {
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
+                    HitOutcome::NeedsMetadata => {
+                        if inner.memory.contains_key(key) {
+                            inner.record_hit(key, len);
+                        }
+                    }
+                }
+            }
+        }
+
+        if deferred.is_empty() {
+            return Ok(results);
+        }
+
+        {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (index, key, started) in deferred {
+                // Expiry is noticed on the read that would have been served.
+                // Re-checked here: another reader may have dropped it since
+                // the probe, or it may have been rewritten with a fresh life.
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                    inner.record_get_latency(started);
+                    continue;
+                }
                 if !inner.ssd_instance_only {
                     if let Some(value) = inner.memory.get(key).cloned() {
-                        inner.stats.memory_hits = inner.stats.memory_hits.saturating_add(1);
+                        inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
                         inner.record_hit_metadata(key, value.len());
-                        if inner.disk_index.contains_key(key) {
-                            disk_touches.push(key.clone());
-                        }
                         inner.record_get_latency(started);
                         inner.record_read_through_latency(started);
                         results[index] = Some(value.to_vec());
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(key).cloned() {
-                        inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
+                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
                         inner.record_hit_metadata(key, value.len());
-                        if inner.disk_index.contains_key(key) {
-                            disk_touches.push(key.clone());
-                        }
                         let decoded = value.to_vec();
                         if !inner.put_memory(key.clone(), decoded.clone()) {
                             inner.stats.refill_failures =
@@ -1395,9 +2382,10 @@ impl MultiLayerCache {
                 unique_ssd_candidates.push((key, vec![(index, started)]));
             }
         }
+        // Pointers, not copies: these keys are read and nothing more.
         let candidate_keys = unique_ssd_candidates
             .iter()
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| key)
             .collect::<Vec<_>>();
         let refill_started = Instant::now();
         let blocks = {
@@ -1422,13 +2410,9 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut disk_touches = Vec::new();
             for (key, occurrences, refill_started, decoded) in ssd_reads {
                 match decoded {
                     Some((value, compressed)) => {
-                        if inner.disk_index.contains_key(&key) {
-                            disk_touches.push(key.clone());
-                        }
                         if !inner.ssd_instance_only
                             && !inner.refill_from_ssd(key.clone(), value.clone())
                         {
@@ -1436,7 +2420,7 @@ impl MultiLayerCache {
                                 inner.stats.refill_failures.saturating_add(1);
                         }
                         for (index, started) in occurrences {
-                            inner.stats.disk_hits = inner.stats.disk_hits.saturating_add(1);
+                            inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                             if compressed {
                                 inner.stats.compressed_hits =
                                     inner.stats.compressed_hits.saturating_add(1);
@@ -1451,7 +2435,7 @@ impl MultiLayerCache {
                     }
                     None => {
                         for (_index, started) in occurrences {
-                            inner.stats.misses = inner.stats.misses.saturating_add(1);
+                            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                             inner.record_get_latency(started);
                             inner.record_read_through_latency(started);
                         }
@@ -1466,20 +2450,29 @@ impl MultiLayerCache {
     }
 
     pub fn get_memory(&self, key: &CacheKey) -> Option<Vec<u8>> {
-        self.emit_access_record(CacheAccessRecordType::Get, key);
+        self.emit_access_record(CacheAccessRecordKind::Get, key);
         let mut inner = self.inner.write().expect("cache lock poisoned");
         if !inner.started {
             return None;
         }
+        // Holding the cache exclusively already, so an expired entry is
+        // dropped here rather than left for something else to find, which is
+        // what `get` does with the same opportunity.
+        if inner.entry_expired(key, CoarseClock::now_millis()) {
+            inner.remove_expired_entry(key);
+            inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let value = inner.memory.get(key).cloned();
         if value.is_some() {
-            inner.stats.memory_hits += 1;
+            inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
             inner.record_hit(
                 key,
                 value.as_ref().map(|bytes| bytes.len()).unwrap_or_default(),
             );
         } else {
-            inner.stats.misses += 1;
+            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
         }
         value.map(|value| value.to_vec())
     }
@@ -1491,38 +2484,108 @@ impl MultiLayerCache {
         self.acquire(key)
     }
 
+    /// Take a handle on an entry, without copying it.
+    ///
+    /// The memory-tier hit is served under a **shared** lock, the way `get`
+    /// serves one, and the way the model this crate follows takes a handle --
+    /// a refcount on the item, never a container lock.
+    ///
+    /// This used to take the cache exclusively, and so did giving the handle
+    /// back, so every reader serialised against every other twice per
+    /// zero-copy read. It did not scale at all: past two threads it went
+    /// backwards, leaving the zero-copy read about eighteen times slower than
+    /// the copying one it exists to beat.
     pub fn acquire(&self, key: &CacheKey) -> Result<Option<CachePinnedHandle>, CacheError> {
         let started = Instant::now();
+        let now_millis = CoarseClock::now_millis();
+        let expired;
+        let probe = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            // Checked under the same shared lock as the lookup, so an entry
+            // cannot be judged live and then handed out after it expired.
+            expired = inner.entry_expired(key, now_millis);
+            if expired {
+                None
+            } else {
+                inner.memory.get(key).cloned()
+            }
+        };
+
+        // A handle outlives the call that made it, so serving an expired entry
+        // here is worse than serving one from `get`: the caller holds the
+        // bytes, and holding them pins the entry against the eviction that
+        // would otherwise have removed it.
+        if expired {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if inner.entry_expired(key, now_millis) {
+                inner.remove_expired_entry(key);
+                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(None);
+        }
+
+        if let Some(value) = probe {
+            let outcome = {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                inner.increment_pin_for_handle(key, value.len());
+                inner
+                    .read_counters
+                    .memory_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                // An entry can be evicted between the probe and here. What was
+                // read was resident when it was read, so it is still a hit;
+                // only the per-entry bookkeeping is conditional on it still
+                // being there.
+                let outcome = if inner.memory.contains_key(key) {
+                    inner.record_hit_shared(key)
+                } else {
+                    HitOutcome::Accounted
+                };
+                inner.record_get_latency_micros(elapsed_micros(started));
+                outcome
+            };
+            // Only these two need the cache exclusively, and a hit on a
+            // recently-read entry is neither.
+            match outcome {
+                HitOutcome::Accounted => {}
+                HitOutcome::NeedsAccessOrderRefresh => {
+                    let mut inner = self.inner.write().expect("cache lock poisoned");
+                    inner.refresh_access_order(key);
+                }
+                HitOutcome::NeedsMetadata => {
+                    let mut inner = self.inner.write().expect("cache lock poisoned");
+                    if inner.memory.contains_key(key) {
+                        inner.record_hit(key, value.len());
+                    }
+                }
+            }
+            return Ok(Some(CachePinnedHandle {
+                key: key.clone(),
+                value,
+                tier: CacheReadTier::Memory,
+            }));
+        }
+
+        // Below memory the read refills the tier above it, which is a change
+        // to the cache and needs it exclusively. Unchanged from before, and
+        // reached only when the shared path above found nothing.
         {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if let Some(value) = inner.memory.get(key).cloned() {
-                inner.increment_pin_with_size(key, value.len());
-                inner.stats.zero_copy_handle_hits =
-                    inner.stats.zero_copy_handle_hits.saturating_add(1);
-                inner.stats.memory_hits = inner.stats.memory_hits.saturating_add(1);
-                inner.record_hit(key, value.len());
-                inner.refresh_pin_stats();
-                inner.record_get_latency(started);
-                return Ok(Some(CachePinnedHandle {
-                    key: key.clone(),
-                    value,
-                    tier: CacheReadTier::Memory,
-                }));
-            }
             if let Some(value) = inner.pmem.get(key).cloned() {
                 let decoded = value.to_vec();
-                inner.increment_pin_with_size(key, value.len());
+                inner.increment_pin_for_handle(key, value.len());
                 if !inner.put_memory(key.clone(), decoded) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
-                inner.stats.zero_copy_handle_hits =
-                    inner.stats.zero_copy_handle_hits.saturating_add(1);
-                inner.stats.pmem_hits = inner.stats.pmem_hits.saturating_add(1);
+                inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
                 inner.record_hit(key, value.len());
-                inner.refresh_pin_stats();
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 inner.record_refill_latency(started);
@@ -1542,19 +2605,16 @@ impl MultiLayerCache {
             Some(block) => {
                 let decoded = Arc::<[u8]>::from(decode_cache_block(&block)?);
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                inner.increment_pin_with_size(key, decoded.len());
+                inner.increment_pin_for_handle(key, decoded.len());
                 if !inner.ssd_instance_only && !inner.refill_from_ssd(key.clone(), decoded.to_vec())
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
-                inner.stats.zero_copy_handle_hits =
-                    inner.stats.zero_copy_handle_hits.saturating_add(1);
-                inner.stats.disk_hits = inner.stats.disk_hits.saturating_add(1);
+                inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 if is_encoded_compressed_block(&block) {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
                 inner.record_hit(key, decoded.len());
-                inner.refresh_pin_stats();
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 inner.record_refill_latency(started);
@@ -1568,7 +2628,7 @@ impl MultiLayerCache {
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.stats.zero_copy_handle_misses =
                     inner.stats.zero_copy_handle_misses.saturating_add(1);
-                inner.stats.misses = inner.stats.misses.saturating_add(1);
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 Ok(None)
@@ -1585,9 +2645,14 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
+            if inner.entry_expired(key, CoarseClock::now_millis()) {
+                inner.remove_expired_entry(key);
+                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
             if let Some(value) = inner.memory.get(key).cloned() {
                 inner.increment_pin_with_size(key, value.len());
-                inner.refresh_pin_stats();
                 return Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -1596,7 +2661,6 @@ impl MultiLayerCache {
             }
             if let Some(value) = inner.pmem.get(key).cloned() {
                 inner.increment_pin_with_size(key, value.len());
-                inner.refresh_pin_stats();
                 return Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -1613,9 +2677,10 @@ impl MultiLayerCache {
             return Ok(None);
         };
         let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        // Shared: taking the pin changes only the pin state, which has its own
+        // lock.
+        let inner = self.inner.read().expect("cache lock poisoned");
         inner.increment_pin_with_size(key, value.len());
-        inner.refresh_pin_stats();
         Ok(Some(CachePinnedHandle {
             key: key.clone(),
             value,
@@ -1665,16 +2730,15 @@ impl MultiLayerCache {
             return 0;
         }
         let released = handles.len();
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inner = self.inner.read().expect("cache lock poisoned");
         for handle in handles {
             inner.decrement_pin(&handle.key);
         }
-        inner.refresh_pin_stats();
         released
     }
 
     pub fn clone_handle(&self, handle: &CachePinnedHandle) -> CachePinnedHandle {
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inner = self.inner.read().expect("cache lock poisoned");
         inner.increment_pin(&handle.key);
         CachePinnedHandle {
             key: handle.key.clone(),
@@ -1788,7 +2852,9 @@ impl MultiLayerCache {
                 inner.stats.insert_pinned_operations.saturating_add(1);
         }
         self.put_sized(key.clone(), value.clone(), logical_size)?;
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        // The write happened above; what is left is a lookup and a pin, and
+        // neither needs the cache exclusively any more.
+        let inner = self.inner.read().expect("cache lock poisoned");
         if !inner.started {
             return Err(CacheError::Stopped);
         }
@@ -1809,7 +2875,6 @@ impl MultiLayerCache {
         };
         if let Some((value, tier)) = handle_value {
             inner.increment_pin_with_size(&key, value.len());
-            inner.refresh_pin_stats();
             Ok(Some(CachePinnedHandle { key, value, tier }))
         } else {
             Ok(None)
@@ -1827,7 +2892,7 @@ impl MultiLayerCache {
         drop(inner);
         if result.is_ok() {
             self.drain_eviction_records();
-            self.emit_access_record(CacheAccessRecordType::Put, &key);
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
         }
         result
     }
@@ -1849,7 +2914,7 @@ impl MultiLayerCache {
         drop(inner);
         if result.is_ok() {
             self.drain_eviction_records();
-            self.emit_access_record(CacheAccessRecordType::Put, &key);
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
         }
         result
     }
@@ -1879,7 +2944,7 @@ impl MultiLayerCache {
         };
         self.drain_eviction_records();
         for key in &inserted_keys {
-            self.emit_access_record(CacheAccessRecordType::Put, key);
+            self.emit_access_record(CacheAccessRecordKind::Put, key);
         }
         Ok(inserted)
     }
@@ -1920,7 +2985,7 @@ impl MultiLayerCache {
         drop(inner);
         if result.is_ok() {
             self.drain_eviction_records();
-            self.emit_access_record(CacheAccessRecordType::Put, &key);
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
         }
         result
     }
@@ -1946,7 +3011,7 @@ impl MultiLayerCache {
         inner.record_put_latency(started);
         drop(inner);
         self.drain_eviction_records();
-        self.emit_access_record(CacheAccessRecordType::Put, &key);
+        self.emit_access_record(CacheAccessRecordKind::Put, &key);
     }
 
     pub fn put_bypass_storage_for_tier(
@@ -1967,7 +3032,7 @@ impl MultiLayerCache {
 
     pub fn test_insert(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: CacheKey,
         value: Vec<u8>,
         size: usize,
@@ -1987,14 +3052,14 @@ impl MultiLayerCache {
 
     pub fn test_acquire(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: &CacheKey,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
         let Some(tier) = instance_type.as_tier() else {
             return Err(CacheError::UnsupportedInstance(instance_type));
         };
 
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inner = self.inner.read().expect("cache lock poisoned");
         if !inner.started {
             return Err(CacheError::Stopped);
         }
@@ -2004,7 +3069,6 @@ impl MultiLayerCache {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
-                inner.refresh_pin_stats();
                 Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -2016,7 +3080,6 @@ impl MultiLayerCache {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
-                inner.refresh_pin_stats();
                 Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -2027,7 +3090,6 @@ impl MultiLayerCache {
                 Some(block) => {
                     let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
                     inner.increment_pin_with_size(key, value.len());
-                    inner.refresh_pin_stats();
                     Ok(Some(CachePinnedHandle {
                         key: key.clone(),
                         value,
@@ -2042,7 +3104,7 @@ impl MultiLayerCache {
 
     pub fn test_remove(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: &CacheKey,
     ) -> Result<(), CacheError> {
         let Some(tier) = instance_type.as_tier() else {
@@ -2053,28 +3115,26 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         inner.test_remove_for_tier(tier, key)?;
-        inner.refresh_usage_stats();
-        inner.refresh_pin_stats();
         drop(inner);
         self.drain_eviction_records();
         Ok(())
     }
 
-    pub fn test_get_unified_acquire_count(&self) -> u64 {
+    pub fn test_unified_acquire_count(&self) -> u64 {
         self.stats().zero_copy_handle_hits
     }
 
-    pub fn test_get_unified_put_count(&self) -> u64 {
+    pub fn test_unified_put_count(&self) -> u64 {
         self.stats().puts
     }
 
-    pub fn test_get_unified_insert_pinned_count(&self) -> u64 {
+    pub fn test_unified_insert_pinned_count(&self) -> u64 {
         self.stats().insert_pinned_operations
     }
 
     pub fn test_join_pmem_write_executor(&self) {}
 
-    pub fn test_get_pmem_paths(&self) -> Vec<String> {
+    pub fn test_pmem_paths(&self) -> Vec<String> {
         self.pmem_paths()
             .into_iter()
             .map(|path| path.to_string_lossy().into_owned())
@@ -2179,8 +3239,12 @@ impl MultiLayerCache {
         let mut rejected = Vec::new();
         for (key, value) in entries {
             let value_len = value.len() as u64;
-            if let Some(index) = inner.async_writeback_positions.get(&key).copied() {
-                if let Some(existing) = inner.async_writeback_queue.get_mut(index) {
+            let head = inner.async_writeback_head;
+            if let Some(sequence) = inner.async_writeback_positions.get(&key).copied() {
+                let index = sequence.checked_sub(head).map(|offset| offset as usize);
+                if let Some(existing) =
+                    index.and_then(|index| inner.async_writeback_queue.get_mut(index))
+                {
                     let old_len = existing.value.len() as u64;
                     existing.value = value;
                     inner.async_writeback_queue_bytes = inner
@@ -2193,14 +3257,15 @@ impl MultiLayerCache {
                     rejected.push(CacheWritebackJob { key, value });
                 }
             } else if inner.async_writeback_queue.len() < inner.max_async_writeback_queue {
-                let index = inner.async_writeback_queue.len();
+                let sequence =
+                    inner.async_writeback_head + inner.async_writeback_queue.len() as u64;
                 inner.async_writeback_queue.push_back(CacheWritebackJob {
                     key: key.clone(),
                     value,
                 });
                 inner.async_writeback_queue_bytes =
                     inner.async_writeback_queue_bytes.saturating_add(value_len);
-                inner.async_writeback_positions.insert(key, index);
+                inner.async_writeback_positions.insert(key, sequence);
                 enqueued = enqueued.saturating_add(1);
             } else {
                 rejected.push(CacheWritebackJob { key, value });
@@ -2278,9 +3343,9 @@ impl MultiLayerCache {
                     .async_writeback_queue_bytes
                     .saturating_sub(job.value.len() as u64);
                 inner.async_writeback_positions.remove(&job.key);
+                inner.async_writeback_head += 1;
                 jobs.push(job);
             }
-            inner.rebuild_async_writeback_positions();
             inner.refresh_async_writeback_pressure_stats();
             jobs
         };
@@ -2347,16 +3412,31 @@ impl MultiLayerCache {
             .record_compaction_latency_micros(micros);
     }
 
+    /// Pin an entry. Takes the cache **shared**.
+    ///
+    /// Does nothing on a stopped cache. [`Self::acquire`] refuses one with
+    /// `Stopped`, and the two take the same pin: a cache that will not hand
+    /// out a handle should not hand out a pin either.
+    ///
+    /// [`Self::unpin`] deliberately still works when stopped. A pin taken
+    /// before the stop has to be releasable after it, or shutting down while
+    /// handles are outstanding would leave them pinned forever.
     pub fn pin(&self, key: CacheKey) {
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inner = self.inner.read().expect("cache lock poisoned");
+        if !inner.started {
+            return;
+        }
         inner.increment_pin(&key);
-        inner.refresh_pin_stats();
     }
 
+    /// Give back a handle.
+    ///
+    /// Takes the cache **shared**. Dropping a pin changes only the pin state,
+    /// which has its own lock, so one reader releasing a handle no longer
+    /// stops every other reader from taking one.
     pub fn unpin(&self, key: &CacheKey) {
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inner = self.inner.read().expect("cache lock poisoned");
         inner.decrement_pin(key);
-        inner.refresh_pin_stats();
     }
 
     pub fn invalidate(&self, key: &CacheKey) -> Result<(), CacheError> {
@@ -2366,7 +3446,7 @@ impl MultiLayerCache {
         }
         inner.invalidate_key_locked(key, true);
         drop(inner);
-        self.emit_access_record(CacheAccessRecordType::Delete, key);
+        self.emit_access_record(CacheAccessRecordKind::Delete, key);
         Ok(())
     }
 
@@ -2384,7 +3464,7 @@ impl MultiLayerCache {
             keys.len()
         };
         for key in keys {
-            self.emit_access_record(CacheAccessRecordType::Delete, key);
+            self.emit_access_record(CacheAccessRecordKind::Delete, key);
         }
         Ok(removed)
     }
@@ -2469,7 +3549,7 @@ impl MultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn GetCapacity(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn GetCapacity(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_capacity(instance_type)
     }
 
@@ -2479,19 +3559,19 @@ impl MultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn SetCapacityForInstance(&self, instance_type: CacheInstanceType, capacity: usize) {
+    pub fn SetCapacityForInstance(&self, instance_type: CacheInstanceKind, capacity: usize) {
         self.set_capacity_for_instance(instance_type, capacity);
     }
 
     #[allow(non_snake_case)]
-    pub fn GetUsed(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn GetUsed(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_used(instance_type)
     }
 
     #[allow(non_snake_case)]
     pub fn SetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) {
         self.set_replacement_policy_type(instance_type, policy);
@@ -2500,7 +3580,7 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn TrySetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) -> Result<(), CacheError> {
         self.try_set_replacement_policy_type(instance_type, policy)
@@ -2509,7 +3589,7 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn GetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
     ) -> CacheReplacementPolicy {
         self.get_replacement_policy_type(instance_type)
     }
@@ -2520,7 +3600,7 @@ impl MultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn SetDRAMPMEMDataPlacementType(&self, placement: DRAMPMEMDataPlacementType) {
+    pub fn SetDRAMPMEMDataPlacementType(&self, placement: DramPmemDataPlacement) {
         self.set_config_data_placement_type(placement);
     }
 
@@ -2530,7 +3610,7 @@ impl MultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn GetDRAMPMEMDataPlacementType(&self) -> DRAMPMEMDataPlacementType {
+    pub fn GetDRAMPMEMDataPlacementType(&self) -> DramPmemDataPlacement {
         self.config_data_placement_type()
     }
 
@@ -2660,7 +3740,7 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn TEST_Insert(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: CacheKey,
         value: Vec<u8>,
         size: usize,
@@ -2671,7 +3751,7 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn TEST_Acquire(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: &CacheKey,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
         self.test_acquire(instance_type, key)
@@ -2680,7 +3760,7 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn TEST_Remove(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         key: &CacheKey,
     ) -> Result<(), CacheError> {
         self.test_remove(instance_type, key)
@@ -2688,17 +3768,17 @@ impl MultiLayerCache {
 
     #[allow(non_snake_case)]
     pub fn TEST_GetUnifiedAcquireCount(&self) -> u64 {
-        self.test_get_unified_acquire_count()
+        self.test_unified_acquire_count()
     }
 
     #[allow(non_snake_case)]
     pub fn TEST_GetUnifiedPutCount(&self) -> u64 {
-        self.test_get_unified_put_count()
+        self.test_unified_put_count()
     }
 
     #[allow(non_snake_case)]
     pub fn TEST_GetUnifiedInsertPinnedCount(&self) -> u64 {
-        self.test_get_unified_insert_pinned_count()
+        self.test_unified_insert_pinned_count()
     }
 
     #[allow(non_snake_case)]
@@ -2708,12 +3788,21 @@ impl MultiLayerCache {
 
     #[allow(non_snake_case)]
     pub fn TEST_GetPmemPaths(&self) -> Vec<String> {
-        self.test_get_pmem_paths()
+        self.test_pmem_paths()
     }
 
+    /// Drop an entry from the memory tier, leaving the copies below it.
+    ///
+    /// Does nothing on a stopped cache, because [`Self::invalidate`] refuses
+    /// with `Stopped` and the two differ only in how far down they reach. It
+    /// returns nothing, so there is no error to give: not acting is the whole
+    /// of the refusal.
     pub fn invalidate_memory_only(&self, key: &CacheKey) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
-        let key_pinned = inner.pinned.contains_key(key);
+        if !inner.started {
+            return;
+        }
+        let key_pinned = inner.is_pinned(key);
         let mut removed_pinned_bytes = 0usize;
         if let Some(value) = inner.memory.remove(key) {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
@@ -2723,21 +3812,20 @@ impl MultiLayerCache {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
         }
-        if key_pinned && removed_pinned_bytes > 0 {
-            inner
-                .pinned_removed_bytes
-                .insert(key.clone(), removed_pinned_bytes);
-        } else {
-            inner.pinned.remove(key);
-            inner.pinned_handle_bytes.remove(key);
-            inner.pinned_removed_bytes.remove(key);
+        {
+            let mut pins = inner.pins_for(key);
+            if key_pinned && removed_pinned_bytes > 0 {
+                pins.entries
+                    .entry(key.clone())
+                    .or_default()
+                    .removed_bytes = Some(removed_pinned_bytes);
+            } else {
+                pins.entries.remove(key);
+            }
         }
         inner.stats.invalidations += 1;
-        inner.stats.memory_bytes = inner.memory_bytes as u64;
-        inner.stats.pmem_bytes = inner.pmem_bytes as u64;
-        inner.refresh_pin_stats();
         drop(inner);
-        self.emit_access_record(CacheAccessRecordType::Delete, key);
+        self.emit_access_record(CacheAccessRecordKind::Delete, key);
     }
 
     pub fn production_tiering_policy(&self) -> CacheTieringPolicy {
@@ -2753,7 +3841,7 @@ impl MultiLayerCache {
             .data_placement
     }
 
-    pub fn config_data_placement_type(&self) -> DRAMPMEMDataPlacementType {
+    pub fn config_data_placement_type(&self) -> DramPmemDataPlacement {
         self.data_placement().into()
     }
 
@@ -2762,7 +3850,7 @@ impl MultiLayerCache {
         inner.tiering_policy.data_placement = placement;
     }
 
-    pub fn set_config_data_placement_type(&self, placement: DRAMPMEMDataPlacementType) {
+    pub fn set_config_data_placement_type(&self, placement: DramPmemDataPlacement) {
         self.set_data_placement(placement.into());
     }
 
@@ -2796,8 +3884,6 @@ impl MultiLayerCache {
             inner.pmem_order.clear();
             inner.memory_bytes = 0;
             inner.pmem_bytes = 0;
-            inner.refresh_usage_stats();
-            inner.refresh_pin_stats();
         }
     }
 
@@ -2823,19 +3909,329 @@ impl MultiLayerCache {
         inner.evict_memory_to_capacity();
         inner.evict_pmem_to_capacity();
         inner.evict_ssd_to_capacity();
-        inner.refresh_usage_stats();
-        inner.refresh_pin_stats();
         drop(inner);
         self.drain_eviction_records();
     }
 }
 
+/// Add one shard's statistics into a running total for the whole cache.
+///
+/// Written out field by field on purpose. The list was maintained by hand and
+/// checked by a second hand-maintained list of the same names, which is no
+/// check at all: a statistic could be added to the checker and summed nowhere,
+/// and two of them were, so a sharded cache reported them as zero -- which
+/// looks exactly like a statistic that is genuinely zero.
+///
+/// Here the pattern has no `..`, so a new statistic that reaches neither list
+/// fails the build with its own name in the message, and `unused_variables` is
+/// denied, so one that is destructured and then never used fails the same way.
+/// Both mistakes are caught, and both say which field.
+#[deny(unused_variables)]
+fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
+    let CacheStats {
+        memory_hits,
+        disk_hits,
+        misses,
+        puts,
+        invalidations,
+        memory_evictions,
+        pmem_hits,
+        pmem_fills,
+        pmem_evictions,
+        pmem_admission_accepted,
+        pmem_admission_rejected,
+        pmem_eviction_capacity,
+        pmem_eviction_pinned_skips,
+        memory_admission_accepted,
+        memory_admission_rejected,
+        memory_fills,
+        disk_fills,
+        ssd_admission_accepted,
+        ssd_admission_rejected,
+        ssd_evictions,
+        ssd_eviction_capacity,
+        ssd_eviction_pinned_skips,
+        ssd_oversize_rejections,
+        ssd_bytes_written,
+        ssd_write_budget_rejections,
+        ssd_write_budget_observed_bytes_per_sec,
+        ssd_write_budget_target_bytes_per_sec,
+        stale_tier_copies_dropped,
+        expired_demotions_skipped,
+        expired_reads,
+        expired_removals,
+        eviction_expired,
+        expired_delete_failures,
+        ssd_write_through_admissions,
+        hotness_promotions,
+        access_order_refreshes,
+        refill_failures,
+        eviction_capacity,
+        eviction_oversize,
+        eviction_cold,
+        eviction_low_hit,
+        eviction_stale,
+        pinned_entries,
+        pinned_bytes,
+        pin_operations,
+        unpin_operations,
+        insert_pinned_operations,
+        eviction_pinned_skips,
+        zero_copy_handle_hits,
+        zero_copy_handle_misses,
+        async_writeback_enqueued,
+        async_writeback_drained,
+        async_writeback_backpressure_rejections,
+        writeback_backpressure_events,
+        async_writeback_queue_depth,
+        async_writeback_queue_bytes,
+        async_writeback_max_queue_depth,
+        async_writeback_max_queue_bytes,
+        get_latency_samples,
+        put_latency_samples,
+        get_latency_total_micros,
+        put_latency_total_micros,
+        get_latency_max_micros,
+        put_latency_max_micros,
+        get_latency_le_10us,
+        get_latency_le_100us,
+        get_latency_le_1ms,
+        get_latency_le_10ms,
+        get_latency_gt_10ms,
+        put_latency_le_10us,
+        put_latency_le_100us,
+        put_latency_le_1ms,
+        put_latency_le_10ms,
+        put_latency_gt_10ms,
+        read_through_latency_samples,
+        read_through_latency_le_10us,
+        read_through_latency_le_100us,
+        read_through_latency_le_1ms,
+        read_through_latency_le_10ms,
+        read_through_latency_gt_10ms,
+        refill_latency_samples,
+        refill_latency_le_10us,
+        refill_latency_le_100us,
+        refill_latency_le_1ms,
+        refill_latency_le_10ms,
+        refill_latency_gt_10ms,
+        writeback_latency_samples,
+        writeback_latency_le_10us,
+        writeback_latency_le_100us,
+        writeback_latency_le_1ms,
+        writeback_latency_le_10ms,
+        writeback_latency_gt_10ms,
+        eviction_latency_samples,
+        eviction_latency_le_10us,
+        eviction_latency_le_100us,
+        eviction_latency_le_1ms,
+        eviction_latency_le_10ms,
+        eviction_latency_gt_10ms,
+        compaction_latency_samples,
+        compaction_latency_le_10us,
+        compaction_latency_le_100us,
+        compaction_latency_le_1ms,
+        compaction_latency_le_10ms,
+        compaction_latency_gt_10ms,
+        eviction_sampled_groups,
+        memory_slot_evictions,
+        ssd_slot_evictions,
+        ssd_eviction_cold,
+        ssd_eviction_low_hit,
+        ssd_eviction_stale,
+        compressed_puts,
+        compressed_hits,
+        compression_bytes_saved,
+        get_latency_count,
+        get_latency_total_us,
+        get_latency_max_us,
+        put_latency_count,
+        put_latency_total_us,
+        put_latency_max_us,
+        memory_bytes,
+        pmem_bytes,
+        disk_bytes,
+        ssd_write_budget_share,
+    } = shard;
+
+    total.memory_hits = total.memory_hits.saturating_add(memory_hits);
+    total.disk_hits = total.disk_hits.saturating_add(disk_hits);
+    total.misses = total.misses.saturating_add(misses);
+    total.puts = total.puts.saturating_add(puts);
+    total.invalidations = total.invalidations.saturating_add(invalidations);
+    total.memory_evictions = total.memory_evictions.saturating_add(memory_evictions);
+    total.pmem_hits = total.pmem_hits.saturating_add(pmem_hits);
+    total.pmem_fills = total.pmem_fills.saturating_add(pmem_fills);
+    total.pmem_evictions = total.pmem_evictions.saturating_add(pmem_evictions);
+    total.pmem_admission_accepted = total.pmem_admission_accepted.saturating_add(pmem_admission_accepted);
+    total.pmem_admission_rejected = total.pmem_admission_rejected.saturating_add(pmem_admission_rejected);
+    total.pmem_eviction_capacity = total.pmem_eviction_capacity.saturating_add(pmem_eviction_capacity);
+    total.pmem_eviction_pinned_skips = total.pmem_eviction_pinned_skips.saturating_add(pmem_eviction_pinned_skips);
+    total.memory_admission_accepted = total.memory_admission_accepted.saturating_add(memory_admission_accepted);
+    total.memory_admission_rejected = total.memory_admission_rejected.saturating_add(memory_admission_rejected);
+    total.memory_fills = total.memory_fills.saturating_add(memory_fills);
+    total.disk_fills = total.disk_fills.saturating_add(disk_fills);
+    total.ssd_admission_accepted = total.ssd_admission_accepted.saturating_add(ssd_admission_accepted);
+    total.ssd_admission_rejected = total.ssd_admission_rejected.saturating_add(ssd_admission_rejected);
+    total.ssd_evictions = total.ssd_evictions.saturating_add(ssd_evictions);
+    total.ssd_eviction_capacity = total.ssd_eviction_capacity.saturating_add(ssd_eviction_capacity);
+    total.ssd_eviction_pinned_skips = total.ssd_eviction_pinned_skips.saturating_add(ssd_eviction_pinned_skips);
+    total.ssd_oversize_rejections = total.ssd_oversize_rejections.saturating_add(ssd_oversize_rejections);
+    total.ssd_bytes_written = total.ssd_bytes_written.saturating_add(ssd_bytes_written);
+    total.ssd_write_budget_rejections = total.ssd_write_budget_rejections.saturating_add(ssd_write_budget_rejections);
+    total.ssd_write_budget_observed_bytes_per_sec = total.ssd_write_budget_observed_bytes_per_sec.saturating_add(ssd_write_budget_observed_bytes_per_sec);
+    total.ssd_write_budget_target_bytes_per_sec = total.ssd_write_budget_target_bytes_per_sec.saturating_add(ssd_write_budget_target_bytes_per_sec);
+    total.stale_tier_copies_dropped = total.stale_tier_copies_dropped.saturating_add(stale_tier_copies_dropped);
+    total.expired_demotions_skipped = total
+        .expired_demotions_skipped
+        .saturating_add(expired_demotions_skipped);
+    total.expired_reads = total.expired_reads.saturating_add(expired_reads);
+    total.expired_removals = total.expired_removals.saturating_add(expired_removals);
+    total.eviction_expired = total.eviction_expired.saturating_add(eviction_expired);
+    total.expired_delete_failures = total.expired_delete_failures.saturating_add(expired_delete_failures);
+    total.ssd_write_through_admissions = total.ssd_write_through_admissions.saturating_add(ssd_write_through_admissions);
+    total.hotness_promotions = total.hotness_promotions.saturating_add(hotness_promotions);
+    total.access_order_refreshes = total.access_order_refreshes.saturating_add(access_order_refreshes);
+    total.refill_failures = total.refill_failures.saturating_add(refill_failures);
+    total.eviction_capacity = total.eviction_capacity.saturating_add(eviction_capacity);
+    total.eviction_oversize = total.eviction_oversize.saturating_add(eviction_oversize);
+    total.eviction_cold = total.eviction_cold.saturating_add(eviction_cold);
+    total.eviction_low_hit = total.eviction_low_hit.saturating_add(eviction_low_hit);
+    total.eviction_stale = total.eviction_stale.saturating_add(eviction_stale);
+    total.pinned_entries = total.pinned_entries.saturating_add(pinned_entries);
+    total.pinned_bytes = total.pinned_bytes.saturating_add(pinned_bytes);
+    total.pin_operations = total.pin_operations.saturating_add(pin_operations);
+    total.unpin_operations = total.unpin_operations.saturating_add(unpin_operations);
+    total.insert_pinned_operations = total.insert_pinned_operations.saturating_add(insert_pinned_operations);
+    total.eviction_pinned_skips = total.eviction_pinned_skips.saturating_add(eviction_pinned_skips);
+    total.zero_copy_handle_hits = total.zero_copy_handle_hits.saturating_add(zero_copy_handle_hits);
+    total.zero_copy_handle_misses = total.zero_copy_handle_misses.saturating_add(zero_copy_handle_misses);
+    total.async_writeback_enqueued = total.async_writeback_enqueued.saturating_add(async_writeback_enqueued);
+    total.async_writeback_drained = total.async_writeback_drained.saturating_add(async_writeback_drained);
+    total.async_writeback_backpressure_rejections = total.async_writeback_backpressure_rejections.saturating_add(async_writeback_backpressure_rejections);
+    total.writeback_backpressure_events = total.writeback_backpressure_events.saturating_add(writeback_backpressure_events);
+    total.async_writeback_queue_depth = total.async_writeback_queue_depth.saturating_add(async_writeback_queue_depth);
+    total.async_writeback_queue_bytes = total.async_writeback_queue_bytes.saturating_add(async_writeback_queue_bytes);
+    total.async_writeback_max_queue_depth = total.async_writeback_max_queue_depth.saturating_add(async_writeback_max_queue_depth);
+    total.async_writeback_max_queue_bytes = total.async_writeback_max_queue_bytes.saturating_add(async_writeback_max_queue_bytes);
+    total.get_latency_samples = total.get_latency_samples.saturating_add(get_latency_samples);
+    total.put_latency_samples = total.put_latency_samples.saturating_add(put_latency_samples);
+    total.get_latency_total_micros = total.get_latency_total_micros.saturating_add(get_latency_total_micros);
+    total.put_latency_total_micros = total.put_latency_total_micros.saturating_add(put_latency_total_micros);
+    total.get_latency_max_micros = total.get_latency_max_micros.saturating_add(get_latency_max_micros);
+    total.put_latency_max_micros = total.put_latency_max_micros.saturating_add(put_latency_max_micros);
+    total.get_latency_le_10us = total.get_latency_le_10us.saturating_add(get_latency_le_10us);
+    total.get_latency_le_100us = total.get_latency_le_100us.saturating_add(get_latency_le_100us);
+    total.get_latency_le_1ms = total.get_latency_le_1ms.saturating_add(get_latency_le_1ms);
+    total.get_latency_le_10ms = total.get_latency_le_10ms.saturating_add(get_latency_le_10ms);
+    total.get_latency_gt_10ms = total.get_latency_gt_10ms.saturating_add(get_latency_gt_10ms);
+    total.put_latency_le_10us = total.put_latency_le_10us.saturating_add(put_latency_le_10us);
+    total.put_latency_le_100us = total.put_latency_le_100us.saturating_add(put_latency_le_100us);
+    total.put_latency_le_1ms = total.put_latency_le_1ms.saturating_add(put_latency_le_1ms);
+    total.put_latency_le_10ms = total.put_latency_le_10ms.saturating_add(put_latency_le_10ms);
+    total.put_latency_gt_10ms = total.put_latency_gt_10ms.saturating_add(put_latency_gt_10ms);
+    total.read_through_latency_samples = total.read_through_latency_samples.saturating_add(read_through_latency_samples);
+    total.read_through_latency_le_10us = total.read_through_latency_le_10us.saturating_add(read_through_latency_le_10us);
+    total.read_through_latency_le_100us = total.read_through_latency_le_100us.saturating_add(read_through_latency_le_100us);
+    total.read_through_latency_le_1ms = total.read_through_latency_le_1ms.saturating_add(read_through_latency_le_1ms);
+    total.read_through_latency_le_10ms = total.read_through_latency_le_10ms.saturating_add(read_through_latency_le_10ms);
+    total.read_through_latency_gt_10ms = total.read_through_latency_gt_10ms.saturating_add(read_through_latency_gt_10ms);
+    total.refill_latency_samples = total.refill_latency_samples.saturating_add(refill_latency_samples);
+    total.refill_latency_le_10us = total.refill_latency_le_10us.saturating_add(refill_latency_le_10us);
+    total.refill_latency_le_100us = total.refill_latency_le_100us.saturating_add(refill_latency_le_100us);
+    total.refill_latency_le_1ms = total.refill_latency_le_1ms.saturating_add(refill_latency_le_1ms);
+    total.refill_latency_le_10ms = total.refill_latency_le_10ms.saturating_add(refill_latency_le_10ms);
+    total.refill_latency_gt_10ms = total.refill_latency_gt_10ms.saturating_add(refill_latency_gt_10ms);
+    total.writeback_latency_samples = total.writeback_latency_samples.saturating_add(writeback_latency_samples);
+    total.writeback_latency_le_10us = total.writeback_latency_le_10us.saturating_add(writeback_latency_le_10us);
+    total.writeback_latency_le_100us = total.writeback_latency_le_100us.saturating_add(writeback_latency_le_100us);
+    total.writeback_latency_le_1ms = total.writeback_latency_le_1ms.saturating_add(writeback_latency_le_1ms);
+    total.writeback_latency_le_10ms = total.writeback_latency_le_10ms.saturating_add(writeback_latency_le_10ms);
+    total.writeback_latency_gt_10ms = total.writeback_latency_gt_10ms.saturating_add(writeback_latency_gt_10ms);
+    total.eviction_latency_samples = total.eviction_latency_samples.saturating_add(eviction_latency_samples);
+    total.eviction_latency_le_10us = total.eviction_latency_le_10us.saturating_add(eviction_latency_le_10us);
+    total.eviction_latency_le_100us = total.eviction_latency_le_100us.saturating_add(eviction_latency_le_100us);
+    total.eviction_latency_le_1ms = total.eviction_latency_le_1ms.saturating_add(eviction_latency_le_1ms);
+    total.eviction_latency_le_10ms = total.eviction_latency_le_10ms.saturating_add(eviction_latency_le_10ms);
+    total.eviction_latency_gt_10ms = total.eviction_latency_gt_10ms.saturating_add(eviction_latency_gt_10ms);
+    total.compaction_latency_samples = total.compaction_latency_samples.saturating_add(compaction_latency_samples);
+    total.compaction_latency_le_10us = total.compaction_latency_le_10us.saturating_add(compaction_latency_le_10us);
+    total.compaction_latency_le_100us = total.compaction_latency_le_100us.saturating_add(compaction_latency_le_100us);
+    total.compaction_latency_le_1ms = total.compaction_latency_le_1ms.saturating_add(compaction_latency_le_1ms);
+    total.compaction_latency_le_10ms = total.compaction_latency_le_10ms.saturating_add(compaction_latency_le_10ms);
+    total.compaction_latency_gt_10ms = total.compaction_latency_gt_10ms.saturating_add(compaction_latency_gt_10ms);
+    total.eviction_sampled_groups = total.eviction_sampled_groups.saturating_add(eviction_sampled_groups);
+    total.memory_slot_evictions = total.memory_slot_evictions.saturating_add(memory_slot_evictions);
+    total.ssd_slot_evictions = total.ssd_slot_evictions.saturating_add(ssd_slot_evictions);
+    total.ssd_eviction_cold = total.ssd_eviction_cold.saturating_add(ssd_eviction_cold);
+    total.ssd_eviction_low_hit = total.ssd_eviction_low_hit.saturating_add(ssd_eviction_low_hit);
+    total.ssd_eviction_stale = total.ssd_eviction_stale.saturating_add(ssd_eviction_stale);
+    total.compressed_puts = total.compressed_puts.saturating_add(compressed_puts);
+    total.compressed_hits = total.compressed_hits.saturating_add(compressed_hits);
+    total.compression_bytes_saved = total.compression_bytes_saved.saturating_add(compression_bytes_saved);
+    total.get_latency_count = total.get_latency_count.saturating_add(get_latency_count);
+    total.get_latency_total_us = total.get_latency_total_us.saturating_add(get_latency_total_us);
+    total.get_latency_max_us = total.get_latency_max_us.saturating_add(get_latency_max_us);
+    total.put_latency_count = total.put_latency_count.saturating_add(put_latency_count);
+    total.put_latency_total_us = total.put_latency_total_us.saturating_add(put_latency_total_us);
+    total.put_latency_max_us = total.put_latency_max_us.saturating_add(put_latency_max_us);
+    total.memory_bytes = total.memory_bytes.saturating_add(memory_bytes);
+    total.pmem_bytes = total.pmem_bytes.saturating_add(pmem_bytes);
+    total.disk_bytes = total.disk_bytes.saturating_add(disk_bytes);
+
+    // Named above to prove the pattern is complete, combined after the loop
+    // where the whole set of shards is in hand.
+    let _ = ssd_write_budget_share;
+}
+
+/// A [`MultiLayerCache`] split into independent shards, chosen by key hash.
+///
+/// The same [`CacheApi`] and [`ZeroCopyCacheApi`] surface, and the answer to the
+/// read-scaling limit described on `MultiLayerCache`: each shard has its own
+/// lock, so readers on different keys do not contend.
+///
+/// The trade is the usual one for sharding -- with a single thread it is
+/// slightly *slower* than the unsharded cache, because there is no contention to
+/// relieve and the extra bookkeeping still has to be paid. It pays off from two
+/// threads upward. `examples/cache_scaling_bench.rs` measures the crossover.
+///
+/// Note that anything global is per-shard: `size` sums the shards, and a
+/// capacity is divided among them rather than applying to each.
 #[derive(Debug, Clone)]
 pub struct ShardedMultiLayerCache {
     shards: Arc<Vec<MultiLayerCache>>,
 }
 
 impl ShardedMultiLayerCache {
+    /// Build a sharded cache, refusing a configuration it cannot honour.
+    ///
+    /// The counterpart to [`MultiLayerCache::try_with_options`], and it checks
+    /// the configuration as written rather than a shard's slice of it: the
+    /// slices are a consequence of sharding, and reporting them as if the
+    /// caller had asked for them would name the wrong number.
+    ///
+    /// [`Self::with_options`] stays infallible and unchanged.
+    pub fn try_with_options(
+        options: CacheOptions,
+        shard_count: usize,
+    ) -> Result<Self, CacheError> {
+        let refusals: Vec<_> = options
+            .validate_for_shards(shard_count)
+            .into_iter()
+            .filter(|finding| finding.severity == CacheHealthSeverity::Critical)
+            .collect();
+        if !refusals.is_empty() {
+            return Err(CacheError::InvalidConfig(
+                refusals
+                    .into_iter()
+                    .map(|finding| format!("{}: {}", finding.field, finding.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        Ok(Self::with_options(options, shard_count))
+    }
+
     pub fn with_options(options: CacheOptions, shard_count: usize) -> Self {
         let shard_count = shard_count.max(1);
         let shards = (0..shard_count)
@@ -3105,134 +4501,33 @@ impl ShardedMultiLayerCache {
 
     pub fn stats(&self) -> CacheStats {
         let mut total = CacheStats::default();
-        macro_rules! add_stats {
-            ($stats:expr, [$($field:ident),+ $(,)?]) => {
-                $(
-                    total.$field = total.$field.saturating_add($stats.$field);
-                )+
-            };
-        }
 
         for shard in self.shards.iter() {
             let stats = shard.stats();
-            add_stats!(
-                stats,
-                [
-                    memory_hits,
-                    disk_hits,
-                    misses,
-                    puts,
-                    invalidations,
-                    memory_evictions,
-                    pmem_hits,
-                    pmem_fills,
-                    pmem_evictions,
-                    pmem_admission_accepted,
-                    pmem_admission_rejected,
-                    pmem_eviction_capacity,
-                    pmem_eviction_pinned_skips,
-                    memory_admission_accepted,
-                    memory_admission_rejected,
-                    memory_fills,
-                    disk_fills,
-                    ssd_admission_accepted,
-                    ssd_admission_rejected,
-                    ssd_evictions,
-                    ssd_eviction_capacity,
-                    ssd_eviction_pinned_skips,
-                    ssd_oversize_rejections,
-                    ssd_write_through_admissions,
-                    hotness_promotions,
-                    refill_failures,
-                    eviction_capacity,
-                    eviction_oversize,
-                    eviction_cold,
-                    eviction_low_hit,
-                    eviction_stale,
-                    pinned_entries,
-                    pinned_bytes,
-                    pin_operations,
-                    unpin_operations,
-                    insert_pinned_operations,
-                    eviction_pinned_skips,
-                    zero_copy_handle_hits,
-                    zero_copy_handle_misses,
-                    async_writeback_enqueued,
-                    async_writeback_drained,
-                    async_writeback_backpressure_rejections,
-                    writeback_backpressure_events,
-                    async_writeback_queue_depth,
-                    async_writeback_queue_bytes,
-                    async_writeback_max_queue_depth,
-                    async_writeback_max_queue_bytes,
-                    get_latency_samples,
-                    put_latency_samples,
-                    get_latency_total_micros,
-                    put_latency_total_micros,
-                    get_latency_max_micros,
-                    put_latency_max_micros,
-                    get_latency_le_10us,
-                    get_latency_le_100us,
-                    get_latency_le_1ms,
-                    get_latency_le_10ms,
-                    get_latency_gt_10ms,
-                    put_latency_le_10us,
-                    put_latency_le_100us,
-                    put_latency_le_1ms,
-                    put_latency_le_10ms,
-                    put_latency_gt_10ms,
-                    read_through_latency_samples,
-                    read_through_latency_le_10us,
-                    read_through_latency_le_100us,
-                    read_through_latency_le_1ms,
-                    read_through_latency_le_10ms,
-                    read_through_latency_gt_10ms,
-                    refill_latency_samples,
-                    refill_latency_le_10us,
-                    refill_latency_le_100us,
-                    refill_latency_le_1ms,
-                    refill_latency_le_10ms,
-                    refill_latency_gt_10ms,
-                    writeback_latency_samples,
-                    writeback_latency_le_10us,
-                    writeback_latency_le_100us,
-                    writeback_latency_le_1ms,
-                    writeback_latency_le_10ms,
-                    writeback_latency_gt_10ms,
-                    eviction_latency_samples,
-                    eviction_latency_le_10us,
-                    eviction_latency_le_100us,
-                    eviction_latency_le_1ms,
-                    eviction_latency_le_10ms,
-                    eviction_latency_gt_10ms,
-                    compaction_latency_samples,
-                    compaction_latency_le_10us,
-                    compaction_latency_le_100us,
-                    compaction_latency_le_1ms,
-                    compaction_latency_le_10ms,
-                    compaction_latency_gt_10ms,
-                    eviction_sampled_groups,
-                    memory_slot_evictions,
-                    ssd_slot_evictions,
-                    ssd_eviction_cold,
-                    ssd_eviction_low_hit,
-                    ssd_eviction_stale,
-                    compressed_puts,
-                    compressed_hits,
-                    compression_bytes_saved,
-                    get_latency_count,
-                    get_latency_total_us,
-                    get_latency_max_us,
-                    put_latency_count,
-                    put_latency_total_us,
-                    put_latency_max_us,
-                    memory_bytes,
-                    pmem_bytes,
-                    disk_bytes,
-                ]
-            );
+            fold_shard_stats(&mut total, stats);
         }
+        // Not a count, so adding it would report four shards each admitting
+        // half of everything as a share of two. The tightest shard is the
+        // useful one: it is the reason a caller is seeing writes refused.
+        // Taken after the loop because the running total starts at zero, which
+        // is a minimum nothing can beat.
+        total.ssd_write_budget_share = self
+            .shards
+            .iter()
+            .map(|shard| shard.stats().ssd_write_budget_share)
+            .min()
+            .unwrap_or(0);
         total
+    }
+
+
+    /// What this cache's current statistics say about its health.
+    ///
+    /// A shortcut for `cache_health_report(&self.stats())`. Taking the snapshot
+    /// and judging it are separate so the judgement can also be applied to a
+    /// snapshot from somewhere else, such as one recovered from a scrape.
+    pub fn health_report(&self) -> CacheHealthReport {
+        cache_health_report(&self.stats())
     }
 
     pub fn eviction_report(&self) -> CacheEvictionReport {
@@ -4274,7 +5569,7 @@ impl ShardedMultiLayerCache {
             .sum()
     }
 
-    pub fn get_capacity(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn get_capacity(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type.as_tier() {
             Some(tier) => self.capacity_for_tier(tier),
             None => self.capacity(),
@@ -4302,6 +5597,92 @@ impl ShardedMultiLayerCache {
         });
     }
 
+    /// Write `value` under `key` with a time to live, on the shard that owns it.
+    pub fn put_with_ttl(
+        &self,
+        key: CacheKey,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.shard_for_key(&key).put_with_ttl(key, value, ttl)
+    }
+
+    /// Time to live for entries that do not ask for their own, on every shard.
+    pub fn set_default_ttl(&self, ttl: Duration) {
+        for shard in self.shards.iter() {
+            shard.set_default_ttl(ttl);
+        }
+    }
+
+    /// Drop expired entries from every shard, and say how many in total.
+    pub fn purge_expired(&self) -> usize {
+        self.shards.iter().map(|shard| shard.purge_expired()).sum()
+    }
+
+    /// Hear about entries leaving any shard.
+    ///
+    /// A sharded cache had no way to register a handler at all, so anyone who
+    /// sharded lost eviction notifications entirely -- including the expiry
+    /// notifications a handler needs to release whatever it holds for an
+    /// entry.
+    ///
+    /// One handler, shared by every shard, rather than a copy each: a caller
+    /// counting departures wants one total, and a caller holding a resource
+    /// wants one place that releases it. Shards call it concurrently, which is
+    /// what the `Send + Sync` bound already promised.
+    pub fn register_eviction_callback<F>(&self, callback: F)
+    where
+        F: Fn(CacheEvictionRecord) + Send + Sync + 'static,
+    {
+        let shared = Arc::new(callback);
+        for shard in self.shards.iter() {
+            let handler = Arc::clone(&shared);
+            shard.register_eviction_callback(move |record| handler(record));
+        }
+    }
+
+    /// Stop hearing about entries leaving, on every shard.
+    ///
+    /// Cleared everywhere, because a handler left on some shards and not
+    /// others reports a fraction of the cache, which is worse than reporting
+    /// none of it: the number looks like a measurement.
+    pub fn clear_eviction_callback(&self) {
+        for shard in self.shards.iter() {
+            shard.clear_eviction_callback();
+        }
+    }
+
+    /// Cap how fast the SSD tier absorbs writes, in bytes per second, across
+    /// all shards.
+    ///
+    /// Split the same way capacity is, so the shards together aim at the
+    /// number asked for rather than each aiming at all of it.
+    pub fn set_ssd_write_budget_bytes_per_sec(&self, bytes_per_sec: u64) {
+        let shard_count = self.shard_count() as u64;
+        if shard_count == 0 {
+            return;
+        }
+        for (index, shard) in self.shards.iter().enumerate() {
+            // Hand the remainder to the first shards, so the parts sum exactly.
+            let mut share = bytes_per_sec / shard_count;
+            if (index as u64) < bytes_per_sec % shard_count {
+                share = share.saturating_add(1);
+            }
+            shard.set_ssd_write_budget_bytes_per_sec(share);
+        }
+    }
+
+    /// The SSD write cap across all shards, in bytes per second.
+    ///
+    /// Sums the shards, so it reports the number the whole cache is aiming at
+    /// rather than one shard's slice of it.
+    pub fn ssd_write_budget_bytes_per_sec(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.ssd_write_budget_bytes_per_sec())
+            .sum()
+    }
+
     pub fn set_capacity_for_tier(&self, tier: CacheTier, capacity: usize) {
         let shard_count = self.shard_count();
         std::thread::scope(|scope| {
@@ -4323,7 +5704,7 @@ impl ShardedMultiLayerCache {
         });
     }
 
-    pub fn set_capacity_for_instance(&self, instance_type: CacheInstanceType, capacity: usize) {
+    pub fn set_capacity_for_instance(&self, instance_type: CacheInstanceKind, capacity: usize) {
         match instance_type.as_tier() {
             Some(tier) => self.set_capacity_for_tier(tier, capacity),
             None => self.set_capacity(capacity),
@@ -4348,7 +5729,7 @@ impl ShardedMultiLayerCache {
             .sum()
     }
 
-    pub fn get_used(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn get_used(&self, instance_type: CacheInstanceKind) -> usize {
         match instance_type.as_tier() {
             Some(tier) => self.used_space_for_tier(tier),
             None => self.size(),
@@ -4371,7 +5752,7 @@ impl ShardedMultiLayerCache {
 
     pub fn get_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
     ) -> CacheReplacementPolicy {
         match instance_type.as_tier() {
             Some(tier) => self.replacement_policy_for_tier(tier),
@@ -4413,7 +5794,7 @@ impl ShardedMultiLayerCache {
 
     pub fn set_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) {
         if let Some(tier) = instance_type.as_tier() {
@@ -4423,7 +5804,7 @@ impl ShardedMultiLayerCache {
 
     pub fn try_set_replacement_policy_type(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) -> Result<(), CacheError> {
         let Some(tier) = instance_type.as_tier() else {
@@ -4448,7 +5829,7 @@ impl ShardedMultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn GetCapacity(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn GetCapacity(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_capacity(instance_type)
     }
 
@@ -4458,7 +5839,7 @@ impl ShardedMultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn SetCapacityForInstance(&self, instance_type: CacheInstanceType, capacity: usize) {
+    pub fn SetCapacityForInstance(&self, instance_type: CacheInstanceKind, capacity: usize) {
         self.set_capacity_for_instance(instance_type, capacity);
     }
 
@@ -4468,14 +5849,14 @@ impl ShardedMultiLayerCache {
     }
 
     #[allow(non_snake_case)]
-    pub fn GetUsed(&self, instance_type: CacheInstanceType) -> usize {
+    pub fn GetUsed(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_used(instance_type)
     }
 
     #[allow(non_snake_case)]
     pub fn GetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
     ) -> CacheReplacementPolicy {
         self.get_replacement_policy_type(instance_type)
     }
@@ -4483,7 +5864,7 @@ impl ShardedMultiLayerCache {
     #[allow(non_snake_case)]
     pub fn SetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) {
         self.set_replacement_policy_type(instance_type, policy);
@@ -4492,7 +5873,7 @@ impl ShardedMultiLayerCache {
     #[allow(non_snake_case)]
     pub fn TrySetReplacementPolicyType(
         &self,
-        instance_type: CacheInstanceType,
+        instance_type: CacheInstanceKind,
         policy: CacheReplacementPolicy,
     ) -> Result<(), CacheError> {
         self.try_set_replacement_policy_type(instance_type, policy)
@@ -4661,7 +6042,7 @@ impl CacheApi for ShardedMultiLayerCache {
         self.capacity()
     }
 
-    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn capacity_for_instance_cache(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_capacity(instance_type)
     }
 
@@ -4669,7 +6050,7 @@ impl CacheApi for ShardedMultiLayerCache {
         self.set_capacity(capacity);
     }
 
-    fn set_capacity_for_instance_cache(&self, instance_type: CacheInstanceType, capacity: usize) {
+    fn set_capacity_for_instance_cache(&self, instance_type: CacheInstanceKind, capacity: usize) {
         self.set_capacity_for_instance(instance_type, capacity);
     }
 
@@ -4677,7 +6058,7 @@ impl CacheApi for ShardedMultiLayerCache {
         self.size()
     }
 
-    fn used_cache(&self, instance_type: CacheInstanceType) -> usize {
+    fn used_cache(&self, instance_type: CacheInstanceKind) -> usize {
         self.get_used(instance_type)
     }
 }
@@ -4733,15 +6114,48 @@ impl ZeroCopyCacheApi for ShardedMultiLayerCache {
     }
 }
 impl CacheInner {
+    /// Write, then forget the entry if no tier took it.
+    ///
+    /// The per-entry metadata is recorded before the value is offered to a
+    /// tier, because the branch that needs it is the one that stores. A write
+    /// every tier refuses — a value larger than any of them, or one the SSD
+    /// write budget declines — therefore leaves a description behind with
+    /// nothing described. Nothing else removes it: removal is driven by an
+    /// entry *leaving* a tier, and this one never entered.
+    ///
+    /// Wrapping the write rather than cleaning up at each of its six exits,
+    /// because a cleanup repeated at every `return` is one the seventh will
+    /// miss.
     fn put_with_request(
         &mut self,
         key: CacheKey,
         value: Vec<u8>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
-        if !self.pinned.contains_key(&key) {
-            self.pinned_handle_bytes.remove(&key);
-            self.pinned_removed_bytes.remove(&key);
+        let outcome = self.put_with_request_inner(key.clone(), value, request);
+        if !self.memory.contains_key(&key)
+            && !self.pmem.contains_key(&key)
+            && !self.disk_index.contains_key(&key)
+        {
+            self.metadata.remove(&key);
+        }
+        outcome
+    }
+
+    fn put_with_request_inner(
+        &mut self,
+        key: CacheKey,
+        value: Vec<u8>,
+        request: Option<CacheAdmissionRequest>,
+    ) -> Result<(), CacheError> {
+        // Reclaim a few lapsed entries before this write is placed. Done here
+        // rather than inside the memory tier's admission: a cache with no
+        // memory tier configured never reaches that, and its entries need
+        // sweeping just as much. Before admission rather than after, so room
+        // an expired entry gives up can spare a live one from eviction.
+        self.sweep_some_expired();
+        if !self.is_pinned(&key) {
+            self.pins_for(&key).entries.remove(&key);
         }
         let request = request.unwrap_or_else(|| self.default_request(&key, value.len()));
         let decision = self.tiering_policy.decide(&request);
@@ -4782,6 +6196,16 @@ impl CacheInner {
             }
         } else if !self.ssd_instance_only {
             self.stats.memory_admission_rejected += 1;
+            // A write that is not admitted here must still take out whatever
+            // this tier was holding for the key. Reads look in the memory tier
+            // first, so leaving the old value behind serves it in preference to
+            // the one just written -- the write appears to have been lost, and
+            // stays lost until something evicts the entry.
+            //
+            // A key gets here by having grown hot enough for the tiering
+            // decision to route its rewrite past memory, which is exactly the
+            // case of a key being written repeatedly.
+            self.drop_stale_tier_copy(&key, CacheTier::Memory);
         }
 
         if admit_pmem && !pmem_admitted_via_memory_fallback {
@@ -4797,6 +6221,15 @@ impl CacheInner {
         } else if !self.ssd_instance_only {
             self.stats.pmem_admission_rejected =
                 self.stats.pmem_admission_rejected.saturating_add(1);
+            // Same reasoning as the memory tier above: reads reach the
+            // persistent-memory tier before the SSD one.
+            //
+            // Except when the memory tier's fallback has just written the
+            // value here. That path lands in this branch too, and dropping the
+            // copy it wrote would throw away the write it was making.
+            if !pmem_admitted_via_memory_fallback {
+                self.drop_stale_tier_copy(&key, CacheTier::Pmem);
+            }
         }
 
         if !admit_ssd {
@@ -4814,6 +6247,12 @@ impl CacheInner {
                 self.stats.ssd_oversize_rejections.saturating_add(1);
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
+            self.stats.puts += 1;
+            return Ok(());
+        }
+        // Ask the write budget before encoding: a block the budget will not let
+        // through is not worth compressing first.
+        if !self.ssd_write_budget_admits(&key) {
             self.stats.puts += 1;
             return Ok(());
         }
@@ -4873,7 +6312,6 @@ impl CacheInner {
         self.stats.puts += 1;
         self.stats.disk_fills += 1;
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
-        self.stats.disk_bytes = self.ssd_bytes;
         self.append_disk_manifest_put(&key, block_len as u64)?;
         Ok(())
     }
@@ -4882,15 +6320,17 @@ impl CacheInner {
         &mut self,
         entries: Vec<(CacheKey, Vec<u8>, usize)>,
     ) -> Result<usize, CacheError> {
+        // Once for the batch, not once per entry: the sweep is bounded, and
+        // running it per entry would turn it into a scan on a large batch.
+        self.sweep_some_expired();
         let mut staged_ssd = Vec::<StagedSsdBatchWrite>::new();
         let mut staged_ssd_positions = HashMap::<CacheKey, usize>::new();
         let mut staged_ssd_bytes = self.ssd_bytes;
         let mut inserted = 0usize;
 
         for (key, value, logical_size) in entries {
-            if !self.pinned.contains_key(&key) {
-                self.pinned_handle_bytes.remove(&key);
-                self.pinned_removed_bytes.remove(&key);
+            if !self.is_pinned(&key) {
+                self.pins_for(&key).entries.remove(&key);
             }
             let request = self.default_insert_request(&key, value.len(), logical_size);
             let decision = self.tiering_policy.decide(&request);
@@ -4967,6 +6407,11 @@ impl CacheInner {
                     self.stats.ssd_oversize_rejections.saturating_add(1);
                 self.stats.writeback_backpressure_events =
                     self.stats.writeback_backpressure_events.saturating_add(1);
+                self.stats.puts = self.stats.puts.saturating_add(1);
+                inserted = inserted.saturating_add(1);
+                continue;
+            }
+            if !self.ssd_write_budget_admits(&key) {
                 self.stats.puts = self.stats.puts.saturating_add(1);
                 inserted = inserted.saturating_add(1);
                 continue;
@@ -5059,24 +6504,29 @@ impl CacheInner {
             inserted = inserted.saturating_add(1);
         }
 
+        // Move the blocks out rather than copying them: `entry.block` is read
+        // here and nowhere afterwards, so the batch's bytes can go straight to
+        // the store instead of being copied on the way.
         let storage_entries = staged_ssd
-            .iter()
-            .map(|entry| (entry.key.clone(), entry.block.clone()))
+            .iter_mut()
+            .map(|entry| (entry.key.clone(), std::mem::take(&mut entry.block)))
             .collect::<Vec<_>>();
-        self.write_ssd_blocks(&storage_entries)?;
+        self.write_ssd_blocks(storage_entries)?;
         if !staged_ssd.is_empty() {
             const SET_MEMBERSHIP_THRESHOLD: usize = 8;
-            let staged_keys = staged_ssd
-                .iter()
-                .map(|entry| entry.key.clone())
-                .collect::<Vec<_>>();
-            if staged_keys.len() > SET_MEMBERSHIP_THRESHOLD {
-                let staged_key_set = staged_keys.iter().cloned().collect::<HashSet<_>>();
+            // Borrowed, not cloned. Building this list used to clone every
+            // staged key, and then clone them all again into the set.
+            if staged_ssd.len() > SET_MEMBERSHIP_THRESHOLD {
+                let staged_key_set = staged_ssd
+                    .iter()
+                    .map(|entry| &entry.key)
+                    .collect::<HashSet<_>>();
                 self.disk_order
                     .retain(|candidate| !staged_key_set.contains(candidate));
             } else {
-                self.disk_order
-                    .retain(|candidate| !staged_keys.contains(candidate));
+                self.disk_order.retain(|candidate| {
+                    !staged_ssd.iter().any(|entry| &entry.key == candidate)
+                });
             }
         }
         for entry in staged_ssd {
@@ -5096,11 +6546,8 @@ impl CacheInner {
             self.stats.puts = self.stats.puts.saturating_add(1);
             self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
             self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
-            self.stats.disk_bytes = self.ssd_bytes;
             self.append_disk_manifest_put(&entry.key, entry.block_len)?;
         }
-        self.refresh_usage_stats();
-        self.refresh_pin_stats();
         Ok(inserted)
     }
     fn put_bypass_storage_for_tier(
@@ -5170,7 +6617,6 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                self.stats.disk_bytes = self.ssd_bytes;
                 self.append_disk_manifest_put(&key, block_len)?;
             }
             CacheTier::Reject => {}
@@ -5232,14 +6678,11 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                self.stats.disk_bytes = self.ssd_bytes;
                 self.append_disk_manifest_put(&key, block_len as u64)?;
             }
             CacheTier::Reject => return Err(CacheError::UnsupportedTier(tier)),
         }
         self.stats.puts = self.stats.puts.saturating_add(1);
-        self.refresh_usage_stats();
-        self.refresh_pin_stats();
         Ok(())
     }
 
@@ -5248,8 +6691,12 @@ impl CacheInner {
             CacheTier::Memory => {
                 if let Some(value) = self.memory.remove(key) {
                     self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
-                    if self.pinned.contains_key(key) {
-                        self.pinned_removed_bytes.insert(key.clone(), value.len());
+                    if self.is_pinned(key) {
+                        self.pins_for(key)
+                            .entries
+                            .entry(key.clone())
+                            .or_default()
+                            .removed_bytes = Some(value.len());
                     }
                 }
                 self.memory_order.remove(key);
@@ -5257,8 +6704,12 @@ impl CacheInner {
             CacheTier::Pmem => {
                 if let Some(value) = self.pmem.remove(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
-                    if self.pinned.contains_key(key) {
-                        self.pinned_removed_bytes.insert(key.clone(), value.len());
+                    if self.is_pinned(key) {
+                        self.pins_for(key)
+                            .entries
+                            .entry(key.clone())
+                            .or_default()
+                            .removed_bytes = Some(value.len());
                     }
                 }
                 self.pmem_order.remove(key);
@@ -5270,7 +6721,6 @@ impl CacheInner {
                 }
                 self.delete_ssd_block(key)?;
                 self.disk_order.remove(key);
-                self.stats.disk_bytes = self.ssd_bytes;
                 self.append_disk_manifest_delete(key)?;
             }
             CacheTier::Reject => return Err(CacheError::UnsupportedTier(tier)),
@@ -5331,8 +6781,6 @@ impl CacheInner {
                     .saturating_sub(current.len())
                     .saturating_add(new_value.len());
                 *current = Arc::clone(&new_value);
-                self.stats.memory_bytes = self.memory_bytes as u64;
-                self.refresh_pin_stats();
                 Ok(())
             }
             CacheTier::Pmem => {
@@ -5347,8 +6795,6 @@ impl CacheInner {
                     .saturating_sub(current.len())
                     .saturating_add(new_value.len());
                 *current = Arc::clone(&new_value);
-                self.stats.pmem_bytes = self.pmem_bytes as u64;
-                self.refresh_pin_stats();
                 Ok(())
             }
             CacheTier::Ssd => {
@@ -5378,7 +6824,6 @@ impl CacheInner {
                     self.disk_index.insert(key.clone(), indexed_old_len);
                     self.disk_order.push_back_if_absent(key.clone());
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
-                    self.stats.disk_bytes = self.ssd_bytes;
                     return Err(CacheError::CapacityExceeded);
                 }
                 self.write_ssd_block(key, &block)?;
@@ -5393,9 +6838,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                self.stats.disk_bytes = self.ssd_bytes;
                 self.append_disk_manifest_put(key, block.len() as u64)?;
-                self.refresh_pin_stats();
                 Ok(())
             }
             CacheTier::Reject => Err(CacheError::UnsupportedTier(tier)),
@@ -5471,22 +6914,14 @@ impl MultiLayerCache {
         let _ = inner.delete_ssd_blocks(&disk_keys);
         inner.disk_order.retain(|key| key.shard_id != shard_id);
         inner.metadata.retain(|key, _| key.shard_id != shard_id);
-        inner.pinned.retain(|key, _| key.shard_id != shard_id);
-        inner
-            .pinned_handle_bytes
-            .retain(|key, _| key.shard_id != shard_id);
-        inner
-            .pinned_removed_bytes
-            .retain(|key, _| key.shard_id != shard_id);
+        for mut pins in inner.all_pins() {
+            pins.entries.retain(|key, _| key.shard_id != shard_id);
+        }
         inner.stats.invalidations = inner
             .stats
             .invalidations
             .saturating_add((memory_entries_removed + disk_keys.len()) as u64);
-        inner.stats.memory_bytes = inner.memory_bytes as u64;
-        inner.stats.pmem_bytes = inner.pmem_bytes as u64;
         inner.ssd_bytes = inner.ssd_bytes.saturating_sub(disk_bytes_before);
-        inner.stats.disk_bytes = inner.ssd_bytes;
-        inner.refresh_pin_stats();
         inner.rewrite_disk_manifest()?;
         Ok(CacheGcReport {
             shard_id,
@@ -5529,9 +6964,9 @@ impl MultiLayerCache {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
-            inner.pinned.remove(key);
-            inner.pinned_handle_bytes.remove(key);
-            inner.pinned_removed_bytes.remove(key);
+            {
+                inner.pins_for(key).entries.remove(key);
+            }
             inner.metadata.remove(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
@@ -5548,11 +6983,7 @@ impl MultiLayerCache {
             .stats
             .invalidations
             .saturating_add(slot_keys.len() as u64);
-        inner.stats.memory_bytes = inner.memory_bytes as u64;
-        inner.stats.pmem_bytes = inner.pmem_bytes as u64;
         inner.ssd_bytes = inner.ssd_bytes.saturating_sub(disk_bytes_removed);
-        inner.stats.disk_bytes = inner.ssd_bytes;
-        inner.refresh_pin_stats();
         inner.rewrite_disk_manifest()?;
         Ok(CacheGcReport {
             shard_id,
@@ -5597,9 +7028,9 @@ impl MultiLayerCache {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
-            inner.pinned.remove(key);
-            inner.pinned_handle_bytes.remove(key);
-            inner.pinned_removed_bytes.remove(key);
+            {
+                inner.pins_for(key).entries.remove(key);
+            }
             inner.metadata.remove(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
@@ -5616,11 +7047,7 @@ impl MultiLayerCache {
             .stats
             .invalidations
             .saturating_add(segment_keys.len() as u64);
-        inner.stats.memory_bytes = inner.memory_bytes as u64;
-        inner.stats.pmem_bytes = inner.pmem_bytes as u64;
         inner.ssd_bytes = inner.ssd_bytes.saturating_sub(disk_bytes_removed);
-        inner.stats.disk_bytes = inner.ssd_bytes;
-        inner.refresh_pin_stats();
         inner.rewrite_disk_manifest()?;
         Ok(CacheGcReport {
             shard_id,
@@ -5642,7 +7069,7 @@ impl MultiLayerCache {
         let mut entries = keys
             .into_iter()
             .map(|key| {
-                let pinned = inner.pinned.contains_key(&key);
+                let pinned = inner.is_pinned(&key);
                 let memory_bytes = inner
                     .memory
                     .get(&key)
@@ -5660,7 +7087,7 @@ impl MultiLayerCache {
                         .map(|metadata| metadata.len())
                         .unwrap_or_default()
                 });
-                let meta = inner.metadata.get(&key).copied();
+                let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace,
@@ -5672,9 +7099,15 @@ impl MultiLayerCache {
                     pinned,
                     block_kind: meta.map(|meta| meta.block_kind),
                     routing_slot: meta.and_then(|meta| meta.routing_slot),
-                    hotness: meta.map(|meta| meta.hotness).unwrap_or_default(),
-                    hits: meta.map(|meta| meta.hits).unwrap_or_default(),
-                    last_access_epoch: meta.map(|meta| meta.last_access_epoch).unwrap_or_default(),
+                    hotness: meta
+                        .map(|meta| meta.hotness.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    hits: meta
+                        .map(|meta| meta.hits.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    last_access_epoch: meta
+                        .map(|meta| meta.last_access_epoch.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
                     admission_reason: meta.map(|meta| meta.admission_reason),
                 }
             })
@@ -5700,7 +7133,7 @@ impl MultiLayerCache {
         let mut entries = keys
             .into_iter()
             .map(|key| {
-                let pinned = inner.pinned.contains_key(&key);
+                let pinned = inner.is_pinned(&key);
                 let memory_bytes = inner
                     .memory
                     .get(&key)
@@ -5718,7 +7151,7 @@ impl MultiLayerCache {
                         .map(|metadata| metadata.len())
                         .unwrap_or_default()
                 });
-                let meta = inner.metadata.get(&key).copied();
+                let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace,
@@ -5730,9 +7163,15 @@ impl MultiLayerCache {
                     pinned,
                     block_kind: meta.map(|meta| meta.block_kind),
                     routing_slot: meta.and_then(|meta| meta.routing_slot),
-                    hotness: meta.map(|meta| meta.hotness).unwrap_or_default(),
-                    hits: meta.map(|meta| meta.hits).unwrap_or_default(),
-                    last_access_epoch: meta.map(|meta| meta.last_access_epoch).unwrap_or_default(),
+                    hotness: meta
+                        .map(|meta| meta.hotness.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    hits: meta
+                        .map(|meta| meta.hits.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    last_access_epoch: meta
+                        .map(|meta| meta.last_access_epoch.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
                     admission_reason: meta.map(|meta| meta.admission_reason),
                 }
             })
@@ -5749,16 +7188,141 @@ impl MultiLayerCache {
 
     pub fn stats(&self) -> CacheStats {
         let inner = self.inner.read().expect("cache lock poisoned");
+        // Every stripe held together, so the four figures describe one instant
+        // rather than four.
+        let (pinned_entries, pin_operations, unpin_operations, zero_copy_handle_hits) = {
+            let stripes = inner.all_pins();
+            stripes.iter().fold((0, 0, 0, 0), |total, pins| {
+                (
+                    total.0 + pins.entries.len() as u64,
+                    total.1 + pins.pin_operations,
+                    total.2 + pins.unpin_operations,
+                    total.3 + pins.zero_copy_handle_hits,
+                )
+            })
+        };
         CacheStats {
             memory_bytes: inner.memory_bytes as u64,
             pmem_bytes: inner.pmem_bytes as u64,
             disk_bytes: inner.ssd_bytes,
-            pinned_entries: inner.pinned.len() as u64,
+            pinned_entries,
+            pin_operations,
+            unpin_operations,
+            zero_copy_handle_hits,
             pinned_bytes: inner.pinned_memory_bytes(),
             async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
             async_writeback_queue_bytes: inner.async_writeback_queue_bytes,
+            memory_hits: inner.read_counters.memory_hits.load(Ordering::Relaxed),
+            pmem_hits: inner.read_counters.pmem_hits.load(Ordering::Relaxed),
+            disk_hits: inner.read_counters.disk_hits.load(Ordering::Relaxed),
+            misses: inner.read_counters.misses.load(Ordering::Relaxed),
+            hotness_promotions: inner
+                .read_counters
+                .hotness_promotions
+                .load(Ordering::Relaxed),
+            access_order_refreshes: inner
+                .read_counters
+                .access_order_refreshes
+                .load(Ordering::Relaxed),
+            get_latency_samples: inner.read_counters.get_latency.samples(),
+            get_latency_total_micros: inner
+                .read_counters
+                .get_latency
+                .total_micros
+                .load(Ordering::Relaxed),
+            get_latency_max_micros: inner
+                .read_counters
+                .get_latency
+                .max_micros
+                .load(Ordering::Relaxed),
+            get_latency_le_10us: inner
+                .read_counters
+                .get_latency
+                .le_10us
+                .load(Ordering::Relaxed),
+            get_latency_le_100us: inner
+                .read_counters
+                .get_latency
+                .le_100us
+                .load(Ordering::Relaxed),
+            get_latency_le_1ms: inner
+                .read_counters
+                .get_latency
+                .le_1ms
+                .load(Ordering::Relaxed),
+            get_latency_le_10ms: inner
+                .read_counters
+                .get_latency
+                .le_10ms
+                .load(Ordering::Relaxed),
+            get_latency_gt_10ms: inner
+                .read_counters
+                .get_latency
+                .gt_10ms
+                .load(Ordering::Relaxed),
+            read_through_latency_samples: inner.read_counters.read_through_latency.samples(),
+            read_through_latency_le_10us: inner
+                .read_counters
+                .read_through_latency
+                .le_10us
+                .load(Ordering::Relaxed),
+            read_through_latency_le_100us: inner
+                .read_counters
+                .read_through_latency
+                .le_100us
+                .load(Ordering::Relaxed),
+            read_through_latency_le_1ms: inner
+                .read_counters
+                .read_through_latency
+                .le_1ms
+                .load(Ordering::Relaxed),
+            read_through_latency_le_10ms: inner
+                .read_counters
+                .read_through_latency
+                .le_10ms
+                .load(Ordering::Relaxed),
+            read_through_latency_gt_10ms: inner
+                .read_counters
+                .read_through_latency
+                .gt_10ms
+                .load(Ordering::Relaxed),
+            refill_latency_samples: inner.read_counters.refill_latency.samples(),
+            refill_latency_le_10us: inner
+                .read_counters
+                .refill_latency
+                .le_10us
+                .load(Ordering::Relaxed),
+            refill_latency_le_100us: inner
+                .read_counters
+                .refill_latency
+                .le_100us
+                .load(Ordering::Relaxed),
+            refill_latency_le_1ms: inner
+                .read_counters
+                .refill_latency
+                .le_1ms
+                .load(Ordering::Relaxed),
+            refill_latency_le_10ms: inner
+                .read_counters
+                .refill_latency
+                .le_10ms
+                .load(Ordering::Relaxed),
+            refill_latency_gt_10ms: inner
+                .read_counters
+                .refill_latency
+                .gt_10ms
+                .load(Ordering::Relaxed),
             ..inner.stats
         }
+    }
+
+    /// What this cache's current statistics say about its health.
+    ///
+    /// A shortcut for `cache_health_report(&self.stats())`. Taking the snapshot
+    /// and judging it are separate so the judgement can also be applied to a
+    /// snapshot from somewhere else, such as one recovered from a scrape.
+    pub fn health_report(&self) -> CacheHealthReport {
+        cache_health_report(&self.stats())
     }
 
     pub fn eviction_report(&self) -> CacheEvictionReport {
@@ -5848,9 +7412,6 @@ impl MultiLayerCache {
         inner.pmem.clear();
         inner.memory_bytes = 0;
         inner.pmem_bytes = 0;
-        inner.stats.memory_bytes = 0;
-        inner.stats.pmem_bytes = 0;
-        inner.refresh_pin_stats();
     }
 
     pub fn replacement_policy_soak(&self, iterations: usize) -> CacheReplacementPolicySoakReport {
