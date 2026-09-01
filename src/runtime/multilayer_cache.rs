@@ -1965,6 +1965,38 @@ impl MultiLayerCache {
         Ok(self.get_with_tier(key)?.map(|result| result.value))
     }
 
+    /// The cached bytes, shared rather than copied.
+    ///
+    /// The memory tier already holds an `Arc<[u8]>`, so a reader that parses the bytes and drops
+    /// them does not need a copy of its own -- and `get` gives it one, a page-sized memcpy plus an
+    /// allocation, every hit. For a store fetching one record per retrieval candidate that is a
+    /// copy per candidate.
+    ///
+    /// Only the memory tier can share; the others materialise their bytes on the way out, so there
+    /// is nothing to point at and this falls back to `get`. Always correct, sometimes free.
+    ///
+    /// The value is immutable once cached: a write replaces the entry rather than editing it, so a
+    /// holder of one of these keeps reading the bytes it asked for even if the key is overwritten or
+    /// evicted meanwhile. That is the same guarantee the copy gave, without the copy.
+    pub fn get_shared(&self, key: &CacheKey) -> Result<Option<std::sync::Arc<[u8]>>, CacheError> {
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if let Some(value) = inner.memory.get(key) {
+                let shared = std::sync::Arc::clone(value);
+                drop(inner);
+                // Through `get` as well, so a shared read counts, promotes and ages exactly as a
+                // copying read does. A read that is invisible to the policy would quietly change
+                // what the cache evicts.
+                let _ = self.get(key)?;
+                return Ok(Some(shared));
+            }
+        }
+        Ok(self.get(key)?.map(std::sync::Arc::from))
+    }
+
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         self.get(key)
     }
@@ -4889,6 +4921,11 @@ impl ShardedMultiLayerCache {
 
     pub fn get(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         self.shard_for_key(key).get(key)
+    }
+
+    /// The cached bytes, shared rather than copied. See the per-shard `get_shared`.
+    pub fn get_shared(&self, key: &CacheKey) -> Result<Option<std::sync::Arc<[u8]>>, CacheError> {
+        self.shard_for_key(key).get_shared(key)
     }
 
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
