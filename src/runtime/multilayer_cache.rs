@@ -1979,22 +1979,68 @@ impl MultiLayerCache {
     /// holder of one of these keeps reading the bytes it asked for even if the key is overwritten or
     /// evicted meanwhile. That is the same guarantee the copy gave, without the copy.
     pub fn get_shared(&self, key: &CacheKey) -> Result<Option<std::sync::Arc<[u8]>>, CacheError> {
-        {
+        self.emit_access_record(CacheAccessRecordKind::Get, key);
+        let started = Instant::now();
+        let now_millis = CoarseClock::now_millis();
+        let expired;
+        let probe = {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if let Some(value) = inner.memory.get(key) {
-                let shared = std::sync::Arc::clone(value);
-                drop(inner);
-                // Through `get` as well, so a shared read counts, promotes and ages exactly as a
-                // copying read does. A read that is invisible to the policy would quietly change
-                // what the cache evicts.
-                let _ = self.get(key)?;
-                return Ok(Some(shared));
+            expired = inner.entry_expired(key, now_millis);
+            if inner.ssd_instance_only || expired {
+                None
+            } else {
+                inner.memory.get(key).cloned()
+            }
+        };
+
+        // An expired entry is noticed on the read that would have been served, exactly as `get`
+        // notices it. Falling through to `get` here would report a miss twice.
+        if expired {
+            return self.get(key).map(|value| value.map(std::sync::Arc::from));
+        }
+
+        let Some(value) = probe else {
+            // Every other tier materialises its bytes on the way out, so there is nothing to share
+            // and the copy is unavoidable. Fall through to `get`, which also covers the miss.
+            return Ok(self.get(key)?.map(std::sync::Arc::from));
+        };
+
+        // The accounting a memory hit does, without the copy it does it alongside. `record_hit`
+        // wants the entry's length, which the shared buffer knows without being copied.
+        let length = value.len();
+        let outcome = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner
+                .read_counters
+                .memory_hits
+                .fetch_add(1, Ordering::Relaxed);
+            let outcome = if inner.memory.contains_key(key) {
+                inner.record_hit_shared(key)
+            } else {
+                HitOutcome::Accounted
+            };
+            let micros = elapsed_micros(started);
+            inner.record_get_latency_micros(micros);
+            inner.record_read_through_latency_micros(micros);
+            outcome
+        };
+        match outcome {
+            HitOutcome::Accounted => {}
+            HitOutcome::NeedsAccessOrderRefresh => {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                inner.refresh_access_order(key);
+            }
+            HitOutcome::NeedsMetadata => {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if inner.memory.contains_key(key) {
+                    inner.record_hit(key, length);
+                }
             }
         }
-        Ok(self.get(key)?.map(std::sync::Arc::from))
+        Ok(Some(value))
     }
 
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
