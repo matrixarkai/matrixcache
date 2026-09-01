@@ -49,6 +49,75 @@ RocksDB SSD backend and prints a JSON report (backend, tier evictions, resident
 hot key count, cold SSD refills, pressure and replacement-soak status) that is
 useful as local performance/behavior evidence.
 
+## Durability
+
+Each durable tier decides separately whether a write also survives the machine
+losing power, and the two default differently. Both are set on `CacheOptions`.
+
+| option | default | what the default means |
+|---|---|---|
+| `ssd_block_durability` | `true` | every SSD block write is flushed, and so is the directory entry after the rename |
+| `pmem_block_durability` | `false` | the persistent tier writes and renames, and flushes neither |
+
+A block is always **whole** either way, because it arrives by rename -- no
+reader ever sees a torn block. What the setting decides is whether a block the
+cache believed it had written is still there after the machine stops abruptly.
+
+The persistent tier's name invites the opposite assumption, so it is worth
+stating plainly: real persistent memory is durable without being flushed, and
+this tier is files standing in for it. Files are not.
+
+Flushing is most of what a block write costs. Measured on one machine, 500 puts
+of 64-byte values:
+
+| | us/put | fsync calls |
+|---|---|---|
+| SSD tier flushed | ~7,600 | 1,000 |
+| SSD tier not flushed | ~420 | 0 |
+| persistent tier flushed | ~5,500 | 872, for 436 blocks |
+| persistent tier not flushed | ~330 | 0 |
+
+Those ratios are one machine's virtual disk and will be smaller on real flash;
+the call counts will not be. `examples/manifest_append_cost.rs` takes both
+settings as arguments, so the numbers can be re-measured rather than believed.
+
+**Choosing.** On a tier that is purely a cache, a block lost to a crash is a
+miss, and not flushing is the cheaper trade. It stops being a miss if something
+recovers the tier and expects it to be complete: with `auto_recover_on_start`
+set, recovery restores a tier with holes in it and no way to know which entries
+used to be there. `CacheOptions::validate()` reports that combination.
+
+`auto_recover_on_start` is `false` by default, so a default cache does not read
+its SSD tier back at all -- and is paying for durability it never uses.
+
+## Checking a configuration
+
+`CacheOptions::validate()` reads a configuration back and says what the cache
+will actually do where that differs from what was asked for: a replacement
+policy name nobody offers, a tier given a size and no path, recovery from a
+tier that was never flushed, or a shard count that makes a tier refuse values
+it has room for. `MultiLayerCache::try_with_options` refuses the findings that
+mean the cache cannot do its job and starts anyway on the rest.
+
+## Measuring
+
+The examples are measurements rather than demonstrations. Each prints a table
+and says what the number means:
+
+- `read_path_cost` -- where the time goes on a memory-tier hit, and what the
+  promotion bookkeeping costs
+- `hit_concurrency_bench` -- how reads and zero-copy handles scale with threads
+- `eviction_bench`, `steady_state_put_bench` -- eviction cost at capacity, and
+  whether it grows with the cache
+- `manifest_append_cost` -- the write path's syscalls, with the durability
+  settings above
+- `scan_resistance_bench`, `admission_filter_bench` -- what the admission
+  policy is worth against a scan
+
+Benchmarks that report a ratio measure both sides inside one pass and print the
+spread across passes. A run whose spread is wide measured the machine rather
+than the cache, and the number should be discarded rather than quoted.
+
 ## Minimum Supported Rust Version
 
 MSRV is **1.88**, set by the `rocksdb` dependency behind the default
