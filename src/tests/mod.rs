@@ -15387,3 +15387,65 @@ fn page_cache_keys_keep_their_exact_bytes() {
     // two different pages cannot collapse onto one key.
     assert_ne!(CacheKey::page(1, 8, 81, 92).selector, CacheKey::page(1, 8, 8192, 0).selector);
 }
+
+
+/// A shared read returns exactly what a copying read returns, and keeps it.
+///
+/// Handing out the cached `Arc<[u8]>` instead of a copy saves the reader a page-sized memcpy and an
+/// allocation. The bytes being equal on the way out is the easy half; the half worth testing is what
+/// happens next -- the key overwritten, the key evicted -- while a reader still holds what it was
+/// given. A copy is obviously safe under both. A share has to be shown to be.
+#[test]
+fn a_shared_read_matches_a_copying_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let key = CacheKey::page(1, 42, 0, 64);
+    let payload: Vec<u8> = (0..64_u8).collect();
+    cache.put(key.clone(), payload.clone()).expect("put");
+
+    let copied = cache.get(&key).expect("get").expect("the key is present");
+    let shared = cache.get_shared(&key).expect("get_shared").expect("the key is present");
+    assert_eq!(&*shared, copied.as_slice(), "a shared read must return the copied read's bytes");
+    assert_eq!(&*shared, payload.as_slice(), "and both must return what was put");
+
+    // Overwrite the key while the share is held. The holder keeps reading what it asked for: a put
+    // replaces the entry rather than editing it, which is what makes sharing safe at all.
+    let replacement: Vec<u8> = (100..164_u8).collect();
+    cache.put(key.clone(), replacement.clone()).expect("overwrite");
+    assert_eq!(
+        &*shared,
+        payload.as_slice(),
+        "an overwrite must not change the bytes a reader is already holding"
+    );
+    let after = cache.get(&key).expect("get").expect("still present");
+    assert_eq!(after, replacement, "and the next reader must see the new value");
+
+    // A miss is a miss either way, not an empty slice.
+    let absent = CacheKey::page(1, 43, 0, 64);
+    assert!(cache.get_shared(&absent).expect("get_shared").is_none());
+    assert!(cache.get(&absent).expect("get").is_none());
+}
+
+/// A shared read is visible to the eviction policy, exactly as a copying read is.
+///
+/// A read that the policy cannot see would quietly change what the cache chooses to evict -- the
+/// hottest key in the store could look untouched. This is the property most easily lost by
+/// short-circuiting the lookup, so it is asserted rather than assumed.
+#[test]
+fn a_shared_read_counts_as_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let key = CacheKey::page(1, 7, 0, 16);
+    cache.put(key.clone(), vec![9_u8; 16]).expect("put");
+
+    let before = cache.stats().memory_hits;
+    let _ = cache.get_shared(&key).expect("get_shared").expect("present");
+    let after = cache.stats().memory_hits;
+    assert!(
+        after > before,
+        "a shared read must register as a memory hit ({before} -> {after}), or the policy stops seeing \
+         reads of whatever uses it"
+    );
+}
