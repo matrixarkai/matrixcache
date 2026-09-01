@@ -5,8 +5,17 @@
 //
 // Every put and every delete on the persistent tier appends a line, and the
 // expiry sweep appends one per reclaimed entry whether or not the entry was
-// ever on that tier. Counting the syscalls per line is the point: run this
-// under  and read openat, close and the directory calls.
+// ever on that tier. Counting the syscalls per line is the point: run it under
+// `strace -c -f` and read openat, close, fsync and the directory calls.
+//
+// **Pass `keep` as the fourth argument when profiling.** Otherwise the run ends
+// by deleting everything it wrote, and those unlinks land in the profile: one
+// per SSD block and one per persistent block, which is roughly two per put and
+// is the benchmark tidying up rather than the cache doing anything. Traced at
+// 200 puts, the teardown was 200 `.cache_block` and 136 `.bin` unlinks -- all
+// of it cleanup, none of it the write path.
+//
+//   arguments: <entries> <ssd durability 0|1> <pmem durability 0|1> [keep]
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
 
@@ -27,6 +36,9 @@ fn main() {
         .nth(3)
         .map(|arg| arg != "0")
         .unwrap_or(false);
+    // Fourth argument: leave the directory behind, so the teardown's unlinks
+    // stay out of a syscall profile of this run.
+    let keep = std::env::args().nth(4).is_some_and(|arg| arg == "keep");
     let cache = MultiLayerCache::with_options(CacheOptions {
         dram_capacity: 1 << 14,
         pmem_capacity: 1 << 22,
@@ -64,5 +76,11 @@ fn main() {
         "  persistent-tier durability {}",
         if pmem_durable { "on" } else { "off" }
     );
-    let _ = std::fs::remove_dir_all(&root);
+    // Left in place when asked, so a syscall profile measures the writes and
+    // not the tidying up afterwards.
+    if keep {
+        println!("  left {} in place", root.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
