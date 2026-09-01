@@ -16,6 +16,13 @@
 //! immune to load on the machine and is the number that says whether the
 //! algorithm changed or only the weather did.
 //!
+//!
+//! The hit-rate table reports promotions beside the hit rate, because the hit
+//! rate follows them: a promotion is what keeps the access order carrying
+//! recency, and the refresh window is what decides how often one happens. If
+//! the hit rate here moves and the promotion count moved with it, the cause is
+//! the window rather than anything about eviction.
+//!
 //! ```text
 //! cargo run --release --no-default-features --example eviction_bench
 //! ```
@@ -94,7 +101,7 @@ fn steady_state(entries: usize) -> (f64, f64) {
 /// cache, with most reads landing on a small hot subset, and reports the share
 /// of reads the cache served. A selector that evicts hot entries shows up here
 /// as a hit rate below what the hot subset alone would guarantee.
-fn hit_rate(entries: usize) -> f64 {
+fn hit_rate(entries: usize) -> (f64, u64) {
     let dir = bench_dir(&format!("hitrate-{entries}"));
     let _ = std::fs::remove_dir_all(&dir);
     let cache = MultiLayerCache::with_options(
@@ -127,9 +134,10 @@ fn hit_rate(entries: usize) -> f64 {
         }
     }
 
+    let refreshes = cache.stats().access_order_refreshes;
     cache.stop();
     let _ = std::fs::remove_dir_all(&dir);
-    hits as f64 * 100.0 / reads as f64
+    (hits as f64 * 100.0 / reads as f64, refreshes)
 }
 
 fn main() {
@@ -145,8 +153,12 @@ fn main() {
 
     println!();
     println!("hit rate, working set 4x the cache, 80% of reads on a hot half-cache");
-    println!("{:>10}  {:>14}", "entries", "hit rate %");
+    println!(
+        "{:>10}  {:>14}  {:>14}",
+        "entries", "hit rate %", "promotions"
+    );
     for entries in [1_024usize, 4_096, 16_384] {
-        println!("{entries:>10}  {:>14.2}", hit_rate(entries));
+        let (rate, refreshes) = hit_rate(entries);
+        println!("{entries:>10}  {rate:>14.2}  {refreshes:>14}");
     }
 }

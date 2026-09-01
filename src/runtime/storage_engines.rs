@@ -1,6 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+/// Everything a cache can be configured with.
+///
+/// Tier capacities and paths are typed; the policy and engine choices are
+/// **strings**, parsed when the cache is built -- `cache_dram_replacement_policy`
+/// takes names like `"FIFO"` or `"SLRU"`, and
+/// `cache_dram_pmem_data_placement_type` takes `"SideBySide"` or `"Tiered"`.
+/// That is deliberate: these come from configuration files, so the vocabulary is
+/// the file's rather than Rust's.
+///
+/// Build one with [`CacheOptions::new`] and the `with_*` methods, then hand it
+/// to [`MultiLayerCache::with_options`] or [`MatrixCacheBuilder`].
+///
+/// # Examples
+///
+/// ```
+/// use matrixcache::{CacheKey, CacheOptions, MatrixCacheBuilder};
+///
+/// let dir = tempfile::tempdir()?;
+/// let options = CacheOptions::new(1 << 20, 0, 1 << 22)
+///     .with_ssd_paths([dir.path().to_path_buf()]);
+///
+/// let cache = MatrixCacheBuilder::build_cache(options);
+/// let key = CacheKey::string(0, "greeting");
+/// cache.put(key.clone(), b"hello".to_vec())?;
+/// assert_eq!(cache.get(&key)?, Some(b"hello".to_vec()));
+/// # Ok::<(), matrixcache::CacheError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheOptions {
     pub dram_capacity: usize,
@@ -26,12 +53,46 @@ pub struct CacheOptions {
     pub metric_id_prefix: String,
     #[serde(default)]
     pub metric_registry_tags: HashMap<String, String>,
+    /// Bytes per second the SSD tier may absorb. Zero, the default, is no cap.
+    #[serde(default)]
+    pub ssd_write_bytes_per_sec: u64,
     #[serde(default)]
     pub cache_ssd_instance_only: bool,
     #[serde(default)]
     pub blockcache_clear_ssd_folder: bool,
     #[serde(default)]
     pub auto_recover_on_start: bool,
+    /// Whether an SSD block write also survives the machine losing power.
+    ///
+    /// True by default, which is what it has always done: the block is
+    /// flushed and the directory entry flushed after the rename. That is two
+    /// `fsync` calls per write and most of what a block write costs.
+    ///
+    /// Turning it off keeps the block atomic -- a reader still sees a whole
+    /// block or none -- and gives up only surviving a crash of the machine. On
+    /// a tier that is a cache, a block lost that way is a miss. It is not a
+    /// miss if something recovers this tier and expects it to be complete, so
+    /// leave it on if `auto_recover_on_start` is set or anything calls
+    /// `recover_disk_index`.
+    #[serde(default = "default_ssd_block_durability")]
+    pub ssd_block_durability: bool,
+    /// Whether a write to the persistent tier also survives the machine losing
+    /// power.
+    ///
+    /// **False by default, which is what this tier has always done.** It writes
+    /// the block and renames it into place and never flushes either, so the
+    /// block is always whole and is not always there after a crash.
+    ///
+    /// The name invites the opposite assumption. Real persistent memory is
+    /// durable without being flushed; this tier is files standing in for it,
+    /// and files are not. Anything that recovers this tier and expects it to be
+    /// complete wants this on.
+    ///
+    /// The default is false rather than true only because that is the existing
+    /// behaviour and turning it on costs what flushing costs. The SSD tier
+    /// defaults the other way for the same reason -- each keeps what it did.
+    #[serde(default)]
+    pub pmem_block_durability: bool,
     #[serde(default)]
     pub block_options: CacheBlockOptions,
 }
@@ -45,6 +106,7 @@ impl Default for CacheOptions {
             ssd_capacity: policy.ssd_capacity_bytes,
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
+            ssd_write_bytes_per_sec: 0,
             cache_dram_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_pmem_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_ssd_replacement_policy: "WeightedHotnessLru".to_string(),
@@ -55,6 +117,8 @@ impl Default for CacheOptions {
             cache_ssd_instance_only: false,
             blockcache_clear_ssd_folder: false,
             auto_recover_on_start: false,
+            ssd_block_durability: true,
+            pmem_block_durability: false,
             block_options: CacheBlockOptions::default(),
         }
     }
@@ -115,7 +179,7 @@ impl CacheOptions {
 
     pub fn with_config_dram_pmem_data_placement(
         self,
-        placement: DRAMPMEMDataPlacementType,
+        placement: DramPmemDataPlacement,
         threshold: usize,
     ) -> Self {
         self.with_dram_pmem_data_placement(placement.into(), threshold)
@@ -124,7 +188,7 @@ impl CacheOptions {
     #[allow(non_snake_case)]
     pub fn WithDRAMPMEMDataPlacement(
         self,
-        placement: DRAMPMEMDataPlacementType,
+        placement: DramPmemDataPlacement,
         threshold: usize,
     ) -> Self {
         self.with_config_dram_pmem_data_placement(placement, threshold)
@@ -180,6 +244,14 @@ impl CacheOptions {
     }
 }
 
+/// Constructors for every cache this crate exposes.
+///
+/// A namespace rather than a value -- the methods are associated functions, so
+/// call `MatrixCacheBuilder::build_cache(options)` without making one.
+///
+/// Each `build_*` returns a concrete type; the `*_api` variants return the same
+/// cache boxed as `dyn CacheApi` or `dyn ZeroCopyCacheApi` for a caller that
+/// wants to hold several kinds behind one type.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MatrixCacheBuilder;
 
@@ -188,6 +260,8 @@ enum EvictionReason {
     Cold,
     LowHit,
     Stale,
+    /// The entry had passed its time to live, so evicting it costs nothing.
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,6 +271,16 @@ struct EvictionScore {
     last_access_epoch: u64,
 }
 
+/// Borrowed bytes from a cache, held resident until the handle is released.
+///
+/// Returned by the [`ZeroCopyCacheApi`] reads. The entry cannot be evicted while
+/// this exists, and its bytes are still counted by `size` -- an entry removed
+/// while pinned is *retired* rather than freed, and only released once the last
+/// handle drops.
+///
+/// Release it through the cache rather than merely dropping it, so the eviction
+/// accounting is told. [`CacheScopedHandle`] does that on drop if you would
+/// rather not track it.
 #[derive(Debug)]
 pub struct CachePinnedHandle {
     pub key: CacheKey,
@@ -270,6 +354,12 @@ impl CachePinnedHandle {
     }
 }
 
+/// A [`CachePinnedHandle`] that releases itself.
+///
+/// Holds the cache alongside the handle so `Drop` can return the pin properly
+/// rather than merely dropping it, which would leave the eviction accounting
+/// believing the entry is still held. Prefer this to a bare handle unless you
+/// need to move the pin somewhere the scope does not reach.
 #[derive(Debug)]
 pub struct CacheScopedHandle {
     cache: MultiLayerCache,
@@ -409,6 +499,11 @@ impl CacheScopedLookup {
     }
 }
 
+/// Which tier served a read.
+///
+/// The read-side counterpart of [`CacheTier`], and deliberately narrower: a
+/// value that was returned necessarily came from somewhere, so there is no
+/// rejection case here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheReadTier {
     Memory,
@@ -432,6 +527,12 @@ pub struct CacheReadResult {
     pub tier: CacheReadTier,
 }
 
+/// A value read from a cache, together with where it came from.
+///
+/// Carries the key, the bytes, the [`CacheReadTier`] that served them and -- when
+/// the read was a pinned one -- the handle keeping them resident. Dropping the
+/// buffer releases that pin, which is why it has a `Drop` impl and why holding
+/// one holds an entry in the cache.
 #[derive(Debug)]
 pub struct CacheBuffer {
     key: String,
@@ -649,15 +750,14 @@ impl From<StringBuffer> for CacheBuffer {
     }
 }
 
-pub type StringBufferPtr = StringBuffer;
 
 #[derive(Debug)]
-pub struct IOBufBuffer {
+pub struct IoBufBuffer {
     key: String,
     value: Vec<u8>,
 }
 
-impl IOBufBuffer {
+impl IoBufBuffer {
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
         Self {
             key: String::new(),
@@ -724,8 +824,8 @@ impl IOBufBuffer {
     }
 }
 
-impl From<IOBufBuffer> for CacheBuffer {
-    fn from(buffer: IOBufBuffer) -> Self {
+impl From<IoBufBuffer> for CacheBuffer {
+    fn from(buffer: IoBufBuffer) -> Self {
         let mut converted = CacheBuffer::new(buffer.value);
         converted.set_key(buffer.key);
         converted
@@ -736,7 +836,7 @@ impl From<IOBufBuffer> for CacheBuffer {
 pub struct RawBuffer {
     key: String,
     value: Option<Vec<u8>>,
-    storage_engine: Option<StorageEngineType>,
+    storage_engine: Option<StorageEngineKind>,
     async_delete: bool,
 }
 
@@ -752,7 +852,7 @@ impl RawBuffer {
 
     pub fn with_storage_engine(
         value: impl Into<Vec<u8>>,
-        storage_engine: StorageEngineType,
+        storage_engine: StorageEngineKind,
         async_delete: bool,
     ) -> Self {
         Self {
@@ -789,7 +889,7 @@ impl RawBuffer {
         self.value.as_ref().map_or(0, Vec::len)
     }
 
-    pub fn storage_engine(&self) -> Option<StorageEngineType> {
+    pub fn storage_engine(&self) -> Option<StorageEngineKind> {
         self.storage_engine
     }
 
@@ -852,13 +952,28 @@ impl From<RawBuffer> for CacheBuffer {
     }
 }
 
-pub type RawBufferPtr = RawBuffer;
 
+/// Receives each record found while a tier is recovered at startup.
+///
+/// `on_recover_data` is called once per record read back from persistent
+/// storage, in the order the store enumerates them, before the cache is
+/// serving.
 pub trait RecoverDataCallback {
     fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer);
 }
 
-pub trait GCCopyCallback {
+/// Repairs an index when collection moves a record.
+///
+/// `update` is handed the record's new location so an index pointing at the old
+/// one can be corrected.
+///
+/// **Nothing in this crate calls it.** Collection here sweeps freed slots rather
+/// than relocating live ones, so no record ever changes address and the callback
+/// has no occasion to fire. It is implemented — [`CacheInstance`] provides it —
+/// for callers driving collection themselves, and to keep the surface the
+/// reference defines, where collection does compact and an implementor that
+/// ignored this would be left with dangling entries.
+pub trait GcCopyCallback {
     fn update(
         &mut self,
         key: &str,
@@ -870,7 +985,7 @@ pub trait GCCopyCallback {
 #[derive(Debug, Default)]
 pub struct RecoverDataCallbackMock {
     last_recover_key: String,
-    recovered_record_cnt: i64,
+    recovered_record_count: i64,
     recovered: Vec<(String, CacheBuffer)>,
 }
 
@@ -879,12 +994,12 @@ impl RecoverDataCallbackMock {
         Self::default()
     }
 
-    pub fn get_last_recover_key(&self) -> &str {
+    pub fn last_recover_key(&self) -> &str {
         &self.last_recover_key
     }
 
-    pub fn get_recovered_record_cnt(&self) -> i64 {
-        self.recovered_record_cnt
+    pub fn recovered_record_count(&self) -> i64 {
+        self.recovered_record_count
     }
 
     pub fn recovered(&self) -> &[(String, CacheBuffer)] {
@@ -893,12 +1008,12 @@ impl RecoverDataCallbackMock {
 
     #[allow(non_snake_case)]
     pub fn GetLastRecoverKey(&self) -> &str {
-        self.get_last_recover_key()
+        self.last_recover_key()
     }
 
     #[allow(non_snake_case)]
     pub fn GetRecoveredRecordCnt(&self) -> i64 {
-        self.get_recovered_record_cnt()
+        self.recovered_record_count()
     }
 
     #[allow(non_snake_case)]
@@ -910,17 +1025,17 @@ impl RecoverDataCallbackMock {
 impl RecoverDataCallback for RecoverDataCallbackMock {
     fn on_recover_data(&mut self, key: &str, buffer: CacheBuffer) {
         self.last_recover_key = key.to_string();
-        self.recovered_record_cnt = self.recovered_record_cnt.saturating_add(1);
+        self.recovered_record_count = self.recovered_record_count.saturating_add(1);
         self.recovered.push((key.to_string(), buffer));
     }
 }
 
 #[derive(Debug, Default)]
-pub struct GCCopyCallbackMock {
+pub struct GcCopyCallbackMock {
     map: HashMap<String, CacheBuffer>,
 }
 
-impl GCCopyCallbackMock {
+impl GcCopyCallbackMock {
     pub fn new() -> Self {
         Self::default()
     }
@@ -977,7 +1092,7 @@ impl GCCopyCallbackMock {
     }
 }
 
-impl GCCopyCallback for GCCopyCallbackMock {
+impl GcCopyCallback for GcCopyCallbackMock {
     fn update(
         &mut self,
         key: &str,
@@ -993,6 +1108,15 @@ impl GCCopyCallback for GCCopyCallbackMock {
     }
 }
 
+/// What a tier's storage engine must provide.
+///
+/// Implemented by [`StorageEngineRocksDb`] (the default SSD backend),
+/// [`StorageEngineSimple`] (the file-backed store used when the `rocksdb-ssd`
+/// feature is off) and [`StorageEngineMultiSsd`] (several device paths, one
+/// chosen per key by hash).
+///
+/// `peek` is the read that does not disturb anything the engine tracks; `get` is
+/// the ordinary one.
 pub trait StorageEngineApi {
     fn start(&mut self) -> bool;
     fn stop(&mut self) -> bool;
@@ -1012,13 +1136,13 @@ pub trait StorageEngineApi {
     fn set_capacity(&mut self, capacity: u64);
     fn capacity(&self) -> u64;
     fn is_started(&self) -> bool;
-    fn storage_engine_type(&self) -> StorageEngineType;
+    fn storage_engine_type(&self) -> StorageEngineKind;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemStorageRecordHandle {
-    pub record_ptr: AllocatorPtr,
-    pub data_ptr: AllocatorPtr,
+    pub record_address: AllocatorAddress,
+    pub data_address: AllocatorAddress,
     pub record_len: usize,
     pub value_len: usize,
     pub key_len: usize,
@@ -1026,7 +1150,7 @@ pub struct MemStorageRecordHandle {
 
 impl MemStorageRecordHandle {
     pub fn payload_offset(&self) -> usize {
-        self.data_ptr.saturating_sub(self.record_ptr)
+        self.data_address.saturating_sub(self.record_address)
     }
 
     #[allow(non_snake_case)]
@@ -1035,13 +1159,13 @@ impl MemStorageRecordHandle {
     }
 
     #[allow(non_snake_case)]
-    pub fn RecordPtr(&self) -> AllocatorPtr {
-        self.record_ptr
+    pub fn RecordPtr(&self) -> AllocatorAddress {
+        self.record_address
     }
 
     #[allow(non_snake_case)]
-    pub fn DataPtr(&self) -> AllocatorPtr {
-        self.data_ptr
+    pub fn DataPtr(&self) -> AllocatorAddress {
+        self.data_address
     }
 
     #[allow(non_snake_case)]
@@ -1144,18 +1268,18 @@ impl MemStorage {
         A: MemStorageAllocatorApi,
     {
         let record = Self::do_put_with_crc(key, value, crc)?;
-        let record_ptr = allocator.allocate(record.len())?;
-        if let Err(err) = allocator.write_region(record_ptr, &record) {
-            let _ = allocator.free(record_ptr, record.len());
+        let record_address = allocator.allocate(record.len())?;
+        if let Err(err) = allocator.write_region(record_address, &record) {
+            let _ = allocator.free(record_address, record.len());
             return Err(err);
         }
-        if let Err(err) = allocator.seal_with_crc(record_ptr, record.len(), crc) {
-            let _ = allocator.free(record_ptr, record.len());
+        if let Err(err) = allocator.seal_with_crc(record_address, record.len(), crc) {
+            let _ = allocator.free(record_address, record.len());
             return Err(err);
         }
         Ok(MemStorageRecordHandle {
-            record_ptr,
-            data_ptr: record_ptr.saturating_add(Self::HEADER_BYTES),
+            record_address,
+            data_address: record_address.saturating_add(Self::HEADER_BYTES),
             record_len: record.len(),
             value_len: value.len(),
             key_len: key.len(),
@@ -1190,7 +1314,7 @@ impl MemStorage {
 
     pub fn create_cache_buffer_from_data(
         data: &[u8],
-        storage_engine: StorageEngineType,
+        storage_engine: StorageEngineKind,
         async_delete: bool,
     ) -> Result<CacheBuffer, CacheError> {
         let key = Self::get_key_from_data(data)?.to_string();
@@ -1203,13 +1327,13 @@ impl MemStorage {
     pub fn create_cache_buffer_from_allocator_data<A>(
         allocator: &A,
         handle: MemStorageRecordHandle,
-        storage_engine: StorageEngineType,
+        storage_engine: StorageEngineKind,
         async_delete: bool,
     ) -> Result<CacheBuffer, CacheError>
     where
         A: MemStorageAllocatorApi,
     {
-        let record = allocator.read_region(handle.record_ptr)?;
+        let record = allocator.read_region(handle.record_address)?;
         let expected_offset = Self::HEADER_BYTES;
         if handle.payload_offset() != expected_offset {
             return Err(CacheError::CorruptBlock(
@@ -1231,7 +1355,7 @@ impl MemStorage {
         A: MemStorageAllocatorApi,
     {
         let (value_len, key_len, record_len) = {
-            let record = allocator.read_region(handle.record_ptr)?;
+            let record = allocator.read_region(handle.record_address)?;
             let (value_len, key_len) = Self::record_lengths(record)?;
             let record_len = Self::HEADER_BYTES
                 .saturating_add(value_len)
@@ -1246,7 +1370,7 @@ impl MemStorage {
                 "mem storage handle length mismatch".to_string(),
             ));
         }
-        allocator.free(handle.record_ptr, handle.record_len)
+        allocator.free(handle.record_address, handle.record_len)
     }
 
     fn record_lengths(data: &[u8]) -> Result<(usize, usize), CacheError> {
@@ -1331,7 +1455,7 @@ impl MemStorage {
     #[allow(non_snake_case)]
     pub fn CreateCacheBufferFromData(
         data: &[u8],
-        storage_engine: StorageEngineType,
+        storage_engine: StorageEngineKind,
         async_delete: bool,
     ) -> Result<CacheBuffer, CacheError> {
         Self::create_cache_buffer_from_data(data, storage_engine, async_delete)
@@ -1341,7 +1465,7 @@ impl MemStorage {
     pub fn CreateCacheBufferFromAllocatorData<A>(
         allocator: &A,
         handle: MemStorageRecordHandle,
-        storage_engine: StorageEngineType,
+        storage_engine: StorageEngineKind,
         async_delete: bool,
     ) -> Result<CacheBuffer, CacheError>
     where
@@ -1401,7 +1525,7 @@ impl PmemAllocatorRecoverListenerImpl {
                 continue;
             };
             let buffer =
-                MemStorage::create_cache_buffer_from_data(record, StorageEngineType::Pmem, true)?;
+                MemStorage::create_cache_buffer_from_data(record, StorageEngineKind::Pmem, true)?;
             callback.on_recover_data(&key, buffer);
             valid_records = valid_records.saturating_add(1);
         }
@@ -1432,6 +1556,19 @@ impl PmemAllocatorRecoverListenerImpl {
 }
 
 #[derive(Debug, Clone)]
+/// An in-memory storage engine: a `HashMap<String, Vec<u8>>` with a capacity.
+///
+/// Also what [`StorageEngineDram`] and [`StorageEnginePmem`] name -- both are
+/// aliases for this type, so the three tier names share one implementation and
+/// differ only in what a signature calls them. Nothing in this crate constructs
+/// any of the three; the tiers of a [`MultiLayerCache`] are owned directly.
+///
+/// It implements more than the reference engine of the same name, which returns
+/// "not implemented" from `Get` and from recovery. In particular
+/// [`StorageEngineApi::recover_data`] here succeeds by replaying the records it
+/// currently holds, rather than reporting that a volatile tier has nothing to
+/// recover. On a fresh instance that is a successful recovery of zero records,
+/// which is not the same answer as "this tier cannot be recovered".
 pub struct StorageEngineSimple {
     initialized: bool,
     capacity: u64,
@@ -1464,10 +1601,10 @@ impl StorageEngineSimple {
     }
 
     fn buffer_from_record(&self, record: &[u8]) -> Result<CacheBuffer, CacheError> {
-        MemStorage::create_cache_buffer_from_data(record, StorageEngineType::Simple, false)
+        MemStorage::create_cache_buffer_from_data(record, StorageEngineKind::Simple, false)
     }
 
-    pub fn test_get_num_delete_completed_count(&self) -> u32 {
+    pub fn test_num_delete_completed_count(&self) -> u32 {
         self.delete_completed_count
     }
 
@@ -1486,7 +1623,7 @@ impl StorageEngineSimple {
         self.put(key, value)
     }
 
-    pub fn test_get_recover_stats(&self) -> PmemRecoverStats {
+    pub fn test_recover_stats(&self) -> PmemRecoverStats {
         let mut stats = PmemRecoverStats::default();
         for record in self.records.values() {
             match (
@@ -1633,8 +1770,8 @@ impl StorageEngineApi for StorageEngineSimple {
         self.initialized
     }
 
-    fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::Simple
+    fn storage_engine_type(&self) -> StorageEngineKind {
+        StorageEngineKind::Simple
     }
 }
 
@@ -1698,12 +1835,12 @@ impl StorageEngineSimple {
         self.capacity()
     }
 
-    pub fn StorageEngineType(&self) -> StorageEngineType {
+    pub fn StorageEngineType(&self) -> StorageEngineKind {
         self.storage_engine_type()
     }
 
     pub fn TEST_GetNumDeleteCompletedCount(&self) -> u32 {
-        self.test_get_num_delete_completed_count()
+        self.test_num_delete_completed_count()
     }
 
     pub fn TEST_IncreaseDeleteCompletedCount(&mut self) {
@@ -1724,17 +1861,35 @@ impl StorageEngineSimple {
     }
 
     pub fn TEST_GetRecoverStats(&self) -> PmemRecoverStats {
-        self.test_get_recover_stats()
+        self.test_recover_stats()
     }
 }
 
 pub type StorageEngineDram = StorageEngineSimple;
-pub type StorageEnginePMem = StorageEngineSimple;
+pub type StorageEnginePmem = StorageEngineSimple;
 
-pub struct StorageEngineRocksDB {
+/// The default SSD engine, backed by RocksDB.
+///
+/// Present only with the `rocksdb-ssd` feature, which is on by default. Keeps an
+/// in-memory index alongside the database so `peek` and capacity accounting do
+/// not have to touch it; `recover_data` walks the database itself, which is what
+/// makes a restart able to re-enumerate what is on disk.
+pub struct StorageEngineRocksDb {
     db_path: String,
     initialized: bool,
     records: HashMap<String, Vec<u8>>,
+    /// Bytes appended to the journal since the last snapshot, so compaction
+    /// can be triggered by how much has accumulated rather than by a count of
+    /// operations, which says nothing about the size of them.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    journal_bytes: u64,
+    /// How large the snapshot was when it was last written or read.
+    ///
+    /// Compaction compares the journal against it, and that comparison happens
+    /// on every append. Asking the filesystem each time cost one `statx` per
+    /// write -- and failed, because before the first compaction there is no
+    /// snapshot to stat. The size is known at the two moments it changes.
+    snapshot_bytes: u64,
     recover_finished: bool,
     capacity: u64,
     #[cfg(feature = "rocksdb-ssd")]
@@ -1745,9 +1900,9 @@ pub struct StorageEngineRocksDB {
 static ROCKSDB_HANDLE_REGISTRY: OnceLock<Mutex<HashMap<String, std::sync::Weak<rocksdb::DB>>>> =
     OnceLock::new();
 
-impl std::fmt::Debug for StorageEngineRocksDB {
+impl std::fmt::Debug for StorageEngineRocksDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageEngineRocksDB")
+        f.debug_struct("StorageEngineRocksDb")
             .field("db_path", &self.db_path)
             .field("initialized", &self.initialized)
             .field("records", &self.records)
@@ -1757,12 +1912,15 @@ impl std::fmt::Debug for StorageEngineRocksDB {
     }
 }
 
-impl Clone for StorageEngineRocksDB {
+impl Clone for StorageEngineRocksDb {
     fn clone(&self) -> Self {
         Self {
             db_path: self.db_path.clone(),
             initialized: self.initialized,
             records: self.records.clone(),
+            #[cfg(not(feature = "rocksdb-ssd"))]
+            journal_bytes: self.journal_bytes,
+            snapshot_bytes: self.snapshot_bytes,
             recover_finished: self.recover_finished,
             capacity: self.capacity,
             #[cfg(feature = "rocksdb-ssd")]
@@ -1771,17 +1929,34 @@ impl Clone for StorageEngineRocksDB {
     }
 }
 
-impl StorageEngineRocksDB {
+impl StorageEngineRocksDb {
     #[cfg(not(feature = "rocksdb-ssd"))]
     const STORE_FILE_NAME: &'static str = "matrixcache_rocksdb_compat_store.bin";
     #[cfg(not(feature = "rocksdb-ssd"))]
     const STORE_MAGIC: &'static [u8] = b"matrixcache-rocksdb-v1\0";
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const JOURNAL_FILE_NAME: &'static str = "matrixcache_rocksdb_compat_journal.bin";
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const JOURNAL_MAGIC: &'static [u8] = b"matrixcache-rocksdb-journal-v1\0";
+    /// A journal is compacted once it is larger than the snapshot it is
+    /// appended to, so the bytes written to keep a store of n records is
+    /// proportional to n rather than to n squared: each snapshot is paid for
+    /// by at least its own size in appends.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const JOURNAL_COMPACTION_FLOOR_BYTES: u64 = 64 * 1024;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const JOURNAL_PUT: u8 = 1;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const JOURNAL_DELETE: u8 = 2;
 
     pub fn new(db_path: impl Into<String>) -> Self {
         Self {
             db_path: db_path.into(),
             initialized: false,
             records: HashMap::new(),
+            #[cfg(not(feature = "rocksdb-ssd"))]
+            journal_bytes: 0,
+            snapshot_bytes: 0,
             recover_finished: false,
             capacity: u64::MAX,
             #[cfg(feature = "rocksdb-ssd")]
@@ -1879,13 +2054,143 @@ impl StorageEngineRocksDB {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
+    fn journal_path(&self) -> PathBuf {
+        PathBuf::from(&self.db_path).join(Self::JOURNAL_FILE_NAME)
+    }
+
+    /// Record one change, and take a fresh snapshot once enough have built up.
+    ///
+    /// The store used to be rewritten in full after every put, which costs the
+    /// whole store per write and so n squared to fill it: measured, 250, 500
+    /// and 1000 puts wrote 3.4 MB, 13.3 MB and 53.0 MB -- four times the bytes
+    /// for twice the entries, each time.
+    ///
+    /// An append also cannot destroy what is already there. `fs::write`
+    /// truncates first, so a crash during any put left the store shorter than
+    /// it should be, and it is the whole store.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn journal_change(&mut self, key: &str, value: Option<&[u8]>) -> Result<(), CacheError> {
+        let mut record = Vec::with_capacity(key.len() + value.map_or(0, <[u8]>::len) + 24);
+        match value {
+            Some(value) => {
+                record.push(Self::JOURNAL_PUT);
+                put_fixed_uint64(&mut record, key.len() as u64);
+                put_fixed_uint64(&mut record, value.len() as u64);
+                record.extend_from_slice(key.as_bytes());
+                record.extend_from_slice(value);
+            }
+            None => {
+                record.push(Self::JOURNAL_DELETE);
+                put_fixed_uint64(&mut record, key.len() as u64);
+                record.extend_from_slice(key.as_bytes());
+            }
+        }
+
+        let path = self.journal_path();
+        let directory = PathBuf::from(&self.db_path);
+        let appended = record.len() as u64;
+        creating_the_directory_if_missing(&directory, || {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(CacheError::Io)?;
+            use std::io::Write as _;
+            if file.metadata().map_err(CacheError::Io)?.len() == 0 {
+                file.write_all(Self::JOURNAL_MAGIC).map_err(CacheError::Io)?;
+            }
+            file.write_all(&record).map_err(CacheError::Io)
+        })?;
+        self.journal_bytes = self.journal_bytes.saturating_add(appended);
+
+        // Compact when the journal has grown past the snapshot it sits beside,
+        // so the cost of snapshots is spread across at least their own size in
+        // appends. The floor keeps a small store from snapshotting constantly.
+        if self.journal_bytes > self.snapshot_bytes.max(Self::JOURNAL_COMPACTION_FLOOR_BYTES) {
+            self.persist_records()?;
+        }
+        Ok(())
+    }
+
+    /// Replay the journal over the snapshot.
+    ///
+    /// Applied in order, so a later delete removes an earlier put, exactly as
+    /// the operations happened. A journal that ends mid-record is truncated
+    /// rather than rejected: a torn tail is a write that was interrupted, and
+    /// the records before it are still the ones that were made.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn replay_journal(&mut self) -> Result<(), CacheError> {
+        let path = self.journal_path();
+        let Ok(raw) = fs::read(&path) else {
+            self.journal_bytes = 0;
+            return Ok(());
+        };
+        if !raw.starts_with(Self::JOURNAL_MAGIC) {
+            if raw.is_empty() {
+                self.journal_bytes = 0;
+                return Ok(());
+            }
+            return Err(CacheError::CorruptBlock(
+                "rocksdb compatibility journal has invalid magic".to_string(),
+            ));
+        }
+        let mut offset = Self::JOURNAL_MAGIC.len();
+        while offset < raw.len() {
+            let tag = raw[offset];
+            offset += 1;
+            let Some((key_len, next)) = get_fixed_uint64(&raw, offset) else {
+                break;
+            };
+            offset = next;
+            let value_len = if tag == Self::JOURNAL_PUT {
+                let Some((value_len, next)) = get_fixed_uint64(&raw, offset) else {
+                    break;
+                };
+                offset = next;
+                value_len as usize
+            } else if tag == Self::JOURNAL_DELETE {
+                0
+            } else {
+                return Err(CacheError::CorruptBlock(
+                    "rocksdb compatibility journal has an unknown operation".to_string(),
+                ));
+            };
+            let key_end = offset + key_len as usize;
+            let value_end = key_end + value_len;
+            if value_end > raw.len() {
+                break;
+            }
+            let Ok(key) = std::str::from_utf8(&raw[offset..key_end]) else {
+                return Err(CacheError::CorruptBlock(
+                    "rocksdb compatibility journal key is not utf8".to_string(),
+                ));
+            };
+            if tag == Self::JOURNAL_PUT {
+                self.records
+                    .insert(key.to_string(), raw[key_end..value_end].to_vec());
+            } else {
+                self.records.remove(key);
+            }
+            offset = value_end;
+        }
+        self.journal_bytes = raw.len() as u64;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn load_records(&mut self) -> Result<(), CacheError> {
         let store_path = self.store_path();
         if !store_path.exists() {
+            // No snapshot yet does not mean no records: everything written
+            // since the last compaction is in the journal, and before the
+            // first compaction that is everything there is.
             self.records.clear();
-            return Ok(());
+            self.snapshot_bytes = 0;
+            return self.replay_journal();
         }
         let raw = fs::read(store_path)?;
+        // The other moment the snapshot's size is known without asking for it.
+        self.snapshot_bytes = raw.len() as u64;
         if raw.len() < Self::STORE_MAGIC.len() || !raw.starts_with(Self::STORE_MAGIC) {
             return Err(CacheError::CorruptBlock(
                 "rocksdb compatibility store has invalid magic".to_string(),
@@ -1934,11 +2239,11 @@ impl StorageEngineRocksDB {
             ));
         }
         self.records = records;
-        Ok(())
+        self.replay_journal()
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    fn persist_records(&self) -> Result<(), CacheError> {
+    fn persist_records(&mut self) -> Result<(), CacheError> {
         let path = PathBuf::from(&self.db_path);
         fs::create_dir_all(&path)?;
         let mut raw = Vec::new();
@@ -1956,7 +2261,16 @@ impl StorageEngineRocksDB {
             raw.extend_from_slice(key.as_bytes());
             raw.extend_from_slice(value);
         }
-        fs::write(self.store_path(), raw)?;
+        // Written beside the store and renamed over it, so a crash leaves
+        // either the previous snapshot or the new one, never half of either.
+        let temporary = path.join(format!("{}.tmp.{}", Self::STORE_FILE_NAME, std::process::id()));
+        let written = raw.len() as u64;
+        fs::write(&temporary, raw)?;
+        fs::rename(&temporary, self.store_path())?;
+        self.snapshot_bytes = written;
+        // Everything in the journal is now in the snapshot.
+        let _ = fs::remove_file(self.journal_path());
+        self.journal_bytes = 0;
         Ok(())
     }
 
@@ -1984,7 +2298,12 @@ impl StorageEngineRocksDB {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             self.records.insert(key.to_string(), value);
-            self.persist_records()?;
+            let recorded = self
+                .records
+                .get(key)
+                .expect("the record just inserted must be present")
+                .clone();
+            self.journal_change(key, Some(&recorded))?;
         }
         Ok(view)
     }
@@ -2058,9 +2377,14 @@ impl StorageEngineRocksDB {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             for (key, value) in coalesced {
-                self.records.insert(key, value);
+                self.records.insert(key.clone(), value);
+                let recorded = self
+                    .records
+                    .get(&key)
+                    .expect("the record just inserted must be present")
+                    .clone();
+                self.journal_change(&key, Some(&recorded))?;
             }
-            self.persist_records()?;
         }
         Ok(count)
     }
@@ -2105,10 +2429,8 @@ impl StorageEngineRocksDB {
             for key in &unique_keys {
                 if self.records.remove(key).is_some() {
                     deleted = deleted.saturating_add(1);
+                    self.journal_change(key, None)?;
                 }
-            }
-            if deleted > 0 {
-                self.persist_records()?;
             }
         }
         Ok(deleted)
@@ -2189,7 +2511,7 @@ impl StorageEngineRocksDB {
     }
 }
 
-impl StorageEngineApi for StorageEngineRocksDB {
+impl StorageEngineApi for StorageEngineRocksDb {
     fn start(&mut self) -> bool {
         let path = PathBuf::from(&self.db_path);
         if path.is_file() {
@@ -2337,7 +2659,7 @@ impl StorageEngineApi for StorageEngineRocksDB {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             self.records.remove(key).ok_or(CacheError::NotFound)?;
-            self.persist_records()
+            self.journal_change(key, None)
         }
     }
 
@@ -2413,13 +2735,13 @@ impl StorageEngineApi for StorageEngineRocksDB {
         self.initialized
     }
 
-    fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::Ssd
+    fn storage_engine_type(&self) -> StorageEngineKind {
+        StorageEngineKind::Ssd
     }
 }
 
 #[allow(non_snake_case)]
-impl StorageEngineRocksDB {
+impl StorageEngineRocksDb {
     pub fn Start(&mut self) -> bool {
         self.start()
     }
@@ -2478,7 +2800,7 @@ impl StorageEngineRocksDB {
         self.capacity()
     }
 
-    pub fn StorageEngineType(&self) -> StorageEngineType {
+    pub fn StorageEngineType(&self) -> StorageEngineKind {
         self.storage_engine_type()
     }
 
@@ -2487,20 +2809,30 @@ impl StorageEngineRocksDB {
     }
 }
 
-pub type StorageEngineSSD = StorageEngineRocksDB;
+pub type StorageEngineSsd = StorageEngineRocksDb;
 
 #[derive(Debug, Clone)]
-pub struct StorageEngineMultiSSD {
+/// Several SSD devices behind one engine, one chosen per key by hash.
+///
+/// Each device is a [`StorageEngineRocksDb`] over its own path. **The capacity is
+/// per device, not shared**: setting it applies the same figure to every device,
+/// so total capacity is the capacity times the device count -- matching the
+/// reference, whose field carries the same caveat.
+///
+/// Devices can be added and removed while running. Removing one drops the data
+/// it held, and because placement is by hash of the key, changing the device set
+/// changes where subsequent keys land.
+pub struct StorageEngineMultiSsd {
     paths: Vec<String>,
-    storages: Vec<StorageEngineRocksDB>,
+    storages: Vec<StorageEngineRocksDb>,
     capacity: u64,
     initialized: bool,
-    ssdcache_type: StorageEngineType,
+    ssdcache_type: StorageEngineKind,
 }
 
-impl StorageEngineMultiSSD {
+impl StorageEngineMultiSsd {
     pub fn new(paths: impl IntoIterator<Item = String>, capacity: u64) -> Self {
-        Self::with_type(paths, capacity, StorageEngineType::Ssd)
+        Self::with_type(paths, capacity, StorageEngineKind::Ssd)
     }
 
     pub fn with_paths(paths: impl IntoIterator<Item = PathBuf>, capacity: u64) -> Self {
@@ -2515,7 +2847,7 @@ impl StorageEngineMultiSSD {
     pub fn with_type(
         paths: impl IntoIterator<Item = String>,
         capacity: u64,
-        ssdcache_type: StorageEngineType,
+        ssdcache_type: StorageEngineKind,
     ) -> Self {
         Self {
             paths: paths.into_iter().collect(),
@@ -2542,8 +2874,8 @@ impl StorageEngineMultiSSD {
         true
     }
 
-    fn create_storage_by_device_path(&self, path: &str) -> StorageEngineRocksDB {
-        let mut storage = StorageEngineRocksDB::new(path.to_string());
+    fn create_storage_by_device_path(&self, path: &str) -> StorageEngineRocksDb {
+        let mut storage = StorageEngineRocksDb::new(path.to_string());
         if self.capacity != 0 {
             storage.SetCapacity(self.capacity);
         }
@@ -2623,7 +2955,7 @@ impl StorageEngineMultiSSD {
         self.paths.get(index).map(String::as_str)
     }
 
-    pub fn ssdcache_type(&self) -> StorageEngineType {
+    pub fn ssdcache_type(&self) -> StorageEngineKind {
         self.ssdcache_type
     }
 
@@ -2651,9 +2983,13 @@ impl StorageEngineMultiSSD {
         self.remove_device(path)
     }
 
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
     #[allow(non_snake_case)]
     pub fn PathCount(&self) -> usize {
-        self.paths.len()
+        self.path_count()
     }
 
     #[allow(non_snake_case)]
@@ -2662,7 +2998,7 @@ impl StorageEngineMultiSSD {
     }
 }
 
-impl StorageEngineApi for StorageEngineMultiSSD {
+impl StorageEngineApi for StorageEngineMultiSsd {
     fn start(&mut self) -> bool {
         if self.initialized {
             return true;
@@ -2781,13 +3117,13 @@ impl StorageEngineApi for StorageEngineMultiSSD {
         self.initialized
     }
 
-    fn storage_engine_type(&self) -> StorageEngineType {
-        StorageEngineType::MultiSsd
+    fn storage_engine_type(&self) -> StorageEngineKind {
+        StorageEngineKind::MultiSsd
     }
 }
 
 #[allow(non_snake_case)]
-impl StorageEngineMultiSSD {
+impl StorageEngineMultiSsd {
     pub fn Start(&mut self) -> bool {
         self.start()
     }
@@ -2846,7 +3182,7 @@ impl StorageEngineMultiSSD {
         self.capacity()
     }
 
-    pub fn StorageEngineType(&self) -> StorageEngineType {
+    pub fn StorageEngineType(&self) -> StorageEngineKind {
         self.storage_engine_type()
     }
 }
@@ -2868,7 +3204,7 @@ fn cache_error_for_callback(err: &CacheError) -> CacheError {
     }
 }
 
-type AsyncWriteResult = Result<AllocatorPtr, CacheError>;
+type AsyncWriteResult = Result<AllocatorAddress, CacheError>;
 type AsyncWriteFunc =
     Box<dyn FnOnce(&mut SimpleLogBasedMemoryAllocator) -> AsyncWriteResult + Send + 'static>;
 type AsyncWriteCallback = Box<
@@ -2880,7 +3216,7 @@ type AsyncWriteCallback = Box<
 pub struct AsyncWriteTask {
     write_func: Option<AsyncWriteFunc>,
     callback_func: Option<AsyncWriteCallback>,
-    addr: Option<AllocatorPtr>,
+    addr: Option<AllocatorAddress>,
 }
 
 impl AsyncWriteTask {
@@ -2901,7 +3237,7 @@ impl AsyncWriteTask {
         }
     }
 
-    pub fn with_addr<W, C>(write_func: W, callback_func: C, addr: AllocatorPtr) -> Self
+    pub fn with_addr<W, C>(write_func: W, callback_func: C, addr: AllocatorAddress) -> Self
     where
         W: FnOnce(&mut SimpleLogBasedMemoryAllocator) -> AsyncWriteResult + Send + 'static,
         C: FnOnce(
@@ -2918,12 +3254,12 @@ impl AsyncWriteTask {
         }
     }
 
-    pub fn addr(&self) -> Option<AllocatorPtr> {
+    pub fn addr(&self) -> Option<AllocatorAddress> {
         self.addr
     }
 
     #[allow(non_snake_case)]
-    pub fn Addr(&self) -> Option<AllocatorPtr> {
+    pub fn Addr(&self) -> Option<AllocatorAddress> {
         self.addr()
     }
 }
@@ -2931,10 +3267,10 @@ impl AsyncWriteTask {
 pub struct AsyncWriter {
     allocator: SimpleLogBasedMemoryAllocator,
     stopped: bool,
-    fly_write_num: u64,
-    fly_cb_num: u64,
-    completed_write_num: u64,
-    completed_cb_num: u64,
+    in_flight_write_count: u64,
+    in_flight_callback_count: u64,
+    completed_write_count: u64,
+    completed_callback_count: u64,
 }
 
 impl AsyncWriter {
@@ -2942,10 +3278,10 @@ impl AsyncWriter {
         Self {
             allocator,
             stopped: false,
-            fly_write_num: 0,
-            fly_cb_num: 0,
-            completed_write_num: 0,
-            completed_cb_num: 0,
+            in_flight_write_count: 0,
+            in_flight_callback_count: 0,
+            completed_write_count: 0,
+            completed_callback_count: 0,
         }
     }
 
@@ -2962,23 +3298,23 @@ impl AsyncWriter {
             .take()
             .ok_or_else(|| CacheError::CorruptBlock("missing async write callback".to_string()))?;
 
-        self.fly_write_num = self.fly_write_num.saturating_add(1);
+        self.in_flight_write_count = self.in_flight_write_count.saturating_add(1);
         let write_result = write(&mut self.allocator);
-        self.fly_write_num = self.fly_write_num.saturating_sub(1);
-        self.completed_write_num = self.completed_write_num.saturating_add(1);
+        self.in_flight_write_count = self.in_flight_write_count.saturating_sub(1);
+        self.completed_write_count = self.completed_write_count.saturating_add(1);
 
-        self.fly_cb_num = self.fly_cb_num.saturating_add(1);
+        self.in_flight_callback_count = self.in_flight_callback_count.saturating_add(1);
         let callback_result = callback(write_result, &self.allocator);
-        self.fly_cb_num = self.fly_cb_num.saturating_sub(1);
-        self.completed_cb_num = self.completed_cb_num.saturating_add(1);
+        self.in_flight_callback_count = self.in_flight_callback_count.saturating_sub(1);
+        self.completed_callback_count = self.completed_callback_count.saturating_add(1);
         callback_result
     }
 
-    // Completion barrier: `fly_write_num`/`fly_cb_num` are maintained by the write
+    // Completion barrier: `in_flight_write_count`/`in_flight_callback_count` are maintained by the write
     // executor's submit/complete accounting, not mutated in this spin body.
     #[allow(clippy::while_immutable_condition)]
     pub fn stop(&mut self) {
-        while self.fly_write_num != 0 || self.fly_cb_num != 0 {
+        while self.in_flight_write_count != 0 || self.in_flight_callback_count != 0 {
             std::thread::yield_now();
         }
         self.stopped = true;
@@ -2986,7 +3322,7 @@ impl AsyncWriter {
 
     #[allow(clippy::while_immutable_condition)]
     pub fn test_join_write_executor(&mut self) {
-        while self.fly_write_num != 0 {
+        while self.in_flight_write_count != 0 {
             std::thread::yield_now();
         }
     }
@@ -3000,19 +3336,19 @@ impl AsyncWriter {
     }
 
     pub fn in_flight_writes(&self) -> u64 {
-        self.fly_write_num
+        self.in_flight_write_count
     }
 
     pub fn in_flight_callbacks(&self) -> u64 {
-        self.fly_cb_num
+        self.in_flight_callback_count
     }
 
     pub fn completed_writes(&self) -> u64 {
-        self.completed_write_num
+        self.completed_write_count
     }
 
     pub fn completed_callbacks(&self) -> u64 {
-        self.completed_cb_num
+        self.completed_callback_count
     }
 
     #[allow(non_snake_case)]
@@ -3041,19 +3377,19 @@ impl AsyncWriter {
     }
 }
 
-pub struct PMemDispatcher {
-    alloc_type: AllocatorType,
+pub struct PmemDispatcher {
+    allocator_kind: AllocatorKind,
     writers: Vec<AsyncWriter>,
     current_numa: usize,
     stopped: bool,
 }
 
-impl PMemDispatcher {
+impl PmemDispatcher {
     pub fn new(numa_count: usize, allocator_capacity: usize) -> Self {
         let numa_count = numa_count.max(1);
         let writers = (0..numa_count)
             .map(|numa_id| {
-                let base_ptr = ((numa_id + 1) as AllocatorPtr) << 48;
+                let base_ptr = ((numa_id + 1) as AllocatorAddress) << 48;
                 AsyncWriter::new(SimpleLogBasedMemoryAllocator::with_capacity_and_base(
                     allocator_capacity,
                     base_ptr,
@@ -3061,7 +3397,7 @@ impl PMemDispatcher {
             })
             .collect();
         Self {
-            alloc_type: AllocatorType::LogBasedAllocator,
+            allocator_kind: AllocatorKind::LogBasedAllocator,
             writers,
             current_numa: 0,
             stopped: true,
@@ -3071,7 +3407,7 @@ impl PMemDispatcher {
     pub fn from_allocators(allocators: Vec<SimpleLogBasedMemoryAllocator>) -> Self {
         let writers = allocators.into_iter().map(AsyncWriter::new).collect();
         Self {
-            alloc_type: AllocatorType::LogBasedAllocator,
+            allocator_kind: AllocatorKind::LogBasedAllocator,
             writers,
             current_numa: 0,
             stopped: true,
@@ -3115,7 +3451,7 @@ impl PMemDispatcher {
         numa_id
     }
 
-    pub fn get_numa_id_by_pmem_addr(&self, addr: AllocatorPtr) -> Option<usize> {
+    pub fn get_numa_id_by_pmem_addr(&self, addr: AllocatorAddress) -> Option<usize> {
         self.writers
             .iter()
             .position(|writer| writer.allocator().Contains(addr))
@@ -3123,7 +3459,7 @@ impl PMemDispatcher {
 
     pub fn get_allocator(
         &mut self,
-        addr: Option<AllocatorPtr>,
+        addr: Option<AllocatorAddress>,
     ) -> Option<&mut SimpleLogBasedMemoryAllocator> {
         if self.writers.is_empty() {
             return None;
@@ -3204,8 +3540,8 @@ impl PMemDispatcher {
         self.writers.len()
     }
 
-    pub fn allocator_type(&self) -> AllocatorType {
-        self.alloc_type
+    pub fn allocator_type(&self) -> AllocatorKind {
+        self.allocator_kind
     }
 
     #[allow(non_snake_case)]
@@ -3226,7 +3562,7 @@ impl PMemDispatcher {
     #[allow(non_snake_case)]
     pub fn GetAllocator(
         &mut self,
-        addr: Option<AllocatorPtr>,
+        addr: Option<AllocatorAddress>,
     ) -> Option<&mut SimpleLogBasedMemoryAllocator> {
         self.get_allocator(addr)
     }
@@ -3252,7 +3588,6 @@ impl PMemDispatcher {
     }
 }
 
-pub type PmemDispatcher = PMemDispatcher;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringViewBuffer {
@@ -3329,4 +3664,3 @@ impl StringViewBuffer {
     }
 }
 
-pub type StringViewBufferPtr = StringViewBuffer;

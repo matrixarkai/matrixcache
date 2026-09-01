@@ -3,8 +3,21 @@
 
 /// Stable shard identifier used to scope cache keys.
 pub type ShardId = u64;
-pub type ChunkID = u64;
+pub type ChunkId = u64;
 
+/// Everything this crate can fail with.
+///
+/// Most variants read directly from their `Display` text. Three are worth
+/// knowing before you match on them:
+///
+/// * `ReplaceMismatch` means a replace found the entry had already changed
+///   since it was read, not that the entry was missing.
+/// * `CorruptBlock` covers a stored record that does not describe itself
+///   consistently -- a failed CRC-32C, or a header whose offsets do not match
+///   the payload that follows it.
+/// * `UnsupportedTier` is what an operation answers when handed
+///   [`CacheTier::Reject`], which names an admission decision rather than a
+///   place data can live.
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("io error: {0}")]
@@ -20,7 +33,7 @@ pub enum CacheError {
     #[error("cache tier does not support this operation: {0:?}")]
     UnsupportedTier(CacheTier),
     #[error("cache instance does not support this operation: {0:?}")]
-    UnsupportedInstance(CacheInstanceType),
+    UnsupportedInstance(CacheInstanceKind),
     #[error("corrupt cache block: {0}")]
     CorruptBlock(String),
     #[error("unsupported cache block codec {0}")]
@@ -92,9 +105,19 @@ pub const CRC_LEN: usize = RDMA_CRC_LEN;
 pub const FAIL_ALLOC: i32 = RDMA_FAIL_ALLOC;
 #[allow(non_upper_case_globals)]
 pub const CRC_MISMATCH: i32 = RDMA_CRC_MISMATCH;
+/// Which medium a remote (RDMA) cache entry lives on.
+///
+/// More than a label: each variant selects the base of its own synthetic address
+/// range (`0x0100_0000` for `Dram`, `0x0200_0000` for `Pmem`, and so on), so an
+/// [`AllocatorAddress`] on the remote side carries its medium in the high bits
+/// and can be recovered from an index entry with `from_code`.
+///
+/// `Invalid` is the unset or unrecognised case rather than a fourth medium, and
+/// it has an address range of its own so a bad value stays distinguishable
+/// instead of aliasing a real one.
 #[repr(u8)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RdmaStorageEngineType {
+pub enum RdmaStorageEngineKind {
     #[default]
     #[serde(alias = "DRAM")]
     Dram = 0,
@@ -106,15 +129,14 @@ pub enum RdmaStorageEngineType {
     Invalid = 3,
 }
 
-#[allow(non_upper_case_globals)]
-impl RdmaStorageEngineType {
+impl RdmaStorageEngineKind {
     pub const DRAM: Self = Self::Dram;
     pub const PMEM: Self = Self::Pmem;
     pub const SSD: Self = Self::Ssd;
     pub const INVALID: Self = Self::Invalid;
 }
 
-impl RdmaStorageEngineType {
+impl RdmaStorageEngineKind {
     pub fn from_code(code: u8) -> Self {
         match code {
             0 => Self::Dram,
@@ -130,14 +152,14 @@ impl RdmaStorageEngineType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RDMAResponse {
+pub struct RdmaResponse {
     buffer: Vec<u8>,
     allocator: StdAllocator,
-    ptr: Option<AllocatorPtr>,
+    ptr: Option<AllocatorAddress>,
     buf_size: usize,
 }
 
-impl Default for RDMAResponse {
+impl Default for RdmaResponse {
     fn default() -> Self {
         Self {
             buffer: Vec::new(),
@@ -148,7 +170,7 @@ impl Default for RDMAResponse {
     }
 }
 
-impl RDMAResponse {
+impl RdmaResponse {
     pub fn new() -> Self {
         Self::default()
     }
@@ -202,25 +224,25 @@ impl RDMAResponse {
         self.clear();
     }
 
-    pub fn get_resp_size(&self) -> usize {
+    pub fn response_size(&self) -> usize {
         self.buf_size
     }
 
     #[allow(non_snake_case)]
     pub fn GetRespSize(&self) -> usize {
-        self.get_resp_size()
+        self.response_size()
     }
 
-    pub fn get_response(&self) -> &[u8] {
+    pub fn response(&self) -> &[u8] {
         &self.buffer
     }
 
     #[allow(non_snake_case)]
     pub fn GetResponse(&self) -> &[u8] {
-        self.get_response()
+        self.response()
     }
 
-    pub fn allocation_addr(&self) -> Option<AllocatorPtr> {
+    pub fn allocation_addr(&self) -> Option<AllocatorAddress> {
         self.ptr
     }
 
@@ -277,14 +299,19 @@ pub fn IsEqual(left: &[u8], right: &[u8]) -> bool {
     rdma_is_equal(left, right)
 }
 
+/// Allocation over remote (RDMA) memory.
+///
+/// The remote counterpart to [`CacheAllocatorApi`], reduced to what a remote
+/// region needs: `allocate` and `free`, both in terms of an
+/// [`AllocatorAddress`].
 pub trait RdmaCacheAllocatorApi {
-    fn allocate(&mut self, len: usize) -> Option<AllocatorPtr>;
-    fn free(&mut self, addr: AllocatorPtr, len: usize);
+    fn allocate(&mut self, len: usize) -> Option<AllocatorAddress>;
+    fn free(&mut self, addr: AllocatorAddress, len: usize);
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RdmaStdAllocator {
-    outstanding: HashMap<AllocatorPtr, usize>,
+    outstanding: HashMap<AllocatorAddress, usize>,
 }
 
 impl RdmaStdAllocator {
@@ -292,24 +319,24 @@ impl RdmaStdAllocator {
         Self::default()
     }
 
-    pub fn allocate(&mut self, len: usize) -> Option<AllocatorPtr> {
+    pub fn allocate(&mut self, len: usize) -> Option<AllocatorAddress> {
         let addr = allocate_virtual_region(len, 1).ok()?;
         self.outstanding.insert(addr, len);
         Some(addr)
     }
 
     #[allow(non_snake_case)]
-    pub fn Allocate(&mut self, len: usize) -> Option<AllocatorPtr> {
+    pub fn Allocate(&mut self, len: usize) -> Option<AllocatorAddress> {
         self.allocate(len)
     }
 
-    pub fn free(&mut self, addr: AllocatorPtr, _len: usize) {
+    pub fn free(&mut self, addr: AllocatorAddress, _len: usize) {
         self.outstanding.remove(&addr);
         let _ = free_virtual_region(addr);
     }
 
     #[allow(non_snake_case)]
-    pub fn Free(&mut self, addr: AllocatorPtr, len: usize) {
+    pub fn Free(&mut self, addr: AllocatorAddress, len: usize) {
         self.free(addr, len);
     }
 
@@ -323,11 +350,11 @@ impl RdmaStdAllocator {
 }
 
 impl RdmaCacheAllocatorApi for RdmaStdAllocator {
-    fn allocate(&mut self, len: usize) -> Option<AllocatorPtr> {
+    fn allocate(&mut self, len: usize) -> Option<AllocatorAddress> {
         RdmaStdAllocator::allocate(self, len)
     }
 
-    fn free(&mut self, addr: AllocatorPtr, len: usize) {
+    fn free(&mut self, addr: AllocatorAddress, len: usize) {
         RdmaStdAllocator::free(self, addr, len);
     }
 }
@@ -399,56 +426,56 @@ impl Default for RdmaIndexEntry {
 }
 
 impl RdmaIndexEntry {
-    pub fn get_ptr(&self) -> AllocatorPtr {
-        ((self.addr & 0xFFFF_FFFF_FFFF_0000) >> 16) as AllocatorPtr
+    pub fn ptr(&self) -> AllocatorAddress {
+        ((self.addr & 0xFFFF_FFFF_FFFF_0000) >> 16) as AllocatorAddress
     }
 
     #[allow(non_snake_case)]
-    pub fn GetPtr(&self) -> AllocatorPtr {
-        self.get_ptr()
+    pub fn GetPtr(&self) -> AllocatorAddress {
+        self.ptr()
     }
 
-    pub fn get_crc(&self) -> u8 {
+    pub fn crc(&self) -> u8 {
         ((self.addr & 0xFF00) >> 8) as u8
     }
 
     #[allow(non_snake_case)]
     pub fn GetCRC(&self) -> u8 {
-        self.get_crc()
+        self.crc()
     }
 
-    pub fn get_type(&self) -> u8 {
+    pub fn entry_type(&self) -> u8 {
         ((self.addr & 0xC0) >> 6) as u8
     }
 
     #[allow(non_snake_case)]
     pub fn GetType(&self) -> u8 {
-        self.get_type()
+        self.entry_type()
     }
 
-    pub fn get_storage_engine_type(&self) -> RdmaStorageEngineType {
-        RdmaStorageEngineType::from_code(self.get_type())
+    pub fn storage_engine_type(&self) -> RdmaStorageEngineKind {
+        RdmaStorageEngineKind::from_code(self.entry_type())
     }
 
-    pub fn get_overflow_flag(&self) -> i32 {
+    pub fn overflow_flag(&self) -> i32 {
         ((self.addr & 0x20) >> 5) as i32
     }
 
     #[allow(non_snake_case)]
     pub fn GetOverflowFlag(&self) -> i32 {
-        self.get_overflow_flag()
+        self.overflow_flag()
     }
 
-    pub fn get_signature_128b(&self) -> [u8; 16] {
+    pub fn signature_128b(&self) -> [u8; 16] {
         self.signature
     }
 
     #[allow(non_snake_case)]
     pub fn GetSignature128b(&self) -> [u8; 16] {
-        self.get_signature_128b()
+        self.signature_128b()
     }
 
-    pub fn get_signature_96b(&self) -> [u8; 12] {
+    pub fn signature_96b(&self) -> [u8; 12] {
         let mut signature = [0; 12];
         signature.copy_from_slice(&self.signature[..12]);
         signature
@@ -456,7 +483,7 @@ impl RdmaIndexEntry {
 
     #[allow(non_snake_case)]
     pub fn GetSignature96b(&self) -> [u8; 12] {
-        self.get_signature_96b()
+        self.signature_96b()
     }
 
     pub fn set_signature_96(&mut self, signature: [u8; 12]) {
@@ -468,13 +495,13 @@ impl RdmaIndexEntry {
         self.signature = signature;
     }
 
-    pub fn get_length(&self) -> i32 {
+    pub fn length(&self) -> i32 {
         self.length
     }
 
     #[allow(non_snake_case)]
     pub fn GetLength(&self) -> i32 {
-        self.get_length()
+        self.length()
     }
 
     pub fn set_data_length(&mut self, len: i32) {
@@ -486,13 +513,13 @@ impl RdmaIndexEntry {
         self.set_data_length(len);
     }
 
-    pub fn get_version(&self) -> i32 {
+    pub fn version(&self) -> i32 {
         self.version
     }
 
     #[allow(non_snake_case)]
     pub fn GetVersion(&self) -> i32 {
-        self.get_version()
+        self.version()
     }
 
     pub fn set_version(&mut self) {
@@ -504,13 +531,13 @@ impl RdmaIndexEntry {
         self.set_version();
     }
 
-    pub fn get_addr(&self) -> u64 {
+    pub fn addr(&self) -> u64 {
         self.addr
     }
 
     #[allow(non_snake_case)]
     pub fn GetAddr(&self) -> u64 {
-        self.get_addr()
+        self.addr()
     }
 
     pub fn set_addr(&mut self, addr: u64) {
@@ -532,8 +559,8 @@ impl RdmaIndexEntry {
 
     pub fn set_packed_addr(
         &mut self,
-        ptr: AllocatorPtr,
-        storage_type: RdmaStorageEngineType,
+        ptr: AllocatorAddress,
+        storage_type: RdmaStorageEngineKind,
         block_size: usize,
     ) {
         let overflow = if block_size > RDMA_MAX_BLOCK_SIZE {
@@ -583,13 +610,13 @@ impl Default for RdmaBucketHeader {
 }
 
 impl RdmaBucketHeader {
-    pub fn get_bitmap(&self) -> u16 {
+    pub fn bitmap(&self) -> u16 {
         self.bitmap
     }
 
     #[allow(non_snake_case)]
     pub fn GetBitmap(&self) -> u16 {
-        self.get_bitmap()
+        self.bitmap()
     }
 
     pub fn fingerprint(&self, pos: usize) -> Option<u8> {
@@ -618,13 +645,13 @@ impl<K> RdmaBucket<K>
 where
     K: Clone + Eq + Hash,
 {
-    pub fn get_metadata(&self) -> &RdmaBucketHeader {
+    pub fn metadata(&self) -> &RdmaBucketHeader {
         &self.metadata
     }
 
     #[allow(non_snake_case)]
     pub fn GetMetadata(&self) -> &RdmaBucketHeader {
-        self.get_metadata()
+        self.metadata()
     }
 
     pub fn get_entry(&self, pos: usize) -> Option<&RdmaIndexEntry> {
@@ -667,7 +694,7 @@ where
         self.is_locked()
     }
 
-    pub fn get_empty_entry(&self) -> i32 {
+    pub fn empty_entry(&self) -> i32 {
         for pos in 0..RDMA_BUCKET_CAP {
             if self.metadata.bitmap & (1 << (pos + 1)) == 0 {
                 return pos as i32;
@@ -678,7 +705,7 @@ where
 
     #[allow(non_snake_case)]
     pub fn GetEmptyEntry(&self) -> i32 {
-        self.get_empty_entry()
+        self.empty_entry()
     }
 
     pub fn occupy_entry(&mut self, pos: usize) {
@@ -722,13 +749,13 @@ where
         self.evict_entry()
     }
 
-    pub fn get_occupied_entry_num(&self) -> u64 {
+    pub fn occupied_entry_count(&self) -> u64 {
         ((self.metadata.bitmap >> 1) & 0x7fff).count_ones() as u64
     }
 
     #[allow(non_snake_case)]
     pub fn GetOccupiedEntryNum(&self) -> u64 {
-        self.get_occupied_entry_num()
+        self.occupied_entry_count()
     }
 
     pub fn get_index(&self, key: &K, sig96: &[u8; 12], sig128: &[u8; 16]) -> i32 {
@@ -741,10 +768,10 @@ where
                 continue;
             }
             let entry = &self.entries[pos];
-            let signature_match = if entry.get_storage_engine_type() == RdmaStorageEngineType::Ssd {
+            let signature_match = if entry.storage_engine_type() == RdmaStorageEngineKind::Ssd {
                 &entry.signature == sig128
             } else {
-                &entry.get_signature_96b() == sig96
+                &entry.signature_96b() == sig96
             };
             if signature_match && self.keys[pos].as_ref() == Some(key) {
                 return pos as i32;
@@ -761,25 +788,25 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaHashTableGet {
-    pub addr: Option<AllocatorPtr>,
+    pub addr: Option<AllocatorAddress>,
     pub len: usize,
-    pub storage_type: RdmaStorageEngineType,
+    pub storage_type: RdmaStorageEngineKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaHashTablePut {
     pub status: i32,
-    pub old_addr: Option<AllocatorPtr>,
+    pub old_addr: Option<AllocatorAddress>,
     pub old_len: usize,
-    pub old_type: RdmaStorageEngineType,
+    pub old_type: RdmaStorageEngineKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaHashTableDel {
     pub status: i32,
-    pub addr: Option<AllocatorPtr>,
+    pub addr: Option<AllocatorAddress>,
     pub len: usize,
-    pub storage_type: RdmaStorageEngineType,
+    pub storage_type: RdmaStorageEngineKind,
 }
 
 #[derive(Debug, Clone)]
@@ -812,18 +839,18 @@ where
             return RdmaHashTableGet {
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::Invalid,
+                storage_type: RdmaStorageEngineKind::Invalid,
             };
         }
         let entry = &bucket.entries[pos as usize];
         RdmaHashTableGet {
-            addr: Some(entry.get_ptr()),
-            len: if entry.get_overflow_flag() == 1 {
+            addr: Some(entry.ptr()),
+            len: if entry.overflow_flag() == 1 {
                 0
             } else {
-                entry.get_length().max(0) as usize
+                entry.length().max(0) as usize
             },
-            storage_type: entry.get_storage_engine_type(),
+            storage_type: entry.storage_engine_type(),
         }
     }
 
@@ -835,9 +862,9 @@ where
     pub fn put(
         &mut self,
         key: K,
-        addr: AllocatorPtr,
+        addr: AllocatorAddress,
         kv_size: usize,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
     ) -> RdmaHashTablePut {
         let bucket_pos = self.bucket_pos(&key);
         let bucket = &mut self.buckets[bucket_pos];
@@ -846,7 +873,7 @@ where
                 status: RDMA_BUCKET_LOCKED,
                 old_addr: None,
                 old_len: 0,
-                old_type: RdmaStorageEngineType::Invalid,
+                old_type: RdmaStorageEngineKind::Invalid,
             };
         }
         let sig96 = signature_96(&key, bucket_pos as u64);
@@ -855,16 +882,16 @@ where
         let block_size = kv_size.saturating_add(RDMA_DATA_HEADER + RDMA_CRC_LEN);
         let mut old_addr = None;
         let mut old_len = 0;
-        let mut old_type = RdmaStorageEngineType::Invalid;
+        let mut old_type = RdmaStorageEngineKind::Invalid;
         let pos = if existing >= 0 {
             let pos = existing as usize;
             let old = &bucket.entries[pos];
-            old_addr = Some(old.get_ptr());
-            old_len = old.get_length().max(0) as usize;
-            old_type = old.get_storage_engine_type();
+            old_addr = Some(old.ptr());
+            old_len = old.length().max(0) as usize;
+            old_type = old.storage_engine_type();
             pos
         } else {
-            let empty = bucket.get_empty_entry();
+            let empty = bucket.empty_entry();
             let pos = if empty >= 0 {
                 empty as usize
             } else {
@@ -877,7 +904,7 @@ where
         };
 
         let entry = &mut bucket.entries[pos];
-        if storage_type == RdmaStorageEngineType::Ssd {
+        if storage_type == RdmaStorageEngineKind::Ssd {
             entry.set_signature_128(sig128);
         } else {
             entry.set_signature_96(sig96);
@@ -898,9 +925,9 @@ where
     pub fn Put(
         &mut self,
         key: K,
-        addr: AllocatorPtr,
+        addr: AllocatorAddress,
         kv_size: usize,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
     ) -> RdmaHashTablePut {
         self.put(key, addr, kv_size, storage_type)
     }
@@ -913,7 +940,7 @@ where
                 status: RDMA_BUCKET_LOCKED,
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::Invalid,
+                storage_type: RdmaStorageEngineKind::Invalid,
             };
         }
         let sig96 = signature_96(key, bucket_pos as u64);
@@ -925,7 +952,7 @@ where
                 status: RDMA_NOT_FOUND,
                 addr: None,
                 len: 0,
-                storage_type: RdmaStorageEngineType::Invalid,
+                storage_type: RdmaStorageEngineKind::Invalid,
             };
         }
         let entry = bucket.entries[pos as usize].clone();
@@ -933,9 +960,9 @@ where
         bucket.unlock_bucket();
         RdmaHashTableDel {
             status: RDMA_OP_SUCCESS,
-            addr: Some(entry.get_ptr()),
-            len: entry.get_length().max(0) as usize,
-            storage_type: entry.get_storage_engine_type(),
+            addr: Some(entry.ptr()),
+            len: entry.length().max(0) as usize,
+            storage_type: entry.storage_engine_type(),
         }
     }
 
@@ -953,25 +980,25 @@ where
         self.get_bucket(index)
     }
 
-    pub fn get_size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.buckets.len() * RDMA_BUCKET_SIZE
     }
 
     #[allow(non_snake_case)]
     pub fn GetSize(&self) -> usize {
-        self.get_size()
+        self.size()
     }
 
-    pub fn get_num_entries(&self) -> u64 {
+    pub fn num_entries(&self) -> u64 {
         self.buckets
             .iter()
-            .map(RdmaBucket::get_occupied_entry_num)
+            .map(RdmaBucket::occupied_entry_count)
             .sum()
     }
 
     #[allow(non_snake_case)]
     pub fn GetNumEntries(&self) -> u64 {
-        self.get_num_entries()
+        self.num_entries()
     }
 
     pub fn all_buckets_unlocked(&self) -> bool {
@@ -1045,20 +1072,20 @@ impl RdmaStoredBlock {
 
 #[derive(Debug, Clone)]
 pub struct RdmaStorageEngine {
-    storage_type: RdmaStorageEngineType,
+    storage_type: RdmaStorageEngineKind,
     capacity: usize,
     used: usize,
-    next_addr: AllocatorPtr,
-    blocks: HashMap<AllocatorPtr, RdmaStoredBlock>,
+    next_addr: AllocatorAddress,
+    blocks: HashMap<AllocatorAddress, RdmaStoredBlock>,
 }
 
 impl RdmaStorageEngine {
-    pub fn new(storage_type: RdmaStorageEngineType, capacity: usize) -> Self {
+    pub fn new(storage_type: RdmaStorageEngineKind, capacity: usize) -> Self {
         let base = match storage_type {
-            RdmaStorageEngineType::Dram => 0x0100_0000,
-            RdmaStorageEngineType::Pmem => 0x0200_0000,
-            RdmaStorageEngineType::Ssd => 0x0300_0000,
-            RdmaStorageEngineType::Invalid => 0x0400_0000,
+            RdmaStorageEngineKind::Dram => 0x0100_0000,
+            RdmaStorageEngineKind::Pmem => 0x0200_0000,
+            RdmaStorageEngineKind::Ssd => 0x0300_0000,
+            RdmaStorageEngineKind::Invalid => 0x0400_0000,
         };
         Self {
             storage_type,
@@ -1069,7 +1096,7 @@ impl RdmaStorageEngine {
         }
     }
 
-    pub fn storage_type(&self) -> RdmaStorageEngineType {
+    pub fn storage_type(&self) -> RdmaStorageEngineKind {
         self.storage_type
     }
 
@@ -1081,7 +1108,7 @@ impl RdmaStorageEngine {
         self.used
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         let block = RdmaStoredBlock::new(key, value);
         let len = block.encoded_len();
         if self.used.saturating_add(len) > self.capacity {
@@ -1095,7 +1122,7 @@ impl RdmaStorageEngine {
     }
 
     #[allow(non_snake_case)]
-    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.put(key, value)
     }
 
@@ -1103,8 +1130,8 @@ impl RdmaStorageEngine {
         &self,
         key: &[u8],
         mut size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         let Some(block) = self.blocks.get(&addr) else {
             return RDMA_NOT_FOUND;
@@ -1134,13 +1161,13 @@ impl RdmaStorageEngine {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.get(key, size, response, addr)
     }
 
-    pub fn del(&mut self, addr: AllocatorPtr, _len: usize) -> i32 {
+    pub fn del(&mut self, addr: AllocatorAddress, _len: usize) -> i32 {
         if let Some(block) = self.blocks.remove(&addr) {
             self.used = self.used.saturating_sub(block.encoded_len());
         }
@@ -1148,7 +1175,7 @@ impl RdmaStorageEngine {
     }
 
     #[allow(non_snake_case)]
-    pub fn Del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn Del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.del(addr, len)
     }
 
@@ -1170,7 +1197,7 @@ pub struct RdmaStorageEngineDram {
 impl RdmaStorageEngineDram {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Dram, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineKind::Dram, capacity),
         }
     }
 
@@ -1178,12 +1205,12 @@ impl RdmaStorageEngineDram {
         Self::new(capacity)
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.inner.put(key, value)
     }
 
     #[allow(non_snake_case)]
-    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.put(key, value)
     }
 
@@ -1191,8 +1218,8 @@ impl RdmaStorageEngineDram {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.inner.get(key, size, response, addr)
     }
@@ -1202,18 +1229,18 @@ impl RdmaStorageEngineDram {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.get(key, size, response, addr)
     }
 
-    pub fn del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.inner.del(addr, len)
     }
 
     #[allow(non_snake_case)]
-    pub fn Del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn Del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.del(addr, len)
     }
 
@@ -1228,14 +1255,14 @@ impl RdmaStorageEngineDram {
 }
 
 #[derive(Debug, Clone)]
-pub struct RdmaStorageEnginePMem {
+pub struct RdmaStorageEnginePmem {
     inner: RdmaStorageEngine,
 }
 
-impl RdmaStorageEnginePMem {
+impl RdmaStorageEnginePmem {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Pmem, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineKind::Pmem, capacity),
         }
     }
 
@@ -1243,7 +1270,7 @@ impl RdmaStorageEnginePMem {
         Self::new(capacity)
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         let ptr = self.inner.put(key, value);
         if let Some(addr) = ptr {
             PMemPersist(
@@ -1258,7 +1285,7 @@ impl RdmaStorageEnginePMem {
     }
 
     #[allow(non_snake_case)]
-    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.put(key, value)
     }
 
@@ -1266,8 +1293,8 @@ impl RdmaStorageEnginePMem {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.inner.get(key, size, response, addr)
     }
@@ -1277,18 +1304,18 @@ impl RdmaStorageEnginePMem {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.get(key, size, response, addr)
     }
 
-    pub fn del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.inner.del(addr, len)
     }
 
     #[allow(non_snake_case)]
-    pub fn Del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn Del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.del(addr, len)
     }
 
@@ -1303,14 +1330,14 @@ impl RdmaStorageEnginePMem {
 }
 
 #[derive(Debug, Clone)]
-pub struct RdmaStorageEngineSSD {
+pub struct RdmaStorageEngineSsd {
     inner: RdmaStorageEngine,
 }
 
-impl RdmaStorageEngineSSD {
+impl RdmaStorageEngineSsd {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: RdmaStorageEngine::new(RdmaStorageEngineType::Ssd, capacity),
+            inner: RdmaStorageEngine::new(RdmaStorageEngineKind::Ssd, capacity),
         }
     }
 
@@ -1318,12 +1345,12 @@ impl RdmaStorageEngineSSD {
         Self::new(capacity)
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.inner.put(key, value)
     }
 
     #[allow(non_snake_case)]
-    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorPtr> {
+    pub fn Put(&mut self, key: &[u8], value: &[u8]) -> Option<AllocatorAddress> {
         self.put(key, value)
     }
 
@@ -1331,8 +1358,8 @@ impl RdmaStorageEngineSSD {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.inner.get(key, size, response, addr)
     }
@@ -1342,18 +1369,18 @@ impl RdmaStorageEngineSSD {
         &self,
         key: &[u8],
         size: usize,
-        response: &mut RDMAResponse,
-        addr: AllocatorPtr,
+        response: &mut RdmaResponse,
+        addr: AllocatorAddress,
     ) -> i32 {
         self.get(key, size, response, addr)
     }
 
-    pub fn del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.inner.del(addr, len)
     }
 
     #[allow(non_snake_case)]
-    pub fn Del(&mut self, addr: AllocatorPtr, len: usize) -> i32 {
+    pub fn Del(&mut self, addr: AllocatorAddress, len: usize) -> i32 {
         self.del(addr, len)
     }
 
@@ -1367,9 +1394,14 @@ impl RdmaStorageEngineSSD {
     }
 }
 
+/// The replacement policy a remote (RDMA) cache reports.
+///
+/// Narrower than [`ReplacementPolicyKind`], which it converts into:
+/// `Fifo` and `Lru` map across directly, and `Other` -- anything this crate does
+/// not model -- arrives as `ReplacementPolicyKind::MaxCode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
-pub enum RdmaReplacementPolicyType {
+pub enum RdmaReplacementPolicyKind {
     #[default]
     #[serde(alias = "FIFO")]
     Fifo = 0,
@@ -1379,86 +1411,85 @@ pub enum RdmaReplacementPolicyType {
     Other = 2,
 }
 
-#[allow(non_upper_case_globals)]
-impl RdmaReplacementPolicyType {
+impl RdmaReplacementPolicyKind {
     pub const FIFO: Self = Self::Fifo;
     pub const LRU: Self = Self::Lru;
     pub const OTHER: Self = Self::Other;
 }
 
 
-impl RdmaReplacementPolicyType {
-    pub fn as_replacement_policy_type(self) -> ReplacementPolicyType {
+impl RdmaReplacementPolicyKind {
+    pub fn as_replacement_policy_type(self) -> ReplacementPolicyKind {
         match self {
-            Self::Fifo => ReplacementPolicyType::Fifo,
-            Self::Lru => ReplacementPolicyType::Lru,
-            Self::Other => ReplacementPolicyType::MaxCode,
+            Self::Fifo => ReplacementPolicyKind::Fifo,
+            Self::Lru => ReplacementPolicyKind::Lru,
+            Self::Other => ReplacementPolicyKind::MaxCode,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct RDMACache {
+pub struct RdmaCache {
     cache_index: RdmaHashTable<Vec<u8>>,
     dram_engine: Option<RdmaStorageEngineDram>,
-    pmem_engine: Option<RdmaStorageEnginePMem>,
-    ssd_engine: Option<RdmaStorageEngineSSD>,
-    replacement_policy: RdmaReplacementPolicyType,
+    pmem_engine: Option<RdmaStorageEnginePmem>,
+    ssd_engine: Option<RdmaStorageEngineSsd>,
+    replacement_policy: RdmaReplacementPolicyKind,
 }
 
-impl RDMACache {
+impl RdmaCache {
     pub fn new(
         dram_capacity: usize,
         pmem_capacity: usize,
         ssd_capacity: usize,
-        replacement_policy: RdmaReplacementPolicyType,
+        replacement_policy: RdmaReplacementPolicyKind,
     ) -> Self {
         Self {
             cache_index: RdmaHashTable::new(1024),
             dram_engine: (dram_capacity > 0).then(|| RdmaStorageEngineDram::new(dram_capacity)),
-            pmem_engine: (pmem_capacity > 0).then(|| RdmaStorageEnginePMem::new(pmem_capacity)),
-            ssd_engine: (ssd_capacity > 0).then(|| RdmaStorageEngineSSD::new(ssd_capacity)),
+            pmem_engine: (pmem_capacity > 0).then(|| RdmaStorageEnginePmem::new(pmem_capacity)),
+            ssd_engine: (ssd_capacity > 0).then(|| RdmaStorageEngineSsd::new(ssd_capacity)),
             replacement_policy,
         }
     }
 
     pub fn with_dram_capacity(dram_capacity: usize) -> Self {
-        Self::new(dram_capacity, 0, 0, RdmaReplacementPolicyType::Fifo)
+        Self::new(dram_capacity, 0, 0, RdmaReplacementPolicyKind::Fifo)
     }
 
-    pub fn lookup(&self, key: &[u8], response: &mut RDMAResponse) -> i32 {
+    pub fn lookup(&self, key: &[u8], response: &mut RdmaResponse) -> i32 {
         let key_vec = key.to_vec();
         let index = self.cache_index.get(&key_vec);
         let Some(addr) = index.addr else {
             return RDMA_NOT_FOUND;
         };
         match index.storage_type {
-            RdmaStorageEngineType::Dram => {
+            RdmaStorageEngineKind::Dram => {
                 self.dram_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::Pmem => {
+            RdmaStorageEngineKind::Pmem => {
                 self.pmem_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::Ssd => {
+            RdmaStorageEngineKind::Ssd => {
                 self.ssd_engine.as_ref().map_or(RDMA_NOT_FOUND, |engine| {
                     engine.get(key, index.len, response, addr)
                 })
             }
-            RdmaStorageEngineType::Invalid => RDMA_NOT_FOUND,
+            RdmaStorageEngineKind::Invalid => RDMA_NOT_FOUND,
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn Lookup(&self, key: &[u8], response: &mut RDMAResponse) -> i32 {
+    pub fn Lookup(&self, key: &[u8], response: &mut RdmaResponse) -> i32 {
         self.lookup(key, response)
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> i32 {
-        self.insert_to_storage(RdmaStorageEngineType::Dram, key, value)
+        self.insert_to_storage(RdmaStorageEngineKind::Dram, key, value)
     }
 
     #[allow(non_snake_case)]
@@ -1468,7 +1499,7 @@ impl RDMACache {
 
     pub fn insert_to_storage(
         &mut self,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
         key: &[u8],
         value: &[u8],
     ) -> i32 {
@@ -1497,7 +1528,7 @@ impl RDMACache {
     #[allow(non_snake_case)]
     pub fn InsertToStorage(
         &mut self,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
         key: &[u8],
         value: &[u8],
     ) -> i32 {
@@ -1521,121 +1552,121 @@ impl RDMACache {
         self.remove(key)
     }
 
-    pub fn get_capacity(&self, storage_type: RdmaStorageEngineType) -> usize {
+    pub fn get_capacity(&self, storage_type: RdmaStorageEngineKind) -> usize {
         match storage_type {
-            RdmaStorageEngineType::Dram => self
+            RdmaStorageEngineKind::Dram => self
                 .dram_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::Pmem => self
+            RdmaStorageEngineKind::Pmem => self
                 .pmem_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::Ssd => self
+            RdmaStorageEngineKind::Ssd => self
                 .ssd_engine
                 .as_ref()
                 .map_or(0, |engine| engine.stats().0),
-            RdmaStorageEngineType::Invalid => 0,
+            RdmaStorageEngineKind::Invalid => 0,
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn GetCapacity(&self, storage_type: RdmaStorageEngineType) -> usize {
+    pub fn GetCapacity(&self, storage_type: RdmaStorageEngineKind) -> usize {
         self.get_capacity(storage_type)
     }
 
-    pub fn init_storage_engine(&mut self, storage_type: RdmaStorageEngineType, capacity: usize) {
+    pub fn init_storage_engine(&mut self, storage_type: RdmaStorageEngineKind, capacity: usize) {
         match storage_type {
-            RdmaStorageEngineType::Dram => {
+            RdmaStorageEngineKind::Dram => {
                 self.dram_engine = Some(RdmaStorageEngineDram::new(capacity));
             }
-            RdmaStorageEngineType::Pmem => {
-                self.pmem_engine = Some(RdmaStorageEnginePMem::new(capacity));
+            RdmaStorageEngineKind::Pmem => {
+                self.pmem_engine = Some(RdmaStorageEnginePmem::new(capacity));
             }
-            RdmaStorageEngineType::Ssd => {
-                self.ssd_engine = Some(RdmaStorageEngineSSD::new(capacity));
+            RdmaStorageEngineKind::Ssd => {
+                self.ssd_engine = Some(RdmaStorageEngineSsd::new(capacity));
             }
-            RdmaStorageEngineType::Invalid => {}
+            RdmaStorageEngineKind::Invalid => {}
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn InitStorageEngine(&mut self, storage_type: RdmaStorageEngineType, capacity: usize) {
+    pub fn InitStorageEngine(&mut self, storage_type: RdmaStorageEngineKind, capacity: usize) {
         self.init_storage_engine(storage_type, capacity);
     }
 
-    pub fn get_replacement_policy_type(&self) -> RdmaReplacementPolicyType {
+    pub fn replacement_policy_type(&self) -> RdmaReplacementPolicyKind {
         self.replacement_policy
     }
 
     #[allow(non_snake_case)]
-    pub fn GetReplacementPolicyType(&self) -> RdmaReplacementPolicyType {
-        self.get_replacement_policy_type()
+    pub fn GetReplacementPolicyType(&self) -> RdmaReplacementPolicyKind {
+        self.replacement_policy_type()
     }
 
-    pub fn set_replacement_policy(&mut self, policy: RdmaReplacementPolicyType) {
+    pub fn set_replacement_policy(&mut self, policy: RdmaReplacementPolicyKind) {
         self.replacement_policy = policy;
     }
 
     #[allow(non_snake_case)]
-    pub fn SetReplacementPolicy(&mut self, policy: RdmaReplacementPolicyType) {
+    pub fn SetReplacementPolicy(&mut self, policy: RdmaReplacementPolicyKind) {
         self.set_replacement_policy(policy);
     }
 
     pub fn num_index_entries(&self) -> u64 {
-        self.cache_index.get_num_entries()
+        self.cache_index.num_entries()
     }
 
     pub fn storage_stats(
         &self,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
     ) -> Option<(usize, usize, usize)> {
         match storage_type {
-            RdmaStorageEngineType::Dram => {
+            RdmaStorageEngineKind::Dram => {
                 self.dram_engine.as_ref().map(RdmaStorageEngineDram::stats)
             }
-            RdmaStorageEngineType::Pmem => {
-                self.pmem_engine.as_ref().map(RdmaStorageEnginePMem::stats)
+            RdmaStorageEngineKind::Pmem => {
+                self.pmem_engine.as_ref().map(RdmaStorageEnginePmem::stats)
             }
-            RdmaStorageEngineType::Ssd => self.ssd_engine.as_ref().map(RdmaStorageEngineSSD::stats),
-            RdmaStorageEngineType::Invalid => None,
+            RdmaStorageEngineKind::Ssd => self.ssd_engine.as_ref().map(RdmaStorageEngineSsd::stats),
+            RdmaStorageEngineKind::Invalid => None,
         }
     }
 
     fn put_storage_block(
         &mut self,
-        storage_type: RdmaStorageEngineType,
+        storage_type: RdmaStorageEngineKind,
         key: &[u8],
         value: &[u8],
-    ) -> Option<AllocatorPtr> {
+    ) -> Option<AllocatorAddress> {
         match storage_type {
-            RdmaStorageEngineType::Dram => self.dram_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::Pmem => self.pmem_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::Ssd => self.ssd_engine.as_mut()?.put(key, value),
-            RdmaStorageEngineType::Invalid => None,
+            RdmaStorageEngineKind::Dram => self.dram_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineKind::Pmem => self.pmem_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineKind::Ssd => self.ssd_engine.as_mut()?.put(key, value),
+            RdmaStorageEngineKind::Invalid => None,
         }
     }
 
     fn delete_storage_block(
         &mut self,
-        storage_type: RdmaStorageEngineType,
-        addr: AllocatorPtr,
+        storage_type: RdmaStorageEngineKind,
+        addr: AllocatorAddress,
         len: usize,
     ) -> i32 {
         match storage_type {
-            RdmaStorageEngineType::Dram => self
+            RdmaStorageEngineKind::Dram => self
                 .dram_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::Pmem => self
+            RdmaStorageEngineKind::Pmem => self
                 .pmem_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::Ssd => self
+            RdmaStorageEngineKind::Ssd => self
                 .ssd_engine
                 .as_mut()
                 .map_or(RDMA_NOT_FOUND, |engine| engine.del(addr, len)),
-            RdmaStorageEngineType::Invalid => RDMA_NOT_FOUND,
+            RdmaStorageEngineKind::Invalid => RDMA_NOT_FOUND,
         }
     }
 }
@@ -1662,9 +1693,9 @@ pub fn mur_mur_hash2_with_seed(key: &[u8], seed: u32) -> u32 {
     const R: u32 = 24;
 
     let mut h = seed ^ key.len() as u32;
-    let (blocks, tail) = key.as_chunks::<4>();
-    for chunk in blocks {
-        let mut k = u32::from_le_bytes(*chunk);
+    let mut chunks = key.chunks_exact(4);
+    for chunk in &mut chunks {
+        let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
@@ -1673,6 +1704,7 @@ pub fn mur_mur_hash2_with_seed(key: &[u8], seed: u32) -> u32 {
         h ^= k;
     }
 
+    let tail = chunks.remainder();
     match tail.len() {
         3 => {
             h ^= ((tail[2] as i8 as i32) << 16) as u32;

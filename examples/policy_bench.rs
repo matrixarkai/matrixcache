@@ -30,7 +30,7 @@
 //! second argument skips the eviction-pressure sweep.
 
 use matrixcache::{
-    CacheBuffer, ConcurrentReplacementSLRU, ReplacementArc, ReplacementFIFO, ReplacementSLRU,
+    CacheBuffer, ConcurrentReplacementSlru, ReplacementArc, ReplacementFifo, ReplacementSlru,
 };
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -109,7 +109,7 @@ fn byte_capacity(entries: usize, pressure: usize) -> usize {
 
 fn run_slru(workload: &Workload, segments: usize, pressure: usize) -> CaseResult {
     let entries = workload.keys.len();
-    let mut policy = ReplacementSLRU::with_num_segments(byte_capacity(entries, pressure), segments);
+    let mut policy = ReplacementSlru::with_num_segments(byte_capacity(entries, pressure), segments);
     policy.init().expect("init segmented lru");
 
     let mut evicted = 0usize;
@@ -139,13 +139,13 @@ fn run_slru(workload: &Workload, segments: usize, pressure: usize) -> CaseResult
         get_ns: ns_per_op(get_elapsed, entries),
         churn_ns: ns_per_op(churn_elapsed, churn * 2),
         evicted,
-        resident: policy.get_item_num(),
+        resident: policy.item_count(),
     }
 }
 
 fn run_fifo(workload: &Workload, pressure: usize) -> CaseResult {
     let entries = workload.keys.len();
-    let mut policy = ReplacementFIFO::new(byte_capacity(entries, pressure));
+    let mut policy = ReplacementFifo::new(byte_capacity(entries, pressure));
     policy.init().expect("init fifo");
 
     let mut evicted = 0usize;
@@ -177,7 +177,7 @@ fn run_fifo(workload: &Workload, pressure: usize) -> CaseResult {
         get_ns: ns_per_op(get_elapsed, entries),
         churn_ns: ns_per_op(churn_elapsed, churn * 2),
         evicted,
-        resident: policy.get_item_num(),
+        resident: policy.item_count(),
     }
 }
 
@@ -226,7 +226,7 @@ const CONTENTION_OPS_PER_THREAD: usize = 8_192;
 fn run_contention_global(keys: &[String], threads: usize) -> f64 {
     let capacity = keys.len() * entry_space() * 4;
     let policy = Mutex::new({
-        let mut inner = ReplacementSLRU::with_num_segments(capacity, 256);
+        let mut inner = ReplacementSlru::with_num_segments(capacity, 256);
         inner.init().expect("init segmented lru");
         inner
     });
@@ -252,7 +252,7 @@ fn run_contention_global(keys: &[String], threads: usize) -> f64 {
 /// segments proceed in parallel.
 fn run_contention_sharded(keys: &[String], threads: usize, segments: usize) -> f64 {
     let capacity = keys.len() * entry_space() * 4;
-    let policy = ConcurrentReplacementSLRU::with_num_segments(capacity, segments);
+    let policy = ConcurrentReplacementSlru::with_num_segments(capacity, segments);
     policy.init().expect("init segmented lru");
     let per_thread = keys.len() / threads;
 

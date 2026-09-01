@@ -38,7 +38,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "rocksdb-ssd")]
 use std::str;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -54,4 +54,12 @@ include!("runtime/storage_engines.rs");
 include!("runtime/multilayer_cache.rs");
 include!("runtime/cache_facades.rs");
 include!("runtime/builder_and_gc.rs");
+include!("runtime/zoned_store.rs");
+include!("runtime/zoned_gc.rs");
+include!("core/frequency_sketch.rs");
+include!("core/metrics.rs");
+include!("core/write_budget.rs");
+include!("core/health.rs");
+include!("core/config_check.rs");
+include!("core/legacy_names.rs");
 include!("tests/mod.rs");
