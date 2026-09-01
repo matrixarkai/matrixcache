@@ -180,6 +180,47 @@ pub struct CacheKey {
     pub selector: String,
 }
 
+/// `segment-00000000000000000008`, built directly.
+///
+/// `format!` allocates twice here: once for the returned String and once inside the padded-integer
+/// path. Writing into a String sized up front is one allocation for the same bytes. This runs on
+/// every page cache get and put, so the second allocation is pure overhead on the hot read path.
+fn segment_record_key(page_segment_id: u64) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(SEGMENT_PREFIX.len() + 20);
+    key.push_str(SEGMENT_PREFIX);
+    let _ = write!(key, "{page_segment_id:020}");
+    key
+}
+
+const SEGMENT_PREFIX: &str = "segment-";
+
+/// The page selector, built directly for the same reason as [`segment_record_key`].
+///
+/// Four shapes, one per combination of routing slot and generation, kept byte for byte as the
+/// `format!` calls they replace -- these strings are hashed and compared against keys already
+/// written, so a changed byte is a silent cache miss, not a test failure.
+fn page_selector(
+    routing_slot: Option<u32>,
+    generation: Option<u64>,
+    offset: u64,
+    length: u64,
+) -> String {
+    use std::fmt::Write as _;
+    // "slot-" + u32 + ":gen-" + u64 + ":" + u64 + ":" + u64, generously.
+    let mut selector = String::with_capacity(64);
+    if let Some(slot) = routing_slot {
+        selector.push_str("slot-");
+        let _ = write!(selector, "{slot}:");
+    }
+    if let Some(generation) = generation {
+        selector.push_str("gen-");
+        let _ = write!(selector, "{generation}:");
+    }
+    let _ = write!(selector, "{offset}:{length}");
+    selector
+}
+
 impl CacheKey {
     pub fn string(shard_id: ShardId, key: &str) -> Self {
         Self {
@@ -226,9 +267,9 @@ impl CacheKey {
     pub fn page(shard_id: ShardId, page_segment_id: u64, offset: u64, length: u64) -> Self {
         Self {
             shard_id,
-            record_key: format!("segment-{page_segment_id:020}"),
+            record_key: segment_record_key(page_segment_id),
             namespace: "page".to_string(),
-            selector: format!("{offset}:{length}"),
+            selector: page_selector(None, None, offset, length),
         }
     }
 
@@ -239,13 +280,10 @@ impl CacheKey {
         length: u64,
         routing_slot: Option<u32>,
     ) -> Self {
-        let selector = match routing_slot {
-            Some(slot) => format!("slot-{slot}:{offset}:{length}"),
-            None => format!("{offset}:{length}"),
-        };
+        let selector = page_selector(routing_slot, None, offset, length);
         Self {
             shard_id,
-            record_key: format!("segment-{page_segment_id:020}"),
+            record_key: segment_record_key(page_segment_id),
             namespace: "page".to_string(),
             selector,
         }
@@ -263,12 +301,12 @@ impl CacheKey {
             return Self::page_with_slot(shard_id, page_segment_id, offset, length, routing_slot);
         };
         let selector = match routing_slot {
-            Some(slot) => format!("slot-{slot}:gen-{generation}:{offset}:{length}"),
-            None => format!("gen-{generation}:{offset}:{length}"),
+            Some(slot) => page_selector(Some(slot), Some(generation), offset, length),
+            None => page_selector(None, Some(generation), offset, length),
         };
         Self {
             shard_id,
-            record_key: format!("segment-{page_segment_id:020}"),
+            record_key: segment_record_key(page_segment_id),
             namespace: "page".to_string(),
             selector,
         }
