@@ -158,12 +158,12 @@ impl ZoneDevice {
     /// multiple of `zone_capacity`; anything else cannot be addressed by whole
     /// pages and is rejected rather than silently rounded.
     pub fn open(path: impl AsRef<Path>, capacity: u64, zone_capacity: u64) -> Result<Self, CacheError> {
-        if zone_capacity == 0 || zone_capacity % ZONE_PAGE_SIZE != 0 {
+        if zone_capacity == 0 || !zone_capacity.is_multiple_of(ZONE_PAGE_SIZE) {
             return Err(CacheError::InvalidConfig(format!(
                 "zone capacity {zone_capacity} must be a non-zero multiple of {ZONE_PAGE_SIZE}"
             )));
         }
-        if capacity == 0 || capacity % zone_capacity != 0 {
+        if capacity == 0 || !capacity.is_multiple_of(zone_capacity) {
             return Err(CacheError::InvalidConfig(format!(
                 "device capacity {capacity} must be a non-zero multiple of zone capacity {zone_capacity}"
             )));
@@ -488,7 +488,7 @@ impl ZoneManager {
     pub fn ensure_available_space(&mut self, data_size: u64, meta_size: u64) -> bool {
         self.ensured = true;
         let page_size = self.device.info().page_size;
-        if data_size % page_size != 0 || meta_size % page_size != 0 {
+        if !data_size.is_multiple_of(page_size) || !meta_size.is_multiple_of(page_size) {
             return false;
         }
         let needed = data_size.saturating_add(meta_size);
@@ -505,7 +505,7 @@ impl ZoneManager {
     pub fn append(&mut self, buf: &[u8], kind: DataKind) -> Result<u64, CacheError> {
         let info = self.device.info();
         let size = buf.len() as u64;
-        if size == 0 || size % info.page_size != 0 || size > info.zone_size {
+        if size == 0 || !size.is_multiple_of(info.page_size) || size > info.zone_size {
             return Err(CacheError::InvalidConfig(format!(
                 "append of {size} bytes is not a whole number of {} byte pages within a zone",
                 info.page_size
