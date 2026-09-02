@@ -454,7 +454,7 @@ impl CacheInner {
     fn disk_path(&self, key: &CacheKey) -> PathBuf {
         self.disk_dir
             .join(format!("shard-{}", key.shard_id))
-            .join(&key.namespace)
+            .join(&*key.namespace)
             .join(key.disk_name())
     }
 
@@ -724,7 +724,8 @@ impl CacheInner {
         Some(CacheKey {
             shard_id,
             record_key,
-            namespace,
+            // Decoded from a manifest line, so it is owned rather than one of the literals.
+            namespace: std::borrow::Cow::Owned(namespace),
             selector,
         })
     }
@@ -2461,7 +2462,7 @@ fn observe_latency_bucket(
 }
 
 fn infer_block_kind(key: &CacheKey) -> CacheBlockKind {
-    match key.namespace.as_str() {
+    match &*key.namespace {
         "page" => CacheBlockKind::Page,
         "index" => CacheBlockKind::Index,
         "oplog" => CacheBlockKind::Oplog,
