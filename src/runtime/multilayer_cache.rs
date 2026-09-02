@@ -915,7 +915,9 @@ impl CacheManifestRecord {
         Self {
             shard_id: key.shard_id,
             record_key: key.record_key.clone(),
-            namespace: key.namespace.clone(),
+            // The record is a manifest line: always owned, whether the key it came from borrowed
+            // its namespace or not.
+            namespace: key.namespace.to_string(),
             selector: key.selector.clone(),
             block_len,
         }
@@ -925,7 +927,8 @@ impl CacheManifestRecord {
         CacheKey {
             shard_id: self.shard_id,
             record_key: self.record_key.clone(),
-            namespace: self.namespace.clone(),
+            // Read out of a manifest, so it is owned rather than one of the literals.
+            namespace: std::borrow::Cow::Owned(self.namespace.clone()),
             selector: self.selector.clone(),
         }
     }
@@ -7173,7 +7176,7 @@ impl MultiLayerCache {
                 let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
-                    namespace: key.namespace,
+                    namespace: key.namespace.into_owned(),
                     record_key: key.record_key,
                     selector: key.selector,
                     memory_bytes,
@@ -7237,7 +7240,7 @@ impl MultiLayerCache {
                 let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
-                    namespace: key.namespace,
+                    namespace: key.namespace.into_owned(),
                     record_key: key.record_key,
                     selector: key.selector,
                     memory_bytes,

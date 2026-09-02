@@ -176,7 +176,13 @@ impl NumaInfo {
 pub struct CacheKey {
     pub shard_id: ShardId,
     pub record_key: String,
-    pub namespace: String,
+    /// Always one of a handful of literals in practice -- `page`, `hash`, `string`, `set`,
+    /// `feature`. A `Cow` holds those without allocating, and still holds an owned String for the
+    /// one caller that produces one: `decode_line`, reading a namespace back out of a manifest.
+    ///
+    /// Serde writes a `Cow<str>` exactly as it writes a `String`, and `Ord`/`Hash`/`Eq` work on the
+    /// `str` either way, so the manifest format, the map lookups and the ordering are unchanged.
+    pub namespace: std::borrow::Cow<'static, str>,
     pub selector: String,
 }
 
@@ -226,7 +232,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: key.to_string(),
-            namespace: "string".to_string(),
+            namespace: std::borrow::Cow::Borrowed("string"),
             selector: "value".to_string(),
         }
     }
@@ -235,7 +241,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: key.to_string(),
-            namespace: "hash".to_string(),
+            namespace: std::borrow::Cow::Borrowed("hash"),
             selector: field.to_string(),
         }
     }
@@ -244,7 +250,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: key.to_string(),
-            namespace: "set".to_string(),
+            namespace: std::borrow::Cow::Borrowed("set"),
             selector: "members".to_string(),
         }
     }
@@ -259,7 +265,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: key.to_string(),
-            namespace: "feature".to_string(),
+            namespace: std::borrow::Cow::Borrowed("feature"),
             selector: format!("{start_ms}:{end_ms}:{}", count.unwrap_or(5000)),
         }
     }
@@ -268,7 +274,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: segment_record_key(page_segment_id),
-            namespace: "page".to_string(),
+            namespace: std::borrow::Cow::Borrowed("page"),
             selector: page_selector(None, None, offset, length),
         }
     }
@@ -284,7 +290,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: segment_record_key(page_segment_id),
-            namespace: "page".to_string(),
+            namespace: std::borrow::Cow::Borrowed("page"),
             selector,
         }
     }
@@ -307,7 +313,7 @@ impl CacheKey {
         Self {
             shard_id,
             record_key: segment_record_key(page_segment_id),
-            namespace: "page".to_string(),
+            namespace: std::borrow::Cow::Borrowed("page"),
             selector,
         }
     }
