@@ -5405,6 +5405,107 @@ mod tests {
         zero_copy.release(handle);
     }
 
+    /// A tier with no capacity creates no store on disk.
+    ///
+    /// Every admission path already reads a zero SSD capacity as "this tier is off" --
+    /// `ssd_enabled` is `ssd_capacity_bytes > 0`, and admit and evict return early on it. The
+    /// store was built anyway, so a node that can never put anything in the tier still paid
+    /// for its directory and its files. Measured on a one-box TemporalStore node, which keeps
+    /// its durable copy on its own disk and so switches this tier off: 4,160 kB of a 58,612 kB
+    /// footprint, 7.1%, held by a tier nothing could be admitted to.
+    #[test]
+    fn a_zero_capacity_ssd_tier_creates_no_store_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64 * 1024,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 0,
+                ..CacheTieringPolicy::default()
+            },
+            CacheBlockOptions::default(),
+        );
+
+        for index in 0..64 {
+            cache
+                .put(CacheKey::string(0, &format!("k{index:03}")), vec![b'v'; 128])
+                .unwrap();
+        }
+
+        let store = dir.path().join("rocksdb-cache-blocks");
+        assert!(
+            !store.exists(),
+            "a tier with no capacity must not create a store; the cache directory holds {:?}",
+            std::fs::read_dir(dir.path())
+                .map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 0);
+    }
+
+    /// The cache still works with no SSD tier -- this is the common case for a single node,
+    /// not a degraded one, so it has to serve reads rather than merely not crash.
+    #[test]
+    fn a_cache_with_no_ssd_tier_still_serves_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64 * 1024,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 0,
+                ..CacheTieringPolicy::default()
+            },
+            CacheBlockOptions::default(),
+        );
+
+        let key = CacheKey::string(0, "served-from-memory");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(&b"value"[..]));
+
+        // A key that was never written is a miss, not an error: the tier being absent must not
+        // turn a lookup into a failure.
+        let absent = CacheKey::string(0, "never-written");
+        assert_eq!(cache.get(&absent).unwrap(), None);
+    }
+
+    /// Raising the capacity brings the tier up.
+    ///
+    /// `set_capacity_for_tier` can raise it at any time. A tier that stayed disabled through
+    /// that would accept nothing while the policy said it was there -- a worse failure than
+    /// the one the disabled state exists to fix, because it is silent and shows up only as a
+    /// hit rate that never recovers.
+    #[test]
+    fn raising_the_ssd_capacity_brings_a_disabled_tier_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64 * 1024,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 0,
+                ..CacheTieringPolicy::default()
+            },
+            CacheBlockOptions::default(),
+        );
+        let store = dir.path().join("rocksdb-cache-blocks");
+        assert!(!store.exists(), "nothing yet");
+
+        cache.set_capacity_for_tier(CacheTier::Ssd, 16 * 1024 * 1024);
+
+        assert_eq!(cache.capacity_for_tier(CacheTier::Ssd), 16 * 1024 * 1024);
+        assert!(
+            store.exists(),
+            "raising the capacity must bring the store up, or the tier accepts nothing while \
+             the policy says it is there"
+        );
+
+        // And it serves: coming up is only useful if the tier then works.
+        let key = CacheKey::string(0, "after-the-raise");
+        cache.put(key.clone(), vec![b'x'; 256]).unwrap();
+        assert_eq!(cache.get(&key).unwrap().map(|v| v.len()), Some(256));
+    }
+
     #[test]
     fn cache_options_zero_ssd_capacity_disables_ssd_tier() {
         let dir = tempfile::tempdir().unwrap();
@@ -15511,4 +15612,6 @@ fn a_shared_read_counts_as_a_read() {
         "a shared read must register as a memory hit ({before} -> {after}), or the policy stops seeing \
          reads of whatever uses it"
     );
+
+
 }
