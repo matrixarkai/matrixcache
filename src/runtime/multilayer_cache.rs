@@ -1021,7 +1021,9 @@ impl CacheManifestOp {
         Some(Self::Delete(CacheKey {
             shard_id,
             record_key,
-            namespace,
+            // The one place that produces an owned namespace rather than one
+            // of the handful of literals, which is why the field is a .
+            namespace: namespace.into(),
             selector,
         }))
     }
