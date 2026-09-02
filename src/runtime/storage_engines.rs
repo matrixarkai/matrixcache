@@ -1883,6 +1883,20 @@ pub struct StorageEngineRocksDb {
     /// operations, which says nothing about the size of them.
     #[cfg(not(feature = "rocksdb-ssd"))]
     journal_bytes: u64,
+    /// The journal, held open between appends.
+    ///
+    /// Every record used to open the file, write, and close it again -- three
+    /// syscalls of overhead for one append, on a path that runs once per
+    /// write. It is an append-only log with a single writer, so there is
+    /// nothing to reopen for.
+    ///
+    /// `None` means "not opened yet, or the file underneath is gone". It MUST
+    /// be cleared wherever the journal is removed, or appends would go to an
+    /// unlinked inode and be lost at the next restart -- which is why the only
+    /// place that removes it also clears this, and a test writes across a
+    /// compaction to prove it.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    journal_file: Option<File>,
     /// How large the snapshot was when it was last written or read.
     ///
     /// Compaction compares the journal against it, and that comparison happens
@@ -1920,6 +1934,11 @@ impl Clone for StorageEngineRocksDb {
             records: self.records.clone(),
             #[cfg(not(feature = "rocksdb-ssd"))]
             journal_bytes: self.journal_bytes,
+            // A clone opens its own handle when it first appends: a file
+            // descriptor is not shared state, and two writers on one
+            // append-only log is not a thing this wants.
+            #[cfg(not(feature = "rocksdb-ssd"))]
+            journal_file: None,
             snapshot_bytes: self.snapshot_bytes,
             recover_finished: self.recover_finished,
             capacity: self.capacity,
@@ -1956,6 +1975,8 @@ impl StorageEngineRocksDb {
             records: HashMap::new(),
             #[cfg(not(feature = "rocksdb-ssd"))]
             journal_bytes: 0,
+            #[cfg(not(feature = "rocksdb-ssd"))]
+            journal_file: None,
             snapshot_bytes: 0,
             recover_finished: false,
             capacity: u64::MAX,
@@ -2086,21 +2107,34 @@ impl StorageEngineRocksDb {
             }
         }
 
-        let path = self.journal_path();
-        let directory = PathBuf::from(&self.db_path);
         let appended = record.len() as u64;
-        creating_the_directory_if_missing(&directory, || {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(CacheError::Io)?;
-            use std::io::Write as _;
+        if self.journal_file.is_none() {
+            let path = self.journal_path();
+            let directory = PathBuf::from(&self.db_path);
+            // The `metadata` call that decided whether to write the magic ran
+            // on every append and is now paid once per open, because the only
+            // time a journal can be empty is when it has just been created.
+            let mut file = creating_the_directory_if_missing(&directory, || {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(CacheError::Io)
+            })?;
             if file.metadata().map_err(CacheError::Io)?.len() == 0 {
+                use std::io::Write as _;
                 file.write_all(Self::JOURNAL_MAGIC).map_err(CacheError::Io)?;
             }
-            file.write_all(&record).map_err(CacheError::Io)
-        })?;
+            self.journal_file = Some(file);
+        }
+        {
+            use std::io::Write as _;
+            let file = self
+                .journal_file
+                .as_mut()
+                .expect("the journal was just opened");
+            file.write_all(&record).map_err(CacheError::Io)?;
+        }
         self.journal_bytes = self.journal_bytes.saturating_add(appended);
 
         // Compact when the journal has grown past the snapshot it sits beside,
@@ -2268,7 +2302,10 @@ impl StorageEngineRocksDb {
         fs::write(&temporary, raw)?;
         fs::rename(&temporary, self.store_path())?;
         self.snapshot_bytes = written;
-        // Everything in the journal is now in the snapshot.
+        // Everything in the journal is now in the snapshot. Drop the handle
+        // with the file: appending through it after this would write to an
+        // unlinked inode, and those records would vanish at the next restart.
+        self.journal_file = None;
         let _ = fs::remove_file(self.journal_path());
         self.journal_bytes = 0;
         Ok(())
