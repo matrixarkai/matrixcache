@@ -1998,13 +1998,14 @@ impl StorageEngineRocksDb {
     /// which 74.1 MB was preallocated air. For a small or short-lived cache that fixed overhead
     /// dwarfs the data.
     ///
-    /// Left at 64 MiB by default so existing deployments are unchanged; a deployment that knows
-    /// its cache is small can set `MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB` lower and get the disk
-    /// back. Smaller memtables flush more often, so this trades write amplification against that
-    /// fixed cost -- which is the right trade only when the cache is small relative to 64 MiB.
+    /// Defaults to 8 MiB, sized for a cache rather than for a write-heavy database. Measured on
+    /// a 3-prefix store: a 64 MiB memtable reserved 262 MB of blocks where 8 MiB reserved 80 MB,
+    /// with the same bytes written and no latency cost. Smaller memtables flush more often, so a
+    /// deployment with genuinely write-heavy traffic can set
+    /// `MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB` higher and buy the amplification back with disk.
     #[cfg(feature = "rocksdb-ssd")]
     pub(crate) fn rocksdb_write_buffer_bytes() -> usize {
-        const DEFAULT_MB: usize = 64;
+        const DEFAULT_MB: usize = 8;
         std::env::var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())

@@ -14,14 +14,14 @@ mod tests {
         std::env::remove_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB");
         assert_eq!(
             crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
-            64 * 1024 * 1024,
-            "the default must stay 64 MiB so existing deployments are unchanged"
+            8 * 1024 * 1024,
+            "the default is sized for a cache, not for a write-heavy database"
         );
 
-        std::env::set_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB", "8");
+        std::env::set_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB", "64");
         assert_eq!(
             crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
-            8 * 1024 * 1024
+            64 * 1024 * 1024
         );
 
         // Garbage and zero fall back rather than configuring a degenerate DB.
@@ -29,7 +29,7 @@ mod tests {
             std::env::set_var("MATRIXCACHE_ROCKSDB_WRITE_BUFFER_MB", bad);
             assert_eq!(
                 crate::StorageEngineRocksDB::rocksdb_write_buffer_bytes(),
-                64 * 1024 * 1024,
+                8 * 1024 * 1024,
                 "{bad:?} should fall back to the default"
             );
         }
