@@ -758,12 +758,37 @@ struct StagedSsdBatchWrite {
 
 #[derive(Debug, Clone)]
 enum SsdTierStore {
+    /// No store at all, because the tier's capacity is zero.
+    ///
+    /// Every admission path already treats a zero capacity as "this tier is off" --
+    /// `ssd_enabled` is `ssd_capacity_bytes > 0`, and the admit/evict paths return early on
+    /// it. The store was built anyway, so a node that can never use the tier still created
+    /// its directory and its files. Keeps what it would need to become real, because a
+    /// capacity raised after construction has to be able to bring the tier up.
+    Disabled {
+        disk_dir: PathBuf,
+        ssd_paths: Vec<PathBuf>,
+    },
     Single(StorageEngineRocksDb),
     Multi(StorageEngineMultiSsd),
 }
 
 impl SsdTierStore {
     fn new(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize) -> Self {
+        if capacity_bytes == 0 {
+            return Self::Disabled {
+                disk_dir: disk_dir.to_path_buf(),
+                ssd_paths: ssd_paths.to_vec(),
+            };
+        }
+        Self::build(disk_dir, ssd_paths, capacity_bytes)
+    }
+
+    /// Build the store for a non-zero capacity.
+    ///
+    /// Split out from [`Self::new`] so a tier switched on after construction comes up exactly
+    /// the way one built with a capacity does, rather than by a second, similar path.
+    fn build(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize) -> Self {
         let capacity = capacity_bytes as u64;
         let default_path = disk_dir.join("rocksdb-cache-blocks");
         let paths = if ssd_paths.is_empty() {
@@ -792,8 +817,28 @@ impl SsdTierStore {
         }
     }
 
+    /// Bring a disabled tier up, for a capacity raised after construction.
+    ///
+    /// `set_capacity_for_tier(CacheTier::Ssd, n)` can raise it at any time. A tier that stayed
+    /// disabled through that would accept nothing while the policy said it was there, which is
+    /// a worse failure than the one this variant exists to fix -- silent, and only visible as
+    /// a hit rate that never recovers.
+    fn enable(&mut self, capacity_bytes: usize) {
+        if capacity_bytes == 0 {
+            return;
+        }
+        if let Self::Disabled { disk_dir, ssd_paths } = self {
+            let (disk_dir, ssd_paths) = (disk_dir.clone(), ssd_paths.clone());
+            *self = Self::build(&disk_dir, &ssd_paths, capacity_bytes);
+            let _ = self.start();
+        }
+    }
+
     fn start(&mut self) -> bool {
         match self {
+            // Nothing to start, and reporting failure would make the caller treat an
+            // intentionally absent tier as a broken one.
+            Self::Disabled { .. } => true,
             Self::Single(storage) => storage.start(),
             Self::Multi(storage) => storage.start(),
         }
@@ -801,6 +846,7 @@ impl SsdTierStore {
 
     fn stop(&mut self) -> bool {
         match self {
+            Self::Disabled { .. } => true,
             Self::Single(storage) => storage.stop(),
             Self::Multi(storage) => storage.stop(),
         }
@@ -808,6 +854,9 @@ impl SsdTierStore {
 
     fn is_started(&self) -> bool {
         match self {
+            // Vacuously started: there is nothing to bring up, and answering false would send
+            // the caller down its "start it, and fail if that does not work" path.
+            Self::Disabled { .. } => true,
             Self::Single(storage) => storage.is_started(),
             Self::Multi(storage) => storage.is_started(),
         }
@@ -815,6 +864,7 @@ impl SsdTierStore {
 
     fn peek(&self, key: &str) -> bool {
         match self {
+            Self::Disabled { .. } => false,
             Self::Single(storage) => storage.peek(key),
             Self::Multi(storage) => storage.peek(key),
         }
@@ -822,6 +872,7 @@ impl SsdTierStore {
 
     fn get(&self, key: &str) -> Result<CacheBuffer, CacheError> {
         match self {
+            Self::Disabled { .. } => Err(CacheError::NotFound),
             Self::Single(storage) => storage.get(key),
             Self::Multi(storage) => storage.get(key),
         }
@@ -829,6 +880,7 @@ impl SsdTierStore {
 
     fn get_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         match self {
+            Self::Disabled { .. } => Ok(vec![None; keys.len()]),
             Self::Single(storage) => storage.get_batch(keys),
             Self::Multi(storage) => keys
                 .iter()
@@ -843,6 +895,10 @@ impl SsdTierStore {
 
     fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), CacheError> {
         match self {
+            // Unreachable through admission, which returns early on a zero capacity. A no-op
+            // rather than an error so a caller that reaches it anyway is not broken by a tier
+            // it was told is not there.
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.put(key, value).map(|_| ()),
             Self::Multi(storage) => storage.put(key, value).map(|_| ()),
         }
@@ -850,6 +906,7 @@ impl SsdTierStore {
 
     fn put_batch(&mut self, entries: Vec<(String, Vec<u8>)>) -> Result<(), CacheError> {
         match self {
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.put_batch(entries).map(|_| ()),
             Self::Multi(storage) => {
                 for (key, value) in entries {
@@ -862,6 +919,8 @@ impl SsdTierStore {
 
     fn delete(&mut self, key: &str) -> Result<(), CacheError> {
         match self {
+            // Deleting from a tier that holds nothing has already happened.
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.delete(key),
             Self::Multi(storage) => storage.delete(key),
         }
@@ -869,6 +928,7 @@ impl SsdTierStore {
 
     fn delete_batch(&mut self, keys: &[String]) -> Result<(), CacheError> {
         match self {
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.delete_batch(keys).map(|_| ()),
             Self::Multi(storage) => {
                 for key in keys {
@@ -884,6 +944,7 @@ impl SsdTierStore {
 
     fn reset(&mut self) -> Result<(), CacheError> {
         match self {
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.reset(),
             Self::Multi(storage) => storage.reset(),
         }
@@ -895,6 +956,8 @@ impl SsdTierStore {
         F: FnMut(&str, StringViewBuffer),
     {
         match self {
+            // Nothing was ever written, so there is nothing to recover.
+            Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.recover_view_data(callback),
             Self::Multi(storage) => storage.recover_view_data(callback),
         }
@@ -1411,6 +1474,9 @@ impl MultiLayerCache {
             CacheTier::Ssd => {
                 inner.ssd_capacity_bytes = capacity_bytes;
                 inner.tiering_policy.ssd_capacity_bytes = capacity_bytes;
+                // A tier built with no capacity has no store behind it; raising the capacity
+                // is what brings one up.
+                inner.ssd_store.enable(capacity_bytes);
                 inner.evict_ssd_to_capacity();
             }
             CacheTier::Reject => {}
@@ -1439,6 +1505,7 @@ impl MultiLayerCache {
         if inner.ssd_capacity_bytes > 0 || inner.ssd_instance_only {
             inner.ssd_capacity_bytes = capacity_bytes;
             inner.tiering_policy.ssd_capacity_bytes = capacity_bytes;
+            inner.ssd_store.enable(capacity_bytes);
         }
 
         if volatile_capacity > 0 {
