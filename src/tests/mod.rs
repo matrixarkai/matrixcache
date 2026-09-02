@@ -1506,6 +1506,69 @@ mod tests {
         );
     }
 
+    /// Records written after a compaction are still there after a reopen.
+    ///
+    /// The journal is held open between appends rather than reopened for each
+    /// one. Compaction folds it into a snapshot and deletes it, so the handle
+    /// has to be dropped at the same moment: an append through a handle whose
+    /// file has been unlinked succeeds, writes to an inode nothing can reach,
+    /// and loses the record at the next restart. Nothing about that failure is
+    /// visible until the reopen.
+    ///
+    /// So this writes across a compaction on purpose, and checks the far side.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    #[test]
+    fn records_written_after_a_compaction_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store_file = path.join("matrixcache_rocksdb_compat_store.bin");
+
+        let mut store = StorageEngineRocksDb::new(path.to_string_lossy().to_string());
+        assert!(store.start());
+
+        // Enough bytes to force at least one compaction, which is what removes
+        // the journal underneath the handle.
+        for index in 0..64 {
+            store
+                .put(&format!("before-{index:03}"), vec![b'v'; 4096])
+                .unwrap();
+        }
+        assert!(
+            store_file.exists(),
+            "nothing compacted, so the handle was never invalidated and this \
+             test proves nothing"
+        );
+
+        // Written after the journal was deleted. These are the records a stale
+        // handle would swallow.
+        for index in 0..8 {
+            store
+                .put(&format!("after-{index:03}"), format!("value-{index}").into_bytes())
+                .unwrap();
+        }
+        store.delete("before-000").unwrap();
+        drop(store);
+
+        let mut reopened = StorageEngineRocksDb::new(path.to_string_lossy().to_string());
+        assert!(reopened.start());
+        for index in 0..8 {
+            assert_eq!(
+                reopened
+                    .get(&format!("after-{index:03}"))
+                    .unwrap_or_else(|_| panic!("record after-{index:03} was written through a \
+                                                stale handle and lost"))
+                    .to_vec(),
+                format!("value-{index}").into_bytes()
+            );
+        }
+        assert!(
+            matches!(reopened.get("before-000"), Err(CacheError::NotFound)),
+            "a delete written after the compaction was lost"
+        );
+        // And the pre-compaction records are still in the snapshot.
+        assert_eq!(reopened.get("before-001").unwrap().to_vec().len(), 4096);
+    }
+
     /// The write-budget share is a proportion, not a count, so aggregating it
     /// by addition would report nonsense. The tightest shard is the one that
     /// explains why a caller is seeing writes refused.
