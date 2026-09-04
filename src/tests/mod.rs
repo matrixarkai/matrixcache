@@ -15746,12 +15746,18 @@ fn sharded_batch_fanout_metrics_are_exported() {
         stats.sharded_batch_fanout_shards >= 2,
         "fan-out should record participating shard groups: {stats:?}"
     );
+    assert!(
+        stats.sharded_batch_latency_samples >= 4,
+        "batch get/acquire paths should record latency samples: {stats:?}"
+    );
 
     let exported = prometheus_text(&stats, &[("cache", "batch")]);
     for metric in [
         "matrixcache_sharded_batch_fanout_operations",
         "matrixcache_sharded_batch_local_operations",
         "matrixcache_sharded_batch_fanout_shards",
+        "matrixcache_sharded_batch_latency_seconds",
+        "matrixcache_sharded_batch_latency_p95_seconds",
     ] {
         assert!(
             exported.contains(metric),

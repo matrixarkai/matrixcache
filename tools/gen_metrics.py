@@ -52,6 +52,7 @@ LATENCY_FAMILIES = [
     ("writeback_latency", "writeback_latency_total_micros", None),
     ("eviction_latency", "eviction_latency_total_micros", None),
     ("compaction_latency", "compaction_latency_total_micros", None),
+    ("sharded_batch_latency", "sharded_batch_latency_total_micros", "sharded_batch_latency_max_micros"),
 ]
 BUCKETS = [("le_10us", "1e-05"), ("le_100us", "0.0001"), ("le_1ms", "0.001"),
            ("le_10ms", "0.01"), ("gt_10ms", "+Inf")]

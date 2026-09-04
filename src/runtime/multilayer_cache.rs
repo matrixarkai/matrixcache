@@ -4358,6 +4358,14 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         sharded_batch_fanout_operations,
         sharded_batch_local_operations,
         sharded_batch_fanout_shards,
+        sharded_batch_latency_samples,
+        sharded_batch_latency_total_micros,
+        sharded_batch_latency_max_micros,
+        sharded_batch_latency_le_10us,
+        sharded_batch_latency_le_100us,
+        sharded_batch_latency_le_1ms,
+        sharded_batch_latency_le_10ms,
+        sharded_batch_latency_gt_10ms,
         get_latency_samples,
         put_latency_samples,
         get_latency_total_micros,
@@ -4499,6 +4507,30 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.sharded_batch_fanout_shards = total
         .sharded_batch_fanout_shards
         .saturating_add(sharded_batch_fanout_shards);
+    total.sharded_batch_latency_samples = total
+        .sharded_batch_latency_samples
+        .saturating_add(sharded_batch_latency_samples);
+    total.sharded_batch_latency_total_micros = total
+        .sharded_batch_latency_total_micros
+        .saturating_add(sharded_batch_latency_total_micros);
+    total.sharded_batch_latency_max_micros = total
+        .sharded_batch_latency_max_micros
+        .max(sharded_batch_latency_max_micros);
+    total.sharded_batch_latency_le_10us = total
+        .sharded_batch_latency_le_10us
+        .saturating_add(sharded_batch_latency_le_10us);
+    total.sharded_batch_latency_le_100us = total
+        .sharded_batch_latency_le_100us
+        .saturating_add(sharded_batch_latency_le_100us);
+    total.sharded_batch_latency_le_1ms = total
+        .sharded_batch_latency_le_1ms
+        .saturating_add(sharded_batch_latency_le_1ms);
+    total.sharded_batch_latency_le_10ms = total
+        .sharded_batch_latency_le_10ms
+        .saturating_add(sharded_batch_latency_le_10ms);
+    total.sharded_batch_latency_gt_10ms = total
+        .sharded_batch_latency_gt_10ms
+        .saturating_add(sharded_batch_latency_gt_10ms);
     total.get_latency_samples = total.get_latency_samples.saturating_add(get_latency_samples);
     total.put_latency_samples = total.put_latency_samples.saturating_add(put_latency_samples);
     total.get_latency_total_micros = total.get_latency_total_micros.saturating_add(get_latency_total_micros);
@@ -4598,6 +4630,7 @@ struct ShardedBatchStats {
     fanout_operations: AtomicU64,
     local_operations: AtomicU64,
     fanout_shards: AtomicU64,
+    latency: AtomicLatencyHistogram,
 }
 
 impl ShardedBatchStats {
@@ -4609,6 +4642,10 @@ impl ShardedBatchStats {
 
     fn record_local(&self) {
         self.local_operations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_latency(&self, started: Instant) {
+        self.latency.observe_with_total(elapsed_micros(started));
     }
 }
 
@@ -4939,6 +4976,42 @@ impl ShardedMultiLayerCache {
         total.sharded_batch_fanout_shards = self
             .sharded_stats
             .fanout_shards
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_samples = self.sharded_stats.latency.samples();
+        total.sharded_batch_latency_total_micros = self
+            .sharded_stats
+            .latency
+            .total_micros
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_max_micros = self
+            .sharded_stats
+            .latency
+            .max_micros
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_le_10us = self
+            .sharded_stats
+            .latency
+            .le_10us
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_le_100us = self
+            .sharded_stats
+            .latency
+            .le_100us
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_le_1ms = self
+            .sharded_stats
+            .latency
+            .le_1ms
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_le_10ms = self
+            .sharded_stats
+            .latency
+            .le_10ms
+            .load(Ordering::Relaxed);
+        total.sharded_batch_latency_gt_10ms = self
+            .sharded_stats
+            .latency
+            .gt_10ms
             .load(Ordering::Relaxed);
 
         for shard in self.shards.iter() {
@@ -5402,7 +5475,9 @@ impl ShardedMultiLayerCache {
         F: Fn(&MultiLayerCache, &[CacheKey]) -> Result<Vec<Option<T>>, CacheError> + Copy + Send,
         T: Clone + Send,
     {
+        let started = Instant::now();
         if keys.is_empty() {
+            self.sharded_stats.record_latency(started);
             return Ok(Vec::new());
         }
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
@@ -5468,6 +5543,7 @@ impl ShardedMultiLayerCache {
         for (position, value) in shard_results {
             results[position] = value;
         }
+        self.sharded_stats.record_latency(started);
         Ok(results)
     }
 
@@ -5687,9 +5763,12 @@ impl ShardedMultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
+        let started = Instant::now();
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
-            return self.acquire_batch_no_promotion_locally(keys);
+            let result = self.acquire_batch_no_promotion_locally(keys);
+            self.sharded_stats.record_latency(started);
+            return result;
         }
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
@@ -5738,6 +5817,7 @@ impl ShardedMultiLayerCache {
                 results[position] = handle;
             }
         }
+        self.sharded_stats.record_latency(started);
         Ok(results)
     }
 
@@ -5778,9 +5858,12 @@ impl ShardedMultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
+        let started = Instant::now();
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
-            return self.acquire_batch_locally(keys);
+            let result = self.acquire_batch_locally(keys);
+            self.sharded_stats.record_latency(started);
+            return result;
         }
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
@@ -5829,6 +5912,7 @@ impl ShardedMultiLayerCache {
                 results[position] = handle;
             }
         }
+        self.sharded_stats.record_latency(started);
         Ok(results)
     }
 

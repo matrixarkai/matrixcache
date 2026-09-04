@@ -947,6 +947,17 @@
           "legendFormat": "fanout shard groups/s",
           "range": true,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "matrixcache_sharded_batch_latency_p95_seconds",
+          "legendFormat": "batch p95 seconds",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Sharded Batch Fanout",

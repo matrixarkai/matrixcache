@@ -1139,6 +1139,22 @@ pub struct CacheStats {
     #[serde(default)]
     pub sharded_batch_fanout_shards: u64,
     #[serde(default)]
+    pub sharded_batch_latency_samples: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_total_micros: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_max_micros: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_le_10us: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_le_100us: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_le_1ms: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_le_10ms: u64,
+    #[serde(default)]
+    pub sharded_batch_latency_gt_10ms: u64,
+    #[serde(default)]
     pub get_latency_samples: u64,
     #[serde(default)]
     pub put_latency_samples: u64,

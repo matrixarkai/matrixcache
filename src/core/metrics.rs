@@ -284,6 +284,33 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     metric_f64(&mut out, "matrixcache_compaction_latency_p50_seconds", "compaction p50 latency", "gauge", &tags, percentile_seconds(stats.compaction_latency_samples, stats.compaction_latency_le_10us, stats.compaction_latency_le_100us, stats.compaction_latency_le_1ms, stats.compaction_latency_le_10ms, stats.compaction_latency_gt_10ms, 0, 50));
     metric_f64(&mut out, "matrixcache_compaction_latency_p95_seconds", "compaction p95 latency", "gauge", &tags, percentile_seconds(stats.compaction_latency_samples, stats.compaction_latency_le_10us, stats.compaction_latency_le_100us, stats.compaction_latency_le_1ms, stats.compaction_latency_le_10ms, stats.compaction_latency_gt_10ms, 0, 95));
 
+    // sharded batch latency
+    let _ = writeln!(out, "# HELP matrixcache_sharded_batch_latency_seconds sharded batch latency");
+    let _ = writeln!(out, "# TYPE matrixcache_sharded_batch_latency_seconds histogram");
+    {
+        let mut cumulative = 0_u64;
+        cumulative = cumulative.saturating_add(stats.sharded_batch_latency_le_10us);
+        bucket(&mut out, "matrixcache_sharded_batch_latency_seconds", &tags, "1e-05", cumulative);
+        cumulative = cumulative.saturating_add(stats.sharded_batch_latency_le_100us);
+        bucket(&mut out, "matrixcache_sharded_batch_latency_seconds", &tags, "0.0001", cumulative);
+        cumulative = cumulative.saturating_add(stats.sharded_batch_latency_le_1ms);
+        bucket(&mut out, "matrixcache_sharded_batch_latency_seconds", &tags, "0.001", cumulative);
+        cumulative = cumulative.saturating_add(stats.sharded_batch_latency_le_10ms);
+        bucket(&mut out, "matrixcache_sharded_batch_latency_seconds", &tags, "0.01", cumulative);
+        cumulative = cumulative.saturating_add(stats.sharded_batch_latency_gt_10ms);
+        bucket(&mut out, "matrixcache_sharded_batch_latency_seconds", &tags, "+Inf", cumulative);
+        let _ = writeln!(
+            out,
+            "matrixcache_sharded_batch_latency_seconds_sum{tags} {:.6}",
+            stats.sharded_batch_latency_total_micros as f64 / 1_000_000.0
+        );
+        let _ = writeln!(out, "matrixcache_sharded_batch_latency_seconds_count{tags} {cumulative}");
+    }
+    metric_f64(&mut out, "matrixcache_sharded_batch_latency_avg_seconds", "sharded batch average latency", "gauge", &tags, average_seconds(stats.sharded_batch_latency_total_micros, stats.sharded_batch_latency_samples));
+    metric(&mut out, "matrixcache_sharded_batch_latency_max_seconds", "sharded batch peak latency", "gauge", &tags, stats.sharded_batch_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_sharded_batch_latency_p50_seconds", "sharded batch p50 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 50));
+    metric_f64(&mut out, "matrixcache_sharded_batch_latency_p95_seconds", "sharded batch p95 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 95));
+
     out
 }
 
