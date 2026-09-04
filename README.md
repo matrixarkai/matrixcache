@@ -114,7 +114,10 @@ and says what the number means:
 - `rocksdb_backend_bench` -- multi-tier DRAM/PMEM/RocksDB-SSD pressure, cold
   read refill, restart refill, replacement soak, and writeback backpressure.
   Add `--json-output <path>` to archive the report and `--require-passed` to
-  fail the process when the cache contract is not satisfied.
+  fail the process when the cache contract is not satisfied. Validate archived
+  reports with `tools/validate_backend_report.py`; CI uses the same validator
+  against the lightweight `--no-default-features` compatibility backend, while
+  production evidence should use the default RocksDB backend.
 - `scan_resistance_bench`, `admission_filter_bench` -- what the admission
   policy is worth against a scan
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`

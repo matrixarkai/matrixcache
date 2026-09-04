@@ -59,6 +59,19 @@ jobs:
             --min-hit-rate-percent 1
           tools/compare_soak_reports.py /tmp/matrixcache-soak.json /tmp/matrixcache-soak.json
 
+      - name: Backend report smoke
+        run: |
+          cargo run --locked --no-default-features --example rocksdb_backend_bench -- \
+            --iterations 500 \
+            --replacement-soak-iterations 128 \
+            --json-output /tmp/matrixcache-backend-compat.json \
+            --require-passed
+          tools/validate_backend_report.py /tmp/matrixcache-backend-compat.json \
+            --expect-backend file-compat \
+            --min-iterations 500 \
+            --min-cold-ssd-refills 1 \
+            --max-refill-failures 0
+
       - name: Doc
         run: cargo doc --no-deps --locked
 

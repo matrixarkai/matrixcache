@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Validate a MatrixCache RocksDB/backend benchmark JSON report."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REQUIRED_TOP_LEVEL = {
+    "report_version": str,
+    "backend": str,
+    "iterations": int,
+    "workload": dict,
+    "put": dict,
+    "resident_hot_get": dict,
+    "hot_get": dict,
+    "cold_ssd_refill_get": dict,
+    "resident_hot_key_count": int,
+    "cold_ssd_refills": int,
+    "memory_hits": int,
+    "pmem_hits": int,
+    "ssd_hits": int,
+    "memory_evictions": int,
+    "pmem_evictions": int,
+    "ssd_evictions": int,
+    "refill_failures": int,
+    "disk_fills": int,
+    "pmem_fills": int,
+    "main_pressure_passed": bool,
+    "replacement_soak_iterations": int,
+    "replacement_soak_passed": bool,
+    "async_writeback_backpressure": int,
+    "restart_disk_refill_ready": bool,
+    "matrixcache_contract": dict,
+    "matrixcache_contract_evidence": dict,
+}
+
+REQUIRED_TIMING = {
+    "count",
+    "total_ms",
+    "total_us",
+    "qps",
+    "p50_us",
+    "p95_us",
+    "p99_us",
+    "p50_ns",
+    "p95_ns",
+    "p99_ns",
+}
+
+REQUIRED_CONTRACT = {
+    "dram_to_pmem_eviction",
+    "pmem_to_ssd_eviction",
+    "ssd_read_through_refill",
+    "replacement_soak",
+    "async_writeback_backpressure",
+    "restart_disk_refill",
+    "passed",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("report", type=Path, help="Path to matrixcache_rocksdb_backend_v1 JSON")
+    parser.add_argument(
+        "--allow-failed",
+        action="store_true",
+        help="Validate shape but do not require matrixcache_contract.passed=true",
+    )
+    parser.add_argument(
+        "--expect-backend",
+        choices=("rocksdb", "file-compat"),
+        help="Require a specific backend value",
+    )
+    parser.add_argument("--min-iterations", type=int)
+    parser.add_argument("--min-cold-ssd-refills", type=int)
+    parser.add_argument("--max-refill-failures", type=int)
+    parser.add_argument("--max-hot-get-p99-us", type=int)
+    parser.add_argument("--max-cold-refill-p99-us", type=int)
+    return parser.parse_args()
+
+
+def fail(message: str) -> None:
+    print(f"matrixcache backend report invalid: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load_report(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        fail(f"{path} does not exist")
+    except json.JSONDecodeError as exc:
+        fail(f"{path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        fail("top-level JSON value must be an object")
+    return data
+
+
+def require_type(data: dict[str, Any], field: str, expected: Any) -> None:
+    if field not in data:
+        fail(f"missing field {field!r}")
+    if not isinstance(data[field], expected):
+        fail(f"field {field!r} has type {type(data[field]).__name__}, not {expected}")
+
+
+def require_numeric_field(data: dict[str, Any], field: str) -> float:
+    value = data.get(field)
+    if not isinstance(value, (int, float)):
+        fail(f"field {field!r} must be numeric")
+    return float(value)
+
+
+def validate_timing(data: dict[str, Any], field: str) -> None:
+    timing = data.get(field)
+    if not isinstance(timing, dict):
+        fail(f"{field!r} must be an object")
+    missing = REQUIRED_TIMING.difference(timing)
+    if missing:
+        fail(f"{field!r} missing timing fields: {', '.join(sorted(missing))}")
+    if require_numeric_field(timing, "count") <= 0:
+        fail(f"{field!r}.count must be positive")
+    if require_numeric_field(timing, "qps") <= 0:
+        fail(f"{field!r}.qps must be positive")
+
+
+def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
+    contract = data["matrixcache_contract"]
+    missing = REQUIRED_CONTRACT.difference(contract)
+    if missing:
+        fail(f"matrixcache_contract missing fields: {', '.join(sorted(missing))}")
+    false_fields = [
+        name
+        for name in sorted(REQUIRED_CONTRACT - {"passed"})
+        if contract.get(name) is not True
+    ]
+    if contract.get("passed") is not True:
+        false_fields.append("passed")
+    if false_fields and not allow_failed:
+        fail(f"failing contract fields: {', '.join(false_fields)}")
+
+    evidence = data["matrixcache_contract_evidence"]
+    for name in sorted(REQUIRED_CONTRACT - {"passed"}):
+        item = evidence.get(name)
+        if not isinstance(item, dict):
+            fail(f"missing evidence object for {name!r}")
+        if item.get("observed") is not contract.get(name):
+            fail(f"evidence observed value disagrees with contract field {name!r}")
+        if "source" not in item or "metric" not in item:
+            fail(f"evidence object for {name!r} must include source and metric")
+
+
+def validate(args: argparse.Namespace) -> dict[str, Any]:
+    data = load_report(args.report)
+    for field, expected in REQUIRED_TOP_LEVEL.items():
+        require_type(data, field, expected)
+
+    if data["report_version"] != "matrixcache_rocksdb_backend_v1":
+        fail(f"unexpected report_version {data['report_version']!r}")
+    if data["backend"] not in {"rocksdb", "file-compat"}:
+        fail(f"unexpected backend {data['backend']!r}")
+    if args.expect_backend and data["backend"] != args.expect_backend:
+        fail(f"backend {data['backend']!r} does not match expected {args.expect_backend!r}")
+    if data["iterations"] <= 0:
+        fail("iterations must be positive")
+    if args.min_iterations is not None and data["iterations"] < args.min_iterations:
+        fail(f"iterations={data['iterations']} below {args.min_iterations}")
+    if args.min_cold_ssd_refills is not None and data["cold_ssd_refills"] < args.min_cold_ssd_refills:
+        fail(f"cold_ssd_refills={data['cold_ssd_refills']} below {args.min_cold_ssd_refills}")
+    if args.max_refill_failures is not None and data["refill_failures"] > args.max_refill_failures:
+        fail(f"refill_failures={data['refill_failures']} exceeds {args.max_refill_failures}")
+
+    for field in ("put", "resident_hot_get", "hot_get", "cold_ssd_refill_get"):
+        validate_timing(data, field)
+    if args.max_hot_get_p99_us is not None:
+        hot_p99 = require_numeric_field(data["hot_get"], "p99_us")
+        if hot_p99 > args.max_hot_get_p99_us:
+            fail(f"hot_get.p99_us={hot_p99:.0f} exceeds {args.max_hot_get_p99_us}")
+    if args.max_cold_refill_p99_us is not None:
+        cold_p99 = require_numeric_field(data["cold_ssd_refill_get"], "p99_us")
+        if cold_p99 > args.max_cold_refill_p99_us:
+            fail(
+                f"cold_ssd_refill_get.p99_us={cold_p99:.0f} "
+                f"exceeds {args.max_cold_refill_p99_us}"
+            )
+
+    validate_contract(data, args.allow_failed)
+    return data
+
+
+def main() -> int:
+    args = parse_args()
+    data = validate(args)
+    print(
+        "OK matrixcache backend report: "
+        f"backend={data['backend']} iterations={data['iterations']} "
+        f"hot_get_p99={data['hot_get']['p99_us']}us "
+        f"cold_refill_p99={data['cold_ssd_refill_get']['p99_us']}us "
+        f"cold_refills={data['cold_ssd_refills']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
