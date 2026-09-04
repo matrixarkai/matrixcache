@@ -44,11 +44,11 @@ FIELDS = cache_stats_fields(STATS)
 LATENCY_FAMILIES = [
     ("get_latency", "get_latency_total_micros", "get_latency_max_micros"),
     ("put_latency", "put_latency_total_micros", "put_latency_max_micros"),
-    ("read_through_latency", None, None),
-    ("refill_latency", None, None),
-    ("writeback_latency", None, None),
-    ("eviction_latency", None, None),
-    ("compaction_latency", None, None),
+    ("read_through_latency", "read_through_latency_total_micros", None),
+    ("refill_latency", "refill_latency_total_micros", None),
+    ("writeback_latency", "writeback_latency_total_micros", None),
+    ("eviction_latency", "eviction_latency_total_micros", None),
+    ("compaction_latency", "compaction_latency_total_micros", None),
 ]
 BUCKETS = [("le_10us", "1e-05"), ("le_100us", "0.0001"), ("le_1ms", "0.001"),
            ("le_10ms", "0.01"), ("gt_10ms", "+Inf")]
@@ -169,6 +169,9 @@ for family, total, mx in LATENCY_FAMILIES:
         out.append("        // instantaneous\" rather than \"not measured\".")
     out.append('        let _ = writeln!(out, "%s_count{tags} {cumulative}");' % metric)
     out.append("    }")
+    if total:
+        out.append('    metric_f64(&mut out, "matrixcache_%s_avg_seconds", "%s average latency", "gauge", &tags, average_seconds(stats.%s, stats.%s_samples));'
+                   % (family, pretty, total, family))
     if mx:
         out.append('    metric(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", &tags, stats.%s);'
                    % (family, pretty, mx))
@@ -207,12 +210,25 @@ out.append('    let _ = writeln!(out, "# TYPE {name} {kind}");')
 out.append('    let _ = writeln!(out, "{name}{tags} {value}");')
 out.append("}")
 out.append("")
+out.append("fn metric_f64(out: &mut String, name: &str, help: &str, kind: &str, tags: &str, value: f64) {")
+out.append('    let _ = writeln!(out, "# HELP {name} {help}");')
+out.append('    let _ = writeln!(out, "# TYPE {name} {kind}");')
+out.append('    let _ = writeln!(out, "{name}{tags} {value:.6}");')
+out.append("}")
+out.append("")
+out.append("fn average_seconds(total_micros: u64, samples: u64) -> f64 {")
+out.append("    if samples == 0 {")
+out.append("        0.0")
+out.append("    } else {")
+out.append("        total_micros as f64 / samples as f64 / 1_000_000.0")
+out.append("    }")
+out.append("}")
+out.append("")
 out.append("fn bucket(out: &mut String, name: &str, tags: &str, le: &str, value: u64) {")
 out.append("    let separator = if tags.is_empty() { \"\" } else { \",\" };")
 out.append("    let inner = tags.trim_start_matches('{').trim_end_matches('}');")
 out.append('    let _ = writeln!(out, "{name}_bucket{{{inner}{separator}le=\\"{le}\\"}} {value}");')
 out.append("}")
-out.append("")
 
 OUTPUT.write_text("\n".join(out) + "\n")
 print("generated metrics.rs: %d scalar metrics + %d histograms"

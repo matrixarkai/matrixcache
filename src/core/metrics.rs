@@ -119,6 +119,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_get_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_get_latency_avg_seconds", "get average latency", "gauge", &tags, average_seconds(stats.get_latency_total_micros, stats.get_latency_samples));
     metric(&mut out, "matrixcache_get_latency_max_seconds", "get peak latency", "gauge", &tags, stats.get_latency_max_micros);
 
     // put latency
@@ -143,6 +144,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_put_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_put_latency_avg_seconds", "put average latency", "gauge", &tags, average_seconds(stats.put_latency_total_micros, stats.put_latency_samples));
     metric(&mut out, "matrixcache_put_latency_max_seconds", "put peak latency", "gauge", &tags, stats.put_latency_max_micros);
 
     // read through latency
@@ -167,6 +169,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_read_through_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_read_through_latency_avg_seconds", "read through average latency", "gauge", &tags, average_seconds(stats.read_through_latency_total_micros, stats.read_through_latency_samples));
 
     // refill latency
     let _ = writeln!(out, "# HELP matrixcache_refill_latency_seconds refill latency");
@@ -190,6 +193,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_refill_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_refill_latency_avg_seconds", "refill average latency", "gauge", &tags, average_seconds(stats.refill_latency_total_micros, stats.refill_latency_samples));
 
     // writeback latency
     let _ = writeln!(out, "# HELP matrixcache_writeback_latency_seconds writeback latency");
@@ -213,6 +217,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_writeback_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_writeback_latency_avg_seconds", "writeback average latency", "gauge", &tags, average_seconds(stats.writeback_latency_total_micros, stats.writeback_latency_samples));
 
     // eviction latency
     let _ = writeln!(out, "# HELP matrixcache_eviction_latency_seconds eviction latency");
@@ -236,6 +241,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_eviction_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_eviction_latency_avg_seconds", "eviction average latency", "gauge", &tags, average_seconds(stats.eviction_latency_total_micros, stats.eviction_latency_samples));
 
     // compaction latency
     let _ = writeln!(out, "# HELP matrixcache_compaction_latency_seconds compaction latency");
@@ -259,6 +265,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         );
         let _ = writeln!(out, "matrixcache_compaction_latency_seconds_count{tags} {cumulative}");
     }
+    metric_f64(&mut out, "matrixcache_compaction_latency_avg_seconds", "compaction average latency", "gauge", &tags, average_seconds(stats.compaction_latency_total_micros, stats.compaction_latency_samples));
 
     out
 }
@@ -291,6 +298,20 @@ fn metric(out: &mut String, name: &str, help: &str, kind: &str, tags: &str, valu
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
     let _ = writeln!(out, "{name}{tags} {value}");
+}
+
+fn metric_f64(out: &mut String, name: &str, help: &str, kind: &str, tags: &str, value: f64) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    let _ = writeln!(out, "{name}{tags} {value:.6}");
+}
+
+fn average_seconds(total_micros: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_micros as f64 / samples as f64 / 1_000_000.0
+    }
 }
 
 fn bucket(out: &mut String, name: &str, tags: &str, le: &str, value: u64) {

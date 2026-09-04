@@ -9651,6 +9651,16 @@ mod tests {
                 metrics.contains(&format!("{family}_sum")),
                 "{family} should export a histogram sum for Grafana averages:\n{metrics}"
             );
+            let avg_gauge = format!(
+                "{}_avg_seconds",
+                family
+                    .strip_suffix("_seconds")
+                    .expect("latency metric family ends in seconds")
+            );
+            assert!(
+                metrics.contains(&avg_gauge),
+                "{family} should export a direct average gauge for Grafana panels:\n{metrics}"
+            );
         }
     }
 
@@ -15199,6 +15209,20 @@ mod tests {
                 .parse()
                 .expect("count parses");
             assert_eq!(count, infinity, "{family}: _count must equal the +Inf bucket");
+        }
+        for gauge in [
+            "matrixcache_get_latency_avg_seconds",
+            "matrixcache_put_latency_avg_seconds",
+            "matrixcache_read_through_latency_avg_seconds",
+            "matrixcache_refill_latency_avg_seconds",
+            "matrixcache_writeback_latency_avg_seconds",
+            "matrixcache_eviction_latency_avg_seconds",
+            "matrixcache_compaction_latency_avg_seconds",
+        ] {
+            assert!(
+                text.contains(gauge),
+                "{gauge} should be exported for direct dashboard averages:\n{text}"
+            );
         }
 
         // A label value with a quote in it must not break the response.
