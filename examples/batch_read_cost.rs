@@ -84,9 +84,10 @@ fn main() {
          median of {PASSES} passes\n"
     );
     println!(
-        "{:<16}{:>14}{:>22}{:>22}{:>28}",
+        "{:<16}{:>14}{:>18}{:>22}{:>22}{:>28}",
         "batch size",
         "get_batch",
+        "sharded_get",
         "get_batch_no_prom",
         "acquire_no_prom",
         "sharded_acquire_no_prom"
@@ -140,6 +141,20 @@ fn main() {
                 })
                 .collect(),
         );
+        let sharded_regular_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in keys.chunks(batch) {
+                        let values = sharded.get_batch(chunk).expect("sharded_get_batch");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(served, RESIDENT, "every key should have hit sharded memory");
+                    started.elapsed().as_nanos() as f64 / RESIDENT as f64
+                })
+                .collect(),
+        );
         let sharded_acquire_no_promotion_ns = median(
             (0..PASSES)
                 .map(|_| {
@@ -158,7 +173,7 @@ fn main() {
                 .collect(),
         );
         println!(
-            "{batch:<16}{regular_ns:>14.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>22.1}{sharded_acquire_no_promotion_ns:>28.1}"
+            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>22.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
     }
 

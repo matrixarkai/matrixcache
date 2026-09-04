@@ -5489,9 +5489,39 @@ impl ShardedMultiLayerCache {
         }
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
-        } else {
-            self.sharded_stats.record_fanout(self.batch_shard_fanout(keys));
+            let mut grouped = vec![Vec::new(); self.shard_count()];
+            for (position, key) in keys.iter().cloned().enumerate() {
+                grouped[self.shard_index_for_key(&key)].push((position, key));
+            }
+            let mut results = vec![None; keys.len()];
+            for (index, group) in grouped.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let mut unique_positions = HashMap::new();
+                let mut unique_keys = Vec::new();
+                let mut requested_positions = Vec::with_capacity(group.len());
+                for (position, key) in group {
+                    let unique_position =
+                        if let Some(position) = unique_positions.get(&key).copied() {
+                            position
+                        } else {
+                            let position = unique_keys.len();
+                            unique_positions.insert(key.clone(), position);
+                            unique_keys.push(key);
+                            position
+                        };
+                    requested_positions.push((position, unique_position));
+                }
+                let values = reader(&self.shards[index], &unique_keys)?;
+                for (position, unique_position) in requested_positions {
+                    results[position] = values[unique_position].clone();
+                }
+            }
+            self.sharded_stats.record_latency(started);
+            return Ok(results);
         }
+        self.sharded_stats.record_fanout(self.batch_shard_fanout(keys));
         let mut grouped = vec![Vec::new(); self.shard_count()];
         for (position, key) in keys.iter().cloned().enumerate() {
             grouped[self.shard_index_for_key(&key)].push((position, key));
