@@ -113,6 +113,9 @@ and says what the number means:
   settings above
 - `scan_resistance_bench`, `admission_filter_bench` -- what the admission
   policy is worth against a scan
+- `soak` -- long-running memory-pressure and latency stability. Add `--json`
+  to append a machine-readable report for Grafana/comparison archives; use
+  `--duration-seconds` and `--sample-seconds` for short validation runs.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather

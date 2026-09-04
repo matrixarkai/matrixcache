@@ -35,7 +35,7 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads>
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--sample-seconds N] [--duration-seconds N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
@@ -47,7 +47,7 @@ const VALUE_BYTES: usize = 256;
 const KEY_SPACE: usize = 32_768;
 /// Room for a quarter of the key space, so eviction runs continuously.
 const RESIDENT: usize = KEY_SPACE / 4;
-const SAMPLE_SECONDS: u64 = 60;
+const DEFAULT_SAMPLE_SECONDS: u64 = 60;
 
 /// Deterministic skew: most draws land in the low keys.
 fn skewed_index(state: &mut u64) -> usize {
@@ -60,9 +60,39 @@ fn skewed_index(state: &mut u64) -> usize {
 }
 
 fn main() {
+    let mut positional = Vec::new();
+    let mut emit_json = false;
+    let mut sample_seconds = DEFAULT_SAMPLE_SECONDS;
+    let mut duration_seconds = None;
     let mut args = std::env::args().skip(1);
-    let minutes: u64 = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(480);
-    let threads: usize = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(4);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => emit_json = true,
+            "--sample-seconds" => {
+                sample_seconds = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(DEFAULT_SAMPLE_SECONDS);
+            }
+            "--duration-seconds" => {
+                duration_seconds = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let minutes: u64 = positional
+        .first()
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(480);
+    let threads: usize = positional
+        .get(1)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(4);
+    let total_duration = Duration::from_secs(duration_seconds.unwrap_or(minutes * 60));
 
     let cache = Arc::new(
         MultiLayerCache::try_with_options(CacheOptions::new(RESIDENT * VALUE_BYTES, 0, 0))
@@ -133,9 +163,13 @@ fn main() {
     // Every interval's rate, so the summary can look at the shape rather than
     // at one number. See the note where they are reported.
     let mut rates: Vec<f64> = Vec::new();
+    let mut hit_rates: Vec<f64> = Vec::new();
+    let mut peak_entries = 0_usize;
+    let mut peak_memory_bytes = 0_u64;
 
-    while started.elapsed() < Duration::from_secs(minutes * 60) {
-        std::thread::sleep(Duration::from_secs(SAMPLE_SECONDS));
+    while started.elapsed() < total_duration {
+        let remaining = total_duration.saturating_sub(started.elapsed());
+        std::thread::sleep(Duration::from_secs(sample_seconds).min(remaining));
 
         let now_reads = reads.load(Ordering::Relaxed);
         let stats = cache.stats();
@@ -159,6 +193,9 @@ fn main() {
         let entries = cache.all_entries().len();
 
         rates.push(rate);
+        hit_rates.push(hit_rate);
+        peak_entries = peak_entries.max(entries);
+        peak_memory_bytes = peak_memory_bytes.max(stats.memory_bytes);
 
         println!(
             "{:>6}{:>12.1}{:>10.2}%{:>12}{:>12.1}{:>12}",
@@ -208,9 +245,11 @@ fn main() {
     // and a moving floor under a flat ceiling is contention.
     let window = (rates.len() / 3).max(1);
     println!("\nthroughput by third, Kops/s (ceiling is the decay signal):");
+    let mut thirds = Vec::new();
     for (index, chunk) in rates.chunks(window).take(3).enumerate() {
         let best = chunk.iter().copied().fold(f64::MIN, f64::max);
         let worst = chunk.iter().copied().fold(f64::MAX, f64::min);
+        thirds.push((best, worst));
         println!(
             "  window {}: ceiling {best:6.1}   floor {worst:6.1}",
             index + 1
@@ -220,4 +259,103 @@ fn main() {
         "get latency max {}us over {} samples",
         stats.get_latency_max_micros, stats.get_latency_samples
     );
+
+    if emit_json {
+        let latency = cache.latency_metrics_report();
+        let final_entries = cache.all_entries().len();
+        let final_reads = reads.load(Ordering::Relaxed);
+        let final_writes = writes.load(Ordering::Relaxed);
+        let observed_hit_rate = if stats.memory_hits + stats.misses == 0 {
+            0.0
+        } else {
+            stats.memory_hits as f64 / (stats.memory_hits + stats.misses) as f64 * 100.0
+        };
+        let best_rate = rates.iter().copied().fold(0.0_f64, f64::max);
+        let worst_rate = rates.iter().copied().fold(f64::MAX, f64::min);
+        let worst_rate = if rates.is_empty() { 0.0 } else { worst_rate };
+        let min_hit_rate = hit_rates.iter().copied().fold(f64::MAX, f64::min);
+        let min_hit_rate = if hit_rates.is_empty() {
+            0.0
+        } else {
+            min_hit_rate
+        };
+        let max_hit_rate = hit_rates.iter().copied().fold(0.0_f64, f64::max);
+        let bounded_entries = peak_entries <= RESIDENT + 64;
+        let bounded_memory =
+            peak_memory_bytes as usize <= RESIDENT * VALUE_BYTES + VALUE_BYTES * 64;
+        let steady_throughput = match (thirds.first(), thirds.last()) {
+            (Some((first_best, _)), Some((last_best, _))) if *first_best > 0.0 => {
+                *last_best >= *first_best * 0.80
+            }
+            _ => true,
+        };
+        let passed = bounded_entries && bounded_memory && steady_throughput;
+
+        println!("\n{{");
+        println!("  \"report_version\": \"matrixcache_soak_v1\",");
+        println!("  \"minutes\": {minutes},");
+        println!("  \"threads\": {threads},");
+        println!("  \"key_space\": {KEY_SPACE},");
+        println!("  \"resident_capacity_entries\": {RESIDENT},");
+        println!("  \"value_bytes\": {VALUE_BYTES},");
+        println!("  \"sample_seconds\": {sample_seconds},");
+        println!("  \"duration_seconds\": {},", total_duration.as_secs());
+        println!("  \"reads\": {final_reads},");
+        println!("  \"writes\": {final_writes},");
+        println!("  \"final_entries\": {final_entries},");
+        println!("  \"peak_entries\": {peak_entries},");
+        println!("  \"final_memory_bytes\": {},", stats.memory_bytes);
+        println!("  \"peak_memory_bytes\": {peak_memory_bytes},");
+        println!("  \"memory_hits\": {},", stats.memory_hits);
+        println!("  \"misses\": {},", stats.misses);
+        println!("  \"memory_evictions\": {},", stats.memory_evictions);
+        println!("  \"observed_hit_rate_percent\": {observed_hit_rate:.4},");
+        println!("  \"interval_best_kops\": {best_rate:.4},");
+        println!("  \"interval_worst_kops\": {worst_rate:.4},");
+        println!("  \"interval_min_hit_rate_percent\": {min_hit_rate:.4},");
+        println!("  \"interval_max_hit_rate_percent\": {max_hit_rate:.4},");
+        println!("  \"throughput_thirds\": [");
+        for (index, (best, worst)) in thirds.iter().enumerate() {
+            let comma = if index + 1 == thirds.len() { "" } else { "," };
+            println!(
+                "    {{\"window\": {}, \"ceiling_kops\": {:.4}, \"floor_kops\": {:.4}}}{comma}",
+                index + 1,
+                best,
+                worst
+            );
+        }
+        println!("  ],");
+        println!("  \"latency\": {{");
+        println!("    \"get_count\": {},", latency.get_count);
+        println!("    \"get_avg_us\": {},", latency.get_avg_us);
+        println!("    \"get_max_us\": {},", latency.get_max_us);
+        println!("    \"put_count\": {},", latency.put_count);
+        println!("    \"put_avg_us\": {},", latency.put_avg_us);
+        println!("    \"put_max_us\": {},", latency.put_max_us);
+        println!(
+            "    \"read_through_count\": {},",
+            latency.read_through_count
+        );
+        println!(
+            "    \"read_through_avg_us\": {},",
+            latency.read_through_avg_us
+        );
+        println!("    \"refill_count\": {},", latency.refill_count);
+        println!("    \"refill_avg_us\": {},", latency.refill_avg_us);
+        println!("    \"writeback_count\": {},", latency.writeback_count);
+        println!("    \"writeback_avg_us\": {},", latency.writeback_avg_us);
+        println!("    \"eviction_count\": {},", latency.eviction_count);
+        println!("    \"eviction_avg_us\": {},", latency.eviction_avg_us);
+        println!("    \"compaction_count\": {},", latency.compaction_count);
+        println!("    \"compaction_avg_us\": {},", latency.compaction_avg_us);
+        println!("    \"histogram_ready\": {}", latency.histogram_ready);
+        println!("  }},");
+        println!("  \"checks\": {{");
+        println!("    \"bounded_entries\": {bounded_entries},");
+        println!("    \"bounded_memory\": {bounded_memory},");
+        println!("    \"steady_throughput_ceiling\": {steady_throughput}");
+        println!("  }},");
+        println!("  \"passed\": {passed}");
+        println!("}}");
+    }
 }
