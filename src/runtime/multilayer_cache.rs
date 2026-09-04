@@ -2996,6 +2996,7 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
+            let mut pin_counts = Vec::<(CacheKey, usize, usize)>::new();
             for (key, positions) in positions_by_key {
                 if inner.entry_expired(&key, now_millis) {
                     expired_keys.push(key);
@@ -3003,8 +3004,8 @@ impl MultiLayerCache {
                 }
                 if !inner.ssd_instance_only {
                     if let Some(value) = inner.memory.get(&key).cloned() {
+                        pin_counts.push((key.clone(), value.len(), positions.len()));
                         for position in positions {
-                            inner.increment_pin_with_size(&key, value.len());
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
                                 value: value.clone(),
@@ -3014,8 +3015,8 @@ impl MultiLayerCache {
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
+                        pin_counts.push((key.clone(), value.len(), positions.len()));
                         for position in positions {
-                            inner.increment_pin_with_size(&key, value.len());
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
                                 value: value.clone(),
@@ -3027,6 +3028,7 @@ impl MultiLayerCache {
                 }
                 ssd_candidates.push((key, positions));
             }
+            inner.increment_pin_with_size_counts(&pin_counts);
         }
 
         if !expired_keys.is_empty() {
@@ -3067,9 +3069,13 @@ impl MultiLayerCache {
         if !inner.started {
             return Err(CacheError::Stopped);
         }
+        let pin_counts = decoded_hits
+            .iter()
+            .map(|(key, positions, value)| (key.clone(), value.len(), positions.len()))
+            .collect::<Vec<_>>();
+        inner.increment_pin_with_size_counts(&pin_counts);
         for (key, positions, value) in decoded_hits {
             for position in positions {
-                inner.increment_pin_with_size(&key, value.len());
                 results[position] = Some(CachePinnedHandle {
                     key: key.clone(),
                     value: value.clone(),
@@ -3089,10 +3095,13 @@ impl MultiLayerCache {
             return 0;
         }
         let released = handles.len();
-        let inner = self.inner.read().expect("cache lock poisoned");
+        let mut counts_by_key = HashMap::<CacheKey, usize>::new();
         for handle in handles {
-            inner.decrement_pin(&handle.key);
+            *counts_by_key.entry(handle.key).or_default() += 1;
         }
+        let counts = counts_by_key.into_iter().collect::<Vec<_>>();
+        let inner = self.inner.read().expect("cache lock poisoned");
+        inner.decrement_pin_counts(&counts);
         released
     }
 

@@ -2200,11 +2200,16 @@ impl CacheInner {
     ///
     /// A key is always in the same stripe, so a count and the sizes beside it
     /// are never split across two locks.
-    fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
+    fn pin_stripe_index(&self, key: &CacheKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        let stripe = (hasher.finish() as usize) % self.pins.len();
-        self.pins[stripe].lock().expect("pin lock poisoned")
+        (hasher.finish() as usize) % self.pins.len()
+    }
+
+    fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
+        self.pins[self.pin_stripe_index(key)]
+            .lock()
+            .expect("pin lock poisoned")
     }
 
     /// Every stripe, in a fixed order.
@@ -2242,6 +2247,34 @@ impl CacheInner {
         self.increment_pin_with_optional_size(key, Some(bytes));
     }
 
+    fn increment_pin_with_size_counts(&self, counts: &[(CacheKey, usize, usize)]) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut by_stripe = (0..self.pins.len())
+            .map(|_| Vec::<usize>::new())
+            .collect::<Vec<_>>();
+        for (index, (key, _, count)) in counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            by_stripe[self.pin_stripe_index(key)].push(index);
+        }
+        for (stripe, indexes) in by_stripe.into_iter().enumerate() {
+            if indexes.is_empty() {
+                continue;
+            }
+            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+            for index in indexes {
+                let (key, bytes, count) = &counts[index];
+                let entry = pins.entries.entry(key.clone()).or_default();
+                entry.handles = entry.handles.saturating_add(*count as u64);
+                entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
+            }
+        }
+    }
+
     /// Pin, and count the handle, under a single acquisition.
     ///
     /// The two used to be separate locks a line apart on the read path. They
@@ -2274,18 +2307,60 @@ impl CacheInner {
     }
 
     fn decrement_pin(&self, key: &CacheKey) {
+        self.decrement_pin_count(key, 1);
+    }
+
+    fn decrement_pin_count(&self, key: &CacheKey, count: usize) {
+        if count == 0 {
+            return;
+        }
         let mut pins = self.pins_for(key);
         let Some(entry) = pins.entries.get_mut(key) else {
             return;
         };
-        if entry.handles > 1 {
-            entry.handles -= 1;
+        let count = count as u64;
+        if entry.handles > count {
+            entry.handles -= count;
         } else {
             // The last handle takes everything known about the key with it, in
             // one removal.
             pins.entries.remove(key);
         }
-        pins.unpin_operations = pins.unpin_operations.saturating_add(1);
+        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+    }
+
+    fn decrement_pin_counts(&self, counts: &[(CacheKey, usize)]) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut by_stripe = (0..self.pins.len())
+            .map(|_| Vec::<usize>::new())
+            .collect::<Vec<_>>();
+        for (index, (key, count)) in counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            by_stripe[self.pin_stripe_index(key)].push(index);
+        }
+        for (stripe, indexes) in by_stripe.into_iter().enumerate() {
+            if indexes.is_empty() {
+                continue;
+            }
+            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+            for index in indexes {
+                let (key, count) = &counts[index];
+                let Some(entry) = pins.entries.get_mut(key) else {
+                    continue;
+                };
+                let count = *count as u64;
+                if entry.handles > count {
+                    entry.handles -= count;
+                } else {
+                    pins.entries.remove(key);
+                }
+                pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+            }
+        }
     }
 
     fn pinned_removed_bytes_total(&self) -> usize {
