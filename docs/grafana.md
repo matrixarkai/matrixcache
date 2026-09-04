@@ -60,6 +60,9 @@ latency and hit rate:
 cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
 ```
 
+Add `--require-passed` when an automated scale gate should exit nonzero after
+the JSON report names the failing check.
+
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate
 budgets so a scale run can fail for the exact reason that moved.
 

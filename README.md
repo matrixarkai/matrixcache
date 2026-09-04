@@ -114,14 +114,16 @@ and says what the number means:
 - `scan_resistance_bench`, `admission_filter_bench` -- what the admission
   policy is worth against a scan
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`
-  to append a machine-readable report for Grafana/comparison archives; use
-  `--duration-seconds` and `--sample-seconds` for short validation runs. The
-  JSON latency section includes average, p50, p95, and max estimates from the
-  same histogram buckets exported to Prometheus.
+  to append a machine-readable report for Grafana/comparison archives; add
+  `--require-passed` when CI or a scale script should fail the process on a
+  missed memory, hit-rate, or p99 latency gate. Use `--duration-seconds` and
+  `--sample-seconds` for short validation runs. The JSON latency section
+  includes average, p50, p95, p99, and max estimates from the same histogram
+  buckets exported to Prometheus.
 - `metrics_server` -- serves Prometheus text metrics for Grafana. Import
   [`docs/grafana/matrixcache-dashboard.json`](docs/grafana/matrixcache-dashboard.json)
   and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup. The
-  exporter includes direct p50/p95 latency gauges alongside Prometheus
+  exporter includes direct p50/p95/p99 latency gauges alongside Prometheus
   histograms.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the

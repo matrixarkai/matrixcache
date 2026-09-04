@@ -35,7 +35,7 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
@@ -62,6 +62,7 @@ fn skewed_index(state: &mut u64) -> usize {
 fn main() {
     let mut positional = Vec::new();
     let mut emit_json = false;
+    let mut require_passed = false;
     let mut sample_seconds = DEFAULT_SAMPLE_SECONDS;
     let mut duration_seconds = None;
     let mut max_get_p99_us = None;
@@ -71,6 +72,7 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => emit_json = true,
+            "--require-passed" => require_passed = true,
             "--sample-seconds" => {
                 sample_seconds = args
                     .next()
@@ -439,6 +441,11 @@ fn main() {
         println!("  }},");
         println!("  \"passed\": {passed}");
         println!("}}");
+
+        if require_passed && !passed {
+            eprintln!("matrixcache soak gate failed; see JSON checks for the failing condition");
+            std::process::exit(1);
+        }
     }
 }
 
