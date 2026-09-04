@@ -2973,6 +2973,10 @@ impl MultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(results);
+        }
+
         let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
         let mut unique_positions = HashMap::<CacheKey, usize>::new();
         for (position, key) in keys.iter().cloned().enumerate() {
@@ -2983,19 +2987,94 @@ impl MultiLayerCache {
                 positions_by_key.push((key, vec![position]));
             }
         }
-        for (key, positions) in positions_by_key {
-            let Some(handle) = self.acquire_no_promotion(&key)? else {
+
+        let now_millis = CoarseClock::now_millis();
+        let mut expired_keys = Vec::new();
+        let mut ssd_candidates = Vec::<(CacheKey, Vec<usize>)>::new();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (key, positions) in positions_by_key {
+                if inner.entry_expired(&key, now_millis) {
+                    expired_keys.push(key);
+                    continue;
+                }
+                if !inner.ssd_instance_only {
+                    if let Some(value) = inner.memory.get(&key).cloned() {
+                        for position in positions {
+                            inner.increment_pin_with_size(&key, value.len());
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Memory,
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(value) = inner.pmem.get(&key).cloned() {
+                        for position in positions {
+                            inner.increment_pin_with_size(&key, value.len());
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Pmem,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                ssd_candidates.push((key, positions));
+            }
+        }
+
+        if !expired_keys.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for key in expired_keys {
+                if inner.entry_expired(&key, now_millis) {
+                    inner.remove_expired_entry(&key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if ssd_candidates.is_empty() {
+            return Ok(results);
+        }
+
+        let candidate_keys = ssd_candidates
+            .iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let blocks = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.read_ssd_blocks(&candidate_keys)?
+        };
+        let mut decoded_hits = Vec::<(CacheKey, Vec<usize>, Arc<[u8]>)>::new();
+        for ((key, positions), block) in ssd_candidates.into_iter().zip(blocks) {
+            let Some(block) = block else {
                 continue;
             };
-            let first_position = positions[0];
-            results[first_position] = Some(handle);
-            for position in positions.into_iter().skip(1) {
-                let cloned = self.clone_handle(
-                    results[first_position]
-                        .as_ref()
-                        .expect("first batch handle is installed"),
-                );
-                results[position] = Some(cloned);
+            decoded_hits.push((key, positions, Arc::<[u8]>::from(decode_cache_block(&block)?)));
+        }
+        if decoded_hits.is_empty() {
+            return Ok(results);
+        }
+
+        let inner = self.inner.read().expect("cache lock poisoned");
+        if !inner.started {
+            return Err(CacheError::Stopped);
+        }
+        for (key, positions, value) in decoded_hits {
+            for position in positions {
+                inner.increment_pin_with_size(&key, value.len());
+                results[position] = Some(CachePinnedHandle {
+                    key: key.clone(),
+                    value: value.clone(),
+                    tier: CacheReadTier::Ssd,
+                });
             }
         }
         Ok(results)
