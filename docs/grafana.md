@@ -17,7 +17,8 @@ It exposes:
 - `http://127.0.0.1:9184/metrics`
 - `http://127.0.0.1:9184/healthz`
 
-The exporter drives a small skewed workload so a dashboard has moving series.
+The exporter drives a small skewed workload plus small and large sharded batch
+reads so the dashboard has moving hit-rate, latency, and batch fan-out series.
 Production services should call `matrixcache::prometheus_text` from their own
 metrics endpoint and attach service-specific labels such as shard, tier, table,
 or process.

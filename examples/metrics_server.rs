@@ -4,8 +4,8 @@
 //! Serves the cache's statistics for Grafana to scrape.
 //!
 //! Exposes `/metrics` in Prometheus text format, covering every field of
-//! `CacheStats` — 59 scalars and seven latency histograms — plus `/healthz`
-//! and a plain-text index at `/`.
+//! `CacheStats` — including tier residency, sharded batch fan-out, and latency
+//! histograms — plus `/healthz` and a plain-text index at `/`.
 //!
 //! No HTTP dependency: this is `std::net::TcpListener` and a handful of lines
 //! of response writing, because a metrics endpoint that drags in an async
@@ -31,7 +31,7 @@
 //!       - targets: ["localhost:9184"]
 //! ```
 
-use matrixcache::{prometheus_text, CacheKey, CacheOptions, MultiLayerCache};
+use matrixcache::{prometheus_text, CacheKey, CacheOptions, ShardedMultiLayerCache};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,9 @@ const PORT: u16 = 9184;
 const VALUE_BYTES: usize = 256;
 const KEY_SPACE: usize = 16_384;
 const RESIDENT: usize = KEY_SPACE / 4;
+const SHARDS: usize = 4;
+const SMALL_BATCH: usize = 32;
+const LARGE_BATCH: usize = 320;
 
 /// Deterministic skew, so the dashboard shows a realistic hit rate rather than
 /// the 100% a uniform loop over a resident set would produce.
@@ -51,6 +54,15 @@ fn skewed(state: &mut u64) -> usize {
         .wrapping_add(1);
     let unit = ((*state >> 11) as f64) / ((1u64 << 53) as f64);
     ((unit * unit * unit * KEY_SPACE as f64) as usize).min(KEY_SPACE - 1)
+}
+
+fn batch_keys(prefix: &str, worker: usize, start: usize, count: usize) -> Vec<CacheKey> {
+    (0..count)
+        .map(|offset| {
+            let logical = start.wrapping_add(offset);
+            CacheKey::string(logical as u64, &format!("{prefix}-{worker}-{logical:06}"))
+        })
+        .collect()
 }
 
 fn respond(mut stream: TcpStream, status: &str, content_type: &str, body: &str) {
@@ -68,9 +80,13 @@ fn respond(mut stream: TcpStream, status: &str, content_type: &str, body: &str) 
 
 fn main() {
     let cache = Arc::new(
-        MultiLayerCache::try_with_options(CacheOptions::new(RESIDENT * VALUE_BYTES, 0, 0))
-            .expect("cache"),
+        ShardedMultiLayerCache::try_with_options(
+            CacheOptions::new(RESIDENT * VALUE_BYTES, 0, 0),
+            SHARDS,
+        )
+        .expect("cache"),
     );
+    cache.start().expect("start cache");
 
     // Something for the dashboard to show.
     let stop = Arc::new(AtomicBool::new(false));
@@ -86,6 +102,21 @@ fn main() {
                         cache.put(key, vec![b'v'; VALUE_BYTES]).expect("put");
                     }
                 }
+                let base = skewed(&mut state);
+                for keys in [
+                    batch_keys("small", worker, base, SMALL_BATCH),
+                    batch_keys("large", worker, base, LARGE_BATCH),
+                ] {
+                    let values = cache.get_batch(&keys).expect("batch get");
+                    let missing = keys
+                        .into_iter()
+                        .zip(values)
+                        .filter_map(|(key, value)| value.is_none().then_some(key))
+                        .collect::<Vec<_>>();
+                    for key in missing {
+                        cache.put(key, vec![b'b'; VALUE_BYTES]).expect("batch fill");
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
         });
@@ -95,7 +126,7 @@ fn main() {
         panic!("cannot bind 127.0.0.1:{PORT}: {err}. Is another exporter running?")
     });
     println!("matrixcache metrics on http://127.0.0.1:{PORT}/metrics");
-    println!("three workers are driving a skewed workload so the series move");
+    println!("three workers are driving skewed single-key and sharded batch workloads");
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
