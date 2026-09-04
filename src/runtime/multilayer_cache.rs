@@ -4863,6 +4863,24 @@ impl ShardedMultiLayerCache {
             let index = self.shard_index_for_key(&key);
             groups[index].push((key, value));
         }
+        if groups.iter().map(Vec::len).sum::<usize>() < Self::BATCH_FANOUT_THRESHOLD {
+            let mut enqueued = 0usize;
+            let mut rejected = Vec::new();
+            for (index, group) in groups.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                match self.shards[index].enqueue_async_writeback_batch(group) {
+                    Ok(count) => enqueued = enqueued.saturating_add(count),
+                    Err(mut jobs) => rejected.append(&mut jobs),
+                }
+            }
+            return if rejected.is_empty() {
+                Ok(enqueued)
+            } else {
+                Err(rejected)
+            };
+        }
 
         std::thread::scope(|scope| {
             let mut workers = Vec::new();
@@ -5459,6 +5477,16 @@ impl ShardedMultiLayerCache {
         let mut grouped = vec![Vec::new(); self.shard_count()];
         for (key, value, size) in entries {
             grouped[self.shard_index_for_key(&key)].push((key, value, size));
+        }
+        if grouped.iter().map(Vec::len).sum::<usize>() < Self::BATCH_FANOUT_THRESHOLD {
+            let mut inserted = 0usize;
+            for (index, group) in grouped.into_iter().enumerate() {
+                if !group.is_empty() {
+                    inserted = inserted
+                        .saturating_add(self.shards[index].put_batch_sized(group)?);
+                }
+            }
+            return Ok(inserted);
         }
         std::thread::scope(|scope| {
             let mut workers = Vec::new();
@@ -6117,6 +6145,14 @@ impl ShardedMultiLayerCache {
         for key in keys {
             groups[self.shard_index_for_key(&key)].push(key);
         }
+        if pinned < Self::BATCH_FANOUT_THRESHOLD {
+            for (index, group) in groups.into_iter().enumerate() {
+                for key in group {
+                    self.shards[index].pin(key);
+                }
+            }
+            return pinned;
+        }
         std::thread::scope(|scope| {
             let workers = groups
                 .into_iter()
@@ -6163,6 +6199,14 @@ impl ShardedMultiLayerCache {
         let unpinned = keys.len();
         for key in keys.iter().cloned() {
             groups[self.shard_index_for_key(&key)].push(key);
+        }
+        if unpinned < Self::BATCH_FANOUT_THRESHOLD {
+            for (index, group) in groups.into_iter().enumerate() {
+                for key in group {
+                    self.shards[index].unpin(&key);
+                }
+            }
+            return unpinned;
         }
         std::thread::scope(|scope| {
             let workers = groups
@@ -6240,6 +6284,15 @@ impl ShardedMultiLayerCache {
         for (position, (key, value, size)) in entries.into_iter().enumerate() {
             groups[self.shard_index_for_key(&key)].push((position, key, value, size));
         }
+        if entry_count < Self::BATCH_FANOUT_THRESHOLD {
+            let mut results = (0..entry_count).map(|_| None).collect::<Vec<_>>();
+            for (index, group) in groups.into_iter().enumerate() {
+                for (position, key, value, size) in group {
+                    results[position] = self.shards[index].insert_pinned_sized(key, value, size)?;
+                }
+            }
+            return Ok(results);
+        }
 
         let shard_results = std::thread::scope(|scope| {
             let mut workers = Vec::new();
@@ -6316,6 +6369,14 @@ impl ShardedMultiLayerCache {
         let mut groups = vec![Vec::new(); self.shard_count()];
         for key in unique_cache_keys(keys) {
             groups[self.shard_index_for_key(&key)].push(key);
+        }
+        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            for (index, group) in groups.into_iter().enumerate() {
+                if !group.is_empty() {
+                    self.shards[index].remove_batch(&group)?;
+                }
+            }
+            return Ok(keys.len());
         }
         std::thread::scope(|scope| {
             let mut workers = Vec::new();
