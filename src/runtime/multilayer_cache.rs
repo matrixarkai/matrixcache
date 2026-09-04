@@ -4581,6 +4581,8 @@ pub struct ShardedMultiLayerCache {
 }
 
 impl ShardedMultiLayerCache {
+    const BATCH_FANOUT_THRESHOLD: usize = 256;
+
     /// Build a sharded cache, refusing a configuration it cannot honour.
     ///
     /// The counterpart to [`MultiLayerCache::try_with_options`], and it checks
@@ -5621,6 +5623,33 @@ impl ShardedMultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
+        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            return self.acquire_batch_no_promotion_locally(keys);
+        }
+        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut groups = (0..self.shard_count())
+            .map(|_| Vec::<(usize, CacheKey)>::new())
+            .collect::<Vec<_>>();
+        for (position, key) in keys.iter().cloned().enumerate() {
+            groups[self.shard_index_for_key(&key)].push((position, key));
+        }
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+            let shard_results = self.shards[shard_index].acquire_batch_no_promotion(&shard_keys)?;
+            for (position, handle) in positions.into_iter().zip(shard_results) {
+                results[position] = handle;
+            }
+        }
+        Ok(results)
+    }
+
+    fn acquire_batch_no_promotion_locally(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
         let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
         let mut unique_positions = HashMap::<CacheKey, usize>::new();
@@ -5642,7 +5671,7 @@ impl ShardedMultiLayerCache {
                 let cloned = self.shard_for_key(&key).clone_handle(
                     results[first_position]
                         .as_ref()
-                        .expect("first batch handle is installed"),
+                        .expect("first sharded batch handle is installed"),
                 );
                 results[position] = Some(cloned);
             }
@@ -5651,6 +5680,33 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn acquire_batch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
+        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            return self.acquire_batch_locally(keys);
+        }
+        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut groups = (0..self.shard_count())
+            .map(|_| Vec::<(usize, CacheKey)>::new())
+            .collect::<Vec<_>>();
+        for (position, key) in keys.iter().cloned().enumerate() {
+            groups[self.shard_index_for_key(&key)].push((position, key));
+        }
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+            let shard_results = self.shards[shard_index].acquire_batch(&shard_keys)?;
+            for (position, handle) in positions.into_iter().zip(shard_results) {
+                results[position] = handle;
+            }
+        }
+        Ok(results)
+    }
+
+    fn acquire_batch_locally(
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
@@ -5697,6 +5753,14 @@ impl ShardedMultiLayerCache {
         let released = handles.len();
         for handle in handles {
             groups[self.shard_index_for_key(&handle.key)].push(handle);
+        }
+        if released < Self::BATCH_FANOUT_THRESHOLD {
+            for (index, group) in groups.into_iter().enumerate() {
+                if !group.is_empty() {
+                    self.shards[index].release_batch(group);
+                }
+            }
+            return released;
         }
         std::thread::scope(|scope| {
             let workers = groups

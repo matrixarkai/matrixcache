@@ -32,7 +32,7 @@
 //! cargo run --release --no-default-features --example batch_read_cost
 //! ```
 
-use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use matrixcache::{CacheKey, CacheOptions, MultiLayerCache, ShardedMultiLayerCache};
 use std::time::Instant;
 
 const VALUE_BYTES: usize = 64;
@@ -59,6 +59,13 @@ fn main() {
             .with_ssd_paths(vec![dir.clone()]),
     )
     .expect("cache");
+    let sharded_dir = dir.join("sharded");
+    let sharded = ShardedMultiLayerCache::try_with_options(
+        CacheOptions::new(RESIDENT * VALUE_BYTES * 8, 0, RESIDENT * VALUE_BYTES * 8)
+            .with_ssd_paths(vec![sharded_dir]),
+        16,
+    )
+    .expect("sharded cache");
 
     let keys: Vec<CacheKey> = (0..RESIDENT)
         .map(|i| CacheKey::string(0, &format!("batch-{i:05}")))
@@ -67,6 +74,9 @@ fn main() {
         cache
             .put(key.clone(), vec![b'v'; VALUE_BYTES])
             .expect("put");
+        sharded
+            .put(key.clone(), vec![b'v'; VALUE_BYTES])
+            .expect("sharded put");
     }
 
     println!(
@@ -74,8 +84,12 @@ fn main() {
          median of {PASSES} passes\n"
     );
     println!(
-        "{:<16}{:>14}{:>22}{:>22}",
-        "batch size", "get_batch", "get_batch_no_prom", "acquire_no_prom"
+        "{:<16}{:>14}{:>22}{:>22}{:>28}",
+        "batch size",
+        "get_batch",
+        "get_batch_no_prom",
+        "acquire_no_prom",
+        "sharded_acquire_no_prom"
     );
 
     for batch in [64_usize, 1024] {
@@ -126,8 +140,25 @@ fn main() {
                 })
                 .collect(),
         );
+        let sharded_acquire_no_promotion_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in keys.chunks(batch) {
+                        let handles = sharded
+                            .acquire_batch_no_promotion(chunk)
+                            .expect("sharded acquire_batch_no_promotion");
+                        served += handles.iter().filter(|handle| handle.is_some()).count();
+                        sharded.release_batch(handles.into_iter().flatten().collect());
+                    }
+                    assert_eq!(served, RESIDENT, "every key should have hit sharded memory");
+                    started.elapsed().as_nanos() as f64 / RESIDENT as f64
+                })
+                .collect(),
+        );
         println!(
-            "{batch:<16}{regular_ns:>14.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>22.1}"
+            "{batch:<16}{regular_ns:>14.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>22.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
     }
 
