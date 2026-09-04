@@ -120,7 +120,9 @@ and says what the number means:
   same histogram buckets exported to Prometheus.
 - `metrics_server` -- serves Prometheus text metrics for Grafana. Import
   [`docs/grafana/matrixcache-dashboard.json`](docs/grafana/matrixcache-dashboard.json)
-  and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup.
+  and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup. The
+  exporter includes direct p50/p95 latency gauges alongside Prometheus
+  histograms.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather

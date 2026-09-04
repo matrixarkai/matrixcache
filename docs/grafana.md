@@ -45,8 +45,8 @@ families directly, including:
   `matrixcache_pmem_bytes`, and `matrixcache_disk_bytes`
 - eviction pressure from memory, PMEM, SSD, and pinned-skip counters
 - async writeback queue depth, drain rate, and backpressure rejections
-- p95 and average latency for get, put, read-through, refill, writeback, and
-  eviction
+- p50, p95, and average latency for get, put, read-through, refill, writeback,
+  and eviction
 
 ## Scale Report Pairing
 
@@ -62,6 +62,6 @@ Use shorter runs for CI smoke checks:
 cargo run --no-default-features --example soak -- 1 1 --duration-seconds 1 --sample-seconds 1 --json
 ```
 
-The JSON report and the Grafana dashboard intentionally watch the same
-families: bounded memory, hit rate, eviction pressure, writeback pressure, and
-latency stability.
+The JSON report, Prometheus exporter, and Grafana dashboard intentionally watch
+the same families: bounded memory, hit rate, eviction pressure, writeback
+pressure, and latency stability.

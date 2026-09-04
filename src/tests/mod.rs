@@ -15226,12 +15226,26 @@ mod tests {
         }
         for gauge in [
             "matrixcache_get_latency_avg_seconds",
+            "matrixcache_get_latency_p50_seconds",
+            "matrixcache_get_latency_p95_seconds",
             "matrixcache_put_latency_avg_seconds",
+            "matrixcache_put_latency_p50_seconds",
+            "matrixcache_put_latency_p95_seconds",
             "matrixcache_read_through_latency_avg_seconds",
+            "matrixcache_read_through_latency_p50_seconds",
+            "matrixcache_read_through_latency_p95_seconds",
             "matrixcache_refill_latency_avg_seconds",
+            "matrixcache_refill_latency_p50_seconds",
+            "matrixcache_refill_latency_p95_seconds",
             "matrixcache_writeback_latency_avg_seconds",
+            "matrixcache_writeback_latency_p50_seconds",
+            "matrixcache_writeback_latency_p95_seconds",
             "matrixcache_eviction_latency_avg_seconds",
+            "matrixcache_eviction_latency_p50_seconds",
+            "matrixcache_eviction_latency_p95_seconds",
             "matrixcache_compaction_latency_avg_seconds",
+            "matrixcache_compaction_latency_p50_seconds",
+            "matrixcache_compaction_latency_p95_seconds",
         ] {
             assert!(
                 text.contains(gauge),

@@ -14,6 +14,9 @@ Two things it does beyond dumping numbers:
     turn into a latency figure.
   * every metric is classified `counter` or `gauge`, because `rate()` on a
     gauge is meaningless and Grafana will happily let you do it.
+  * latency histograms also get direct p50/p95 gauges, so lightweight logs and
+    dashboards can show percentile movement without repeating the bucket
+    expression in every panel.
 """
 from pathlib import Path
 
@@ -175,6 +178,11 @@ for family, total, mx in LATENCY_FAMILIES:
     if mx:
         out.append('    metric(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", &tags, stats.%s);'
                    % (family, pretty, mx))
+    max_expr = "stats.%s" % mx if mx else "0"
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p50_seconds", "%s p50 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 50));'
+               % (family, pretty, family, family, family, family, family, family, max_expr))
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p95_seconds", "%s p95 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 95));'
+               % (family, pretty, family, family, family, family, family, family, max_expr))
     out.append("")
 
 out.append("    out")
@@ -222,6 +230,42 @@ out.append("        0.0")
 out.append("    } else {")
 out.append("        total_micros as f64 / samples as f64 / 1_000_000.0")
 out.append("    }")
+out.append("}")
+out.append("")
+out.append("fn percentile_seconds(")
+out.append("    samples: u64,")
+out.append("    le_10us: u64,")
+out.append("    le_100us: u64,")
+out.append("    le_1ms: u64,")
+out.append("    le_10ms: u64,")
+out.append("    gt_10ms: u64,")
+out.append("    max_micros: u64,")
+out.append("    percentile: u64,")
+out.append(") -> f64 {")
+out.append("    if samples == 0 {")
+out.append("        return 0.0;")
+out.append("    }")
+out.append("    let rank = samples.saturating_mul(percentile).saturating_add(99) / 100;")
+out.append("    let mut cumulative = le_10us;")
+out.append("    if rank <= cumulative {")
+out.append("        return 0.000010;")
+out.append("    }")
+out.append("    cumulative = cumulative.saturating_add(le_100us);")
+out.append("    if rank <= cumulative {")
+out.append("        return 0.000100;")
+out.append("    }")
+out.append("    cumulative = cumulative.saturating_add(le_1ms);")
+out.append("    if rank <= cumulative {")
+out.append("        return 0.001000;")
+out.append("    }")
+out.append("    cumulative = cumulative.saturating_add(le_10ms);")
+out.append("    if rank <= cumulative {")
+out.append("        return 0.010000;")
+out.append("    }")
+out.append("    if gt_10ms > 0 {")
+out.append("        return max_micros.max(10_001) as f64 / 1_000_000.0;")
+out.append("    }")
+out.append("    max_micros as f64 / 1_000_000.0")
 out.append("}")
 out.append("")
 out.append("fn bucket(out: &mut String, name: &str, tags: &str, le: &str, value: u64) {")

@@ -121,6 +121,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     }
     metric_f64(&mut out, "matrixcache_get_latency_avg_seconds", "get average latency", "gauge", &tags, average_seconds(stats.get_latency_total_micros, stats.get_latency_samples));
     metric(&mut out, "matrixcache_get_latency_max_seconds", "get peak latency", "gauge", &tags, stats.get_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_get_latency_p50_seconds", "get p50 latency", "gauge", &tags, percentile_seconds(stats.get_latency_samples, stats.get_latency_le_10us, stats.get_latency_le_100us, stats.get_latency_le_1ms, stats.get_latency_le_10ms, stats.get_latency_gt_10ms, stats.get_latency_max_micros, 50));
+    metric_f64(&mut out, "matrixcache_get_latency_p95_seconds", "get p95 latency", "gauge", &tags, percentile_seconds(stats.get_latency_samples, stats.get_latency_le_10us, stats.get_latency_le_100us, stats.get_latency_le_1ms, stats.get_latency_le_10ms, stats.get_latency_gt_10ms, stats.get_latency_max_micros, 95));
 
     // put latency
     let _ = writeln!(out, "# HELP matrixcache_put_latency_seconds put latency");
@@ -146,6 +148,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     }
     metric_f64(&mut out, "matrixcache_put_latency_avg_seconds", "put average latency", "gauge", &tags, average_seconds(stats.put_latency_total_micros, stats.put_latency_samples));
     metric(&mut out, "matrixcache_put_latency_max_seconds", "put peak latency", "gauge", &tags, stats.put_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_put_latency_p50_seconds", "put p50 latency", "gauge", &tags, percentile_seconds(stats.put_latency_samples, stats.put_latency_le_10us, stats.put_latency_le_100us, stats.put_latency_le_1ms, stats.put_latency_le_10ms, stats.put_latency_gt_10ms, stats.put_latency_max_micros, 50));
+    metric_f64(&mut out, "matrixcache_put_latency_p95_seconds", "put p95 latency", "gauge", &tags, percentile_seconds(stats.put_latency_samples, stats.put_latency_le_10us, stats.put_latency_le_100us, stats.put_latency_le_1ms, stats.put_latency_le_10ms, stats.put_latency_gt_10ms, stats.put_latency_max_micros, 95));
 
     // read through latency
     let _ = writeln!(out, "# HELP matrixcache_read_through_latency_seconds read through latency");
@@ -170,6 +174,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_read_through_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_read_through_latency_avg_seconds", "read through average latency", "gauge", &tags, average_seconds(stats.read_through_latency_total_micros, stats.read_through_latency_samples));
+    metric_f64(&mut out, "matrixcache_read_through_latency_p50_seconds", "read through p50 latency", "gauge", &tags, percentile_seconds(stats.read_through_latency_samples, stats.read_through_latency_le_10us, stats.read_through_latency_le_100us, stats.read_through_latency_le_1ms, stats.read_through_latency_le_10ms, stats.read_through_latency_gt_10ms, 0, 50));
+    metric_f64(&mut out, "matrixcache_read_through_latency_p95_seconds", "read through p95 latency", "gauge", &tags, percentile_seconds(stats.read_through_latency_samples, stats.read_through_latency_le_10us, stats.read_through_latency_le_100us, stats.read_through_latency_le_1ms, stats.read_through_latency_le_10ms, stats.read_through_latency_gt_10ms, 0, 95));
 
     // refill latency
     let _ = writeln!(out, "# HELP matrixcache_refill_latency_seconds refill latency");
@@ -194,6 +200,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_refill_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_refill_latency_avg_seconds", "refill average latency", "gauge", &tags, average_seconds(stats.refill_latency_total_micros, stats.refill_latency_samples));
+    metric_f64(&mut out, "matrixcache_refill_latency_p50_seconds", "refill p50 latency", "gauge", &tags, percentile_seconds(stats.refill_latency_samples, stats.refill_latency_le_10us, stats.refill_latency_le_100us, stats.refill_latency_le_1ms, stats.refill_latency_le_10ms, stats.refill_latency_gt_10ms, 0, 50));
+    metric_f64(&mut out, "matrixcache_refill_latency_p95_seconds", "refill p95 latency", "gauge", &tags, percentile_seconds(stats.refill_latency_samples, stats.refill_latency_le_10us, stats.refill_latency_le_100us, stats.refill_latency_le_1ms, stats.refill_latency_le_10ms, stats.refill_latency_gt_10ms, 0, 95));
 
     // writeback latency
     let _ = writeln!(out, "# HELP matrixcache_writeback_latency_seconds writeback latency");
@@ -218,6 +226,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_writeback_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_writeback_latency_avg_seconds", "writeback average latency", "gauge", &tags, average_seconds(stats.writeback_latency_total_micros, stats.writeback_latency_samples));
+    metric_f64(&mut out, "matrixcache_writeback_latency_p50_seconds", "writeback p50 latency", "gauge", &tags, percentile_seconds(stats.writeback_latency_samples, stats.writeback_latency_le_10us, stats.writeback_latency_le_100us, stats.writeback_latency_le_1ms, stats.writeback_latency_le_10ms, stats.writeback_latency_gt_10ms, 0, 50));
+    metric_f64(&mut out, "matrixcache_writeback_latency_p95_seconds", "writeback p95 latency", "gauge", &tags, percentile_seconds(stats.writeback_latency_samples, stats.writeback_latency_le_10us, stats.writeback_latency_le_100us, stats.writeback_latency_le_1ms, stats.writeback_latency_le_10ms, stats.writeback_latency_gt_10ms, 0, 95));
 
     // eviction latency
     let _ = writeln!(out, "# HELP matrixcache_eviction_latency_seconds eviction latency");
@@ -242,6 +252,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_eviction_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_eviction_latency_avg_seconds", "eviction average latency", "gauge", &tags, average_seconds(stats.eviction_latency_total_micros, stats.eviction_latency_samples));
+    metric_f64(&mut out, "matrixcache_eviction_latency_p50_seconds", "eviction p50 latency", "gauge", &tags, percentile_seconds(stats.eviction_latency_samples, stats.eviction_latency_le_10us, stats.eviction_latency_le_100us, stats.eviction_latency_le_1ms, stats.eviction_latency_le_10ms, stats.eviction_latency_gt_10ms, 0, 50));
+    metric_f64(&mut out, "matrixcache_eviction_latency_p95_seconds", "eviction p95 latency", "gauge", &tags, percentile_seconds(stats.eviction_latency_samples, stats.eviction_latency_le_10us, stats.eviction_latency_le_100us, stats.eviction_latency_le_1ms, stats.eviction_latency_le_10ms, stats.eviction_latency_gt_10ms, 0, 95));
 
     // compaction latency
     let _ = writeln!(out, "# HELP matrixcache_compaction_latency_seconds compaction latency");
@@ -266,6 +278,8 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_compaction_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_compaction_latency_avg_seconds", "compaction average latency", "gauge", &tags, average_seconds(stats.compaction_latency_total_micros, stats.compaction_latency_samples));
+    metric_f64(&mut out, "matrixcache_compaction_latency_p50_seconds", "compaction p50 latency", "gauge", &tags, percentile_seconds(stats.compaction_latency_samples, stats.compaction_latency_le_10us, stats.compaction_latency_le_100us, stats.compaction_latency_le_1ms, stats.compaction_latency_le_10ms, stats.compaction_latency_gt_10ms, 0, 50));
+    metric_f64(&mut out, "matrixcache_compaction_latency_p95_seconds", "compaction p95 latency", "gauge", &tags, percentile_seconds(stats.compaction_latency_samples, stats.compaction_latency_le_10us, stats.compaction_latency_le_100us, stats.compaction_latency_le_1ms, stats.compaction_latency_le_10ms, stats.compaction_latency_gt_10ms, 0, 95));
 
     out
 }
@@ -312,6 +326,42 @@ fn average_seconds(total_micros: u64, samples: u64) -> f64 {
     } else {
         total_micros as f64 / samples as f64 / 1_000_000.0
     }
+}
+
+fn percentile_seconds(
+    samples: u64,
+    le_10us: u64,
+    le_100us: u64,
+    le_1ms: u64,
+    le_10ms: u64,
+    gt_10ms: u64,
+    max_micros: u64,
+    percentile: u64,
+) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    let rank = samples.saturating_mul(percentile).saturating_add(99) / 100;
+    let mut cumulative = le_10us;
+    if rank <= cumulative {
+        return 0.000010;
+    }
+    cumulative = cumulative.saturating_add(le_100us);
+    if rank <= cumulative {
+        return 0.000100;
+    }
+    cumulative = cumulative.saturating_add(le_1ms);
+    if rank <= cumulative {
+        return 0.001000;
+    }
+    cumulative = cumulative.saturating_add(le_10ms);
+    if rank <= cumulative {
+        return 0.010000;
+    }
+    if gt_10ms > 0 {
+        return max_micros.max(10_001) as f64 / 1_000_000.0;
+    }
+    max_micros as f64 / 1_000_000.0
 }
 
 fn bucket(out: &mut String, name: &str, tags: &str, le: &str, value: u64) {

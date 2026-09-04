@@ -470,7 +470,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_get_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_get_latency_p95_seconds",
           "legendFormat": "get p95",
           "refId": "A"
         },
@@ -479,7 +479,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_put_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_put_latency_p95_seconds",
           "legendFormat": "put p95",
           "refId": "B"
         },
@@ -695,7 +695,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_read_through_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_read_through_latency_p95_seconds",
           "legendFormat": "read-through p95",
           "refId": "A"
         },
@@ -704,7 +704,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_refill_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_refill_latency_p95_seconds",
           "legendFormat": "refill p95",
           "refId": "B"
         },
@@ -713,7 +713,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_eviction_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_eviction_latency_p95_seconds",
           "legendFormat": "eviction p95",
           "refId": "C"
         },
@@ -722,7 +722,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(matrixcache_writeback_latency_seconds_bucket[5m])) by (le))",
+          "expr": "matrixcache_writeback_latency_p95_seconds",
           "legendFormat": "writeback p95",
           "refId": "D"
         }
