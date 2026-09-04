@@ -35,7 +35,7 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--sample-seconds N] [--duration-seconds N]
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
@@ -64,6 +64,9 @@ fn main() {
     let mut emit_json = false;
     let mut sample_seconds = DEFAULT_SAMPLE_SECONDS;
     let mut duration_seconds = None;
+    let mut max_get_p99_us = None;
+    let mut max_put_p99_us = None;
+    let mut min_hit_rate_percent = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -80,6 +83,24 @@ fn main() {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .filter(|value| *value > 0);
+            }
+            "--max-get-p99-us" => {
+                max_get_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-put-p99-us" => {
+                max_put_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--min-hit-rate-percent" => {
+                min_hit_rate_percent = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| (0.0..=100.0).contains(value));
             }
             _ => positional.push(arg),
         }
@@ -179,6 +200,9 @@ fn main() {
         let interval_reads = now_reads - last_reads;
         let interval_hits = stats.memory_hits - last_hits;
         let interval_misses = stats.misses - last_misses;
+        if interval_reads == 0 && started.elapsed() >= total_duration {
+            break;
+        }
         last_reads = now_reads;
         last_hits = stats.memory_hits;
         last_misses = stats.misses;
@@ -255,13 +279,17 @@ fn main() {
             index + 1
         );
     }
+    let latency = cache.latency_metrics_report();
     println!(
-        "get latency max {}us over {} samples",
-        stats.get_latency_max_micros, stats.get_latency_samples
+        "get latency p99 {}us max {}us over {} samples",
+        latency.get_p99_us, stats.get_latency_max_micros, stats.get_latency_samples
+    );
+    println!(
+        "put latency p99 {}us max {}us over {} samples",
+        latency.put_p99_us, stats.put_latency_max_micros, stats.put_latency_samples
     );
 
     if emit_json {
-        let latency = cache.latency_metrics_report();
         let final_entries = cache.all_entries().len();
         let final_reads = reads.load(Ordering::Relaxed);
         let final_writes = writes.load(Ordering::Relaxed);
@@ -283,13 +311,28 @@ fn main() {
         let bounded_entries = peak_entries <= RESIDENT + 64;
         let bounded_memory =
             peak_memory_bytes as usize <= RESIDENT * VALUE_BYTES + VALUE_BYTES * 64;
+        let get_p99_within_budget = max_get_p99_us
+            .map(|budget| latency.get_p99_us <= budget)
+            .unwrap_or(true);
+        let put_p99_within_budget = max_put_p99_us
+            .map(|budget| latency.put_p99_us <= budget)
+            .unwrap_or(true);
+        let hit_rate_within_budget = min_hit_rate_percent
+            .map(|budget| observed_hit_rate >= budget)
+            .unwrap_or(true);
         let steady_throughput = match (thirds.first(), thirds.last()) {
+            _ if thirds.len() < 3 => true,
             (Some((first_best, _)), Some((last_best, _))) if *first_best > 0.0 => {
                 *last_best >= *first_best * 0.80
             }
             _ => true,
         };
-        let passed = bounded_entries && bounded_memory && steady_throughput;
+        let passed = bounded_entries
+            && bounded_memory
+            && steady_throughput
+            && get_p99_within_budget
+            && put_p99_within_budget
+            && hit_rate_within_budget;
 
         println!("\n{{");
         println!("  \"report_version\": \"matrixcache_soak_v1\",");
@@ -300,6 +343,12 @@ fn main() {
         println!("  \"value_bytes\": {VALUE_BYTES},");
         println!("  \"sample_seconds\": {sample_seconds},");
         println!("  \"duration_seconds\": {},", total_duration.as_secs());
+        println!("  \"max_get_p99_us\": {},", option_u64_json(max_get_p99_us));
+        println!("  \"max_put_p99_us\": {},", option_u64_json(max_put_p99_us));
+        println!(
+            "  \"min_hit_rate_percent\": {},",
+            option_f64_json(min_hit_rate_percent)
+        );
         println!("  \"reads\": {final_reads},");
         println!("  \"writes\": {final_writes},");
         println!("  \"final_entries\": {final_entries},");
@@ -383,9 +432,24 @@ fn main() {
         println!("  \"checks\": {{");
         println!("    \"bounded_entries\": {bounded_entries},");
         println!("    \"bounded_memory\": {bounded_memory},");
-        println!("    \"steady_throughput_ceiling\": {steady_throughput}");
+        println!("    \"steady_throughput_ceiling\": {steady_throughput},");
+        println!("    \"get_p99_within_budget\": {get_p99_within_budget},");
+        println!("    \"put_p99_within_budget\": {put_p99_within_budget},");
+        println!("    \"hit_rate_within_budget\": {hit_rate_within_budget}");
         println!("  }},");
         println!("  \"passed\": {passed}");
         println!("}}");
     }
+}
+
+fn option_u64_json(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn option_f64_json(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "null".to_string())
 }

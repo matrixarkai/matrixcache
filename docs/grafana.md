@@ -52,6 +52,17 @@ families directly, including:
 - p50, p95, p99, and average latency for get, put, read-through, refill, writeback,
   and eviction
 
+
+The `soak` example can also emit JSON with optional scale gates for p99 get/put
+latency and hit rate:
+
+```text
+cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
+```
+
+The JSON report keeps memory-bound checks separate from optional latency and hit-rate
+budgets so a scale run can fail for the exact reason that moved.
+
 ## Scale Report Pairing
 
 For non-Grafana archives, run:
