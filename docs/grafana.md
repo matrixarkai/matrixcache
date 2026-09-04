@@ -84,6 +84,12 @@ tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-so
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate
 budgets so a scale run can fail for the exact reason that moved.
 
+For RocksDB-backed SSD-cache scale checks, archive the backend report too:
+
+```bash
+cargo run --release --example rocksdb_backend_bench -- --iterations 5000 --json-output /tmp/matrixcache-rocksdb-backend.json --require-passed
+```
+
 ## Scale Report Pairing
 
 For non-Grafana archives, run:

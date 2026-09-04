@@ -2,6 +2,7 @@
 // Copyright 2026 MatrixArkAI
 
 use matrixcache::{CacheDataPlacement, CacheKey, CacheOptions, CacheReadTier, MultiLayerCache};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,7 +61,7 @@ fn unique_bench_dir() -> PathBuf {
     std::env::temp_dir().join(format!("matrixcache-rocksdb-bench-{nanos}"))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BenchConfig {
     iterations: usize,
     value_bytes: usize,
@@ -69,6 +70,8 @@ struct BenchConfig {
     ssd_capacity_bytes: usize,
     placement_threshold_bytes: usize,
     replacement_soak_iterations: usize,
+    json_output: Option<PathBuf>,
+    require_passed: bool,
 }
 
 impl Default for BenchConfig {
@@ -81,6 +84,8 @@ impl Default for BenchConfig {
             ssd_capacity_bytes: 64 * 1024 * 1024,
             placement_threshold_bytes: 1024 * 1024,
             replacement_soak_iterations: 0,
+            json_output: None,
+            require_passed: false,
         }
     }
 }
@@ -120,13 +125,21 @@ fn parse_config() -> BenchConfig {
                 config.replacement_soak_iterations =
                     parse_usize_flag("--replacement-soak-iterations", args.next())
             }
+            "--json-output" => {
+                config.json_output = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --json-output");
+                    process::exit(2);
+                })));
+            }
+            "--require-passed" => config.require_passed = true,
             "--help" | "-h" => {
                 println!(
                     "usage: rocksdb_backend_bench [iterations] [--iterations N] \
                      [--value-bytes N] [--dram-capacity-bytes N] \
                      [--pmem-capacity-bytes N] [--ssd-capacity-bytes N] \
                      [--placement-threshold-bytes N] \
-                     [--replacement-soak-iterations N]"
+                     [--replacement-soak-iterations N] [--json-output PATH] \
+                     [--require-passed]"
                 );
                 process::exit(0);
             }
@@ -278,157 +291,356 @@ fn main() {
         && async_writeback_backpressure_ready
         && restart_disk_refill_ready;
 
-    println!("{{");
-    println!("  \"report_version\": \"matrixcache_rocksdb_backend_v1\",");
-    println!(
+    let mut report = String::new();
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_rocksdb_backend_v1\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"backend\": \"{}\",",
         if cfg!(feature = "rocksdb-ssd") {
             "rocksdb"
         } else {
             "file-compat"
         }
-    );
-    println!("  \"iterations\": {},", iterations);
-    println!("  \"data_dir\": \"{}\",", dir.display());
-    println!("  \"workload\": {{");
-    println!("    \"value_bytes\": {},", config.value_bytes);
-    println!(
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"iterations\": {},", iterations).expect("format report");
+    writeln!(&mut report, "  \"data_dir\": \"{}\",", dir.display()).expect("format report");
+    writeln!(&mut report, "  \"workload\": {{").expect("format report");
+    writeln!(&mut report, "    \"value_bytes\": {},", config.value_bytes).expect("format report");
+    writeln!(
+        &mut report,
         "    \"dram_capacity_bytes\": {},",
         config.dram_capacity_bytes
-    );
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"pmem_capacity_bytes\": {},",
         config.pmem_capacity_bytes
-    );
-    println!("    \"ssd_capacity_bytes\": {},", config.ssd_capacity_bytes);
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"ssd_capacity_bytes\": {},",
+        config.ssd_capacity_bytes
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"placement_threshold_bytes\": {},",
         config.placement_threshold_bytes
-    );
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"replacement_soak_iterations\": {}",
         config.replacement_soak_iterations
-    );
-    println!("  }},");
-    print_timing("put", put_timing, true);
-    println!("  \"resident_hot_key_count\": {},", resident_hot_keys.len());
-    print_timing("resident_hot_get", resident_hot_timing, true);
-    print_timing("hot_get", hot_timing, true);
-    print_timing("cold_ssd_refill_get", cold_timing, true);
-    println!("  \"cold_ssd_refills\": {},", cold_ssd_refills);
-    println!("  \"memory_hits\": {},", stats.memory_hits);
-    println!("  \"pmem_hits\": {},", stats.pmem_hits);
-    println!("  \"ssd_hits\": {},", stats.disk_hits);
-    println!("  \"memory_evictions\": {},", stats.memory_evictions);
-    println!("  \"pmem_evictions\": {},", stats.pmem_evictions);
-    println!("  \"ssd_evictions\": {},", stats.ssd_evictions);
-    println!("  \"refill_failures\": {},", stats.refill_failures);
-    println!("  \"disk_fills\": {},", stats.disk_fills);
-    println!("  \"pmem_fills\": {},", stats.pmem_fills);
-    println!(
+    )
+    .expect("format report");
+    writeln!(&mut report, "  }},").expect("format report");
+    append_timing(&mut report, "put", put_timing, true);
+    writeln!(
+        &mut report,
+        "  \"resident_hot_key_count\": {},",
+        resident_hot_keys.len()
+    )
+    .expect("format report");
+    append_timing(&mut report, "resident_hot_get", resident_hot_timing, true);
+    append_timing(&mut report, "hot_get", hot_timing, true);
+    append_timing(&mut report, "cold_ssd_refill_get", cold_timing, true);
+    writeln!(&mut report, "  \"cold_ssd_refills\": {},", cold_ssd_refills).expect("format report");
+    writeln!(&mut report, "  \"memory_hits\": {},", stats.memory_hits).expect("format report");
+    writeln!(&mut report, "  \"pmem_hits\": {},", stats.pmem_hits).expect("format report");
+    writeln!(&mut report, "  \"ssd_hits\": {},", stats.disk_hits).expect("format report");
+    writeln!(
+        &mut report,
+        "  \"memory_evictions\": {},",
+        stats.memory_evictions
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"pmem_evictions\": {},",
+        stats.pmem_evictions
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"ssd_evictions\": {},", stats.ssd_evictions).expect("format report");
+    writeln!(
+        &mut report,
+        "  \"refill_failures\": {},",
+        stats.refill_failures
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"disk_fills\": {},", stats.disk_fills).expect("format report");
+    writeln!(&mut report, "  \"pmem_fills\": {},", stats.pmem_fills).expect("format report");
+    writeln!(
+        &mut report,
         "  \"main_pressure_passed\": {},",
         stats.memory_evictions > 0
             && stats.pmem_evictions > 0
             && cold_ssd_refills > 0
             && stats.refill_failures == 0
-    );
-    println!("  \"replacement_soak_iterations\": {},", soak_iterations);
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_iterations\": {},",
+        soak_iterations
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"replacement_soak_passed\": {},",
         if soak.passed { "true" } else { "false" }
-    );
-    println!("  \"replacement_soak_reasons\": {:?},", soak.reasons);
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_reasons\": {},",
+        json_string_array(&soak.reasons)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"async_writeback_backpressure\": {},",
         soak.observed_async_writeback_backpressure
-    );
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"restart_disk_refill_ready\": {},",
         soak.restart_disk_refill_ready
-    );
-    println!("  \"matrixcache_contract\": {{");
-    println!("    \"dram_to_pmem_eviction\": {},", dram_to_pmem_eviction);
-    println!("    \"pmem_to_ssd_eviction\": {},", pmem_to_ssd_eviction);
-    println!(
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"matrixcache_contract\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"dram_to_pmem_eviction\": {},",
+        dram_to_pmem_eviction
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"pmem_to_ssd_eviction\": {},",
+        pmem_to_ssd_eviction
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"ssd_read_through_refill\": {},",
         ssd_read_through_refill
-    );
-    println!("    \"replacement_soak\": {},", replacement_soak_ready);
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"replacement_soak\": {},",
+        replacement_soak_ready
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"async_writeback_backpressure\": {},",
         async_writeback_backpressure_ready
-    );
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "    \"restart_disk_refill\": {},",
         restart_disk_refill_ready
+    )
+    .expect("format report");
+    writeln!(&mut report, "    \"passed\": {}", contract_passed).expect("format report");
+    writeln!(&mut report, "  }},").expect("format report");
+    writeln!(&mut report, "  \"matrixcache_contract_evidence\": {{").expect("format report");
+    append_evidence(
+        &mut report,
+        "dram_to_pmem_eviction",
+        dram_to_pmem_eviction,
+        "memory_evictions > 0 && pmem_fills > 0",
+        &[
+            ("memory_evictions", stats.memory_evictions),
+            ("pmem_fills", stats.pmem_fills),
+        ],
+        true,
     );
-    println!("    \"passed\": {}", contract_passed);
-    println!("  }},");
-    println!("  \"matrixcache_contract_evidence\": {{");
-    println!("    \"dram_to_pmem_eviction\": {{");
-    println!("      \"observed\": {},", dram_to_pmem_eviction);
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"memory_evictions > 0 && pmem_fills > 0\",");
-    println!("      \"memory_evictions\": {},", stats.memory_evictions);
-    println!("      \"pmem_fills\": {}", stats.pmem_fills);
-    println!("    }},");
-    println!("    \"pmem_to_ssd_eviction\": {{");
-    println!("      \"observed\": {},", pmem_to_ssd_eviction);
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"pmem_evictions > 0 && disk_fills > 0\",");
-    println!("      \"pmem_evictions\": {},", stats.pmem_evictions);
-    println!("      \"disk_fills\": {}", stats.disk_fills);
-    println!("    }},");
-    println!("    \"ssd_read_through_refill\": {{");
-    println!("      \"observed\": {},", ssd_read_through_refill);
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"cold_ssd_refills > 0 && refill_failures == 0\",");
-    println!("      \"cold_ssd_refills\": {},", cold_ssd_refills);
-    println!("      \"refill_failures\": {}", stats.refill_failures);
-    println!("    }},");
-    println!("    \"replacement_soak\": {{");
-    println!("      \"observed\": {},", replacement_soak_ready);
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"replacement_policy_soak.passed\",");
-    println!("      \"iterations\": {},", soak_iterations);
-    println!("      \"reasons\": {:?}", soak.reasons);
-    println!("    }},");
-    println!("    \"async_writeback_backpressure\": {{");
-    println!(
+    append_evidence(
+        &mut report,
+        "pmem_to_ssd_eviction",
+        pmem_to_ssd_eviction,
+        "pmem_evictions > 0 && disk_fills > 0",
+        &[
+            ("pmem_evictions", stats.pmem_evictions),
+            ("disk_fills", stats.disk_fills),
+        ],
+        true,
+    );
+    append_evidence(
+        &mut report,
+        "ssd_read_through_refill",
+        ssd_read_through_refill,
+        "cold_ssd_refills > 0 && refill_failures == 0",
+        &[
+            ("cold_ssd_refills", cold_ssd_refills as u64),
+            ("refill_failures", stats.refill_failures),
+        ],
+        true,
+    );
+    writeln!(&mut report, "    \"replacement_soak\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "      \"observed\": {},",
+        replacement_soak_ready
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"source\": \"matrixcache_rocksdb_backend_bench\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"metric\": \"replacement_policy_soak.passed\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "      \"iterations\": {},", soak_iterations).expect("format report");
+    writeln!(
+        &mut report,
+        "      \"reasons\": {}",
+        json_string_array(&soak.reasons)
+    )
+    .expect("format report");
+    writeln!(&mut report, "    }},").expect("format report");
+    writeln!(&mut report, "    \"async_writeback_backpressure\": {{").expect("format report");
+    writeln!(
+        &mut report,
         "      \"observed\": {},",
         async_writeback_backpressure_ready
-    );
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"observed_async_writeback_backpressure > 0\",");
-    println!(
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"source\": \"matrixcache_rocksdb_backend_bench\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"metric\": \"observed_async_writeback_backpressure > 0\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "      \"observed_async_writeback_backpressure\": {}",
         soak.observed_async_writeback_backpressure
-    );
-    println!("    }},");
-    println!("    \"restart_disk_refill\": {{");
-    println!("      \"observed\": {},", restart_disk_refill_ready);
-    println!("      \"source\": \"matrixcache_rocksdb_backend_bench\",");
-    println!("      \"metric\": \"replacement_policy_soak.restart_disk_refill_ready\",");
-    println!(
+    )
+    .expect("format report");
+    writeln!(&mut report, "    }},").expect("format report");
+    writeln!(&mut report, "    \"restart_disk_refill\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "      \"observed\": {},",
+        restart_disk_refill_ready
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"source\": \"matrixcache_rocksdb_backend_bench\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"metric\": \"replacement_policy_soak.restart_disk_refill_ready\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "      \"restart_disk_refill_ready\": {}",
         soak.restart_disk_refill_ready
-    );
-    println!("    }}");
-    println!("  }}");
-    println!("}}");
+    )
+    .expect("format report");
+    writeln!(&mut report, "    }}").expect("format report");
+    writeln!(&mut report, "  }}").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+
+    print!("{report}");
+    if let Some(path) = &config.json_output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).expect("create JSON output directory");
+        }
+        std::fs::write(path, &report).expect("write JSON backend report");
+        eprintln!(
+            "matrixcache RocksDB backend report written to {}",
+            path.display()
+        );
+    }
+    if config.require_passed && !contract_passed {
+        eprintln!("matrixcache RocksDB backend contract failed; see JSON report");
+        process::exit(1);
+    }
 }
 
-fn print_timing(name: &str, timing: Timing, trailing_comma: bool) {
-    println!("  \"{name}\": {{");
-    println!("    \"count\": {},", timing.count);
-    println!("    \"total_ms\": {},", timing.total.as_millis());
-    println!("    \"total_us\": {},", timing.total.as_micros());
-    println!("    \"qps\": {:.2},", timing.qps);
-    println!("    \"p50_us\": {},", timing.p50_us);
-    println!("    \"p95_us\": {},", timing.p95_us);
-    println!("    \"p99_us\": {},", timing.p99_us);
-    println!("    \"p50_ns\": {},", timing.p50_ns);
-    println!("    \"p95_ns\": {},", timing.p95_ns);
-    println!("    \"p99_ns\": {}", timing.p99_ns);
-    println!("  }}{}", if trailing_comma { "," } else { "" });
+fn append_timing(report: &mut String, name: &str, timing: Timing, trailing_comma: bool) {
+    writeln!(report, "  \"{name}\": {{").expect("format report");
+    writeln!(report, "    \"count\": {},", timing.count).expect("format report");
+    writeln!(report, "    \"total_ms\": {},", timing.total.as_millis()).expect("format report");
+    writeln!(report, "    \"total_us\": {},", timing.total.as_micros()).expect("format report");
+    writeln!(report, "    \"qps\": {:.2},", timing.qps).expect("format report");
+    writeln!(report, "    \"p50_us\": {},", timing.p50_us).expect("format report");
+    writeln!(report, "    \"p95_us\": {},", timing.p95_us).expect("format report");
+    writeln!(report, "    \"p99_us\": {},", timing.p99_us).expect("format report");
+    writeln!(report, "    \"p50_ns\": {},", timing.p50_ns).expect("format report");
+    writeln!(report, "    \"p95_ns\": {},", timing.p95_ns).expect("format report");
+    writeln!(report, "    \"p99_ns\": {}", timing.p99_ns).expect("format report");
+    writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
+}
+
+fn append_evidence(
+    report: &mut String,
+    name: &str,
+    observed: bool,
+    metric: &str,
+    fields: &[(&str, u64)],
+    trailing_comma: bool,
+) {
+    writeln!(report, "    \"{name}\": {{").expect("format report");
+    writeln!(report, "      \"observed\": {observed},").expect("format report");
+    writeln!(
+        report,
+        "      \"source\": \"matrixcache_rocksdb_backend_bench\","
+    )
+    .expect("format report");
+    writeln!(report, "      \"metric\": \"{}\",", json_escape(metric)).expect("format report");
+    for (index, (field, value)) in fields.iter().enumerate() {
+        let comma = if index + 1 == fields.len() { "" } else { "," };
+        writeln!(report, "      \"{field}\": {value}{comma}").expect("format report");
+    }
+    writeln!(report, "    }}{}", if trailing_comma { "," } else { "" }).expect("format report");
+}
+
+fn json_string_array(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(&json_escape(value));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
