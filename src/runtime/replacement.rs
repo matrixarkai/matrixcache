@@ -234,6 +234,26 @@ pub struct CacheLatencyMetricsReport {
     pub put_count: u64,
     pub put_avg_us: u64,
     pub put_max_us: u64,
+    #[serde(default)]
+    pub read_through_count: u64,
+    #[serde(default)]
+    pub read_through_avg_us: u64,
+    #[serde(default)]
+    pub refill_count: u64,
+    #[serde(default)]
+    pub refill_avg_us: u64,
+    #[serde(default)]
+    pub writeback_count: u64,
+    #[serde(default)]
+    pub writeback_avg_us: u64,
+    #[serde(default)]
+    pub eviction_count: u64,
+    #[serde(default)]
+    pub eviction_avg_us: u64,
+    #[serde(default)]
+    pub compaction_count: u64,
+    #[serde(default)]
+    pub compaction_avg_us: u64,
     pub histogram_ready: bool,
 }
 

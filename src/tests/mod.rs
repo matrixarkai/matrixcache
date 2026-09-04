@@ -4360,6 +4360,11 @@ mod tests {
         assert!(summary.contains("comments=unit-surface"));
         assert!(summary.contains("put_count=2"));
         assert!(summary.contains("get_count=1"));
+        assert!(summary.contains("read_through_count="));
+        assert!(summary.contains("refill_avg_us="));
+        assert!(summary.contains("writeback_count="));
+        assert!(summary.contains("eviction_avg_us="));
+        assert!(summary.contains("compaction_count="));
         assert!(summary.contains("histogram_ready=true"));
         instance.PrintLatency("unit-surface");
     }
@@ -9460,12 +9465,14 @@ mod tests {
         assert!(writeback.backpressure_events > 0);
         assert!(writeback.bounded_queue_ready);
 
+        let stats = cache.stats();
         let latency = cache.latency_metrics_report();
         assert!(latency.put_count >= 3);
         assert!(latency.get_count >= 1);
         assert!(latency.histogram_ready);
         assert!(latency.put_max_us >= latency.put_avg_us);
         assert!(latency.get_max_us >= latency.get_avg_us);
+        assert_eq!(latency.writeback_count, stats.writeback_latency_samples);
     }
 
     #[test]
@@ -9576,6 +9583,16 @@ mod tests {
         assert!(stats.read_through_latency_total_micros > 0);
         assert!(stats.writeback_latency_total_micros > 0);
         assert_eq!(stats.compaction_latency_total_micros, 1_500);
+        let latency = cache.latency_metrics_report();
+        assert_eq!(
+            latency.read_through_count,
+            stats.read_through_latency_samples
+        );
+        assert_eq!(latency.refill_count, stats.refill_latency_samples);
+        assert_eq!(latency.writeback_count, stats.writeback_latency_samples);
+        assert_eq!(latency.eviction_count, stats.eviction_latency_samples);
+        assert_eq!(latency.compaction_count, stats.compaction_latency_samples);
+        assert_eq!(latency.compaction_avg_us, 1_500);
         assert_eq!(
             stats.get_latency_samples,
             stats.get_latency_le_10us

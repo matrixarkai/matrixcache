@@ -809,7 +809,7 @@ impl CacheInstance {
     pub fn latency_summary_line(&self, comments: impl AsRef<str>) -> String {
         let report = self.cache.latency_metrics_report();
         format!(
-            "matrixcache_latency comments={} get_count={} get_avg_us={} get_max_us={} put_count={} put_avg_us={} put_max_us={} histogram_ready={}",
+            "matrixcache_latency comments={} get_count={} get_avg_us={} get_max_us={} put_count={} put_avg_us={} put_max_us={} read_through_count={} read_through_avg_us={} refill_count={} refill_avg_us={} writeback_count={} writeback_avg_us={} eviction_count={} eviction_avg_us={} compaction_count={} compaction_avg_us={} histogram_ready={}",
             comments.as_ref(),
             report.get_count,
             report.get_avg_us,
@@ -817,6 +817,16 @@ impl CacheInstance {
             report.put_count,
             report.put_avg_us,
             report.put_max_us,
+            report.read_through_count,
+            report.read_through_avg_us,
+            report.refill_count,
+            report.refill_avg_us,
+            report.writeback_count,
+            report.writeback_avg_us,
+            report.eviction_count,
+            report.eviction_avg_us,
+            report.compaction_count,
+            report.compaction_avg_us,
             report.histogram_ready
         )
     }
@@ -3036,7 +3046,7 @@ impl MultiTierCache {
     pub fn latency_summary_line(&self, comments: impl AsRef<str>) -> String {
         let report = self.cache.latency_metrics_report();
         format!(
-            "matrixcache_latency comments={} get_count={} get_avg_us={} get_max_us={} put_count={} put_avg_us={} put_max_us={} histogram_ready={}",
+            "matrixcache_latency comments={} get_count={} get_avg_us={} get_max_us={} put_count={} put_avg_us={} put_max_us={} read_through_count={} read_through_avg_us={} refill_count={} refill_avg_us={} writeback_count={} writeback_avg_us={} eviction_count={} eviction_avg_us={} compaction_count={} compaction_avg_us={} histogram_ready={}",
             comments.as_ref(),
             report.get_count,
             report.get_avg_us,
@@ -3044,6 +3054,16 @@ impl MultiTierCache {
             report.put_count,
             report.put_avg_us,
             report.put_max_us,
+            report.read_through_count,
+            report.read_through_avg_us,
+            report.refill_count,
+            report.refill_avg_us,
+            report.writeback_count,
+            report.writeback_avg_us,
+            report.eviction_count,
+            report.eviction_avg_us,
+            report.compaction_count,
+            report.compaction_avg_us,
             report.histogram_ready
         )
     }

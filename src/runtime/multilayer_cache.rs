@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+fn average_latency_us(total_us: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total_us / count
+    }
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -4789,6 +4797,16 @@ impl ShardedMultiLayerCache {
         let mut put_count = 0u64;
         let mut put_total_us = 0u64;
         let mut put_max_us = 0u64;
+        let mut read_through_count = 0u64;
+        let mut read_through_total_us = 0u64;
+        let mut refill_count = 0u64;
+        let mut refill_total_us = 0u64;
+        let mut writeback_count = 0u64;
+        let mut writeback_total_us = 0u64;
+        let mut eviction_count = 0u64;
+        let mut eviction_total_us = 0u64;
+        let mut compaction_count = 0u64;
+        let mut compaction_total_us = 0u64;
         let mut histogram_ready = false;
 
         for shard in self.shards.iter() {
@@ -4801,24 +4819,50 @@ impl ShardedMultiLayerCache {
             put_total_us =
                 put_total_us.saturating_add(report.put_count.saturating_mul(report.put_avg_us));
             put_max_us = put_max_us.max(report.put_max_us);
+            read_through_count = read_through_count.saturating_add(report.read_through_count);
+            read_through_total_us = read_through_total_us.saturating_add(
+                report
+                    .read_through_count
+                    .saturating_mul(report.read_through_avg_us),
+            );
+            refill_count = refill_count.saturating_add(report.refill_count);
+            refill_total_us = refill_total_us
+                .saturating_add(report.refill_count.saturating_mul(report.refill_avg_us));
+            writeback_count = writeback_count.saturating_add(report.writeback_count);
+            writeback_total_us = writeback_total_us.saturating_add(
+                report
+                    .writeback_count
+                    .saturating_mul(report.writeback_avg_us),
+            );
+            eviction_count = eviction_count.saturating_add(report.eviction_count);
+            eviction_total_us = eviction_total_us
+                .saturating_add(report.eviction_count.saturating_mul(report.eviction_avg_us));
+            compaction_count = compaction_count.saturating_add(report.compaction_count);
+            compaction_total_us = compaction_total_us.saturating_add(
+                report
+                    .compaction_count
+                    .saturating_mul(report.compaction_avg_us),
+            );
             histogram_ready |= report.histogram_ready;
         }
 
         CacheLatencyMetricsReport {
             get_count,
-            get_avg_us: if get_count == 0 {
-                0
-            } else {
-                get_total_us / get_count
-            },
+            get_avg_us: average_latency_us(get_total_us, get_count),
             get_max_us,
             put_count,
-            put_avg_us: if put_count == 0 {
-                0
-            } else {
-                put_total_us / put_count
-            },
+            put_avg_us: average_latency_us(put_total_us, put_count),
             put_max_us,
+            read_through_count,
+            read_through_avg_us: average_latency_us(read_through_total_us, read_through_count),
+            refill_count,
+            refill_avg_us: average_latency_us(refill_total_us, refill_count),
+            writeback_count,
+            writeback_avg_us: average_latency_us(writeback_total_us, writeback_count),
+            eviction_count,
+            eviction_avg_us: average_latency_us(eviction_total_us, eviction_count),
+            compaction_count,
+            compaction_avg_us: average_latency_us(compaction_total_us, compaction_count),
             histogram_ready,
         }
     }
@@ -7553,19 +7597,36 @@ impl MultiLayerCache {
         let put_max = stats.put_latency_max_us.max(stats.put_latency_max_micros);
         CacheLatencyMetricsReport {
             get_count,
-            get_avg_us: if get_count == 0 {
-                0
-            } else {
-                get_total / get_count
-            },
+            get_avg_us: average_latency_us(get_total, get_count),
             get_max_us: get_max,
             put_count,
-            put_avg_us: if put_count == 0 {
-                0
-            } else {
-                put_total / put_count
-            },
+            put_avg_us: average_latency_us(put_total, put_count),
             put_max_us: put_max,
+            read_through_count: stats.read_through_latency_samples,
+            read_through_avg_us: average_latency_us(
+                stats.read_through_latency_total_micros,
+                stats.read_through_latency_samples,
+            ),
+            refill_count: stats.refill_latency_samples,
+            refill_avg_us: average_latency_us(
+                stats.refill_latency_total_micros,
+                stats.refill_latency_samples,
+            ),
+            writeback_count: stats.writeback_latency_samples,
+            writeback_avg_us: average_latency_us(
+                stats.writeback_latency_total_micros,
+                stats.writeback_latency_samples,
+            ),
+            eviction_count: stats.eviction_latency_samples,
+            eviction_avg_us: average_latency_us(
+                stats.eviction_latency_total_micros,
+                stats.eviction_latency_samples,
+            ),
+            compaction_count: stats.compaction_latency_samples,
+            compaction_avg_us: average_latency_us(
+                stats.compaction_latency_total_micros,
+                stats.compaction_latency_samples,
+            ),
             histogram_ready: stats.get_latency_le_10us
                 + stats.get_latency_le_100us
                 + stats.get_latency_le_1ms
