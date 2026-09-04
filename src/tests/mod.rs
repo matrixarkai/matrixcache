@@ -15757,6 +15757,47 @@ fn sharded_batch_fanout_metrics_are_exported() {
     let large_handles = cache.acquire_batch(&large).unwrap();
     cache.release_batch(large_handles.into_iter().flatten().collect());
 
+    let before_write_stats = cache.stats();
+    let small_write_entries = small
+        .iter()
+        .cloned()
+        .map(|key| (key, vec![8; 16]))
+        .collect::<Vec<_>>();
+    assert_eq!(cache.put_batch(small_write_entries).unwrap(), small.len());
+    let large_write_entries = large
+        .iter()
+        .cloned()
+        .map(|key| (key, vec![9; 16]))
+        .collect::<Vec<_>>();
+    assert_eq!(cache.put_batch(large_write_entries).unwrap(), large.len());
+    assert_eq!(cache.pin_batch(small.clone()), small.len());
+    assert_eq!(cache.unpin_batch(&small), small.len());
+    let pinned_entries = small
+        .iter()
+        .take(4)
+        .cloned()
+        .map(|key| (key, vec![10; 16], 16))
+        .collect::<Vec<_>>();
+    let pinned = cache.insert_pinned_batch_sized(pinned_entries).unwrap();
+    cache.release_batch(pinned.into_iter().flatten().collect());
+    assert_eq!(cache.remove_batch(&small[..4]).unwrap(), 4);
+    let after_write_stats = cache.stats();
+    assert!(
+        after_write_stats.sharded_batch_local_operations
+            > before_write_stats.sharded_batch_local_operations,
+        "small write/control batches should record local sharded batch metrics: before={before_write_stats:?} after={after_write_stats:?}"
+    );
+    assert!(
+        after_write_stats.sharded_batch_fanout_operations
+            > before_write_stats.sharded_batch_fanout_operations,
+        "large write batches should record fan-out sharded batch metrics: before={before_write_stats:?} after={after_write_stats:?}"
+    );
+    assert!(
+        after_write_stats.sharded_batch_latency_samples
+            > before_write_stats.sharded_batch_latency_samples,
+        "write/control batch paths should record latency samples: before={before_write_stats:?} after={after_write_stats:?}"
+    );
+
     let stats = cache.stats();
     assert!(
         stats.sharded_batch_local_operations >= 4,
