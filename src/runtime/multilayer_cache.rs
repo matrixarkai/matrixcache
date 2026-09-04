@@ -2208,7 +2208,78 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CacheReadResult>>, CacheError> {
-        keys.iter().map(|key| self.get_no_promotion(key)).collect()
+        let mut results = vec![None; keys.len()];
+        if keys.is_empty() {
+            return Ok(results);
+        }
+
+        let mut ssd_candidates = Vec::new();
+        let now_millis = CoarseClock::now_millis();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (index, key) in keys.iter().enumerate() {
+                if inner.entry_expired(key, now_millis) {
+                    continue;
+                }
+                if !inner.ssd_instance_only {
+                    if let Some(value) = inner.memory.get(key).cloned() {
+                        results[index] = Some(CacheReadResult {
+                            value: value.to_vec(),
+                            tier: CacheReadTier::Memory,
+                        });
+                        continue;
+                    }
+                    if let Some(value) = inner.pmem.get(key).cloned() {
+                        results[index] = Some(CacheReadResult {
+                            value: value.to_vec(),
+                            tier: CacheReadTier::Pmem,
+                        });
+                        continue;
+                    }
+                }
+                ssd_candidates.push((index, key.clone()));
+            }
+        }
+
+        if ssd_candidates.is_empty() {
+            return Ok(results);
+        }
+
+        let mut unique_ssd_candidates = Vec::<(CacheKey, Vec<usize>)>::new();
+        let mut unique_ssd_positions = HashMap::<CacheKey, usize>::new();
+        for (index, key) in ssd_candidates {
+            if let Some(position) = unique_ssd_positions.get(&key).copied() {
+                unique_ssd_candidates[position].1.push(index);
+            } else {
+                unique_ssd_positions.insert(key.clone(), unique_ssd_candidates.len());
+                unique_ssd_candidates.push((key, vec![index]));
+            }
+        }
+
+        let candidate_keys = unique_ssd_candidates
+            .iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let blocks = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.read_ssd_blocks(&candidate_keys)?
+        };
+        for ((_, positions), block) in unique_ssd_candidates.into_iter().zip(blocks) {
+            let Some(block) = block else {
+                continue;
+            };
+            let value = decode_cache_block(&block)?;
+            for index in positions {
+                results[index] = Some(CacheReadResult {
+                    value: value.clone(),
+                    tier: CacheReadTier::Ssd,
+                });
+            }
+        }
+        Ok(results)
     }
 
     pub fn lookup_no_promotion(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
@@ -2834,33 +2905,45 @@ impl MultiLayerCache {
         &self,
         key: &CacheKey,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
+        let now_millis = CoarseClock::now_millis();
+        let expired;
         {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
+            let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if inner.entry_expired(key, CoarseClock::now_millis()) {
+            expired = inner.entry_expired(key, now_millis);
+            if expired {
+                // Preserve the single-key acquire behavior below: expired
+                // entries are cleaned up under the exclusive lock.
+            } else {
+                if let Some(value) = inner.memory.get(key).cloned() {
+                    inner.increment_pin_with_size(key, value.len());
+                    return Ok(Some(CachePinnedHandle {
+                        key: key.clone(),
+                        value,
+                        tier: CacheReadTier::Memory,
+                    }));
+                }
+                if let Some(value) = inner.pmem.get(key).cloned() {
+                    inner.increment_pin_with_size(key, value.len());
+                    return Ok(Some(CachePinnedHandle {
+                        key: key.clone(),
+                        value,
+                        tier: CacheReadTier::Pmem,
+                    }));
+                }
+            }
+        }
+
+        if expired {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if inner.entry_expired(key, now_millis) {
                 inner.remove_expired_entry(key);
                 inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
                 inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
             }
-            if let Some(value) = inner.memory.get(key).cloned() {
-                inner.increment_pin_with_size(key, value.len());
-                return Ok(Some(CachePinnedHandle {
-                    key: key.clone(),
-                    value,
-                    tier: CacheReadTier::Memory,
-                }));
-            }
-            if let Some(value) = inner.pmem.get(key).cloned() {
-                inner.increment_pin_with_size(key, value.len());
-                return Ok(Some(CachePinnedHandle {
-                    key: key.clone(),
-                    value,
-                    tier: CacheReadTier::Pmem,
-                }));
-            }
+            return Ok(None);
         }
 
         let block = {
@@ -2874,6 +2957,9 @@ impl MultiLayerCache {
         // Shared: taking the pin changes only the pin state, which has its own
         // lock.
         let inner = self.inner.read().expect("cache lock poisoned");
+        if !inner.started {
+            return Err(CacheError::Stopped);
+        }
         inner.increment_pin_with_size(key, value.len());
         Ok(Some(CachePinnedHandle {
             key: key.clone(),

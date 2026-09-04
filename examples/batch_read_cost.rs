@@ -5,9 +5,10 @@
 //!
 //! `get_batch` serves from the memory tier when it can, so a batch of resident
 //! keys should cost about what the same number of single gets costs and no
-//! more. Anything it does *besides* answering — bookkeeping whose result is
-//! not returned — shows up here as a per-key cost that has nothing to do with
-//! the value.
+//! more. `get_batch_no_promotion` is the scan path: it answers without moving
+//! entries between tiers or updating replacement metadata. Anything the regular
+//! path does *besides* answering -- bookkeeping whose result is not returned --
+//! shows up here as a per-key cost that has nothing to do with the value.
 //!
 //! The cache is given an SSD path so that entries are present in the disk
 //! index as well as in memory. That combination is the one worth measuring:
@@ -70,10 +71,13 @@ fn main() {
         "{RESIDENT} resident values of {VALUE_BYTES} bytes, all hitting memory, \
          median of {PASSES} passes\n"
     );
-    println!("{:<16}{:>14}", "batch size", "ns/key");
+    println!(
+        "{:<16}{:>14}{:>22}",
+        "batch size", "get_batch", "get_batch_no_prom"
+    );
 
     for batch in [64_usize, 1024] {
-        let ns = median(
+        let regular_ns = median(
             (0..PASSES)
                 .map(|_| {
                     let started = Instant::now();
@@ -87,7 +91,23 @@ fn main() {
                 })
                 .collect(),
         );
-        println!("{batch:<16}{ns:>14.1}");
+        let no_promotion_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in keys.chunks(batch) {
+                        let values = cache
+                            .get_batch_no_promotion(chunk)
+                            .expect("get_batch_no_promotion");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(served, RESIDENT, "every key should have hit memory");
+                    started.elapsed().as_nanos() as f64 / RESIDENT as f64
+                })
+                .collect(),
+        );
+        println!("{batch:<16}{regular_ns:>14.1}{no_promotion_ns:>22.1}");
     }
 
     let _ = std::fs::remove_dir_all(&dir);
