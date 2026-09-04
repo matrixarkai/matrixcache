@@ -4774,6 +4774,25 @@ impl ShardedMultiLayerCache {
             .then_some(shard)
     }
 
+    fn single_shard_for_writeback_entries(&self, entries: &[(CacheKey, Vec<u8>)]) -> Option<usize> {
+        let mut iter = entries.iter();
+        let first = iter.next()?;
+        let shard = self.shard_index_for_key(&first.0);
+        iter.all(|entry| self.shard_index_for_key(&entry.0) == shard)
+            .then_some(shard)
+    }
+
+    fn single_shard_for_sized_entries(
+        &self,
+        entries: &[(CacheKey, Vec<u8>, usize)],
+    ) -> Option<usize> {
+        let mut iter = entries.iter();
+        let first = iter.next()?;
+        let shard = self.shard_index_for_key(&first.0);
+        iter.all(|entry| self.shard_index_for_key(&entry.0) == shard)
+            .then_some(shard)
+    }
+
     pub fn start(&self) -> Result<(), CacheError> {
         for shard in self.shards.iter() {
             shard.start()?;
@@ -4835,6 +4854,9 @@ impl ShardedMultiLayerCache {
     ) -> Result<usize, Vec<CacheWritebackJob>> {
         if entries.is_empty() {
             return Ok(0);
+        }
+        if let Some(shard_index) = self.single_shard_for_writeback_entries(&entries) {
+            return self.shards[shard_index].enqueue_async_writeback_batch(entries);
         }
         let mut groups = vec![Vec::new(); self.shard_count()];
         for (key, value) in entries {
@@ -5430,6 +5452,9 @@ impl ShardedMultiLayerCache {
     ) -> Result<usize, CacheError> {
         if entries.is_empty() {
             return Ok(0);
+        }
+        if let Some(shard_index) = self.single_shard_for_sized_entries(&entries) {
+            return self.shards[shard_index].put_batch_sized(entries);
         }
         let mut grouped = vec![Vec::new(); self.shard_count()];
         for (key, value, size) in entries {
@@ -6078,6 +6103,13 @@ impl ShardedMultiLayerCache {
         if keys.is_empty() {
             return 0;
         }
+        if let Some(shard_index) = self.single_shard_for_keys(&keys) {
+            let pinned = keys.len();
+            for key in keys {
+                self.shards[shard_index].pin(key);
+            }
+            return pinned;
+        }
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<CacheKey>::new())
             .collect::<Vec<_>>();
@@ -6118,6 +6150,12 @@ impl ShardedMultiLayerCache {
     pub fn unpin_batch(&self, keys: &[CacheKey]) -> usize {
         if keys.is_empty() {
             return 0;
+        }
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            for key in keys {
+                self.shards[shard_index].unpin(key);
+            }
+            return keys.len();
         }
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<CacheKey>::new())
@@ -6188,6 +6226,12 @@ impl ShardedMultiLayerCache {
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         if entries.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(shard_index) = self.single_shard_for_sized_entries(&entries) {
+            return entries
+                .into_iter()
+                .map(|(key, value, size)| self.shards[shard_index].insert_pinned_sized(key, value, size))
+                .collect();
         }
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<(usize, CacheKey, Vec<u8>, usize)>::new())
@@ -6264,6 +6308,10 @@ impl ShardedMultiLayerCache {
     pub fn remove_batch(&self, keys: &[CacheKey]) -> Result<usize, CacheError> {
         if keys.is_empty() {
             return Ok(0);
+        }
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.shards[shard_index].remove_batch(keys)?;
+            return Ok(keys.len());
         }
         let mut groups = vec![Vec::new(); self.shard_count()];
         for key in unique_cache_keys(keys) {
