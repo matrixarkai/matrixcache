@@ -5633,12 +5633,40 @@ impl ShardedMultiLayerCache {
         for (position, key) in keys.iter().cloned().enumerate() {
             groups[self.shard_index_for_key(&key)].push((position, key));
         }
-        for (shard_index, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
+        let batches = std::thread::scope(|scope| {
+            let workers = groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(shard_index, group)| {
+                    if group.is_empty() {
+                        None
+                    } else {
+                        let shard = &self.shards[shard_index];
+                        let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+                        Some(scope.spawn(move || {
+                            shard
+                                .acquire_batch_no_promotion(&shard_keys)
+                                .map(|shard_results| (positions, shard_results))
+                        }))
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut batches = Vec::with_capacity(workers.len());
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(batch)) => batches.push(batch),
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(CacheError::CorruptBlock(
+                            "sharded cache batch no-promotion worker panicked".to_string(),
+                        ));
+                    }
+                }
             }
-            let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
-            let shard_results = self.shards[shard_index].acquire_batch_no_promotion(&shard_keys)?;
+            Ok(batches)
+        })?;
+        for (positions, shard_results) in batches {
             for (position, handle) in positions.into_iter().zip(shard_results) {
                 results[position] = handle;
             }
@@ -5693,12 +5721,40 @@ impl ShardedMultiLayerCache {
         for (position, key) in keys.iter().cloned().enumerate() {
             groups[self.shard_index_for_key(&key)].push((position, key));
         }
-        for (shard_index, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
+        let batches = std::thread::scope(|scope| {
+            let workers = groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(shard_index, group)| {
+                    if group.is_empty() {
+                        None
+                    } else {
+                        let shard = &self.shards[shard_index];
+                        let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+                        Some(scope.spawn(move || {
+                            shard
+                                .acquire_batch(&shard_keys)
+                                .map(|shard_results| (positions, shard_results))
+                        }))
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut batches = Vec::with_capacity(workers.len());
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(batch)) => batches.push(batch),
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(CacheError::CorruptBlock(
+                            "sharded cache batch acquire worker panicked".to_string(),
+                        ));
+                    }
+                }
             }
-            let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
-            let shard_results = self.shards[shard_index].acquire_batch(&shard_keys)?;
+            Ok(batches)
+        })?;
+        for (positions, shard_results) in batches {
             for (position, handle) in positions.into_iter().zip(shard_results) {
                 results[position] = handle;
             }
