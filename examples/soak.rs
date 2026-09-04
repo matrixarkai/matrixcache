@@ -330,11 +330,13 @@ fn main() {
         println!("    \"get_avg_us\": {},", latency.get_avg_us);
         println!("    \"get_p50_us\": {},", latency.get_p50_us);
         println!("    \"get_p95_us\": {},", latency.get_p95_us);
+        println!("    \"get_p99_us\": {},", latency.get_p99_us);
         println!("    \"get_max_us\": {},", latency.get_max_us);
         println!("    \"put_count\": {},", latency.put_count);
         println!("    \"put_avg_us\": {},", latency.put_avg_us);
         println!("    \"put_p50_us\": {},", latency.put_p50_us);
         println!("    \"put_p95_us\": {},", latency.put_p95_us);
+        println!("    \"put_p99_us\": {},", latency.put_p99_us);
         println!("    \"put_max_us\": {},", latency.put_max_us);
         println!(
             "    \"read_through_count\": {},",
@@ -352,22 +354,30 @@ fn main() {
             "    \"read_through_p95_us\": {},",
             latency.read_through_p95_us
         );
+        println!(
+            "    \"read_through_p99_us\": {},",
+            latency.read_through_p99_us
+        );
         println!("    \"refill_count\": {},", latency.refill_count);
         println!("    \"refill_avg_us\": {},", latency.refill_avg_us);
         println!("    \"refill_p50_us\": {},", latency.refill_p50_us);
         println!("    \"refill_p95_us\": {},", latency.refill_p95_us);
+        println!("    \"refill_p99_us\": {},", latency.refill_p99_us);
         println!("    \"writeback_count\": {},", latency.writeback_count);
         println!("    \"writeback_avg_us\": {},", latency.writeback_avg_us);
         println!("    \"writeback_p50_us\": {},", latency.writeback_p50_us);
         println!("    \"writeback_p95_us\": {},", latency.writeback_p95_us);
+        println!("    \"writeback_p99_us\": {},", latency.writeback_p99_us);
         println!("    \"eviction_count\": {},", latency.eviction_count);
         println!("    \"eviction_avg_us\": {},", latency.eviction_avg_us);
         println!("    \"eviction_p50_us\": {},", latency.eviction_p50_us);
         println!("    \"eviction_p95_us\": {},", latency.eviction_p95_us);
+        println!("    \"eviction_p99_us\": {},", latency.eviction_p99_us);
         println!("    \"compaction_count\": {},", latency.compaction_count);
         println!("    \"compaction_avg_us\": {},", latency.compaction_avg_us);
         println!("    \"compaction_p50_us\": {},", latency.compaction_p50_us);
         println!("    \"compaction_p95_us\": {},", latency.compaction_p95_us);
+        println!("    \"compaction_p99_us\": {},", latency.compaction_p99_us);
         println!("    \"histogram_ready\": {}", latency.histogram_ready);
         println!("  }},");
         println!("  \"checks\": {{");

@@ -48,8 +48,8 @@ families directly, including:
 - async writeback queue depth, drain rate, and backpressure rejections
 - sharded batch fan-out/local decisions from `matrixcache_sharded_batch_fanout_operations`,
   `matrixcache_sharded_batch_local_operations`, `matrixcache_sharded_batch_fanout_shards`,
-  and `matrixcache_sharded_batch_latency_p95_seconds`
-- p50, p95, and average latency for get, put, read-through, refill, writeback,
+  `matrixcache_sharded_batch_latency_p95_seconds`, and `matrixcache_sharded_batch_latency_p99_seconds`
+- p50, p95, p99, and average latency for get, put, read-through, refill, writeback,
   and eviction
 
 ## Scale Report Pairing

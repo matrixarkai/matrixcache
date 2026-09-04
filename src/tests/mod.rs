@@ -9472,9 +9472,11 @@ mod tests {
         assert!(latency.histogram_ready);
         assert!(latency.put_p50_us > 0);
         assert!(latency.put_p95_us >= latency.put_p50_us);
+        assert!(latency.put_p99_us >= latency.put_p95_us);
         assert!(latency.put_max_us >= latency.put_avg_us);
         assert!(latency.get_p50_us > 0);
         assert!(latency.get_p95_us >= latency.get_p50_us);
+        assert!(latency.get_p99_us >= latency.get_p95_us);
         assert!(latency.get_max_us >= latency.get_avg_us);
         assert_eq!(latency.writeback_count, stats.writeback_latency_samples);
     }
@@ -9599,14 +9601,19 @@ mod tests {
         assert_eq!(latency.compaction_avg_us, 1_500);
         assert!(latency.get_p50_us > 0);
         assert!(latency.get_p95_us >= latency.get_p50_us);
+        assert!(latency.get_p99_us >= latency.get_p95_us);
         assert!(latency.put_p50_us > 0);
         assert!(latency.put_p95_us >= latency.put_p50_us);
+        assert!(latency.put_p99_us >= latency.put_p95_us);
         assert!(latency.read_through_p50_us > 0);
         assert!(latency.read_through_p95_us >= latency.read_through_p50_us);
+        assert!(latency.read_through_p99_us >= latency.read_through_p95_us);
         assert!(latency.writeback_p50_us > 0);
         assert!(latency.writeback_p95_us >= latency.writeback_p50_us);
+        assert!(latency.writeback_p99_us >= latency.writeback_p95_us);
         assert_eq!(latency.compaction_p50_us, 10_000);
         assert_eq!(latency.compaction_p95_us, 10_000);
+        assert_eq!(latency.compaction_p99_us, 10_000);
         assert_eq!(
             stats.get_latency_samples,
             stats.get_latency_le_10us
@@ -15228,24 +15235,31 @@ mod tests {
             "matrixcache_get_latency_avg_seconds",
             "matrixcache_get_latency_p50_seconds",
             "matrixcache_get_latency_p95_seconds",
+            "matrixcache_get_latency_p99_seconds",
             "matrixcache_put_latency_avg_seconds",
             "matrixcache_put_latency_p50_seconds",
             "matrixcache_put_latency_p95_seconds",
+            "matrixcache_put_latency_p99_seconds",
             "matrixcache_read_through_latency_avg_seconds",
             "matrixcache_read_through_latency_p50_seconds",
             "matrixcache_read_through_latency_p95_seconds",
+            "matrixcache_read_through_latency_p99_seconds",
             "matrixcache_refill_latency_avg_seconds",
             "matrixcache_refill_latency_p50_seconds",
             "matrixcache_refill_latency_p95_seconds",
+            "matrixcache_refill_latency_p99_seconds",
             "matrixcache_writeback_latency_avg_seconds",
             "matrixcache_writeback_latency_p50_seconds",
             "matrixcache_writeback_latency_p95_seconds",
+            "matrixcache_writeback_latency_p99_seconds",
             "matrixcache_eviction_latency_avg_seconds",
             "matrixcache_eviction_latency_p50_seconds",
             "matrixcache_eviction_latency_p95_seconds",
+            "matrixcache_eviction_latency_p99_seconds",
             "matrixcache_compaction_latency_avg_seconds",
             "matrixcache_compaction_latency_p50_seconds",
             "matrixcache_compaction_latency_p95_seconds",
+            "matrixcache_compaction_latency_p99_seconds",
         ] {
             assert!(
                 text.contains(gauge),
@@ -15758,6 +15772,7 @@ fn sharded_batch_fanout_metrics_are_exported() {
         "matrixcache_sharded_batch_fanout_shards",
         "matrixcache_sharded_batch_latency_seconds",
         "matrixcache_sharded_batch_latency_p95_seconds",
+        "matrixcache_sharded_batch_latency_p99_seconds",
     ] {
         assert!(
             exported.contains(metric),

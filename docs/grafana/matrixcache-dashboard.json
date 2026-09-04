@@ -479,9 +479,27 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
+          "expr": "matrixcache_get_latency_p99_seconds",
+          "legendFormat": "get p99",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "matrixcache_put_latency_p95_seconds",
           "legendFormat": "put p95",
-          "refId": "B"
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_put_latency_p99_seconds",
+          "legendFormat": "put p99",
+          "refId": "D"
         },
         {
           "datasource": {
@@ -490,7 +508,7 @@
           },
           "expr": "matrixcache_get_latency_avg_seconds",
           "legendFormat": "get avg",
-          "refId": "C"
+          "refId": "E"
         },
         {
           "datasource": {
@@ -499,7 +517,7 @@
           },
           "expr": "matrixcache_put_latency_avg_seconds",
           "legendFormat": "put avg",
-          "refId": "D"
+          "refId": "F"
         }
       ],
       "title": "Get/Put Latency",
@@ -713,6 +731,24 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
+          "expr": "matrixcache_read_through_latency_p99_seconds",
+          "legendFormat": "read-through p99",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_refill_latency_p99_seconds",
+          "legendFormat": "refill p99",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "matrixcache_eviction_latency_p95_seconds",
           "legendFormat": "eviction p95",
           "refId": "C"
@@ -725,6 +761,24 @@
           "expr": "matrixcache_writeback_latency_p95_seconds",
           "legendFormat": "writeback p95",
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_eviction_latency_p99_seconds",
+          "legendFormat": "eviction p99",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_writeback_latency_p99_seconds",
+          "legendFormat": "writeback p99",
+          "refId": "H"
         }
       ],
       "title": "Tier Movement Latency",
@@ -958,6 +1012,17 @@
           "legendFormat": "batch p95 seconds",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "matrixcache_sharded_batch_latency_p99_seconds",
+          "legendFormat": "batch p99 seconds",
+          "range": true,
+          "refId": "E"
         }
       ],
       "title": "Sharded Batch Fanout",

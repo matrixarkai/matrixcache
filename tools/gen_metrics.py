@@ -135,7 +135,7 @@ out.append("/// `labels` are appended to every series, so several caches in one 
 out.append("/// can be told apart -- pass something like `&[(\"cache\", \"sessions\")]`.")
 out.append("/// Label values are escaped; names are assumed well-formed.")
 out.append("///")
-out.append("/// The seven latency families are exported as real histograms rather than as")
+out.append("/// The latency families are exported as real histograms rather than as")
 out.append("/// loose counters, so `histogram_quantile` works on them. Their buckets are")
 out.append("/// cumulative, as the format requires.")
 out.append("pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {")
@@ -183,6 +183,8 @@ for family, total, mx in LATENCY_FAMILIES:
     out.append('    metric_f64(&mut out, "matrixcache_%s_p50_seconds", "%s p50 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 50));'
                % (family, pretty, family, family, family, family, family, family, max_expr))
     out.append('    metric_f64(&mut out, "matrixcache_%s_p95_seconds", "%s p95 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 95));'
+               % (family, pretty, family, family, family, family, family, family, max_expr))
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p99_seconds", "%s p99 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 99));'
                % (family, pretty, family, family, family, family, family, family, max_expr))
     out.append("")
 
