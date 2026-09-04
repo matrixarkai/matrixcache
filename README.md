@@ -120,7 +120,8 @@ and says what the number means:
   missed memory, hit-rate, or p99 latency gate. Use `--duration-seconds` and
   `--sample-seconds` for short validation runs. The JSON latency section
   includes average, p50, p95, p99, and max estimates from the same histogram
-  buckets exported to Prometheus.
+  buckets exported to Prometheus. Validate an archived report with
+  `tools/validate_soak_report.py`.
 - `metrics_server` -- serves Prometheus text metrics for Grafana. Import
   [`docs/grafana/matrixcache-dashboard.json`](docs/grafana/matrixcache-dashboard.json)
   and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup. The

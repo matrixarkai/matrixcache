@@ -43,6 +43,21 @@ jobs:
       - name: Test (no default features / compatibility store)
         run: cargo test --locked --no-default-features
 
+      - name: Soak report smoke
+        run: |
+          cargo run --locked --no-default-features --example soak -- 1 1 \
+            --duration-seconds 1 \
+            --sample-seconds 1 \
+            --json-output /tmp/matrixcache-soak.json \
+            --require-passed \
+            --max-get-p99-us 1000000 \
+            --max-put-p99-us 1000000 \
+            --min-hit-rate-percent 1
+          tools/validate_soak_report.py /tmp/matrixcache-soak.json \
+            --max-get-p99-us 1000000 \
+            --max-put-p99-us 1000000 \
+            --min-hit-rate-percent 1
+
       - name: Doc
         run: cargo doc --no-deps --locked
 
