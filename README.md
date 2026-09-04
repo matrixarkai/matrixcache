@@ -116,6 +116,9 @@ and says what the number means:
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`
   to append a machine-readable report for Grafana/comparison archives; use
   `--duration-seconds` and `--sample-seconds` for short validation runs.
+- `metrics_server` -- serves Prometheus text metrics for Grafana. Import
+  [`docs/grafana/matrixcache-dashboard.json`](docs/grafana/matrixcache-dashboard.json)
+  and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather

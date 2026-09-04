@@ -15672,3 +15672,56 @@ fn a_shared_read_counts_as_a_read() {
 
 
 }
+
+#[test]
+fn grafana_dashboard_metrics_are_exported() {
+    let cache =
+        MultiLayerCache::try_with_options(CacheOptions::new(64 * 64, 64 * 64, 64 * 64)).unwrap();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "grafana-drift");
+    cache.put(key.clone(), vec![1; 32]).unwrap();
+    let _ = cache.get(&key).unwrap();
+    cache.record_compaction_latency_micros(25);
+
+    let exported = prometheus_text(&cache.stats(), &[("cache", "dashboard")]);
+    let dashboard = include_str!("../../docs/grafana/matrixcache-dashboard.json");
+    let mut names = dashboard_metric_names(dashboard);
+    names.sort();
+    names.dedup();
+
+    assert!(
+        !names.is_empty(),
+        "the Grafana dashboard should reference MatrixCache metrics"
+    );
+    for name in names {
+        assert!(
+            exported.contains(&name),
+            "dashboard references {name}, but the Prometheus exporter does not expose it"
+        );
+    }
+}
+
+#[cfg(test)]
+fn dashboard_metric_names(input: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if input[index..].starts_with("matrixcache_") {
+            let start = index;
+            index += "matrixcache_".len();
+            while index < bytes.len() {
+                let byte = bytes[index];
+                if byte.is_ascii_alphanumeric() || byte == b'_' {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            names.push(input[start..index].to_string());
+        } else {
+            index += 1;
+        }
+    }
+    names
+}
