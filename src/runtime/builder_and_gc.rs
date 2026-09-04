@@ -2346,16 +2346,22 @@ impl CacheInner {
     }
 
     fn record_read_through_latency_micros(&self, micros: u64) {
-        self.read_counters.read_through_latency.observe(micros);
+        self.read_counters
+            .read_through_latency
+            .observe_with_total(micros);
     }
 
     fn record_refill_latency(&self, started: Instant) {
         let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        self.read_counters.refill_latency.observe(micros);
+        self.read_counters.refill_latency.observe_with_total(micros);
     }
 
     fn record_writeback_latency(&mut self, started: Instant) {
         let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.stats.writeback_latency_total_micros = self
+            .stats
+            .writeback_latency_total_micros
+            .saturating_add(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.writeback_latency_samples,
@@ -2369,6 +2375,10 @@ impl CacheInner {
 
     fn record_eviction_latency(&mut self, started: Instant) {
         let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.stats.eviction_latency_total_micros = self
+            .stats
+            .eviction_latency_total_micros
+            .saturating_add(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.eviction_latency_samples,
@@ -2381,6 +2391,10 @@ impl CacheInner {
     }
 
     fn record_compaction_latency_micros(&mut self, micros: u64) {
+        self.stats.compaction_latency_total_micros = self
+            .stats
+            .compaction_latency_total_micros
+            .saturating_add(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.compaction_latency_samples,

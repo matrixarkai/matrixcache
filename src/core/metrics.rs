@@ -160,9 +160,11 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         bucket(&mut out, "matrixcache_read_through_latency_seconds", &tags, "0.01", cumulative);
         cumulative = cumulative.saturating_add(stats.read_through_latency_gt_10ms);
         bucket(&mut out, "matrixcache_read_through_latency_seconds", &tags, "+Inf", cumulative);
-        // No running total is kept for this family, so no _sum is
-        // exported. Emitting a zero would read as "all samples were
-        // instantaneous" rather than "not measured".
+        let _ = writeln!(
+            out,
+            "matrixcache_read_through_latency_seconds_sum{tags} {:.6}",
+            stats.read_through_latency_total_micros as f64 / 1_000_000.0
+        );
         let _ = writeln!(out, "matrixcache_read_through_latency_seconds_count{tags} {cumulative}");
     }
 
@@ -181,9 +183,11 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         bucket(&mut out, "matrixcache_refill_latency_seconds", &tags, "0.01", cumulative);
         cumulative = cumulative.saturating_add(stats.refill_latency_gt_10ms);
         bucket(&mut out, "matrixcache_refill_latency_seconds", &tags, "+Inf", cumulative);
-        // No running total is kept for this family, so no _sum is
-        // exported. Emitting a zero would read as "all samples were
-        // instantaneous" rather than "not measured".
+        let _ = writeln!(
+            out,
+            "matrixcache_refill_latency_seconds_sum{tags} {:.6}",
+            stats.refill_latency_total_micros as f64 / 1_000_000.0
+        );
         let _ = writeln!(out, "matrixcache_refill_latency_seconds_count{tags} {cumulative}");
     }
 
@@ -202,9 +206,11 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         bucket(&mut out, "matrixcache_writeback_latency_seconds", &tags, "0.01", cumulative);
         cumulative = cumulative.saturating_add(stats.writeback_latency_gt_10ms);
         bucket(&mut out, "matrixcache_writeback_latency_seconds", &tags, "+Inf", cumulative);
-        // No running total is kept for this family, so no _sum is
-        // exported. Emitting a zero would read as "all samples were
-        // instantaneous" rather than "not measured".
+        let _ = writeln!(
+            out,
+            "matrixcache_writeback_latency_seconds_sum{tags} {:.6}",
+            stats.writeback_latency_total_micros as f64 / 1_000_000.0
+        );
         let _ = writeln!(out, "matrixcache_writeback_latency_seconds_count{tags} {cumulative}");
     }
 
@@ -223,9 +229,11 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         bucket(&mut out, "matrixcache_eviction_latency_seconds", &tags, "0.01", cumulative);
         cumulative = cumulative.saturating_add(stats.eviction_latency_gt_10ms);
         bucket(&mut out, "matrixcache_eviction_latency_seconds", &tags, "+Inf", cumulative);
-        // No running total is kept for this family, so no _sum is
-        // exported. Emitting a zero would read as "all samples were
-        // instantaneous" rather than "not measured".
+        let _ = writeln!(
+            out,
+            "matrixcache_eviction_latency_seconds_sum{tags} {:.6}",
+            stats.eviction_latency_total_micros as f64 / 1_000_000.0
+        );
         let _ = writeln!(out, "matrixcache_eviction_latency_seconds_count{tags} {cumulative}");
     }
 
@@ -244,9 +252,11 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         bucket(&mut out, "matrixcache_compaction_latency_seconds", &tags, "0.01", cumulative);
         cumulative = cumulative.saturating_add(stats.compaction_latency_gt_10ms);
         bucket(&mut out, "matrixcache_compaction_latency_seconds", &tags, "+Inf", cumulative);
-        // No running total is kept for this family, so no _sum is
-        // exported. Emitting a zero would read as "all samples were
-        // instantaneous" rather than "not measured".
+        let _ = writeln!(
+            out,
+            "matrixcache_compaction_latency_seconds_sum{tags} {:.6}",
+            stats.compaction_latency_total_micros as f64 / 1_000_000.0
+        );
         let _ = writeln!(out, "matrixcache_compaction_latency_seconds_count{tags} {cumulative}");
     }
 
@@ -288,4 +298,3 @@ fn bucket(out: &mut String, name: &str, tags: &str, le: &str, value: u64) {
     let inner = tags.trim_start_matches('{').trim_end_matches('}');
     let _ = writeln!(out, "{name}_bucket{{{inner}{separator}le=\"{le}\"}} {value}");
 }
-

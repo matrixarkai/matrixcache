@@ -463,7 +463,7 @@ impl AtomicLatencyHistogram {
 
     /// As `observe`, and also keeps a running total and maximum.
     ///
-    /// Only the get histogram publishes those two, so only it pays for them.
+    /// Use this for latency families whose Grafana histograms need a `_sum`.
     /// The maximum is read before it is written: after the first few samples
     /// almost none are a new maximum, and a load is much cheaper than an
     /// unconditional read-modify-write.
@@ -4154,30 +4154,35 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         put_latency_le_10ms,
         put_latency_gt_10ms,
         read_through_latency_samples,
+        read_through_latency_total_micros,
         read_through_latency_le_10us,
         read_through_latency_le_100us,
         read_through_latency_le_1ms,
         read_through_latency_le_10ms,
         read_through_latency_gt_10ms,
         refill_latency_samples,
+        refill_latency_total_micros,
         refill_latency_le_10us,
         refill_latency_le_100us,
         refill_latency_le_1ms,
         refill_latency_le_10ms,
         refill_latency_gt_10ms,
         writeback_latency_samples,
+        writeback_latency_total_micros,
         writeback_latency_le_10us,
         writeback_latency_le_100us,
         writeback_latency_le_1ms,
         writeback_latency_le_10ms,
         writeback_latency_gt_10ms,
         eviction_latency_samples,
+        eviction_latency_total_micros,
         eviction_latency_le_10us,
         eviction_latency_le_100us,
         eviction_latency_le_1ms,
         eviction_latency_le_10ms,
         eviction_latency_gt_10ms,
         compaction_latency_samples,
+        compaction_latency_total_micros,
         compaction_latency_le_10us,
         compaction_latency_le_100us,
         compaction_latency_le_1ms,
@@ -4281,30 +4286,35 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.put_latency_le_10ms = total.put_latency_le_10ms.saturating_add(put_latency_le_10ms);
     total.put_latency_gt_10ms = total.put_latency_gt_10ms.saturating_add(put_latency_gt_10ms);
     total.read_through_latency_samples = total.read_through_latency_samples.saturating_add(read_through_latency_samples);
+    total.read_through_latency_total_micros = total.read_through_latency_total_micros.saturating_add(read_through_latency_total_micros);
     total.read_through_latency_le_10us = total.read_through_latency_le_10us.saturating_add(read_through_latency_le_10us);
     total.read_through_latency_le_100us = total.read_through_latency_le_100us.saturating_add(read_through_latency_le_100us);
     total.read_through_latency_le_1ms = total.read_through_latency_le_1ms.saturating_add(read_through_latency_le_1ms);
     total.read_through_latency_le_10ms = total.read_through_latency_le_10ms.saturating_add(read_through_latency_le_10ms);
     total.read_through_latency_gt_10ms = total.read_through_latency_gt_10ms.saturating_add(read_through_latency_gt_10ms);
     total.refill_latency_samples = total.refill_latency_samples.saturating_add(refill_latency_samples);
+    total.refill_latency_total_micros = total.refill_latency_total_micros.saturating_add(refill_latency_total_micros);
     total.refill_latency_le_10us = total.refill_latency_le_10us.saturating_add(refill_latency_le_10us);
     total.refill_latency_le_100us = total.refill_latency_le_100us.saturating_add(refill_latency_le_100us);
     total.refill_latency_le_1ms = total.refill_latency_le_1ms.saturating_add(refill_latency_le_1ms);
     total.refill_latency_le_10ms = total.refill_latency_le_10ms.saturating_add(refill_latency_le_10ms);
     total.refill_latency_gt_10ms = total.refill_latency_gt_10ms.saturating_add(refill_latency_gt_10ms);
     total.writeback_latency_samples = total.writeback_latency_samples.saturating_add(writeback_latency_samples);
+    total.writeback_latency_total_micros = total.writeback_latency_total_micros.saturating_add(writeback_latency_total_micros);
     total.writeback_latency_le_10us = total.writeback_latency_le_10us.saturating_add(writeback_latency_le_10us);
     total.writeback_latency_le_100us = total.writeback_latency_le_100us.saturating_add(writeback_latency_le_100us);
     total.writeback_latency_le_1ms = total.writeback_latency_le_1ms.saturating_add(writeback_latency_le_1ms);
     total.writeback_latency_le_10ms = total.writeback_latency_le_10ms.saturating_add(writeback_latency_le_10ms);
     total.writeback_latency_gt_10ms = total.writeback_latency_gt_10ms.saturating_add(writeback_latency_gt_10ms);
     total.eviction_latency_samples = total.eviction_latency_samples.saturating_add(eviction_latency_samples);
+    total.eviction_latency_total_micros = total.eviction_latency_total_micros.saturating_add(eviction_latency_total_micros);
     total.eviction_latency_le_10us = total.eviction_latency_le_10us.saturating_add(eviction_latency_le_10us);
     total.eviction_latency_le_100us = total.eviction_latency_le_100us.saturating_add(eviction_latency_le_100us);
     total.eviction_latency_le_1ms = total.eviction_latency_le_1ms.saturating_add(eviction_latency_le_1ms);
     total.eviction_latency_le_10ms = total.eviction_latency_le_10ms.saturating_add(eviction_latency_le_10ms);
     total.eviction_latency_gt_10ms = total.eviction_latency_gt_10ms.saturating_add(eviction_latency_gt_10ms);
     total.compaction_latency_samples = total.compaction_latency_samples.saturating_add(compaction_latency_samples);
+    total.compaction_latency_total_micros = total.compaction_latency_total_micros.saturating_add(compaction_latency_total_micros);
     total.compaction_latency_le_10us = total.compaction_latency_le_10us.saturating_add(compaction_latency_le_10us);
     total.compaction_latency_le_100us = total.compaction_latency_le_100us.saturating_add(compaction_latency_le_100us);
     total.compaction_latency_le_1ms = total.compaction_latency_le_1ms.saturating_add(compaction_latency_le_1ms);
@@ -7416,6 +7426,11 @@ impl MultiLayerCache {
                 .gt_10ms
                 .load(Ordering::Relaxed),
             read_through_latency_samples: inner.read_counters.read_through_latency.samples(),
+            read_through_latency_total_micros: inner
+                .read_counters
+                .read_through_latency
+                .total_micros
+                .load(Ordering::Relaxed),
             read_through_latency_le_10us: inner
                 .read_counters
                 .read_through_latency
@@ -7442,6 +7457,11 @@ impl MultiLayerCache {
                 .gt_10ms
                 .load(Ordering::Relaxed),
             refill_latency_samples: inner.read_counters.refill_latency.samples(),
+            refill_latency_total_micros: inner
+                .read_counters
+                .refill_latency
+                .total_micros
+                .load(Ordering::Relaxed),
             refill_latency_le_10us: inner
                 .read_counters
                 .refill_latency

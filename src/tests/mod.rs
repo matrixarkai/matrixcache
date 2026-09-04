@@ -9573,6 +9573,9 @@ mod tests {
         assert!(stats.compaction_latency_samples > 0);
         assert!(stats.get_latency_total_micros >= stats.get_latency_max_micros);
         assert!(stats.put_latency_total_micros >= stats.put_latency_max_micros);
+        assert!(stats.read_through_latency_total_micros > 0);
+        assert!(stats.writeback_latency_total_micros > 0);
+        assert_eq!(stats.compaction_latency_total_micros, 1_500);
         assert_eq!(
             stats.get_latency_samples,
             stats.get_latency_le_10us
@@ -9619,6 +9622,19 @@ mod tests {
                 stats.compaction_latency_gt_10ms,
             ],
         );
+        let metrics = prometheus_text(&stats, &[("cache", "latency")]);
+        for family in [
+            "matrixcache_read_through_latency_seconds",
+            "matrixcache_refill_latency_seconds",
+            "matrixcache_writeback_latency_seconds",
+            "matrixcache_eviction_latency_seconds",
+            "matrixcache_compaction_latency_seconds",
+        ] {
+            assert!(
+                metrics.contains(&format!("{family}_sum")),
+                "{family} should export a histogram sum for Grafana averages:\n{metrics}"
+            );
+        }
     }
 
     fn assert_latency_buckets_sum(samples: u64, buckets: [u64; 5]) {
