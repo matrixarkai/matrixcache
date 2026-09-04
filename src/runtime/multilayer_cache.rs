@@ -4758,6 +4758,22 @@ impl ShardedMultiLayerCache {
         count
     }
 
+    fn single_shard_for_keys(&self, keys: &[CacheKey]) -> Option<usize> {
+        let mut iter = keys.iter();
+        let first = iter.next()?;
+        let shard = self.shard_index_for_key(first);
+        iter.all(|key| self.shard_index_for_key(key) == shard)
+            .then_some(shard)
+    }
+
+    fn single_shard_for_handles(&self, handles: &[CachePinnedHandle]) -> Option<usize> {
+        let mut iter = handles.iter();
+        let first = iter.next()?;
+        let shard = self.shard_index_for_key(&first.key);
+        iter.all(|handle| self.shard_index_for_key(&handle.key) == shard)
+            .then_some(shard)
+    }
+
     pub fn start(&self) -> Result<(), CacheError> {
         for shard in self.shards.iter() {
             shard.start()?;
@@ -5487,6 +5503,12 @@ impl ShardedMultiLayerCache {
             self.sharded_stats.record_latency(started);
             return Ok(Vec::new());
         }
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.sharded_stats.record_local();
+            let result = reader(&self.shards[shard_index], keys);
+            self.sharded_stats.record_latency(started);
+            return result;
+        }
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let mut grouped = vec![Vec::new(); self.shard_count()];
@@ -5801,6 +5823,12 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let started = Instant::now();
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.sharded_stats.record_local();
+            let result = self.shards[shard_index].acquire_batch_no_promotion(keys);
+            self.sharded_stats.record_latency(started);
+            return result;
+        }
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let result = self.acquire_batch_no_promotion_locally(keys);
@@ -5896,6 +5924,12 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let started = Instant::now();
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.sharded_stats.record_local();
+            let result = self.shards[shard_index].acquire_batch(keys);
+            self.sharded_stats.record_latency(started);
+            return result;
+        }
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let result = self.acquire_batch_locally(keys);
@@ -5993,6 +6027,11 @@ impl ShardedMultiLayerCache {
     pub fn release_batch(&self, handles: Vec<CachePinnedHandle>) -> usize {
         if handles.is_empty() {
             return 0;
+        }
+        if let Some(shard_index) = self.single_shard_for_handles(&handles) {
+            let released = handles.len();
+            self.shards[shard_index].release_batch(handles);
+            return released;
         }
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<CachePinnedHandle>::new())

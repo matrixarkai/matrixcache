@@ -15735,7 +15735,13 @@ fn sharded_batch_fanout_metrics_are_exported() {
     let large = (0..320)
         .map(|index| CacheKey::string(index as u64, &format!("batch-large-{index:03}")))
         .collect::<Vec<_>>();
-    for key in small.iter().chain(large.iter()) {
+    let target_shard = cache.shard_index_for_key(&CacheKey::page_with_slot(9, 70_000, 0, 16, Some(17)));
+    let colocated_large = (0..)
+        .map(|index| CacheKey::page_with_slot(9, 70_000 + index, 0, 16, Some(17)))
+        .filter(|key| cache.shard_index_for_key(key) == target_shard)
+        .take(320)
+        .collect::<Vec<_>>();
+    for key in small.iter().chain(large.iter()).chain(colocated_large.iter()) {
         cache.put(key.clone(), vec![7; 16]).unwrap();
     }
 
@@ -15743,14 +15749,18 @@ fn sharded_batch_fanout_metrics_are_exported() {
     assert!(small_values.iter().all(Option::is_some));
     let large_values = cache.get_batch(&large).unwrap();
     assert!(large_values.iter().all(Option::is_some));
+    let colocated_values = cache.get_batch(&colocated_large).unwrap();
+    assert!(colocated_values.iter().all(Option::is_some));
     let _ = cache.acquire_batch_no_promotion(&small).unwrap();
+    let colocated_handles = cache.acquire_batch(&colocated_large).unwrap();
+    cache.release_batch(colocated_handles.into_iter().flatten().collect());
     let large_handles = cache.acquire_batch(&large).unwrap();
     cache.release_batch(large_handles.into_iter().flatten().collect());
 
     let stats = cache.stats();
     assert!(
-        stats.sharded_batch_local_operations >= 2,
-        "small sharded batches should stay local: {stats:?}"
+        stats.sharded_batch_local_operations >= 4,
+        "small and colocated sharded batches should stay local: {stats:?}"
     );
     assert!(
         stats.sharded_batch_fanout_operations >= 2,

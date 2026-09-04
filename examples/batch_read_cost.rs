@@ -37,6 +37,7 @@ use std::time::Instant;
 
 const VALUE_BYTES: usize = 64;
 const RESIDENT: usize = 4096;
+const COLOCATED_RESIDENT: usize = 1024;
 const PASSES: usize = 9;
 
 fn median(mut samples: Vec<f64>) -> f64 {
@@ -46,6 +47,21 @@ fn median(mut samples: Vec<f64>) -> f64 {
 
 fn bench_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("matrixcache-batch-read-cost")
+}
+
+fn colocated_page_keys(cache: &ShardedMultiLayerCache, count: usize) -> Vec<CacheKey> {
+    let target = cache.shard_index_for_key(&CacheKey::page_with_slot(
+        0,
+        50_000,
+        0,
+        VALUE_BYTES as u64,
+        Some(11),
+    ));
+    (0..)
+        .map(|index| CacheKey::page_with_slot(0, 50_000 + index, 0, VALUE_BYTES as u64, Some(11)))
+        .filter(|key| cache.shard_index_for_key(key) == target)
+        .take(count)
+        .collect()
 }
 
 fn main() {
@@ -66,10 +82,16 @@ fn main() {
         16,
     )
     .expect("sharded cache");
+    let sharded_colocated = ShardedMultiLayerCache::try_with_options(
+        CacheOptions::new(RESIDENT * VALUE_BYTES * 8, 0, 0),
+        16,
+    )
+    .expect("colocated sharded cache");
 
     let keys: Vec<CacheKey> = (0..RESIDENT)
         .map(|i| CacheKey::string(0, &format!("batch-{i:05}")))
         .collect();
+    let colocated_keys = colocated_page_keys(&sharded_colocated, COLOCATED_RESIDENT);
     for key in &keys {
         cache
             .put(key.clone(), vec![b'v'; VALUE_BYTES])
@@ -78,18 +100,25 @@ fn main() {
             .put(key.clone(), vec![b'v'; VALUE_BYTES])
             .expect("sharded put");
     }
+    for key in &colocated_keys {
+        sharded_colocated
+            .put(key.clone(), vec![b'v'; VALUE_BYTES])
+            .expect("sharded colocated put");
+    }
 
     println!(
         "{RESIDENT} resident values of {VALUE_BYTES} bytes, all hitting memory, \
          median of {PASSES} passes\n"
     );
     println!(
-        "{:<16}{:>14}{:>18}{:>22}{:>22}{:>28}",
+        "{:<16}{:>14}{:>18}{:>22}{:>22}{:>24}{:>28}{:>28}",
         "batch size",
         "get_batch",
         "sharded_get",
+        "sharded_colocated",
         "get_batch_no_prom",
         "acquire_no_prom",
+        "sharded_acq_colocated",
         "sharded_acquire_no_prom"
     );
 
@@ -155,6 +184,25 @@ fn main() {
                 })
                 .collect(),
         );
+        let sharded_colocated_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in colocated_keys.chunks(batch) {
+                        let values = sharded_colocated
+                            .get_batch(chunk)
+                            .expect("sharded_colocated");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(
+                        served, COLOCATED_RESIDENT,
+                        "every colocated key should hit sharded memory"
+                    );
+                    started.elapsed().as_nanos() as f64 / COLOCATED_RESIDENT as f64
+                })
+                .collect(),
+        );
         let sharded_acquire_no_promotion_ns = median(
             (0..PASSES)
                 .map(|_| {
@@ -172,8 +220,28 @@ fn main() {
                 })
                 .collect(),
         );
+        let sharded_acquire_colocated_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in colocated_keys.chunks(batch) {
+                        let handles = sharded_colocated
+                            .acquire_batch_no_promotion(chunk)
+                            .expect("sharded colocated acquire_batch_no_promotion");
+                        served += handles.iter().filter(|handle| handle.is_some()).count();
+                        sharded_colocated.release_batch(handles.into_iter().flatten().collect());
+                    }
+                    assert_eq!(
+                        served, COLOCATED_RESIDENT,
+                        "every colocated key should hit sharded memory"
+                    );
+                    started.elapsed().as_nanos() as f64 / COLOCATED_RESIDENT as f64
+                })
+                .collect(),
+        );
         println!(
-            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>22.1}{sharded_acquire_no_promotion_ns:>28.1}"
+            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
     }
 
