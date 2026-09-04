@@ -35,10 +35,12 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--json-output PATH] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,6 +64,7 @@ fn skewed_index(state: &mut u64) -> usize {
 fn main() {
     let mut positional = Vec::new();
     let mut emit_json = false;
+    let mut json_output: Option<PathBuf> = None;
     let mut require_passed = false;
     let mut sample_seconds = DEFAULT_SAMPLE_SECONDS;
     let mut duration_seconds = None;
@@ -72,6 +75,9 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => emit_json = true,
+            "--json-output" => {
+                json_output = args.next().map(PathBuf::from);
+            }
             "--require-passed" => require_passed = true,
             "--sample-seconds" => {
                 sample_seconds = args
@@ -291,7 +297,7 @@ fn main() {
         latency.put_p99_us, stats.put_latency_max_micros, stats.put_latency_samples
     );
 
-    if emit_json {
+    if emit_json || json_output.is_some() || require_passed {
         let final_entries = cache.all_entries().len();
         let final_reads = reads.load(Ordering::Relaxed);
         let final_writes = writes.load(Ordering::Relaxed);
@@ -336,111 +342,316 @@ fn main() {
             && put_p99_within_budget
             && hit_rate_within_budget;
 
-        println!("\n{{");
-        println!("  \"report_version\": \"matrixcache_soak_v1\",");
-        println!("  \"minutes\": {minutes},");
-        println!("  \"threads\": {threads},");
-        println!("  \"key_space\": {KEY_SPACE},");
-        println!("  \"resident_capacity_entries\": {RESIDENT},");
-        println!("  \"value_bytes\": {VALUE_BYTES},");
-        println!("  \"sample_seconds\": {sample_seconds},");
-        println!("  \"duration_seconds\": {},", total_duration.as_secs());
-        println!("  \"max_get_p99_us\": {},", option_u64_json(max_get_p99_us));
-        println!("  \"max_put_p99_us\": {},", option_u64_json(max_put_p99_us));
-        println!(
+        let mut report = String::new();
+        writeln!(&mut report, "{{").expect("format report");
+        writeln!(
+            &mut report,
+            "  \"report_version\": \"matrixcache_soak_v1\","
+        )
+        .expect("format report");
+        writeln!(&mut report, "  \"minutes\": {minutes},").expect("format report");
+        writeln!(&mut report, "  \"threads\": {threads},").expect("format report");
+        writeln!(&mut report, "  \"key_space\": {KEY_SPACE},").expect("format report");
+        writeln!(&mut report, "  \"resident_capacity_entries\": {RESIDENT},")
+            .expect("format report");
+        writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+        writeln!(&mut report, "  \"sample_seconds\": {sample_seconds},").expect("format report");
+        writeln!(
+            &mut report,
+            "  \"duration_seconds\": {},",
+            total_duration.as_secs()
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_get_p99_us\": {},",
+            option_u64_json(max_get_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_put_p99_us\": {},",
+            option_u64_json(max_put_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "  \"min_hit_rate_percent\": {},",
             option_f64_json(min_hit_rate_percent)
-        );
-        println!("  \"reads\": {final_reads},");
-        println!("  \"writes\": {final_writes},");
-        println!("  \"final_entries\": {final_entries},");
-        println!("  \"peak_entries\": {peak_entries},");
-        println!("  \"final_memory_bytes\": {},", stats.memory_bytes);
-        println!("  \"peak_memory_bytes\": {peak_memory_bytes},");
-        println!("  \"memory_hits\": {},", stats.memory_hits);
-        println!("  \"misses\": {},", stats.misses);
-        println!("  \"memory_evictions\": {},", stats.memory_evictions);
-        println!("  \"observed_hit_rate_percent\": {observed_hit_rate:.4},");
-        println!("  \"interval_best_kops\": {best_rate:.4},");
-        println!("  \"interval_worst_kops\": {worst_rate:.4},");
-        println!("  \"interval_min_hit_rate_percent\": {min_hit_rate:.4},");
-        println!("  \"interval_max_hit_rate_percent\": {max_hit_rate:.4},");
-        println!("  \"throughput_thirds\": [");
+        )
+        .expect("format report");
+        writeln!(&mut report, "  \"reads\": {final_reads},").expect("format report");
+        writeln!(&mut report, "  \"writes\": {final_writes},").expect("format report");
+        writeln!(&mut report, "  \"final_entries\": {final_entries},").expect("format report");
+        writeln!(&mut report, "  \"peak_entries\": {peak_entries},").expect("format report");
+        writeln!(
+            &mut report,
+            "  \"final_memory_bytes\": {},",
+            stats.memory_bytes
+        )
+        .expect("format report");
+        writeln!(&mut report, "  \"peak_memory_bytes\": {peak_memory_bytes},")
+            .expect("format report");
+        writeln!(&mut report, "  \"memory_hits\": {},", stats.memory_hits).expect("format report");
+        writeln!(&mut report, "  \"misses\": {},", stats.misses).expect("format report");
+        writeln!(
+            &mut report,
+            "  \"memory_evictions\": {},",
+            stats.memory_evictions
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"observed_hit_rate_percent\": {observed_hit_rate:.4},"
+        )
+        .expect("format report");
+        writeln!(&mut report, "  \"interval_best_kops\": {best_rate:.4},").expect("format report");
+        writeln!(&mut report, "  \"interval_worst_kops\": {worst_rate:.4},")
+            .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"interval_min_hit_rate_percent\": {min_hit_rate:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"interval_max_hit_rate_percent\": {max_hit_rate:.4},"
+        )
+        .expect("format report");
+        writeln!(&mut report, "  \"throughput_thirds\": [").expect("format report");
         for (index, (best, worst)) in thirds.iter().enumerate() {
             let comma = if index + 1 == thirds.len() { "" } else { "," };
-            println!(
+            writeln!(
+                &mut report,
                 "    {{\"window\": {}, \"ceiling_kops\": {:.4}, \"floor_kops\": {:.4}}}{comma}",
                 index + 1,
                 best,
                 worst
-            );
+            )
+            .expect("format report");
         }
-        println!("  ],");
-        println!("  \"latency\": {{");
-        println!("    \"get_count\": {},", latency.get_count);
-        println!("    \"get_avg_us\": {},", latency.get_avg_us);
-        println!("    \"get_p50_us\": {},", latency.get_p50_us);
-        println!("    \"get_p95_us\": {},", latency.get_p95_us);
-        println!("    \"get_p99_us\": {},", latency.get_p99_us);
-        println!("    \"get_max_us\": {},", latency.get_max_us);
-        println!("    \"put_count\": {},", latency.put_count);
-        println!("    \"put_avg_us\": {},", latency.put_avg_us);
-        println!("    \"put_p50_us\": {},", latency.put_p50_us);
-        println!("    \"put_p95_us\": {},", latency.put_p95_us);
-        println!("    \"put_p99_us\": {},", latency.put_p99_us);
-        println!("    \"put_max_us\": {},", latency.put_max_us);
-        println!(
+        writeln!(&mut report, "  ],").expect("format report");
+        writeln!(&mut report, "  \"latency\": {{").expect("format report");
+        writeln!(&mut report, "    \"get_count\": {},", latency.get_count).expect("format report");
+        writeln!(&mut report, "    \"get_avg_us\": {},", latency.get_avg_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"get_p50_us\": {},", latency.get_p50_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"get_p95_us\": {},", latency.get_p95_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"get_p99_us\": {},", latency.get_p99_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"get_max_us\": {},", latency.get_max_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"put_count\": {},", latency.put_count).expect("format report");
+        writeln!(&mut report, "    \"put_avg_us\": {},", latency.put_avg_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"put_p50_us\": {},", latency.put_p50_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"put_p95_us\": {},", latency.put_p95_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"put_p99_us\": {},", latency.put_p99_us)
+            .expect("format report");
+        writeln!(&mut report, "    \"put_max_us\": {},", latency.put_max_us)
+            .expect("format report");
+        writeln!(
+            &mut report,
             "    \"read_through_count\": {},",
             latency.read_through_count
-        );
-        println!(
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"read_through_avg_us\": {},",
             latency.read_through_avg_us
-        );
-        println!(
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"read_through_p50_us\": {},",
             latency.read_through_p50_us
-        );
-        println!(
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"read_through_p95_us\": {},",
             latency.read_through_p95_us
-        );
-        println!(
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"read_through_p99_us\": {},",
             latency.read_through_p99_us
-        );
-        println!("    \"refill_count\": {},", latency.refill_count);
-        println!("    \"refill_avg_us\": {},", latency.refill_avg_us);
-        println!("    \"refill_p50_us\": {},", latency.refill_p50_us);
-        println!("    \"refill_p95_us\": {},", latency.refill_p95_us);
-        println!("    \"refill_p99_us\": {},", latency.refill_p99_us);
-        println!("    \"writeback_count\": {},", latency.writeback_count);
-        println!("    \"writeback_avg_us\": {},", latency.writeback_avg_us);
-        println!("    \"writeback_p50_us\": {},", latency.writeback_p50_us);
-        println!("    \"writeback_p95_us\": {},", latency.writeback_p95_us);
-        println!("    \"writeback_p99_us\": {},", latency.writeback_p99_us);
-        println!("    \"eviction_count\": {},", latency.eviction_count);
-        println!("    \"eviction_avg_us\": {},", latency.eviction_avg_us);
-        println!("    \"eviction_p50_us\": {},", latency.eviction_p50_us);
-        println!("    \"eviction_p95_us\": {},", latency.eviction_p95_us);
-        println!("    \"eviction_p99_us\": {},", latency.eviction_p99_us);
-        println!("    \"compaction_count\": {},", latency.compaction_count);
-        println!("    \"compaction_avg_us\": {},", latency.compaction_avg_us);
-        println!("    \"compaction_p50_us\": {},", latency.compaction_p50_us);
-        println!("    \"compaction_p95_us\": {},", latency.compaction_p95_us);
-        println!("    \"compaction_p99_us\": {},", latency.compaction_p99_us);
-        println!("    \"histogram_ready\": {}", latency.histogram_ready);
-        println!("  }},");
-        println!("  \"checks\": {{");
-        println!("    \"bounded_entries\": {bounded_entries},");
-        println!("    \"bounded_memory\": {bounded_memory},");
-        println!("    \"steady_throughput_ceiling\": {steady_throughput},");
-        println!("    \"get_p99_within_budget\": {get_p99_within_budget},");
-        println!("    \"put_p99_within_budget\": {put_p99_within_budget},");
-        println!("    \"hit_rate_within_budget\": {hit_rate_within_budget}");
-        println!("  }},");
-        println!("  \"passed\": {passed}");
-        println!("}}");
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_count\": {},",
+            latency.refill_count
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_avg_us\": {},",
+            latency.refill_avg_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_p50_us\": {},",
+            latency.refill_p50_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_p95_us\": {},",
+            latency.refill_p95_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_p99_us\": {},",
+            latency.refill_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_count\": {},",
+            latency.writeback_count
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_avg_us\": {},",
+            latency.writeback_avg_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_p50_us\": {},",
+            latency.writeback_p50_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_p95_us\": {},",
+            latency.writeback_p95_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_p99_us\": {},",
+            latency.writeback_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_count\": {},",
+            latency.eviction_count
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_avg_us\": {},",
+            latency.eviction_avg_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_p50_us\": {},",
+            latency.eviction_p50_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_p95_us\": {},",
+            latency.eviction_p95_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_p99_us\": {},",
+            latency.eviction_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_count\": {},",
+            latency.compaction_count
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_avg_us\": {},",
+            latency.compaction_avg_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_p50_us\": {},",
+            latency.compaction_p50_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_p95_us\": {},",
+            latency.compaction_p95_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_p99_us\": {},",
+            latency.compaction_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"histogram_ready\": {}",
+            latency.histogram_ready
+        )
+        .expect("format report");
+        writeln!(&mut report, "  }},").expect("format report");
+        writeln!(&mut report, "  \"checks\": {{").expect("format report");
+        writeln!(&mut report, "    \"bounded_entries\": {bounded_entries},")
+            .expect("format report");
+        writeln!(&mut report, "    \"bounded_memory\": {bounded_memory},").expect("format report");
+        writeln!(
+            &mut report,
+            "    \"steady_throughput_ceiling\": {steady_throughput},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"get_p99_within_budget\": {get_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"put_p99_within_budget\": {put_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"hit_rate_within_budget\": {hit_rate_within_budget}"
+        )
+        .expect("format report");
+        writeln!(&mut report, "  }},").expect("format report");
+        writeln!(&mut report, "  \"passed\": {passed}").expect("format report");
+        writeln!(&mut report, "}}").expect("format report");
+
+        if emit_json {
+            print!("\n{report}");
+        }
+        if let Some(path) = json_output {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).expect("create JSON output directory");
+            }
+            std::fs::write(&path, &report).expect("write JSON soak report");
+            eprintln!("matrixcache soak report written to {}", path.display());
+        }
 
         if require_passed && !passed {
             eprintln!("matrixcache soak gate failed; see JSON checks for the failing condition");

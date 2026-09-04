@@ -114,8 +114,9 @@ and says what the number means:
 - `scan_resistance_bench`, `admission_filter_bench` -- what the admission
   policy is worth against a scan
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`
-  to append a machine-readable report for Grafana/comparison archives; add
-  `--require-passed` when CI or a scale script should fail the process on a
+  to append a machine-readable report to stdout, or `--json-output <path>` to
+  archive the same report as a standalone file for Grafana/comparison scripts.
+  Add `--require-passed` when CI or a scale script should fail the process on a
   missed memory, hit-rate, or p99 latency gate. Use `--duration-seconds` and
   `--sample-seconds` for short validation runs. The JSON latency section
   includes average, p50, p95, p99, and max estimates from the same histogram
