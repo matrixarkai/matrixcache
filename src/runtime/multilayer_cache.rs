@@ -4355,6 +4355,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         async_writeback_queue_bytes,
         async_writeback_max_queue_depth,
         async_writeback_max_queue_bytes,
+        sharded_batch_fanout_operations,
+        sharded_batch_local_operations,
+        sharded_batch_fanout_shards,
         get_latency_samples,
         put_latency_samples,
         get_latency_total_micros,
@@ -4487,6 +4490,15 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.async_writeback_queue_bytes = total.async_writeback_queue_bytes.saturating_add(async_writeback_queue_bytes);
     total.async_writeback_max_queue_depth = total.async_writeback_max_queue_depth.saturating_add(async_writeback_max_queue_depth);
     total.async_writeback_max_queue_bytes = total.async_writeback_max_queue_bytes.saturating_add(async_writeback_max_queue_bytes);
+    total.sharded_batch_fanout_operations = total
+        .sharded_batch_fanout_operations
+        .saturating_add(sharded_batch_fanout_operations);
+    total.sharded_batch_local_operations = total
+        .sharded_batch_local_operations
+        .saturating_add(sharded_batch_local_operations);
+    total.sharded_batch_fanout_shards = total
+        .sharded_batch_fanout_shards
+        .saturating_add(sharded_batch_fanout_shards);
     total.get_latency_samples = total.get_latency_samples.saturating_add(get_latency_samples);
     total.put_latency_samples = total.put_latency_samples.saturating_add(put_latency_samples);
     total.get_latency_total_micros = total.get_latency_total_micros.saturating_add(get_latency_total_micros);
@@ -4578,6 +4590,26 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
 #[derive(Debug, Clone)]
 pub struct ShardedMultiLayerCache {
     shards: Arc<Vec<MultiLayerCache>>,
+    sharded_stats: Arc<ShardedBatchStats>,
+}
+
+#[derive(Debug, Default)]
+struct ShardedBatchStats {
+    fanout_operations: AtomicU64,
+    local_operations: AtomicU64,
+    fanout_shards: AtomicU64,
+}
+
+impl ShardedBatchStats {
+    fn record_fanout(&self, shards: usize) {
+        self.fanout_operations.fetch_add(1, Ordering::Relaxed);
+        self.fanout_shards
+            .fetch_add(shards as u64, Ordering::Relaxed);
+    }
+
+    fn record_local(&self) {
+        self.local_operations.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl ShardedMultiLayerCache {
@@ -4621,6 +4653,7 @@ impl ShardedMultiLayerCache {
             .collect::<Vec<_>>();
         Self {
             shards: Arc::new(shards),
+            sharded_stats: Arc::new(ShardedBatchStats::default()),
         }
     }
 
@@ -4673,6 +4706,19 @@ impl ShardedMultiLayerCache {
 
     fn shard_for_key(&self, key: &CacheKey) -> &MultiLayerCache {
         &self.shards[self.shard_index_for_key(key)]
+    }
+
+    fn batch_shard_fanout(&self, keys: &[CacheKey]) -> usize {
+        let mut seen = vec![false; self.shard_count()];
+        let mut count = 0usize;
+        for key in keys {
+            let index = self.shard_index_for_key(key);
+            if !seen[index] {
+                seen[index] = true;
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn start(&self) -> Result<(), CacheError> {
@@ -4881,6 +4927,19 @@ impl ShardedMultiLayerCache {
 
     pub fn stats(&self) -> CacheStats {
         let mut total = CacheStats::default();
+
+        total.sharded_batch_fanout_operations = self
+            .sharded_stats
+            .fanout_operations
+            .load(Ordering::Relaxed);
+        total.sharded_batch_local_operations = self
+            .sharded_stats
+            .local_operations
+            .load(Ordering::Relaxed);
+        total.sharded_batch_fanout_shards = self
+            .sharded_stats
+            .fanout_shards
+            .load(Ordering::Relaxed);
 
         for shard in self.shards.iter() {
             let stats = shard.stats();
@@ -5346,6 +5405,11 @@ impl ShardedMultiLayerCache {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            self.sharded_stats.record_local();
+        } else {
+            self.sharded_stats.record_fanout(self.batch_shard_fanout(keys));
+        }
         let mut grouped = vec![Vec::new(); self.shard_count()];
         for (position, key) in keys.iter().cloned().enumerate() {
             grouped[self.shard_index_for_key(&key)].push((position, key));
@@ -5624,8 +5688,11 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            self.sharded_stats.record_local();
             return self.acquire_batch_no_promotion_locally(keys);
         }
+        let fanout = self.batch_shard_fanout(keys);
+        self.sharded_stats.record_fanout(fanout);
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<(usize, CacheKey)>::new())
@@ -5712,8 +5779,11 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+            self.sharded_stats.record_local();
             return self.acquire_batch_locally(keys);
         }
+        let fanout = self.batch_shard_fanout(keys);
+        self.sharded_stats.record_fanout(fanout);
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<(usize, CacheKey)>::new())

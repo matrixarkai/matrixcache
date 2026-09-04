@@ -45,6 +45,8 @@ families directly, including:
   `matrixcache_pmem_bytes`, and `matrixcache_disk_bytes`
 - eviction pressure from memory, PMEM, SSD, and pinned-skip counters
 - async writeback queue depth, drain rate, and backpressure rejections
+- sharded batch fan-out/local decisions from `matrixcache_sharded_batch_fanout_operations`,
+  `matrixcache_sharded_batch_local_operations`, and `matrixcache_sharded_batch_fanout_shards`
 - p50, p95, and average latency for get, put, read-through, refill, writeback,
   and eviction
 

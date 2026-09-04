@@ -15701,6 +15701,65 @@ fn a_shared_read_counts_as_a_read() {
 
 }
 
+
+#[test]
+fn sharded_batch_fanout_metrics_are_exported() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardedMultiLayerCache::with_options(
+        CacheOptions {
+            dram_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        },
+        4,
+    );
+    cache.start().unwrap();
+
+    let small = (0..16)
+        .map(|index| CacheKey::string(0, &format!("batch-small-{index:03}")))
+        .collect::<Vec<_>>();
+    let large = (0..320)
+        .map(|index| CacheKey::string(index as u64, &format!("batch-large-{index:03}")))
+        .collect::<Vec<_>>();
+    for key in small.iter().chain(large.iter()) {
+        cache.put(key.clone(), vec![7; 16]).unwrap();
+    }
+
+    let small_values = cache.get_batch(&small).unwrap();
+    assert!(small_values.iter().all(Option::is_some));
+    let large_values = cache.get_batch(&large).unwrap();
+    assert!(large_values.iter().all(Option::is_some));
+    let _ = cache.acquire_batch_no_promotion(&small).unwrap();
+    let large_handles = cache.acquire_batch(&large).unwrap();
+    cache.release_batch(large_handles.into_iter().flatten().collect());
+
+    let stats = cache.stats();
+    assert!(
+        stats.sharded_batch_local_operations >= 2,
+        "small sharded batches should stay local: {stats:?}"
+    );
+    assert!(
+        stats.sharded_batch_fanout_operations >= 2,
+        "large sharded batches should fan out: {stats:?}"
+    );
+    assert!(
+        stats.sharded_batch_fanout_shards >= 2,
+        "fan-out should record participating shard groups: {stats:?}"
+    );
+
+    let exported = prometheus_text(&stats, &[("cache", "batch")]);
+    for metric in [
+        "matrixcache_sharded_batch_fanout_operations",
+        "matrixcache_sharded_batch_local_operations",
+        "matrixcache_sharded_batch_fanout_shards",
+    ] {
+        assert!(
+            exported.contains(metric),
+            "Prometheus output should expose {metric}:\n{exported}"
+        );
+    }
+}
+
 #[test]
 fn grafana_dashboard_metrics_are_exported() {
     let cache =

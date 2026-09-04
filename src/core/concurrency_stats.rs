@@ -1128,6 +1128,16 @@ pub struct CacheStats {
     pub async_writeback_max_queue_depth: u64,
     #[serde(default)]
     pub async_writeback_max_queue_bytes: u64,
+    /// Batch read/acquire calls that were large enough to fan out across shards.
+    #[serde(default)]
+    pub sharded_batch_fanout_operations: u64,
+    /// Batch read/acquire calls kept on the local path because fan-out would cost
+    /// more than it saves.
+    #[serde(default)]
+    pub sharded_batch_local_operations: u64,
+    /// Number of per-shard worker groups used by sharded batch fan-out.
+    #[serde(default)]
+    pub sharded_batch_fanout_shards: u64,
     #[serde(default)]
     pub get_latency_samples: u64,
     #[serde(default)]

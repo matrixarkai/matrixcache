@@ -84,6 +84,9 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     metric(&mut out, "matrixcache_async_writeback_queue_bytes", "Bytes waiting in the write-back queue", "gauge", &tags, stats.async_writeback_queue_bytes);
     metric(&mut out, "matrixcache_async_writeback_max_queue_depth", "Async writeback max queue depth", "gauge", &tags, stats.async_writeback_max_queue_depth);
     metric(&mut out, "matrixcache_async_writeback_max_queue_bytes", "Async writeback max queue bytes", "gauge", &tags, stats.async_writeback_max_queue_bytes);
+    metric(&mut out, "matrixcache_sharded_batch_fanout_operations", "Sharded batch fanout operations", "counter", &tags, stats.sharded_batch_fanout_operations);
+    metric(&mut out, "matrixcache_sharded_batch_local_operations", "Sharded batch local operations", "counter", &tags, stats.sharded_batch_local_operations);
+    metric(&mut out, "matrixcache_sharded_batch_fanout_shards", "Sharded batch fanout shards", "counter", &tags, stats.sharded_batch_fanout_shards);
     metric(&mut out, "matrixcache_eviction_sampled_groups", "Eviction sampled groups", "counter", &tags, stats.eviction_sampled_groups);
     metric(&mut out, "matrixcache_memory_slot_evictions", "Memory slot evictions", "counter", &tags, stats.memory_slot_evictions);
     metric(&mut out, "matrixcache_ssd_slot_evictions", "Ssd slot evictions", "counter", &tags, stats.ssd_slot_evictions);
