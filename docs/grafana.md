@@ -74,6 +74,13 @@ Validate archived reports before publishing or comparing them:
 tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
 ```
 
+Compare a current archive with a known-good baseline before accepting a scale
+run as an optimization result:
+
+```bash
+tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --min-throughput-ratio 0.95
+```
+
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate
 budgets so a scale run can fail for the exact reason that moved.
 
