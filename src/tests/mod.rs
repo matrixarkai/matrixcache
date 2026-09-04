@@ -9470,7 +9470,11 @@ mod tests {
         assert!(latency.put_count >= 3);
         assert!(latency.get_count >= 1);
         assert!(latency.histogram_ready);
+        assert!(latency.put_p50_us > 0);
+        assert!(latency.put_p95_us >= latency.put_p50_us);
         assert!(latency.put_max_us >= latency.put_avg_us);
+        assert!(latency.get_p50_us > 0);
+        assert!(latency.get_p95_us >= latency.get_p50_us);
         assert!(latency.get_max_us >= latency.get_avg_us);
         assert_eq!(latency.writeback_count, stats.writeback_latency_samples);
     }
@@ -9593,6 +9597,16 @@ mod tests {
         assert_eq!(latency.eviction_count, stats.eviction_latency_samples);
         assert_eq!(latency.compaction_count, stats.compaction_latency_samples);
         assert_eq!(latency.compaction_avg_us, 1_500);
+        assert!(latency.get_p50_us > 0);
+        assert!(latency.get_p95_us >= latency.get_p50_us);
+        assert!(latency.put_p50_us > 0);
+        assert!(latency.put_p95_us >= latency.put_p50_us);
+        assert!(latency.read_through_p50_us > 0);
+        assert!(latency.read_through_p95_us >= latency.read_through_p50_us);
+        assert!(latency.writeback_p50_us > 0);
+        assert!(latency.writeback_p95_us >= latency.writeback_p50_us);
+        assert_eq!(latency.compaction_p50_us, 10_000);
+        assert_eq!(latency.compaction_p95_us, 10_000);
         assert_eq!(
             stats.get_latency_samples,
             stats.get_latency_le_10us

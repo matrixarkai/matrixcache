@@ -230,30 +230,58 @@ pub struct CacheWritebackBackpressureReport {
 pub struct CacheLatencyMetricsReport {
     pub get_count: u64,
     pub get_avg_us: u64,
+    #[serde(default)]
+    pub get_p50_us: u64,
+    #[serde(default)]
+    pub get_p95_us: u64,
     pub get_max_us: u64,
     pub put_count: u64,
     pub put_avg_us: u64,
+    #[serde(default)]
+    pub put_p50_us: u64,
+    #[serde(default)]
+    pub put_p95_us: u64,
     pub put_max_us: u64,
     #[serde(default)]
     pub read_through_count: u64,
     #[serde(default)]
     pub read_through_avg_us: u64,
     #[serde(default)]
+    pub read_through_p50_us: u64,
+    #[serde(default)]
+    pub read_through_p95_us: u64,
+    #[serde(default)]
     pub refill_count: u64,
     #[serde(default)]
     pub refill_avg_us: u64,
+    #[serde(default)]
+    pub refill_p50_us: u64,
+    #[serde(default)]
+    pub refill_p95_us: u64,
     #[serde(default)]
     pub writeback_count: u64,
     #[serde(default)]
     pub writeback_avg_us: u64,
     #[serde(default)]
+    pub writeback_p50_us: u64,
+    #[serde(default)]
+    pub writeback_p95_us: u64,
+    #[serde(default)]
     pub eviction_count: u64,
     #[serde(default)]
     pub eviction_avg_us: u64,
     #[serde(default)]
+    pub eviction_p50_us: u64,
+    #[serde(default)]
+    pub eviction_p95_us: u64,
+    #[serde(default)]
     pub compaction_count: u64,
     #[serde(default)]
     pub compaction_avg_us: u64,
+    #[serde(default)]
+    pub compaction_p50_us: u64,
+    #[serde(default)]
+    pub compaction_p95_us: u64,
     pub histogram_ready: bool,
 }
 

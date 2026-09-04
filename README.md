@@ -115,7 +115,9 @@ and says what the number means:
   policy is worth against a scan
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`
   to append a machine-readable report for Grafana/comparison archives; use
-  `--duration-seconds` and `--sample-seconds` for short validation runs.
+  `--duration-seconds` and `--sample-seconds` for short validation runs. The
+  JSON latency section includes average, p50, p95, and max estimates from the
+  same histogram buckets exported to Prometheus.
 - `metrics_server` -- serves Prometheus text metrics for Grafana. Import
   [`docs/grafana/matrixcache-dashboard.json`](docs/grafana/matrixcache-dashboard.json)
   and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup.

@@ -9,6 +9,42 @@ fn average_latency_us(total_us: u64, count: u64) -> u64 {
     }
 }
 
+fn latency_percentile_us(
+    count: u64,
+    le_10us: u64,
+    le_100us: u64,
+    le_1ms: u64,
+    le_10ms: u64,
+    gt_10ms: u64,
+    max_us: u64,
+    percentile: u64,
+) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
+    let mut cumulative = le_10us;
+    if rank <= cumulative {
+        return 10;
+    }
+    cumulative = cumulative.saturating_add(le_100us);
+    if rank <= cumulative {
+        return 100;
+    }
+    cumulative = cumulative.saturating_add(le_1ms);
+    if rank <= cumulative {
+        return 1_000;
+    }
+    cumulative = cumulative.saturating_add(le_10ms);
+    if rank <= cumulative {
+        return 10_000;
+    }
+    if gt_10ms > 0 {
+        return max_us.max(10_001);
+    }
+    max_us
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -4849,20 +4885,34 @@ impl ShardedMultiLayerCache {
         CacheLatencyMetricsReport {
             get_count,
             get_avg_us: average_latency_us(get_total_us, get_count),
+            get_p50_us: 0,
+            get_p95_us: 0,
             get_max_us,
             put_count,
             put_avg_us: average_latency_us(put_total_us, put_count),
+            put_p50_us: 0,
+            put_p95_us: 0,
             put_max_us,
             read_through_count,
             read_through_avg_us: average_latency_us(read_through_total_us, read_through_count),
+            read_through_p50_us: 0,
+            read_through_p95_us: 0,
             refill_count,
             refill_avg_us: average_latency_us(refill_total_us, refill_count),
+            refill_p50_us: 0,
+            refill_p95_us: 0,
             writeback_count,
             writeback_avg_us: average_latency_us(writeback_total_us, writeback_count),
+            writeback_p50_us: 0,
+            writeback_p95_us: 0,
             eviction_count,
             eviction_avg_us: average_latency_us(eviction_total_us, eviction_count),
+            eviction_p50_us: 0,
+            eviction_p95_us: 0,
             compaction_count,
             compaction_avg_us: average_latency_us(compaction_total_us, compaction_count),
+            compaction_p50_us: 0,
+            compaction_p95_us: 0,
             histogram_ready,
         }
     }
@@ -7598,34 +7648,174 @@ impl MultiLayerCache {
         CacheLatencyMetricsReport {
             get_count,
             get_avg_us: average_latency_us(get_total, get_count),
+            get_p50_us: latency_percentile_us(
+                get_count,
+                stats.get_latency_le_10us,
+                stats.get_latency_le_100us,
+                stats.get_latency_le_1ms,
+                stats.get_latency_le_10ms,
+                stats.get_latency_gt_10ms,
+                get_max,
+                50,
+            ),
+            get_p95_us: latency_percentile_us(
+                get_count,
+                stats.get_latency_le_10us,
+                stats.get_latency_le_100us,
+                stats.get_latency_le_1ms,
+                stats.get_latency_le_10ms,
+                stats.get_latency_gt_10ms,
+                get_max,
+                95,
+            ),
             get_max_us: get_max,
             put_count,
             put_avg_us: average_latency_us(put_total, put_count),
+            put_p50_us: latency_percentile_us(
+                put_count,
+                stats.put_latency_le_10us,
+                stats.put_latency_le_100us,
+                stats.put_latency_le_1ms,
+                stats.put_latency_le_10ms,
+                stats.put_latency_gt_10ms,
+                put_max,
+                50,
+            ),
+            put_p95_us: latency_percentile_us(
+                put_count,
+                stats.put_latency_le_10us,
+                stats.put_latency_le_100us,
+                stats.put_latency_le_1ms,
+                stats.put_latency_le_10ms,
+                stats.put_latency_gt_10ms,
+                put_max,
+                95,
+            ),
             put_max_us: put_max,
             read_through_count: stats.read_through_latency_samples,
             read_through_avg_us: average_latency_us(
                 stats.read_through_latency_total_micros,
                 stats.read_through_latency_samples,
             ),
+            read_through_p50_us: latency_percentile_us(
+                stats.read_through_latency_samples,
+                stats.read_through_latency_le_10us,
+                stats.read_through_latency_le_100us,
+                stats.read_through_latency_le_1ms,
+                stats.read_through_latency_le_10ms,
+                stats.read_through_latency_gt_10ms,
+                0,
+                50,
+            ),
+            read_through_p95_us: latency_percentile_us(
+                stats.read_through_latency_samples,
+                stats.read_through_latency_le_10us,
+                stats.read_through_latency_le_100us,
+                stats.read_through_latency_le_1ms,
+                stats.read_through_latency_le_10ms,
+                stats.read_through_latency_gt_10ms,
+                0,
+                95,
+            ),
             refill_count: stats.refill_latency_samples,
             refill_avg_us: average_latency_us(
                 stats.refill_latency_total_micros,
                 stats.refill_latency_samples,
+            ),
+            refill_p50_us: latency_percentile_us(
+                stats.refill_latency_samples,
+                stats.refill_latency_le_10us,
+                stats.refill_latency_le_100us,
+                stats.refill_latency_le_1ms,
+                stats.refill_latency_le_10ms,
+                stats.refill_latency_gt_10ms,
+                0,
+                50,
+            ),
+            refill_p95_us: latency_percentile_us(
+                stats.refill_latency_samples,
+                stats.refill_latency_le_10us,
+                stats.refill_latency_le_100us,
+                stats.refill_latency_le_1ms,
+                stats.refill_latency_le_10ms,
+                stats.refill_latency_gt_10ms,
+                0,
+                95,
             ),
             writeback_count: stats.writeback_latency_samples,
             writeback_avg_us: average_latency_us(
                 stats.writeback_latency_total_micros,
                 stats.writeback_latency_samples,
             ),
+            writeback_p50_us: latency_percentile_us(
+                stats.writeback_latency_samples,
+                stats.writeback_latency_le_10us,
+                stats.writeback_latency_le_100us,
+                stats.writeback_latency_le_1ms,
+                stats.writeback_latency_le_10ms,
+                stats.writeback_latency_gt_10ms,
+                0,
+                50,
+            ),
+            writeback_p95_us: latency_percentile_us(
+                stats.writeback_latency_samples,
+                stats.writeback_latency_le_10us,
+                stats.writeback_latency_le_100us,
+                stats.writeback_latency_le_1ms,
+                stats.writeback_latency_le_10ms,
+                stats.writeback_latency_gt_10ms,
+                0,
+                95,
+            ),
             eviction_count: stats.eviction_latency_samples,
             eviction_avg_us: average_latency_us(
                 stats.eviction_latency_total_micros,
                 stats.eviction_latency_samples,
             ),
+            eviction_p50_us: latency_percentile_us(
+                stats.eviction_latency_samples,
+                stats.eviction_latency_le_10us,
+                stats.eviction_latency_le_100us,
+                stats.eviction_latency_le_1ms,
+                stats.eviction_latency_le_10ms,
+                stats.eviction_latency_gt_10ms,
+                0,
+                50,
+            ),
+            eviction_p95_us: latency_percentile_us(
+                stats.eviction_latency_samples,
+                stats.eviction_latency_le_10us,
+                stats.eviction_latency_le_100us,
+                stats.eviction_latency_le_1ms,
+                stats.eviction_latency_le_10ms,
+                stats.eviction_latency_gt_10ms,
+                0,
+                95,
+            ),
             compaction_count: stats.compaction_latency_samples,
             compaction_avg_us: average_latency_us(
                 stats.compaction_latency_total_micros,
                 stats.compaction_latency_samples,
+            ),
+            compaction_p50_us: latency_percentile_us(
+                stats.compaction_latency_samples,
+                stats.compaction_latency_le_10us,
+                stats.compaction_latency_le_100us,
+                stats.compaction_latency_le_1ms,
+                stats.compaction_latency_le_10ms,
+                stats.compaction_latency_gt_10ms,
+                0,
+                50,
+            ),
+            compaction_p95_us: latency_percentile_us(
+                stats.compaction_latency_samples,
+                stats.compaction_latency_le_10us,
+                stats.compaction_latency_le_100us,
+                stats.compaction_latency_le_1ms,
+                stats.compaction_latency_le_10ms,
+                stats.compaction_latency_gt_10ms,
+                0,
+                95,
             ),
             histogram_ready: stats.get_latency_le_10us
                 + stats.get_latency_le_100us
