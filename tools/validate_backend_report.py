@@ -209,6 +209,35 @@ def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
                     f"{item.get('iterations')!r} does not match "
                     f"replacement_soak_iterations={data['replacement_soak_iterations']}"
                 )
+        elif name == "dram_to_pmem_eviction":
+            require_evidence_counter(item, "memory_evictions", data["memory_evictions"])
+            require_evidence_counter(item, "pmem_fills", data["pmem_fills"])
+        elif name == "pmem_to_ssd_eviction":
+            require_evidence_counter(item, "pmem_evictions", data["pmem_evictions"])
+            require_evidence_counter(item, "disk_fills", data["disk_fills"])
+        elif name == "ssd_read_through_refill":
+            require_evidence_counter(item, "cold_ssd_refills", data["cold_ssd_refills"])
+            require_evidence_counter(item, "refill_failures", data["refill_failures"])
+        elif name == "async_writeback_backpressure":
+            require_evidence_counter(
+                item,
+                "observed_async_writeback_backpressure",
+                data["async_writeback_backpressure"],
+            )
+        elif name == "restart_disk_refill":
+            observed = item.get("restart_disk_refill_ready")
+            if observed is not data["restart_disk_refill_ready"]:
+                fail(
+                    "restart_disk_refill evidence="
+                    f"{observed!r} does not match restart_disk_refill_ready="
+                    f"{data['restart_disk_refill_ready']!r}"
+                )
+
+
+def require_evidence_counter(item: dict[str, Any], field: str, expected: int) -> None:
+    value = item.get(field)
+    if value != expected:
+        fail(f"evidence {field}={value!r} does not match top-level {expected}")
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
