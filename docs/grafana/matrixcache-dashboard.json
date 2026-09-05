@@ -831,9 +831,27 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
+          "expr": "matrixcache_compaction_latency_p95_seconds",
+          "legendFormat": "compaction p95",
+          "refId": "M"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_compaction_latency_p99_seconds",
+          "legendFormat": "compaction p99",
+          "refId": "N"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "matrixcache_compaction_latency_max_seconds",
           "legendFormat": "compaction max",
-          "refId": "M"
+          "refId": "O"
         }
       ],
       "title": "Tier Movement Latency",

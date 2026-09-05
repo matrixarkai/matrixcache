@@ -38,6 +38,8 @@ DEFAULT_REQUIRED = (
     "matrixcache_writeback_latency_p95_seconds",
     "matrixcache_writeback_latency_p99_seconds",
     "matrixcache_writeback_latency_max_seconds",
+    "matrixcache_compaction_latency_p95_seconds",
+    "matrixcache_compaction_latency_p99_seconds",
     "matrixcache_compaction_latency_max_seconds",
     "matrixcache_sharded_batch_latency_p95_seconds",
     "matrixcache_sharded_batch_latency_p99_seconds",

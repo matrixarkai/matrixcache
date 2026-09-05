@@ -63,13 +63,14 @@ families directly, including:
   and eviction
 
 
-The `soak` example can also emit JSON with optional scale gates for p99 get/put
-latency and hit rate. The archived `latency` object includes p50/p95/p99 plus
-max observed latency for read-through, refill, writeback, eviction, and
-compaction so tail spikes stay visible outside Prometheus:
+The `soak` example can also emit JSON with optional scale gates for hit rate
+and p99 latency across get, put, read-through, refill, writeback, eviction,
+and compaction. The archived `latency` object includes p50/p95/p99 plus max
+observed latency for those operational paths so tail spikes stay visible
+outside Prometheus:
 
 ```text
-cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
+cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80
 ```
 
 Add `--require-passed` when an automated scale gate should exit nonzero after
@@ -77,7 +78,7 @@ the JSON report names the failing check. Add `--json-output <path>` when the
 same report should be archived without scraping the console stream:
 
 ```bash
-cargo run --release --no-default-features --example soak -- 10 8 --json-output /tmp/matrixcache-soak.json --require-passed --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
+cargo run --release --no-default-features --example soak -- 10 8 --json-output /tmp/matrixcache-soak.json --require-passed --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80
 ```
 
 Validate archived reports before publishing or comparing them. The validator

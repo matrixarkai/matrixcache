@@ -49,7 +49,7 @@ jobs:
       - name: Soak report smoke
         run: |
           cargo run --locked --no-default-features --example soak -- 1 1 \
-            --duration-seconds 1 \
+            --duration-seconds 2 \
             --sample-seconds 1 \
             --json-output /tmp/matrixcache-soak.json \
             --require-passed \
