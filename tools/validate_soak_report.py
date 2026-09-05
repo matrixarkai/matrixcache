@@ -26,6 +26,7 @@ REQUIRED_TOP_LEVEL = {
     "interval_best_kops": (int, float),
     "interval_samples": list,
     "throughput": dict,
+    "memory_pressure": dict,
     "latency": dict,
     "latency_budgets": dict,
     "checks": dict,
@@ -58,6 +59,16 @@ REQUIRED_THROUGHPUT = {
 
 QPS_RELATIVE_TOLERANCE = 0.01
 FLOAT_ABSOLUTE_TOLERANCE = 0.01
+PERCENT_ABSOLUTE_TOLERANCE = 0.05
+
+REQUIRED_MEMORY_PRESSURE = {
+    "capacity_bytes": int,
+    "final_bytes": int,
+    "peak_bytes": int,
+    "final_utilization_percent": (int, float),
+    "peak_utilization_percent": (int, float),
+    "bounded_memory": bool,
+}
 
 REQUIRED_LATENCY = {
     "get_p50_us",
@@ -220,6 +231,39 @@ def require_latency_budget_consistency(data: dict[str, Any]) -> None:
             )
 
 
+def require_memory_pressure_consistency(data: dict[str, Any]) -> None:
+    pressure = data["memory_pressure"]
+    for field, expected in REQUIRED_MEMORY_PRESSURE.items():
+        if field not in pressure:
+            fail(f"missing memory_pressure field {field!r}")
+        if not isinstance(pressure[field], expected):
+            fail(
+                f"memory_pressure.{field} has type "
+                f"{type(pressure[field]).__name__}, not {expected}"
+            )
+    capacity = pressure["capacity_bytes"]
+    if capacity <= 0:
+        fail("memory_pressure.capacity_bytes must be positive")
+    if pressure["final_bytes"] != data["final_memory_bytes"]:
+        fail("memory_pressure.final_bytes disagrees with final_memory_bytes")
+    if pressure["peak_bytes"] != data["peak_memory_bytes"]:
+        fail("memory_pressure.peak_bytes disagrees with peak_memory_bytes")
+    if pressure["bounded_memory"] is not data["checks"]["bounded_memory"]:
+        fail("memory_pressure.bounded_memory disagrees with checks.bounded_memory")
+    expected_final_utilization = pressure["final_bytes"] / capacity * 100.0
+    expected_peak_utilization = pressure["peak_bytes"] / capacity * 100.0
+    if (
+        abs(float(pressure["final_utilization_percent"]) - expected_final_utilization)
+        > PERCENT_ABSOLUTE_TOLERANCE
+    ):
+        fail("memory_pressure.final_utilization_percent disagrees with bytes/capacity")
+    if (
+        abs(float(pressure["peak_utilization_percent"]) - expected_peak_utilization)
+        > PERCENT_ABSOLUTE_TOLERANCE
+    ):
+        fail("memory_pressure.peak_utilization_percent disagrees with bytes/capacity")
+
+
 def require_interval_sample_consistency(data: dict[str, Any], args: argparse.Namespace) -> None:
     samples = data["interval_samples"]
     if not samples:
@@ -372,6 +416,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     require_numeric_at_most(latency, "writeback_p99_us", args.max_writeback_p99_us)
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
     require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
+    require_memory_pressure_consistency(data)
     require_latency_budget_consistency(data)
     require_interval_sample_consistency(data, args)
     return data

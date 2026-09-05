@@ -156,6 +156,16 @@ def final_interval_memory_bytes(data: dict[str, Any]) -> float:
     return sample_number(interval_samples(data)[-1], "memory_bytes")
 
 
+def memory_pressure(data: dict[str, Any], field: str) -> float:
+    pressure = data.get("memory_pressure")
+    if not isinstance(pressure, dict):
+        fail("missing memory_pressure object")
+    value = pressure.get(field)
+    if not isinstance(value, (int, float)):
+        fail(f"memory_pressure field {field!r} must be numeric")
+    return float(value)
+
+
 def ratio(current: float, baseline: float) -> float:
     if baseline <= 0:
         return 1.0 if current <= 0 else float("inf")
@@ -177,6 +187,14 @@ def main() -> int:
     get_p99_ratio = ratio(latency(current, "get_p99_us"), latency(baseline, "get_p99_us"))
     put_p99_ratio = ratio(latency(current, "put_p99_us"), latency(baseline, "put_p99_us"))
     memory_ratio = ratio(number(current, "peak_memory_bytes"), number(baseline, "peak_memory_bytes"))
+    memory_pressure_peak_ratio = ratio(
+        memory_pressure(current, "peak_utilization_percent"),
+        memory_pressure(baseline, "peak_utilization_percent"),
+    )
+    memory_pressure_final_ratio = ratio(
+        memory_pressure(current, "final_utilization_percent"),
+        memory_pressure(baseline, "final_utilization_percent"),
+    )
     throughput_ratio = ratio(
         number(current, "interval_best_kops"),
         number(baseline, "interval_best_kops"),
@@ -253,6 +271,18 @@ def main() -> int:
             "min",
         )
     check_ratio("peak memory", memory_ratio, args.max_memory_growth, "max")
+    check_ratio(
+        "peak memory utilization",
+        memory_pressure_peak_ratio,
+        args.max_memory_growth,
+        "max",
+    )
+    check_ratio(
+        "final memory utilization",
+        memory_pressure_final_ratio,
+        args.max_final_interval_memory_growth,
+        "max",
+    )
     check_ratio("best throughput", throughput_ratio, args.min_throughput_ratio, "min")
     check_ratio(
         "interval sample count",
@@ -284,6 +314,8 @@ def main() -> int:
         f"put_p99_ratio={put_p99_ratio:.3f} "
         f"throughput_ratio={throughput_ratio:.3f} "
         f"memory_ratio={memory_ratio:.3f} "
+        f"memory_pressure_peak_ratio={memory_pressure_peak_ratio:.3f} "
+        f"memory_pressure_final_ratio={memory_pressure_final_ratio:.3f} "
         f"interval_sample_ratio={interval_sample_ratio:.3f} "
         f"worst_interval_throughput_ratio={worst_interval_throughput_ratio:.3f} "
         f"final_interval_memory_ratio={final_interval_memory_ratio:.3f} "

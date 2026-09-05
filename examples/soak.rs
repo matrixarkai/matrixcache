@@ -390,6 +390,17 @@ fn main() {
         let bounded_entries = peak_entries <= RESIDENT + 64;
         let bounded_memory =
             peak_memory_bytes as usize <= RESIDENT * VALUE_BYTES + VALUE_BYTES * 64;
+        let memory_capacity_bytes = (RESIDENT * VALUE_BYTES) as u64;
+        let final_memory_utilization_percent = if memory_capacity_bytes == 0 {
+            0.0
+        } else {
+            stats.memory_bytes as f64 / memory_capacity_bytes as f64 * 100.0
+        };
+        let peak_memory_utilization_percent = if memory_capacity_bytes == 0 {
+            0.0
+        } else {
+            peak_memory_bytes as f64 / memory_capacity_bytes as f64 * 100.0
+        };
         let get_p99_within_budget = max_get_p99_us
             .map(|budget| latency.get_p99_us <= budget)
             .unwrap_or(true);
@@ -608,6 +619,27 @@ fn main() {
         writeln!(&mut report, "    \"write_qps\": {write_qps:.4},").expect("format report");
         writeln!(&mut report, "    \"duration_seconds\": {duration_secs:.4}")
             .expect("format report");
+        writeln!(&mut report, "  }},").expect("format report");
+        writeln!(&mut report, "  \"memory_pressure\": {{").expect("format report");
+        writeln!(
+            &mut report,
+            "    \"capacity_bytes\": {memory_capacity_bytes},"
+        )
+        .expect("format report");
+        writeln!(&mut report, "    \"final_bytes\": {},", stats.memory_bytes)
+            .expect("format report");
+        writeln!(&mut report, "    \"peak_bytes\": {peak_memory_bytes},").expect("format report");
+        writeln!(
+            &mut report,
+            "    \"final_utilization_percent\": {final_memory_utilization_percent:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"peak_utilization_percent\": {peak_memory_utilization_percent:.4},"
+        )
+        .expect("format report");
+        writeln!(&mut report, "    \"bounded_memory\": {bounded_memory}").expect("format report");
         writeln!(&mut report, "  }},").expect("format report");
         writeln!(&mut report, "  \"latency\": {{").expect("format report");
         writeln!(&mut report, "    \"get_count\": {},", latency.get_count).expect("format report");

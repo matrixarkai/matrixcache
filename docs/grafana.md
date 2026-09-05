@@ -115,6 +115,10 @@ observed p99, configured p99 ceiling, and pass/fail result. The validator
 cross-checks that object against the raw latency fields and built-in checks so
 dashboards and scale reports can consume one compact latency budget summary
 without losing schema honesty.
+The archived `memory_pressure` object records resident capacity, final bytes,
+peak bytes, final utilization, peak utilization, and the bounded-memory result.
+The validator checks its byte and percent math, and the comparator compares
+peak and final utilization between baseline and current runs.
 The archived `interval_samples` array keeps the per-sample drift trace:
 elapsed time, interval Kops/s, interval hit rate, resident entries, memory
 bytes, and cumulative writes. The validator cross-checks those samples against
