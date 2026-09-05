@@ -99,6 +99,9 @@ jobs:
             --min-thread-rows 4 \
             --min-worst-sharded-speedup 0.25 \
             --max-first-hit-ns 1000000
+          tools/compare_read_scaling_reports.py \
+            /tmp/matrixcache-read-scaling.json \
+            /tmp/matrixcache-read-scaling.json
 
       - name: Doc
         run: cargo doc --no-deps --locked

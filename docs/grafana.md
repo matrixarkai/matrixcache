@@ -109,6 +109,7 @@ concurrency:
 ```bash
 cargo run --release --no-default-features --example cache_scaling_bench -- 4096 --json-output /tmp/matrixcache-read-scaling.json --require-passed --min-sharded-speedup 0.25 --max-single-thread-ns 1000000
 tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json --min-hit-costs 1 --min-thread-rows 4 --min-worst-sharded-speedup 0.25 --max-first-hit-ns 1000000
+tools/compare_read_scaling_reports.py /tmp/matrixcache-read-scaling-baseline.json /tmp/matrixcache-read-scaling.json --max-latency-regression 1.35 --min-throughput-ratio 0.80
 ```
 
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
