@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
         help="Validate shape but do not require passed=true",
     )
     parser.add_argument("--min-batches", type=int, default=2)
+    parser.add_argument("--min-passes", type=int, default=1)
     parser.add_argument("--min-disk-hits", type=int, default=1)
     parser.add_argument("--min-zero-copy-hits", type=int, default=1)
     parser.add_argument("--min-refill-samples", type=int, default=1)
@@ -119,6 +120,8 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail("value_bytes must be positive")
     if data["passes"] <= 0:
         fail("passes must be positive")
+    if data["passes"] < args.min_passes:
+        fail(f"passes={data['passes']} below {args.min_passes}")
     if len(data["batches"]) < args.min_batches:
         fail(f"batch count {len(data['batches'])} below {args.min_batches}")
     for index, row in enumerate(data["batches"]):
@@ -160,7 +163,8 @@ def main() -> int:
     stats = data["stats"]
     print(
         "OK matrixcache batch-control report: "
-        f"batches={len(data['batches'])} local={stats['sharded_batch_local_operations']} "
+        f"batches={len(data['batches'])} passes={data['passes']} "
+        f"local={stats['sharded_batch_local_operations']} "
         f"fanout={stats['sharded_batch_fanout_operations']} "
         f"disk_hits={stats['disk_hits']} "
         f"zero_copy_hits={stats['zero_copy_handle_hits']} "
