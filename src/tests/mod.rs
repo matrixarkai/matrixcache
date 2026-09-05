@@ -15985,6 +15985,35 @@ fn shared_batch_coalesces_duplicate_ssd_reads() {
 }
 
 #[test]
+fn shared_batch_coalesces_duplicate_memory_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let repeated = CacheKey::page_with_slot(1, 13, 0, 16, Some(7));
+    let other = CacheKey::page_with_slot(1, 14, 0, 16, Some(8));
+
+    cache.put(repeated.clone(), b"repeat".to_vec()).unwrap();
+    cache.put(other.clone(), b"other".to_vec()).unwrap();
+
+    let before = cache.stats();
+    let values = cache
+        .get_shared_batch(&[repeated.clone(), other.clone(), repeated.clone()])
+        .expect("shared batch");
+    let after = cache.stats();
+
+    assert_eq!(values.len(), 3);
+    assert_eq!(&**values[0].as_ref().unwrap(), b"repeat");
+    assert_eq!(&**values[1].as_ref().unwrap(), b"other");
+    assert_eq!(&**values[2].as_ref().unwrap(), b"repeat");
+    assert!(Arc::ptr_eq(
+        values[0].as_ref().unwrap(),
+        values[2].as_ref().unwrap()
+    ));
+    assert_eq!(after.memory_hits - before.memory_hits, 2);
+    assert_eq!(after.disk_hits - before.disk_hits, 0);
+}
+
+#[test]
 fn sharded_shared_batch_preserves_order_and_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let cache = ShardedMultiLayerCache::with_options(

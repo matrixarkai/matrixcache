@@ -45,6 +45,41 @@ fn latency_percentile_us(
     max_us
 }
 
+const SMALL_BATCH_DEDUP_LIMIT: usize = 64;
+
+fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>) {
+    let mut unique_keys = Vec::<CacheKey>::new();
+    let mut requested_positions = Vec::with_capacity(keys.len());
+    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        for (position, key) in keys.iter().enumerate() {
+            let unique_position = unique_keys
+                .iter()
+                .position(|existing| existing == key)
+                .unwrap_or_else(|| {
+                    let unique_position = unique_keys.len();
+                    unique_keys.push(key.clone());
+                    unique_position
+                });
+            requested_positions.push((position, unique_position));
+        }
+        return (unique_keys, requested_positions);
+    }
+
+    let mut unique_positions = HashMap::<CacheKey, usize>::new();
+    for (position, key) in keys.iter().cloned().enumerate() {
+        let unique_position = if let Some(position) = unique_positions.get(&key).copied() {
+            position
+        } else {
+            let position = unique_keys.len();
+            unique_positions.insert(key.clone(), position);
+            unique_keys.push(key);
+            position
+        };
+        requested_positions.push((position, unique_position));
+    }
+    (unique_keys, requested_positions)
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -2243,20 +2278,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut unique_positions = HashMap::<CacheKey, usize>::new();
-        let mut unique_keys = Vec::<CacheKey>::new();
-        let mut requested_positions = Vec::with_capacity(keys.len());
-        for (position, key) in keys.iter().cloned().enumerate() {
-            let unique_position = if let Some(position) = unique_positions.get(&key).copied() {
-                position
-            } else {
-                let position = unique_keys.len();
-                unique_positions.insert(key.clone(), position);
-                unique_keys.push(key);
-                position
-            };
-            requested_positions.push((position, unique_position));
-        }
+        let (unique_keys, requested_positions) = coalesce_batch_keys(keys);
 
         for key in &unique_keys {
             self.emit_access_record(CacheAccessRecordKind::Get, key);
