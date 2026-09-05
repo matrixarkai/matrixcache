@@ -31,7 +31,10 @@
 //!       - targets: ["localhost:9184"]
 //! ```
 
-use matrixcache::{prometheus_text, CacheKey, CacheOptions, ShardedMultiLayerCache};
+use matrixcache::{
+    prometheus_text_into, CacheKey, CacheOptions, ShardedMultiLayerCache,
+    PROMETHEUS_TEXT_CAPACITY_BYTES,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,7 +144,8 @@ fn main() {
             let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
             match path.as_str() {
                 "/metrics" => {
-                    let body = prometheus_text(&cache.stats(), &[("cache", "example")]);
+                    let mut body = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
+                    prometheus_text_into(&cache.stats(), &[("cache", "example")], &mut body);
                     respond(stream, "200 OK", "text/plain; version=0.0.4", &body);
                 }
                 "/healthz" => respond(stream, "200 OK", "text/plain", "ok\n"),

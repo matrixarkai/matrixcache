@@ -15374,6 +15374,40 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_text_into_reuses_existing_scrape_buffer() {
+        let mut stats = CacheStats {
+            memory_hits: 1,
+            misses: 1,
+            ..CacheStats::default()
+        };
+        let mut text = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
+
+        prometheus_text_into(&stats, &[("cache", "reuse")], &mut text);
+        let first_capacity = text.capacity();
+        assert!(
+            text.contains("matrixcache_memory_hits{cache=\"reuse\"} 1"),
+            "first scrape should render the requested stats:\n{text}"
+        );
+
+        text.push_str("stale text that must be cleared");
+        stats.memory_hits = 2;
+        prometheus_text_into(&stats, &[("cache", "reuse")], &mut text);
+        assert_eq!(
+            text.capacity(),
+            first_capacity,
+            "caller-owned scrape buffer should not reallocate when capacity is sufficient"
+        );
+        assert!(
+            !text.contains("stale text"),
+            "reused scrape buffer should be cleared before rendering"
+        );
+        assert!(
+            text.contains("matrixcache_memory_hits{cache=\"reuse\"} 2"),
+            "second scrape should render fresh stats:\n{text}"
+        );
+    }
+
+    #[test]
     fn prometheus_latency_max_gauges_are_seconds() {
         let stats = CacheStats {
             get_latency_samples: 2,

@@ -21,7 +21,9 @@ The exporter drives a small skewed workload plus small and large sharded batch
 reads so the dashboard has moving hit-rate, latency, and batch fan-out series.
 Production services should call `matrixcache::prometheus_text` from their own
 metrics endpoint and attach service-specific labels such as shard, tier, table,
-or process.
+or process. Hot scrape paths can keep a per-handler `String` and call
+`matrixcache::prometheus_text_into` so the full 32 KiB exposition buffer is
+reused instead of reallocated on every Prometheus pull.
 
 ## Prometheus
 

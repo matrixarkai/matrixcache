@@ -25,6 +25,21 @@ pub const PROMETHEUS_TEXT_CAPACITY_BYTES: usize = 32 * 1024;
 /// cumulative, as the format requires.
 pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
+    prometheus_text_into(stats, labels, &mut out);
+    out
+}
+
+/// Renders a snapshot into a caller-owned Prometheus scrape buffer.
+///
+/// Reusing the same buffer avoids allocating a new 32 KiB scrape body for
+/// every pull while keeping the one-shot `prometheus_text` API available for
+/// tests and small tools.
+pub fn prometheus_text_into(stats: &CacheStats, labels: &[(&str, &str)], out: &mut String) {
+    out.clear();
+    if out.capacity() < PROMETHEUS_TEXT_CAPACITY_BYTES {
+        out.reserve(PROMETHEUS_TEXT_CAPACITY_BYTES - out.capacity());
+    }
+    let mut out = out;
     let tags = render_labels(labels);
 
     metric(&mut out, "matrixcache_memory_hits", "Reads served from the memory tier", "counter", &tags, stats.memory_hits);
@@ -346,7 +361,6 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_p95_seconds", "sharded batch p95 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 95));
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_p99_seconds", "sharded batch p99 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 99));
 
-    out
 }
 
 fn render_labels(labels: &[(&str, &str)]) -> String {
