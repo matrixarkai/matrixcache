@@ -66,15 +66,16 @@ fn batch_keys(prefix: &str, worker: usize, start: usize, count: usize) -> Vec<Ca
 }
 
 fn respond(mut stream: TcpStream, status: &str, content_type: &str, body: &str) {
-    let response = format!(
+    // A scraper that hangs up mid-response is normal and not worth logging.
+    let _ = write!(
+        stream,
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
+         Connection: close\r\n\r\n",
         body.len()
     );
-    // A scraper that hangs up mid-response is normal and not worth logging.
-    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
     let _ = stream.flush();
 }
 
