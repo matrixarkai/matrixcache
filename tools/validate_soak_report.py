@@ -70,13 +70,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-hit-rate-percent", type=float)
     parser.add_argument("--max-get-p99-us", type=int)
     parser.add_argument("--max-put-p99-us", type=int)
+    parser.add_argument("--max-read-through-p99-us", type=int)
+    parser.add_argument("--max-refill-p99-us", type=int)
+    parser.add_argument("--max-writeback-p99-us", type=int)
     parser.add_argument("--max-eviction-p99-us", type=int)
+    parser.add_argument("--max-compaction-p99-us", type=int)
     parser.add_argument("--min-reads", type=int, default=1)
     parser.add_argument("--min-writes", type=int, default=0)
     parser.add_argument("--min-memory-evictions", type=int, default=0)
     parser.add_argument("--min-get-samples", type=int, default=1)
     parser.add_argument("--min-put-samples", type=int, default=0)
+    parser.add_argument("--min-read-through-samples", type=int, default=0)
+    parser.add_argument("--min-refill-samples", type=int, default=0)
+    parser.add_argument("--min-writeback-samples", type=int, default=0)
     parser.add_argument("--min-eviction-samples", type=int, default=0)
+    parser.add_argument("--min-compaction-samples", type=int, default=0)
     return parser.parse_args()
 
 
@@ -149,13 +157,17 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail("latency histogram is not ready")
     if latency.get("get_count", 0) < args.min_get_samples:
         fail(f"get_count={latency.get('get_count', 0)} below minimum {args.min_get_samples}")
-    if latency.get("put_count", 0) < args.min_put_samples:
-        fail(f"put_count={latency.get('put_count', 0)} below minimum {args.min_put_samples}")
-    if latency.get("eviction_count", 0) < args.min_eviction_samples:
-        fail(
-            f"eviction_count={latency.get('eviction_count', 0)} below minimum "
-            f"{args.min_eviction_samples}"
-        )
+    sample_floors = (
+        ("put_count", args.min_put_samples),
+        ("read_through_count", args.min_read_through_samples),
+        ("refill_count", args.min_refill_samples),
+        ("writeback_count", args.min_writeback_samples),
+        ("eviction_count", args.min_eviction_samples),
+        ("compaction_count", args.min_compaction_samples),
+    )
+    for field, minimum in sample_floors:
+        if latency.get(field, 0) < minimum:
+            fail(f"{field}={latency.get(field, 0)} below minimum {minimum}")
 
     if not args.allow_failed and data["passed"] is not True:
         fail("report passed=false")
@@ -166,7 +178,11 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
 
     require_numeric_at_most(latency, "get_p99_us", args.max_get_p99_us)
     require_numeric_at_most(latency, "put_p99_us", args.max_put_p99_us)
+    require_numeric_at_most(latency, "read_through_p99_us", args.max_read_through_p99_us)
+    require_numeric_at_most(latency, "refill_p99_us", args.max_refill_p99_us)
+    require_numeric_at_most(latency, "writeback_p99_us", args.max_writeback_p99_us)
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
+    require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
     return data
 
 

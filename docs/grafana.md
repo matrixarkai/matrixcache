@@ -85,7 +85,7 @@ requires the operational max-latency fields so old archives cannot silently pass
 as current soak evidence:
 
 ```bash
-tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-eviction-samples 1
+tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-read-through-samples 100000 --min-refill-samples 1 --min-writeback-samples 1 --min-eviction-samples 1 --min-compaction-samples 1
 ```
 
 Compare a current archive with a known-good baseline before accepting a scale
