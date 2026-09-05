@@ -108,6 +108,33 @@ fn coalesce_batch_positions(keys: &[CacheKey]) -> Vec<(CacheKey, Vec<usize>)> {
     positions_by_key
 }
 
+fn coalesce_release_counts(handles: Vec<CachePinnedHandle>) -> (usize, Vec<(CacheKey, usize)>) {
+    let released = handles.len();
+    if released == 0 {
+        return (0, Vec::new());
+    }
+    if released <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut counts = Vec::<(CacheKey, usize)>::new();
+        for handle in handles {
+            if let Some((_, count)) = counts
+                .iter_mut()
+                .find(|(existing, _)| existing == &handle.key)
+            {
+                *count = count.saturating_add(1);
+            } else {
+                counts.push((handle.key, 1));
+            }
+        }
+        return (released, counts);
+    }
+
+    let mut counts_by_key = HashMap::<CacheKey, usize>::new();
+    for handle in handles {
+        *counts_by_key.entry(handle.key).or_default() += 1;
+    }
+    (released, counts_by_key.into_iter().collect())
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -3374,15 +3401,10 @@ impl MultiLayerCache {
     }
 
     pub fn release_batch(&self, handles: Vec<CachePinnedHandle>) -> usize {
-        if handles.is_empty() {
+        let (released, counts) = coalesce_release_counts(handles);
+        if released == 0 {
             return 0;
         }
-        let released = handles.len();
-        let mut counts_by_key = HashMap::<CacheKey, usize>::new();
-        for handle in handles {
-            *counts_by_key.entry(handle.key).or_default() += 1;
-        }
-        let counts = counts_by_key.into_iter().collect::<Vec<_>>();
         let inner = self.inner.read().expect("cache lock poisoned");
         inner.decrement_pin_counts(&counts);
         released
