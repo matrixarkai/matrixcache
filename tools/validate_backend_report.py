@@ -307,6 +307,25 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
 
     if data["cold_ssd_refills"] > data["iterations"]:
         fail("cold_ssd_refills cannot exceed iterations")
+    tier_hits = data["memory_hits"] + data["pmem_hits"] + data["ssd_hits"]
+    expected_tier_reads = data["hot_get"]["count"] + data["cold_ssd_refill_get"]["count"]
+    if tier_hits < expected_tier_reads:
+        fail(
+            "tier hit counters cover fewer reads than the benchmark issued: "
+            f"memory_hits+pmem_hits+ssd_hits={tier_hits} expected_at_least={expected_tier_reads}"
+        )
+    if data["ssd_hits"] < data["cold_ssd_refills"]:
+        fail(
+            f"ssd_hits={data['ssd_hits']} below cold_ssd_refills={data['cold_ssd_refills']}"
+        )
+    if data["disk_fills"] < data["cold_ssd_refills"]:
+        fail(
+            f"disk_fills={data['disk_fills']} below cold_ssd_refills={data['cold_ssd_refills']}"
+        )
+    if data["pmem_fills"] < data["memory_evictions"]:
+        fail(
+            f"pmem_fills={data['pmem_fills']} below memory_evictions={data['memory_evictions']}"
+        )
     if data["main_pressure_passed"] != (
         data["memory_evictions"] > 0
         and data["pmem_evictions"] > 0

@@ -182,7 +182,7 @@ full RocksDB native build cost on every tiny backend-report iteration. The
 replacement-soak evidence also records max latency for read-through, refill,
 writeback, eviction, and compaction so backend pressure runs carry the same
 tail-latency signal as the Prometheus dashboard.
-The backend validator also enforces a minimum replacement-soak iteration count and checks that timing sample counts, resident-hot keys, workload fields, nested evidence counters, and replacement-soak evidence all agree with the reported workload, so SSD-cache evidence cannot pass from a short or internally inconsistent run. It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement. The backend comparator keeps archived runs honest against a baseline by checking workload identity, p99 latency regression, QPS ratios, tier movement counters, refill-failure growth, and replacement-soak max latency.
+The backend validator also enforces a minimum replacement-soak iteration count and checks that timing sample counts, resident-hot keys, workload fields, nested evidence counters, tier-hit/refill accounting, and replacement-soak evidence all agree with the reported workload, so SSD-cache evidence cannot pass from a short or internally inconsistent run. It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement. The backend comparator keeps archived runs honest against a baseline by checking workload identity, p99 latency regression, QPS ratios, tier movement counters, refill-failure growth, and replacement-soak max latency.
 
 
 ## Scale Report Pairing
