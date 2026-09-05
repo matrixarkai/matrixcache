@@ -249,6 +249,7 @@ fn main() {
     // at one number. See the note where they are reported.
     let mut rates: Vec<f64> = Vec::new();
     let mut hit_rates: Vec<f64> = Vec::new();
+    let mut interval_samples: Vec<IntervalSample> = Vec::new();
     let mut peak_entries = 0_usize;
     let mut peak_memory_bytes = 0_u64;
 
@@ -279,11 +280,21 @@ fn main() {
             interval_hits as f64 / looked_up as f64 * 100.0
         };
         let entries = cache.all_entries().len();
+        let memory_bytes = stats.memory_bytes;
+        let cumulative_writes = writes.load(Ordering::Relaxed);
 
         rates.push(rate);
         hit_rates.push(hit_rate);
+        interval_samples.push(IntervalSample {
+            elapsed_seconds: started.elapsed().as_secs(),
+            kops: rate,
+            hit_rate_percent: hit_rate,
+            entries,
+            memory_bytes,
+            cumulative_writes,
+        });
         peak_entries = peak_entries.max(entries);
-        peak_memory_bytes = peak_memory_bytes.max(stats.memory_bytes);
+        peak_memory_bytes = peak_memory_bytes.max(memory_bytes);
 
         println!(
             "{:>6}{:>12.1}{:>10.2}%{:>12}{:>12.1}{:>12}",
@@ -291,8 +302,8 @@ fn main() {
             rate,
             hit_rate,
             entries,
-            stats.memory_bytes as f64 / (1024.0 * 1024.0),
-            writes.load(Ordering::Relaxed),
+            memory_bytes as f64 / (1024.0 * 1024.0),
+            cumulative_writes,
         );
 
         // The invariants a soak exists to check. Entries are bounded by
@@ -567,6 +578,26 @@ fn main() {
                 index + 1,
                 best,
                 worst
+            )
+            .expect("format report");
+        }
+        writeln!(&mut report, "  ],").expect("format report");
+        writeln!(&mut report, "  \"interval_samples\": [").expect("format report");
+        for (index, sample) in interval_samples.iter().enumerate() {
+            let comma = if index + 1 == interval_samples.len() {
+                ""
+            } else {
+                ","
+            };
+            writeln!(
+                &mut report,
+                "    {{\"elapsed_seconds\": {}, \"kops\": {:.4}, \"hit_rate_percent\": {:.4}, \"entries\": {}, \"memory_bytes\": {}, \"cumulative_writes\": {}}}{comma}",
+                sample.elapsed_seconds,
+                sample.kops,
+                sample.hit_rate_percent,
+                sample.entries,
+                sample.memory_bytes,
+                sample.cumulative_writes
             )
             .expect("format report");
         }
@@ -945,6 +976,15 @@ fn option_f64_json(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.4}"))
         .unwrap_or_else(|| "null".to_string())
+}
+
+struct IntervalSample {
+    elapsed_seconds: u64,
+    kops: f64,
+    hit_rate_percent: f64,
+    entries: usize,
+    memory_bytes: u64,
+    cumulative_writes: u64,
 }
 
 fn write_latency_budget(

@@ -24,6 +24,7 @@ REQUIRED_TOP_LEVEL = {
     "peak_memory_bytes": int,
     "observed_hit_rate_percent": (int, float),
     "interval_best_kops": (int, float),
+    "interval_samples": list,
     "throughput": dict,
     "latency": dict,
     "latency_budgets": dict,
@@ -56,6 +57,7 @@ REQUIRED_THROUGHPUT = {
 }
 
 QPS_RELATIVE_TOLERANCE = 0.01
+FLOAT_ABSOLUTE_TOLERANCE = 0.01
 
 REQUIRED_LATENCY = {
     "get_p50_us",
@@ -215,6 +217,56 @@ def require_latency_budget_consistency(data: dict[str, Any]) -> None:
             )
 
 
+def require_interval_sample_consistency(data: dict[str, Any]) -> None:
+    samples = data["interval_samples"]
+    if not samples:
+        fail("interval_samples must not be empty")
+    last_elapsed = -1
+    best_kops = 0.0
+    worst_kops = float("inf")
+    min_hit_rate = float("inf")
+    max_hit_rate = 0.0
+    peak_entries = 0
+    peak_memory_bytes = 0
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            fail(f"interval_samples[{index}] must be an object")
+        for field in ("elapsed_seconds", "entries", "memory_bytes", "cumulative_writes"):
+            if not isinstance(sample.get(field), int):
+                fail(f"interval_samples[{index}].{field} must be an integer")
+        for field in ("kops", "hit_rate_percent"):
+            if not isinstance(sample.get(field), (int, float)):
+                fail(f"interval_samples[{index}].{field} must be numeric")
+        elapsed = sample["elapsed_seconds"]
+        if elapsed <= last_elapsed:
+            fail("interval_samples elapsed_seconds must be strictly increasing")
+        last_elapsed = elapsed
+        hit_rate = float(sample["hit_rate_percent"])
+        if not 0.0 <= hit_rate <= 100.0:
+            fail(f"interval_samples[{index}].hit_rate_percent={hit_rate:.4f} is outside 0..100")
+        kops = float(sample["kops"])
+        if kops < 0.0:
+            fail(f"interval_samples[{index}].kops must be non-negative")
+        best_kops = max(best_kops, kops)
+        worst_kops = min(worst_kops, kops)
+        min_hit_rate = min(min_hit_rate, hit_rate)
+        max_hit_rate = max(max_hit_rate, hit_rate)
+        peak_entries = max(peak_entries, sample["entries"])
+        peak_memory_bytes = max(peak_memory_bytes, sample["memory_bytes"])
+    if abs(best_kops - float(data["interval_best_kops"])) > FLOAT_ABSOLUTE_TOLERANCE:
+        fail("interval_best_kops disagrees with interval_samples")
+    if abs(worst_kops - float(data["interval_worst_kops"])) > FLOAT_ABSOLUTE_TOLERANCE:
+        fail("interval_worst_kops disagrees with interval_samples")
+    if abs(min_hit_rate - float(data["interval_min_hit_rate_percent"])) > FLOAT_ABSOLUTE_TOLERANCE:
+        fail("interval_min_hit_rate_percent disagrees with interval_samples")
+    if abs(max_hit_rate - float(data["interval_max_hit_rate_percent"])) > FLOAT_ABSOLUTE_TOLERANCE:
+        fail("interval_max_hit_rate_percent disagrees with interval_samples")
+    if peak_entries != data["peak_entries"]:
+        fail("peak_entries disagrees with interval_samples")
+    if peak_memory_bytes != data["peak_memory_bytes"]:
+        fail("peak_memory_bytes disagrees with interval_samples")
+
+
 def validate(args: argparse.Namespace) -> dict[str, Any]:
     data = load_report(args.report)
     for field, expected in REQUIRED_TOP_LEVEL.items():
@@ -302,6 +354,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
     require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
     require_latency_budget_consistency(data)
+    require_interval_sample_consistency(data)
     return data
 
 

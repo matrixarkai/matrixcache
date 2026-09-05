@@ -115,6 +115,12 @@ observed p99, configured p99 ceiling, and pass/fail result. The validator
 cross-checks that object against the raw latency fields and built-in checks so
 dashboards and scale reports can consume one compact latency budget summary
 without losing schema honesty.
+The archived `interval_samples` array keeps the per-sample drift trace:
+elapsed time, interval Kops/s, interval hit rate, resident entries, memory
+bytes, and cumulative writes. The validator cross-checks those samples against
+the aggregate interval best/worst and peak memory fields, which makes it much
+harder for a truncated or hand-edited scale archive to hide throughput decay or
+resident-memory growth.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for
