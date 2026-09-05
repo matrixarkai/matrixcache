@@ -21,9 +21,10 @@
 //! `set_lru_refresh_distance` at all**. What it measures is what somebody gets
 //! who constructs a cache and reads from it.
 //!
-//! The two are reported side by side — the same skewed workload through
-//! `get_batch` and through a loop of single `get` calls — because the question
-//! a batch API has to answer is whether it beats the loop it replaces.
+//! Three read shapes are reported side by side: copying `get_batch`, shared
+//! `get_shared_batch`, and a loop of single `get` calls. Retrieval callers that
+//! parse bytes and drop them should prefer the shared path; it avoids the
+//! caller-side allocation while still accounting the hit.
 //!
 //! ```text
 //! cargo run --release --no-default-features --example batch_skew_bench
@@ -72,8 +73,15 @@ fn build() -> Arc<MultiLayerCache> {
     Arc::new(cache)
 }
 
-/// Aggregate keys read per second, either batched or one at a time.
-fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, batched: bool) -> f64 {
+#[derive(Clone, Copy)]
+enum ReadShape {
+    CopyingBatch,
+    SharedBatch,
+    GetLoop,
+}
+
+/// Aggregate keys read per second for one read shape.
+fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) -> f64 {
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
@@ -85,12 +93,19 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, batched: bool) -> f6
                     let batch = (0..BATCH)
                         .map(|_| CacheKey::string(0, &format!("sk-{:05}", skewed(&mut state))))
                         .collect::<Vec<_>>();
-                    if batched {
-                        let values = cache.get_batch(&batch).expect("get_batch");
-                        assert!(values.iter().all(|value| value.is_some()), "all resident");
-                    } else {
-                        for key in &batch {
-                            assert!(cache.get(key).expect("get").is_some(), "all resident");
+                    match shape {
+                        ReadShape::CopyingBatch => {
+                            let values = cache.get_batch(&batch).expect("get_batch");
+                            assert!(values.iter().all(|value| value.is_some()), "all resident");
+                        }
+                        ReadShape::SharedBatch => {
+                            let values = cache.get_shared_batch(&batch).expect("get_shared_batch");
+                            assert!(values.iter().all(|value| value.is_some()), "all resident");
+                        }
+                        ReadShape::GetLoop => {
+                            for key in &batch {
+                                assert!(cache.get(key).expect("get").is_some(), "all resident");
+                            }
                         }
                     }
                 }
@@ -117,8 +132,13 @@ fn main() {
         cache.lru_refresh_time()
     );
     println!(
-        "{:<10}{:>18}{:>18}{:>12}{:>18}",
-        "threads", "get_batch Mkeys/s", "get loop Mkeys/s", "batch/loop", "per-repeat spread"
+        "{:<10}{:>18}{:>18}{:>18}{:>12}{:>12}",
+        "threads",
+        "get_batch Mkeys/s",
+        "shared Mkeys/s",
+        "get loop Mkeys/s",
+        "batch/loop",
+        "shared/loop"
     );
     for threads in [1_usize, 2, 4, 8] {
         // Both shapes inside each repeat, alternating which goes first.
@@ -127,34 +147,53 @@ fn main() {
         // most sensitive thing here to what else the machine is doing. Both
         // are reads, so neither leaves the other anything.
         let mut batched_samples = Vec::with_capacity(REPEATS);
+        let mut shared_samples = Vec::with_capacity(REPEATS);
         let mut looped_samples = Vec::with_capacity(REPEATS);
-        let mut ratios = Vec::with_capacity(REPEATS);
+        let mut batch_ratios = Vec::with_capacity(REPEATS);
+        let mut shared_ratios = Vec::with_capacity(REPEATS);
         for repeat in 0..REPEATS {
-            let (batched, looped) = if repeat % 2 == 0 {
-                let batched = throughput(&cache, threads, true);
-                (batched, throughput(&cache, threads, false))
-            } else {
-                let looped = throughput(&cache, threads, false);
-                (throughput(&cache, threads, true), looped)
+            let (batched, shared, looped) = match repeat % 3 {
+                0 => {
+                    let batched = throughput(&cache, threads, ReadShape::CopyingBatch);
+                    let shared = throughput(&cache, threads, ReadShape::SharedBatch);
+                    let looped = throughput(&cache, threads, ReadShape::GetLoop);
+                    (batched, shared, looped)
+                }
+                1 => {
+                    let shared = throughput(&cache, threads, ReadShape::SharedBatch);
+                    let looped = throughput(&cache, threads, ReadShape::GetLoop);
+                    let batched = throughput(&cache, threads, ReadShape::CopyingBatch);
+                    (batched, shared, looped)
+                }
+                _ => {
+                    let looped = throughput(&cache, threads, ReadShape::GetLoop);
+                    let batched = throughput(&cache, threads, ReadShape::CopyingBatch);
+                    let shared = throughput(&cache, threads, ReadShape::SharedBatch);
+                    (batched, shared, looped)
+                }
             };
-            ratios.push(batched / looped.max(f64::MIN_POSITIVE));
+            batch_ratios.push(batched / looped.max(f64::MIN_POSITIVE));
+            shared_ratios.push(shared / looped.max(f64::MIN_POSITIVE));
             batched_samples.push(batched);
+            shared_samples.push(shared);
             looped_samples.push(looped);
         }
-        ratios.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        batch_ratios.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        shared_ratios.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
         let batched = median(batched_samples);
+        let shared = median(shared_samples);
         let looped = median(looped_samples);
         println!(
-            "{threads:<10}{:>18.4}{:>18.4}{:>11.2}x{:>13.2}..{:.2}x",
+            "{threads:<10}{:>18.4}{:>18.4}{:>18.4}{:>11.2}x{:>11.2}x",
             batched / 1e6,
+            shared / 1e6,
             looped / 1e6,
-            ratios[ratios.len() / 2],
-            ratios[0],
-            ratios[ratios.len() - 1]
+            batch_ratios[batch_ratios.len() / 2],
+            shared_ratios[shared_ratios.len() / 2]
         );
     }
     println!(
-        "\nA batch API that cannot beat the loop it replaces is not earning its\n\
-         keep. The batch/loop column is the one that decides that."
+        "\nThe shared column is the retrieval-shaped path: immutable cached bytes\n\
+         are returned by shared buffer instead of copied into a new Vec."
     );
 }
