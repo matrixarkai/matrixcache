@@ -100,6 +100,26 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
     metric(&mut out, "matrixcache_pmem_bytes", "Bytes resident in the persistent-memory tier", "gauge", &tags, stats.pmem_bytes);
     metric(&mut out, "matrixcache_disk_bytes", "Bytes resident on SSD", "gauge", &tags, stats.disk_bytes);
 
+    let total_hits = stats
+        .memory_hits
+        .saturating_add(stats.pmem_hits)
+        .saturating_add(stats.disk_hits);
+    let total_requests = total_hits.saturating_add(stats.misses);
+    let total_ops = total_requests.saturating_add(stats.puts);
+    let resident_bytes = stats
+        .memory_bytes
+        .saturating_add(stats.pmem_bytes)
+        .saturating_add(stats.disk_bytes);
+    metric(&mut out, "matrixcache_total_hits", "Reads served from any cache tier", "counter", &tags, total_hits);
+    metric(&mut out, "matrixcache_total_requests", "Cache read requests across hits and misses", "counter", &tags, total_requests);
+    metric(&mut out, "matrixcache_total_operations", "Cache reads plus writes", "counter", &tags, total_ops);
+    metric(&mut out, "matrixcache_resident_bytes", "Bytes resident across memory, PMEM and SSD tiers", "gauge", &tags, resident_bytes);
+    metric_f64(&mut out, "matrixcache_hit_rate_ratio", "Read hit ratio across all cache tiers", "gauge", &tags, ratio(total_hits, total_requests));
+    metric_f64(&mut out, "matrixcache_memory_hit_share_ratio", "Share of hits served by memory", "gauge", &tags, ratio(stats.memory_hits, total_hits));
+    metric_f64(&mut out, "matrixcache_total_ops_per_resident_mib", "Cumulative cache operations per resident MiB", "gauge", &tags, per_resident_mib(total_ops, resident_bytes));
+    metric_f64(&mut out, "matrixcache_evictions_per_resident_mib", "Cumulative tier evictions per resident MiB", "gauge", &tags, per_resident_mib(stats.memory_evictions.saturating_add(stats.pmem_evictions).saturating_add(stats.ssd_evictions), resident_bytes));
+    metric_f64(&mut out, "matrixcache_writeback_queue_bytes_per_resident_mib", "Async writeback queue bytes per resident MiB", "gauge", &tags, per_resident_mib(stats.async_writeback_queue_bytes, resident_bytes));
+
     // get latency
     let _ = writeln!(out, "# HELP matrixcache_get_latency_seconds get latency");
     let _ = writeln!(out, "# TYPE matrixcache_get_latency_seconds histogram");
@@ -368,6 +388,22 @@ fn average_seconds(total_micros: u64, samples: u64) -> f64 {
         0.0
     } else {
         total_micros as f64 / samples as f64 / 1_000_000.0
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn per_resident_mib(value: u64, resident_bytes: u64) -> f64 {
+    if resident_bytes == 0 {
+        0.0
+    } else {
+        value as f64 / (resident_bytes as f64 / (1024.0 * 1024.0))
     }
 }
 

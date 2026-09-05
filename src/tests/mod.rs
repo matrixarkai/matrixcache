@@ -15247,6 +15247,20 @@ mod tests {
             text.contains("matrixcache_memory_hits{cache=\"unit\"} 64"),
             "hits should be exported and labelled:\n{text}"
         );
+        for metric in [
+            "matrixcache_total_hits{cache=\"unit\"} 64",
+            "matrixcache_total_requests{cache=\"unit\"} 65",
+            "matrixcache_total_operations{cache=\"unit\"} 129",
+            "matrixcache_resident_bytes{cache=\"unit\"} 8192",
+            "matrixcache_hit_rate_ratio{cache=\"unit\"} 0.984615",
+            "matrixcache_memory_hit_share_ratio{cache=\"unit\"} 1.000000",
+            "matrixcache_total_ops_per_resident_mib{cache=\"unit\"} 16512.000000",
+        ] {
+            assert!(
+                text.contains(metric),
+                "derived resident-efficiency metric should be exported: {metric}\n{text}"
+            );
+        }
 
         // Histogram buckets are cumulative, and _count must equal +Inf.
         for family in [

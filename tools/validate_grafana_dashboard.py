@@ -18,6 +18,11 @@ DEFAULT_REQUIRED = (
     "matrixcache_memory_bytes",
     "matrixcache_pmem_bytes",
     "matrixcache_disk_bytes",
+    "matrixcache_resident_bytes",
+    "matrixcache_total_ops_per_resident_mib",
+    "matrixcache_evictions_per_resident_mib",
+    "matrixcache_hit_rate_ratio",
+    "matrixcache_memory_hit_share_ratio",
     "matrixcache_async_writeback_queue_depth",
     "matrixcache_async_writeback_queue_bytes",
     "matrixcache_async_writeback_backpressure_rejections",
@@ -53,6 +58,7 @@ DEFAULT_REQUIRED = (
 )
 DEFAULT_REQUIRED_PANEL_TITLES = (
     "Operation Throughput",
+    "Resident Efficiency",
 )
 
 

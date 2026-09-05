@@ -17,6 +17,9 @@ Two things it does beyond dumping numbers:
   * latency histograms also get direct p50/p95 gauges, so lightweight logs and
     dashboards can show percentile movement without repeating the bucket
     expression in every panel.
+  * derived resident-efficiency gauges expose hit rate, resident bytes, and
+    cumulative operation density without asking every dashboard to repeat the
+    same denominator logic.
 """
 from pathlib import Path
 
@@ -150,6 +153,26 @@ for field in scalars:
                % (metric, help_text, kind(field), field))
 
 out.append("")
+out.append("    let total_hits = stats")
+out.append("        .memory_hits")
+out.append("        .saturating_add(stats.pmem_hits)")
+out.append("        .saturating_add(stats.disk_hits);")
+out.append("    let total_requests = total_hits.saturating_add(stats.misses);")
+out.append("    let total_ops = total_requests.saturating_add(stats.puts);")
+out.append("    let resident_bytes = stats")
+out.append("        .memory_bytes")
+out.append("        .saturating_add(stats.pmem_bytes)")
+out.append("        .saturating_add(stats.disk_bytes);")
+out.append('    metric(&mut out, "matrixcache_total_hits", "Reads served from any cache tier", "counter", &tags, total_hits);')
+out.append('    metric(&mut out, "matrixcache_total_requests", "Cache read requests across hits and misses", "counter", &tags, total_requests);')
+out.append('    metric(&mut out, "matrixcache_total_operations", "Cache reads plus writes", "counter", &tags, total_ops);')
+out.append('    metric(&mut out, "matrixcache_resident_bytes", "Bytes resident across memory, PMEM and SSD tiers", "gauge", &tags, resident_bytes);')
+out.append('    metric_f64(&mut out, "matrixcache_hit_rate_ratio", "Read hit ratio across all cache tiers", "gauge", &tags, ratio(total_hits, total_requests));')
+out.append('    metric_f64(&mut out, "matrixcache_memory_hit_share_ratio", "Share of hits served by memory", "gauge", &tags, ratio(stats.memory_hits, total_hits));')
+out.append('    metric_f64(&mut out, "matrixcache_total_ops_per_resident_mib", "Cumulative cache operations per resident MiB", "gauge", &tags, per_resident_mib(total_ops, resident_bytes));')
+out.append('    metric_f64(&mut out, "matrixcache_evictions_per_resident_mib", "Cumulative tier evictions per resident MiB", "gauge", &tags, per_resident_mib(stats.memory_evictions.saturating_add(stats.pmem_evictions).saturating_add(stats.ssd_evictions), resident_bytes));')
+out.append('    metric_f64(&mut out, "matrixcache_writeback_queue_bytes_per_resident_mib", "Async writeback queue bytes per resident MiB", "gauge", &tags, per_resident_mib(stats.async_writeback_queue_bytes, resident_bytes));')
+out.append("")
 for family, total, mx in LATENCY_FAMILIES:
     metric = "matrixcache_%s_seconds" % family
     pretty = family.replace("_latency", "").replace("_", " ")
@@ -232,6 +255,22 @@ out.append("    if samples == 0 {")
 out.append("        0.0")
 out.append("    } else {")
 out.append("        total_micros as f64 / samples as f64 / 1_000_000.0")
+out.append("    }")
+out.append("}")
+out.append("")
+out.append("fn ratio(numerator: u64, denominator: u64) -> f64 {")
+out.append("    if denominator == 0 {")
+out.append("        0.0")
+out.append("    } else {")
+out.append("        numerator as f64 / denominator as f64")
+out.append("    }")
+out.append("}")
+out.append("")
+out.append("fn per_resident_mib(value: u64, resident_bytes: u64) -> f64 {")
+out.append("    if resident_bytes == 0 {")
+out.append("        0.0")
+out.append("    } else {")
+out.append("        value as f64 / (resident_bytes as f64 / (1024.0 * 1024.0))")
 out.append("    }")
 out.append("}")
 out.append("")
