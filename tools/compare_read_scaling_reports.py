@@ -127,7 +127,7 @@ def main() -> int:
     args = parse_args()
     baseline = load(args.baseline)
     current = load(args.current)
-    for field in ("max_entries", "value_bytes", "repeats", "shards"):
+    for field in ("max_entries", "value_bytes", "repeats", "read_trials", "per_thread_ops", "shards"):
         if baseline.get(field) != current.get(field):
             fail(f"{field} differs: baseline={baseline.get(field)!r} current={current.get(field)!r}")
 

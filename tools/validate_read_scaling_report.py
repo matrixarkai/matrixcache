@@ -15,6 +15,8 @@ REQUIRED_TOP_LEVEL = {
     "max_entries": int,
     "value_bytes": int,
     "repeats": int,
+    "read_trials": int,
+    "per_thread_ops": int,
     "shards": int,
     "hit_costs": list,
     "thread_scaling": list,
@@ -62,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-worst-sharded-speedup", type=float)
     parser.add_argument("--max-first-hit-ns", type=float)
     parser.add_argument("--min-repeats", type=int, default=1)
+    parser.add_argument("--min-read-trials", type=int, default=1)
+    parser.add_argument("--min-per-thread-ops", type=int, default=1)
     return parser.parse_args()
 
 
@@ -131,6 +135,13 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail("max_entries and value_bytes must be positive")
     if data["repeats"] < args.min_repeats:
         fail(f"repeats={data['repeats']} below minimum {args.min_repeats}")
+    if data["read_trials"] < args.min_read_trials:
+        fail(f"read_trials={data['read_trials']} below minimum {args.min_read_trials}")
+    if data["per_thread_ops"] < args.min_per_thread_ops:
+        fail(
+            f"per_thread_ops={data['per_thread_ops']} below minimum "
+            f"{args.min_per_thread_ops}"
+        )
     if data["shards"] <= 0:
         fail("shards must be positive")
     if len(data["hit_costs"]) < args.min_hit_costs:
@@ -183,6 +194,8 @@ def main() -> int:
         f"hit_costs={len(data['hit_costs'])} thread_rows={len(data['thread_scaling'])} "
         f"max_threads={max(row['threads'] for row in data['thread_scaling'])} "
         f"repeats={data['repeats']} "
+        f"read_trials={data['read_trials']} "
+        f"per_thread_ops={data['per_thread_ops']} "
         f"best_sharded_mops={float(summary['best_sharded_mops']):.2f} "
         f"worst_speedup={float(summary['worst_sharded_speedup']):.2f}x "
         f"first_hit_ns={float(summary['first_hit_ns_per_op']):.1f}"

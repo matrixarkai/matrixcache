@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 const VALUE_BYTES: usize = 64;
 const REPEATS: usize = 5;
 const SHARDS: usize = 16;
+const READ_TRIALS: usize = 3;
+const PER_THREAD_OPS: usize = 40_000;
 
 fn bench_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("matrixcache-scaling-{name}"))
@@ -97,16 +99,15 @@ fn read_throughput(entries: usize, threads: usize) -> f64 {
         cache.put(key.clone(), value.clone()).expect("put");
     }
 
-    let per_thread = 40_000usize;
     let mut best = f64::MAX;
-    for _ in 0..3 {
+    for _ in 0..READ_TRIALS {
         let started = Instant::now();
         std::thread::scope(|scope| {
             for thread in 0..threads {
                 let cache = &cache;
                 let keys = &keys;
                 scope.spawn(move || {
-                    for index in 0..per_thread {
+                    for index in 0..PER_THREAD_OPS {
                         // Offset per thread so readers are not in lockstep.
                         let slot = scattered(index + thread * 7919, keys.len());
                         let _ = cache.get(&keys[slot]).expect("get");
@@ -114,7 +115,7 @@ fn read_throughput(entries: usize, threads: usize) -> f64 {
                 });
             }
         });
-        best = best.min(ns_per_op(started.elapsed(), per_thread * threads));
+        best = best.min(ns_per_op(started.elapsed(), PER_THREAD_OPS * threads));
     }
     let _ = std::fs::remove_dir_all(&dir);
     best
@@ -166,15 +167,14 @@ fn drive_readers<F>(threads: usize, keys: &[CacheKey], read: F) -> f64
 where
     F: Fn(&CacheKey) + Sync,
 {
-    let per_thread = 40_000usize;
     let mut best = f64::MAX;
-    for _ in 0..3 {
+    for _ in 0..READ_TRIALS {
         let started = Instant::now();
         std::thread::scope(|scope| {
             for thread in 0..threads {
                 let read = &read;
                 scope.spawn(move || {
-                    for index in 0..per_thread {
+                    for index in 0..PER_THREAD_OPS {
                         // Offset per thread so readers are not in lockstep.
                         let slot = scattered(index + thread * 7919, keys.len());
                         read(&keys[slot]);
@@ -182,7 +182,7 @@ where
                 });
             }
         });
-        best = best.min(ns_per_op(started.elapsed(), per_thread * threads));
+        best = best.min(ns_per_op(started.elapsed(), PER_THREAD_OPS * threads));
     }
     best
 }
@@ -243,6 +243,8 @@ fn write_json_report(
     writeln!(&mut report, "  \"max_entries\": {max_entries},").expect("format report");
     writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
     writeln!(&mut report, "  \"repeats\": {REPEATS},").expect("format report");
+    writeln!(&mut report, "  \"read_trials\": {READ_TRIALS},").expect("format report");
+    writeln!(&mut report, "  \"per_thread_ops\": {PER_THREAD_OPS},").expect("format report");
     writeln!(&mut report, "  \"shards\": {SHARDS},").expect("format report");
     writeln!(
         &mut report,
