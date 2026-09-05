@@ -78,6 +78,7 @@ jobs:
           tools/validate_backend_report.py /tmp/matrixcache-backend-compat.json \
             --expect-backend file-compat \
             --min-iterations 500 \
+            --min-replacement-soak-iterations 128 \
             --min-cold-ssd-refills 1 \
             --max-refill-failures 0
 

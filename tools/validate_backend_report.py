@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
         help="Require a specific backend value",
     )
     parser.add_argument("--min-iterations", type=int)
+    parser.add_argument("--min-replacement-soak-iterations", type=int)
     parser.add_argument("--min-cold-ssd-refills", type=int)
     parser.add_argument("--max-refill-failures", type=int)
     parser.add_argument("--max-hot-get-p99-us", type=int)
@@ -190,6 +191,15 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail("iterations must be positive")
     if args.min_iterations is not None and data["iterations"] < args.min_iterations:
         fail(f"iterations={data['iterations']} below {args.min_iterations}")
+    if (
+        args.min_replacement_soak_iterations is not None
+        and data["replacement_soak_iterations"] < args.min_replacement_soak_iterations
+    ):
+        fail(
+            "replacement_soak_iterations="
+            f"{data['replacement_soak_iterations']} below "
+            f"{args.min_replacement_soak_iterations}"
+        )
     if args.min_cold_ssd_refills is not None and data["cold_ssd_refills"] < args.min_cold_ssd_refills:
         fail(f"cold_ssd_refills={data['cold_ssd_refills']} below {args.min_cold_ssd_refills}")
     if args.max_refill_failures is not None and data["refill_failures"] > args.max_refill_failures:
@@ -220,6 +230,7 @@ def main() -> int:
         "OK matrixcache backend report: "
         f"backend={data['backend']} iterations={data['iterations']} "
         f"hot_get_p99={data['hot_get']['p99_us']}us "
+        f"replacement_soak_iterations={data['replacement_soak_iterations']} "
         f"cold_refill_p99={data['cold_ssd_refill_get']['p99_us']}us "
         f"cold_refills={data['cold_ssd_refills']}"
     )
