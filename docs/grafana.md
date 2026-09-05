@@ -101,6 +101,16 @@ tools/validate_batch_control_report.py /tmp/matrixcache-batch-control.json --min
 tools/compare_batch_control_reports.py /tmp/matrixcache-batch-control-baseline.json /tmp/matrixcache-batch-control.json --max-ns-regression 1.35 --min-counter-ratio 0.95
 ```
 
+For memory-read scale checks, archive `cache_scaling_bench` too. This report
+keeps the single-lock and sharded read paths in one schema so CI and Grafana
+archives can track whether sharding is still buying lower latency under
+concurrency:
+
+```bash
+cargo run --release --no-default-features --example cache_scaling_bench -- 4096 --json-output /tmp/matrixcache-read-scaling.json --require-passed --min-sharded-speedup 0.25 --max-single-thread-ns 1000000
+tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json --min-hit-costs 1 --min-thread-rows 4 --min-worst-sharded-speedup 0.25 --max-first-hit-ns 1000000
+```
+
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash

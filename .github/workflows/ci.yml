@@ -86,6 +86,20 @@ jobs:
             /tmp/matrixcache-batch-control.json \
             /tmp/matrixcache-batch-control.json
 
+      - name: Read scaling report smoke
+        run: |
+          cargo run --locked --no-default-features --example cache_scaling_bench -- \
+            1024 \
+            --json-output /tmp/matrixcache-read-scaling.json \
+            --require-passed \
+            --min-sharded-speedup 0.25 \
+            --max-single-thread-ns 1000000
+          tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json \
+            --min-hit-costs 1 \
+            --min-thread-rows 4 \
+            --min-worst-sharded-speedup 0.25 \
+            --max-first-hit-ns 1000000
+
       - name: Doc
         run: cargo doc --no-deps --locked
 

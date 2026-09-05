@@ -26,13 +26,17 @@
 //! ```text
 //! cargo run --release --example cache_scaling_bench
 //! cargo run --release --example cache_scaling_bench -- 8192
+//! cargo run --release --no-default-features --example cache_scaling_bench -- 1024 --json-output /tmp/matrixcache-read-scaling.json --require-passed
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache, ShardedMultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const VALUE_BYTES: usize = 64;
 const REPEATS: usize = 5;
+const SHARDS: usize = 16;
 
 fn bench_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("matrixcache-scaling-{name}"))
@@ -183,9 +187,199 @@ where
     best
 }
 
+#[derive(Clone, Copy)]
+struct ThreadScalingRow {
+    threads: usize,
+    single_lock_ns_per_op: f64,
+    sharded_ns_per_op: f64,
+    single_lock_mops: f64,
+    sharded_mops: f64,
+    speedup: f64,
+}
+
+fn mops_from_ns(ns: f64) -> f64 {
+    if ns > 0.0 {
+        1_000.0 / ns
+    } else {
+        0.0
+    }
+}
+
+fn option_f64_json(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn option_path_json(path: Option<&PathBuf>) -> String {
+    path.map(|path| format!("\"{}\"", path.display()))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn write_json_report(
+    path: Option<&PathBuf>,
+    max_entries: usize,
+    hit_costs: &[(usize, f64)],
+    rows: &[ThreadScalingRow],
+    min_sharded_speedup: Option<f64>,
+    max_single_thread_ns: Option<f64>,
+    passed: bool,
+) -> String {
+    let mut report = String::new();
+    let best_sharded_mops = rows
+        .iter()
+        .map(|row| row.sharded_mops)
+        .fold(0.0_f64, f64::max);
+    let worst_speedup = rows.iter().map(|row| row.speedup).fold(f64::MAX, f64::min);
+    let worst_speedup = if rows.is_empty() { 0.0 } else { worst_speedup };
+    let first_hit_ns = hit_costs.first().map(|(_, ns)| *ns).unwrap_or(0.0);
+    let last_hit_ns = hit_costs.last().map(|(_, ns)| *ns).unwrap_or(0.0);
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_read_scaling_v1\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"max_entries\": {max_entries},").expect("format report");
+    writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+    writeln!(&mut report, "  \"repeats\": {REPEATS},").expect("format report");
+    writeln!(&mut report, "  \"shards\": {SHARDS},").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"min_sharded_speedup\": {},",
+        option_f64_json(min_sharded_speedup)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"max_single_thread_ns\": {},",
+        option_f64_json(max_single_thread_ns)
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"hit_costs\": [").expect("format report");
+    for (index, (entries, ns)) in hit_costs.iter().enumerate() {
+        let comma = if index + 1 == hit_costs.len() {
+            ""
+        } else {
+            ","
+        };
+        writeln!(
+            &mut report,
+            "    {{\"entries\": {entries}, \"ns_per_op\": {ns:.4}}}{comma}"
+        )
+        .expect("format report");
+    }
+    writeln!(&mut report, "  ],").expect("format report");
+    writeln!(&mut report, "  \"thread_scaling\": [").expect("format report");
+    for (index, row) in rows.iter().enumerate() {
+        let comma = if index + 1 == rows.len() { "" } else { "," };
+        writeln!(
+            &mut report,
+            "    {{\"threads\": {}, \"single_lock_ns_per_op\": {:.4}, \"sharded_ns_per_op\": {:.4}, \"single_lock_mops\": {:.4}, \"sharded_mops\": {:.4}, \"speedup\": {:.4}}}{comma}",
+            row.threads,
+            row.single_lock_ns_per_op,
+            row.sharded_ns_per_op,
+            row.single_lock_mops,
+            row.sharded_mops,
+            row.speedup
+        )
+        .expect("format report");
+    }
+    writeln!(&mut report, "  ],").expect("format report");
+    writeln!(&mut report, "  \"summary\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"first_hit_ns_per_op\": {first_hit_ns:.4},"
+    )
+    .expect("format report");
+    writeln!(&mut report, "    \"last_hit_ns_per_op\": {last_hit_ns:.4},").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"best_sharded_mops\": {best_sharded_mops:.4},"
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"worst_sharded_speedup\": {worst_speedup:.4},"
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"output_path\": {}",
+        option_path_json(path)
+    )
+    .expect("format report");
+    writeln!(&mut report, "  }},").expect("format report");
+    writeln!(&mut report, "  \"checks\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"has_hit_costs\": {},",
+        !hit_costs.is_empty()
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"has_thread_scaling\": {},",
+        !rows.is_empty()
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_speedup_within_budget\": {},",
+        min_sharded_speedup
+            .map(|limit| worst_speedup >= limit)
+            .unwrap_or(true)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"single_thread_hit_within_budget\": {}",
+        max_single_thread_ns
+            .map(|limit| first_hit_ns <= limit)
+            .unwrap_or(true)
+    )
+    .expect("format report");
+    writeln!(&mut report, "  }},").expect("format report");
+    writeln!(&mut report, "  \"passed\": {passed}").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+    if let Some(path) = path {
+        std::fs::write(path, &report).expect("write json report");
+    }
+    report
+}
+
 fn main() {
-    let max_entries: usize = std::env::args()
-        .nth(1)
+    let mut positional = Vec::new();
+    let mut emit_json = false;
+    let mut json_output: Option<PathBuf> = None;
+    let mut require_passed = false;
+    let mut min_sharded_speedup: Option<f64> = None;
+    let mut max_single_thread_ns: Option<f64> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => emit_json = true,
+            "--json-output" => {
+                json_output = args.next().map(PathBuf::from);
+            }
+            "--require-passed" => require_passed = true,
+            "--min-sharded-speedup" => {
+                min_sharded_speedup = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
+            }
+            "--max-single-thread-ns" => {
+                max_single_thread_ns = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let max_entries: usize = positional
+        .first()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4_096);
 
@@ -194,9 +388,12 @@ fn main() {
 
     println!("memory-tier hit, single thread");
     println!("{:>10} {:>14}", "entries", "ns/op");
+    let mut hit_costs = Vec::new();
     let mut size = 1_024usize;
     while size <= max_entries {
-        println!("{size:>10} {:>14.1}", hit_cost(size));
+        let ns = hit_cost(size);
+        hit_costs.push((size, ns));
+        println!("{size:>10} {ns:>14.1}");
         size *= 4;
     }
 
@@ -215,20 +412,57 @@ fn main() {
         "{:>10} {:>14} {:>14} {:>10}",
         "threads", "single", "sharded", "speedup"
     );
+    let mut rows = Vec::new();
     for &threads in &[1usize, 2, 4, 8] {
         let single_ns = single_lock_throughput(max_entries, threads);
-        let sharded_ns = sharded_throughput(max_entries, threads, 16);
-        let single = if single_ns > 0.0 {
-            1_000.0 / single_ns
-        } else {
-            0.0
-        };
-        let sharded = if sharded_ns > 0.0 {
-            1_000.0 / sharded_ns
-        } else {
-            0.0
-        };
+        let sharded_ns = sharded_throughput(max_entries, threads, SHARDS);
+        let single = mops_from_ns(single_ns);
+        let sharded = mops_from_ns(sharded_ns);
         let speedup = if single > 0.0 { sharded / single } else { 0.0 };
+        rows.push(ThreadScalingRow {
+            threads,
+            single_lock_ns_per_op: single_ns,
+            sharded_ns_per_op: sharded_ns,
+            single_lock_mops: single,
+            sharded_mops: sharded,
+            speedup,
+        });
         println!("{threads:>10} {single:>14.2} {sharded:>14.2} {speedup:>9.2}x");
+    }
+
+    let first_hit_ns = hit_costs.first().map(|(_, ns)| *ns).unwrap_or(0.0);
+    let worst_speedup = rows.iter().map(|row| row.speedup).fold(f64::MAX, f64::min);
+    let worst_speedup = if rows.is_empty() { 0.0 } else { worst_speedup };
+    let passed = !hit_costs.is_empty()
+        && !rows.is_empty()
+        && min_sharded_speedup
+            .map(|limit| worst_speedup >= limit)
+            .unwrap_or(true)
+        && max_single_thread_ns
+            .map(|limit| first_hit_ns <= limit)
+            .unwrap_or(true);
+    if emit_json || json_output.is_some() || require_passed {
+        let report = write_json_report(
+            json_output.as_ref(),
+            max_entries,
+            &hit_costs,
+            &rows,
+            min_sharded_speedup,
+            max_single_thread_ns,
+            passed,
+        );
+        if emit_json {
+            print!("{report}");
+        }
+        if let Some(path) = &json_output {
+            println!("wrote {}", path.display());
+        }
+        println!(
+            "read scaling gate: {}",
+            if passed { "passed" } else { "failed" }
+        );
+        if require_passed && !passed {
+            std::process::exit(1);
+        }
     }
 }
