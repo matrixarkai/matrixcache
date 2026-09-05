@@ -80,6 +80,10 @@ jobs:
             --min-iterations 500 \
             --min-replacement-soak-iterations 128 \
             --min-cold-ssd-refills 1 \
+            --min-memory-evictions 1 \
+            --min-pmem-evictions 1 \
+            --min-disk-fills 1 \
+            --min-async-writeback-backpressure 1 \
             --max-refill-failures 0
 
       - name: Batch control report smoke

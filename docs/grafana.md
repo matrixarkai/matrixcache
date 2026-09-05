@@ -161,7 +161,7 @@ For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash
 cargo run --release --example rocksdb_backend_bench -- --iterations 5000 --json-output /tmp/matrixcache-rocksdb-backend.json --require-passed
-tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --max-refill-failures 0
+tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --min-memory-evictions 1 --min-pmem-evictions 1 --min-disk-fills 1 --min-async-writeback-backpressure 1 --max-refill-failures 0
 ```
 
 CI also runs the same report contract against the file-backed compatibility
@@ -172,6 +172,7 @@ replacement-soak evidence also records max latency for read-through, refill,
 writeback, eviction, and compaction so backend pressure runs carry the same
 tail-latency signal as the Prometheus dashboard.
 The backend validator also enforces a minimum replacement-soak iteration count, so SSD-cache evidence cannot pass from a short run that only exercised the hot/cold refill shape.
+It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement.
 
 
 ## Scale Report Pairing

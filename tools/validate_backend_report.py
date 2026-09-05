@@ -87,6 +87,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-iterations", type=int)
     parser.add_argument("--min-replacement-soak-iterations", type=int)
     parser.add_argument("--min-cold-ssd-refills", type=int)
+    parser.add_argument("--min-memory-evictions", type=int)
+    parser.add_argument("--min-pmem-evictions", type=int)
+    parser.add_argument("--min-disk-fills", type=int)
+    parser.add_argument("--min-async-writeback-backpressure", type=int)
     parser.add_argument("--max-refill-failures", type=int)
     parser.add_argument("--max-hot-get-p99-us", type=int)
     parser.add_argument("--max-cold-refill-p99-us", type=int)
@@ -202,6 +206,21 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.min_cold_ssd_refills is not None and data["cold_ssd_refills"] < args.min_cold_ssd_refills:
         fail(f"cold_ssd_refills={data['cold_ssd_refills']} below {args.min_cold_ssd_refills}")
+    if args.min_memory_evictions is not None and data["memory_evictions"] < args.min_memory_evictions:
+        fail(f"memory_evictions={data['memory_evictions']} below {args.min_memory_evictions}")
+    if args.min_pmem_evictions is not None and data["pmem_evictions"] < args.min_pmem_evictions:
+        fail(f"pmem_evictions={data['pmem_evictions']} below {args.min_pmem_evictions}")
+    if args.min_disk_fills is not None and data["disk_fills"] < args.min_disk_fills:
+        fail(f"disk_fills={data['disk_fills']} below {args.min_disk_fills}")
+    if (
+        args.min_async_writeback_backpressure is not None
+        and data["async_writeback_backpressure"] < args.min_async_writeback_backpressure
+    ):
+        fail(
+            "async_writeback_backpressure="
+            f"{data['async_writeback_backpressure']} below "
+            f"{args.min_async_writeback_backpressure}"
+        )
     if args.max_refill_failures is not None and data["refill_failures"] > args.max_refill_failures:
         fail(f"refill_failures={data['refill_failures']} exceeds {args.max_refill_failures}")
 
@@ -232,6 +251,10 @@ def main() -> int:
         f"hot_get_p99={data['hot_get']['p99_us']}us "
         f"replacement_soak_iterations={data['replacement_soak_iterations']} "
         f"cold_refill_p99={data['cold_ssd_refill_get']['p99_us']}us "
+        f"memory_evictions={data['memory_evictions']} "
+        f"pmem_evictions={data['pmem_evictions']} "
+        f"disk_fills={data['disk_fills']} "
+        f"async_writeback_backpressure={data['async_writeback_backpressure']} "
         f"cold_refills={data['cold_ssd_refills']}"
     )
     return 0
