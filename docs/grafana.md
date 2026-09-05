@@ -46,7 +46,8 @@ tools/validate_grafana_dashboard.py
 
 The validator compares panel PromQL metric names against the generated
 `prometheus_text` exporter and also requires the core memory, tier movement,
-writeback, read-path, eviction, and sharded-batch latency panels.
+writeback, read-path, eviction, sharded-batch latency, and latency sample
+coverage panels.
 
 The dashboard uses the generated metric
 families directly, including:
@@ -61,6 +62,9 @@ families directly, including:
   `matrixcache_sharded_batch_latency_p95_seconds`, and `matrixcache_sharded_batch_latency_p99_seconds`
 - p50, p95, p99, and average latency for get, put, read-through, refill, writeback,
   and eviction
+- Prometheus histogram sample counts for get, put, read-through, refill,
+  writeback, eviction, and compaction, so soak dashboards show whether the run
+  actually exercised every cache path being compared
 
 
 The `soak` example can also emit JSON with optional scale gates for hit rate
