@@ -76,7 +76,7 @@ observed latency for those operational paths so tail spikes stay visible
 outside Prometheus:
 
 ```text
-cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80
+cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-total-qps 1000 --min-read-qps 500 --min-write-qps 1
 ```
 
 Add `--require-passed` when an automated scale gate should exit nonzero after
@@ -84,7 +84,7 @@ the JSON report names the failing check. Add `--json-output <path>` when the
 same report should be archived without scraping the console stream:
 
 ```bash
-cargo run --release --no-default-features --example soak -- 10 8 --json-output /tmp/matrixcache-soak.json --require-passed --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80
+cargo run --release --no-default-features --example soak -- 10 8 --json-output /tmp/matrixcache-soak.json --require-passed --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-total-qps 1000 --min-read-qps 500 --min-write-qps 1
 ```
 
 Validate archived reports before publishing or comparing them. The validator
@@ -92,7 +92,7 @@ requires the operational max-latency fields so old archives cannot silently pass
 as current soak evidence:
 
 ```bash
-tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-read-through-samples 100000 --min-refill-samples 1 --min-writeback-samples 1 --min-eviction-samples 1 --min-compaction-samples 1
+tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-total-qps 1000 --min-read-qps 500 --min-write-qps 1 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-read-through-samples 100000 --min-refill-samples 1 --min-writeback-samples 1 --min-eviction-samples 1 --min-compaction-samples 1
 ```
 
 Compare a current archive with a known-good baseline before accepting a scale
@@ -106,8 +106,10 @@ refill, writeback, eviction, or compaction work:
 tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --max-operation-p99-regression 1.25 --max-operation-max-regression 1.50 --min-throughput-ratio 0.95 --min-sample-ratio 0.90
 ```
 
-The JSON report keeps memory-bound checks separate from optional latency and hit-rate
-budgets so a scale run can fail for the exact reason that moved.
+The JSON report keeps memory-bound checks separate from optional latency,
+hit-rate, and throughput budgets so a scale run can fail for the exact reason
+that moved. The archived `throughput` object records total, read, and write
+QPS derived from the same duration and operation counters as the run itself.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for

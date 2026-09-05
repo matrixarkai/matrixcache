@@ -24,6 +24,7 @@ REQUIRED_TOP_LEVEL = {
     "peak_memory_bytes": int,
     "observed_hit_rate_percent": (int, float),
     "interval_best_kops": (int, float),
+    "throughput": dict,
     "latency": dict,
     "checks": dict,
     "passed": bool,
@@ -41,7 +42,19 @@ REQUIRED_CHECKS = {
     "eviction_p99_within_budget",
     "compaction_p99_within_budget",
     "hit_rate_within_budget",
+    "total_qps_within_budget",
+    "read_qps_within_budget",
+    "write_qps_within_budget",
 }
+
+REQUIRED_THROUGHPUT = {
+    "total_qps",
+    "read_qps",
+    "write_qps",
+    "duration_seconds",
+}
+
+QPS_RELATIVE_TOLERANCE = 0.01
 
 REQUIRED_LATENCY = {
     "get_p50_us",
@@ -82,6 +95,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-compaction-p99-us", type=int)
     parser.add_argument("--min-reads", type=int, default=1)
     parser.add_argument("--min-writes", type=int, default=0)
+    parser.add_argument("--min-total-qps", type=float)
+    parser.add_argument("--min-read-qps", type=float)
+    parser.add_argument("--min-write-qps", type=float)
     parser.add_argument("--min-memory-evictions", type=int, default=0)
     parser.add_argument("--min-get-samples", type=int, default=1)
     parser.add_argument("--min-put-samples", type=int, default=0)
@@ -127,6 +143,16 @@ def require_numeric_at_most(data: dict[str, Any], field: str, limit: int | None)
         fail(f"{field}={value} exceeds limit {limit}")
 
 
+def require_numeric_at_least(data: dict[str, Any], field: str, minimum: float | None) -> None:
+    if minimum is None:
+        return
+    value = data.get(field)
+    if not isinstance(value, (int, float)):
+        fail(f"throughput field {field!r} must be numeric")
+    if float(value) < minimum:
+        fail(f"{field}={float(value):.4f} below minimum {minimum:.4f}")
+
+
 def validate(args: argparse.Namespace) -> dict[str, Any]:
     data = load_report(args.report)
     for field, expected in REQUIRED_TOP_LEVEL.items():
@@ -145,6 +171,28 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         )
     if data["peak_entries"] < 0 or data["peak_memory_bytes"] < 0:
         fail("peak entry and memory counts must be non-negative")
+
+    throughput = data["throughput"]
+    missing_throughput = REQUIRED_THROUGHPUT.difference(throughput)
+    if missing_throughput:
+        fail(f"missing throughput fields: {', '.join(sorted(missing_throughput))}")
+    for field in REQUIRED_THROUGHPUT:
+        if not isinstance(throughput.get(field), (int, float)):
+            fail(f"throughput field {field!r} must be numeric")
+    duration_seconds = float(throughput["duration_seconds"])
+    if duration_seconds <= 0:
+        fail("throughput.duration_seconds must be positive")
+    expected_read_qps = data["reads"] / duration_seconds
+    expected_write_qps = data["writes"] / duration_seconds
+    expected_total_qps = (data["reads"] + data["writes"]) / duration_seconds
+    for field, expected in (
+        ("read_qps", expected_read_qps),
+        ("write_qps", expected_write_qps),
+        ("total_qps", expected_total_qps),
+    ):
+        reported = float(throughput[field])
+        if abs(reported - expected) > max(0.01, expected * QPS_RELATIVE_TOLERANCE):
+            fail(f"throughput.{field}={reported:.4f} disagrees with report counts")
 
     checks = data["checks"]
     missing_checks = REQUIRED_CHECKS.difference(checks)
@@ -180,6 +228,9 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         observed = float(data["observed_hit_rate_percent"])
         if observed < args.min_hit_rate_percent:
             fail(f"observed_hit_rate_percent={observed:.4f} below {args.min_hit_rate_percent}")
+    require_numeric_at_least(throughput, "total_qps", args.min_total_qps)
+    require_numeric_at_least(throughput, "read_qps", args.min_read_qps)
+    require_numeric_at_least(throughput, "write_qps", args.min_write_qps)
 
     require_numeric_at_most(latency, "get_p99_us", args.max_get_p99_us)
     require_numeric_at_most(latency, "put_p99_us", args.max_put_p99_us)
@@ -197,6 +248,9 @@ def main() -> int:
     print(
         "OK matrixcache soak report: "
         f"reads={data['reads']} writes={data['writes']} "
+        f"total_qps={data['throughput']['total_qps']:.2f} "
+        f"read_qps={data['throughput']['read_qps']:.2f} "
+        f"write_qps={data['throughput']['write_qps']:.2f} "
         f"evictions={data.get('memory_evictions', 0)} "
         f"hit_rate={float(data['observed_hit_rate_percent']):.2f}% "
         f"get_p99={data['latency']['get_p99_us']}us "

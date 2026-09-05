@@ -35,7 +35,7 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--json-output PATH] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--max-read-through-p99-us N] [--max-refill-p99-us N] [--max-writeback-p99-us N] [--max-eviction-p99-us N] [--max-compaction-p99-us N] [--min-hit-rate-percent N]
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--json-output PATH] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--max-read-through-p99-us N] [--max-refill-p99-us N] [--max-writeback-p99-us N] [--max-eviction-p99-us N] [--max-compaction-p99-us N] [--min-hit-rate-percent N] [--min-total-qps N] [--min-read-qps N] [--min-write-qps N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
@@ -76,6 +76,9 @@ fn main() {
     let mut max_eviction_p99_us = None;
     let mut max_compaction_p99_us = None;
     let mut min_hit_rate_percent = None;
+    let mut min_total_qps = None;
+    let mut min_read_qps = None;
+    let mut min_write_qps = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -144,6 +147,24 @@ fn main() {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .filter(|value| (0.0..=100.0).contains(value));
+            }
+            "--min-total-qps" => {
+                min_total_qps = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
+            }
+            "--min-read-qps" => {
+                min_read_qps = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
+            }
+            "--min-write-qps" => {
+                min_write_qps = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
             }
             _ => positional.push(arg),
         }
@@ -336,6 +357,10 @@ fn main() {
         let final_entries = cache.all_entries().len();
         let final_reads = reads.load(Ordering::Relaxed);
         let final_writes = writes.load(Ordering::Relaxed);
+        let duration_secs = total_duration.as_secs_f64().max(0.001);
+        let total_qps = (final_reads + final_writes) as f64 / duration_secs;
+        let read_qps = final_reads as f64 / duration_secs;
+        let write_qps = final_writes as f64 / duration_secs;
         let observed_hit_rate = if stats.memory_hits + stats.misses == 0 {
             0.0
         } else {
@@ -378,6 +403,15 @@ fn main() {
         let hit_rate_within_budget = min_hit_rate_percent
             .map(|budget| observed_hit_rate >= budget)
             .unwrap_or(true);
+        let total_qps_within_budget = min_total_qps
+            .map(|budget| total_qps >= budget)
+            .unwrap_or(true);
+        let read_qps_within_budget = min_read_qps
+            .map(|budget| read_qps >= budget)
+            .unwrap_or(true);
+        let write_qps_within_budget = min_write_qps
+            .map(|budget| write_qps >= budget)
+            .unwrap_or(true);
         let steady_throughput = match (thirds.first(), thirds.last()) {
             _ if thirds.len() < 3 => true,
             (Some((first_best, _)), Some((last_best, _))) if *first_best > 0.0 => {
@@ -395,7 +429,10 @@ fn main() {
             && writeback_p99_within_budget
             && eviction_p99_within_budget
             && compaction_p99_within_budget
-            && hit_rate_within_budget;
+            && hit_rate_within_budget
+            && total_qps_within_budget
+            && read_qps_within_budget
+            && write_qps_within_budget;
 
         let mut report = String::new();
         writeln!(&mut report, "{{").expect("format report");
@@ -465,6 +502,24 @@ fn main() {
             option_f64_json(min_hit_rate_percent)
         )
         .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"min_total_qps\": {},",
+            option_f64_json(min_total_qps)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"min_read_qps\": {},",
+            option_f64_json(min_read_qps)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"min_write_qps\": {},",
+            option_f64_json(min_write_qps)
+        )
+        .expect("format report");
         writeln!(&mut report, "  \"reads\": {final_reads},").expect("format report");
         writeln!(&mut report, "  \"writes\": {final_writes},").expect("format report");
         writeln!(&mut report, "  \"final_entries\": {final_entries},").expect("format report");
@@ -516,6 +571,13 @@ fn main() {
             .expect("format report");
         }
         writeln!(&mut report, "  ],").expect("format report");
+        writeln!(&mut report, "  \"throughput\": {{").expect("format report");
+        writeln!(&mut report, "    \"total_qps\": {total_qps:.4},").expect("format report");
+        writeln!(&mut report, "    \"read_qps\": {read_qps:.4},").expect("format report");
+        writeln!(&mut report, "    \"write_qps\": {write_qps:.4},").expect("format report");
+        writeln!(&mut report, "    \"duration_seconds\": {duration_secs:.4}")
+            .expect("format report");
+        writeln!(&mut report, "  }},").expect("format report");
         writeln!(&mut report, "  \"latency\": {{").expect("format report");
         writeln!(&mut report, "    \"get_count\": {},", latency.get_count).expect("format report");
         writeln!(&mut report, "    \"get_avg_us\": {},", latency.get_avg_us)
@@ -772,7 +834,22 @@ fn main() {
         .expect("format report");
         writeln!(
             &mut report,
-            "    \"hit_rate_within_budget\": {hit_rate_within_budget}"
+            "    \"hit_rate_within_budget\": {hit_rate_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"total_qps_within_budget\": {total_qps_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"read_qps_within_budget\": {read_qps_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"write_qps_within_budget\": {write_qps_within_budget}"
         )
         .expect("format report");
         writeln!(&mut report, "  }},").expect("format report");
