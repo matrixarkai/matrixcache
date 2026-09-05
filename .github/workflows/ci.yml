@@ -112,6 +112,7 @@ jobs:
           tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json \
             --min-hit-costs 1 \
             --min-thread-rows 4 \
+            --min-max-threads 8 \
             --min-worst-sharded-speedup 0.25 \
             --max-first-hit-ns 1000000 \
             --min-repeats 5

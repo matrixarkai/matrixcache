@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-hit-costs", type=int, default=1)
     parser.add_argument("--min-thread-rows", type=int, default=4)
+    parser.add_argument("--min-max-threads", type=int)
     parser.add_argument("--min-best-sharded-mops", type=float)
     parser.add_argument("--min-worst-sharded-speedup", type=float)
     parser.add_argument("--max-first-hit-ns", type=float)
@@ -138,8 +139,12 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"thread row count {len(data['thread_scaling'])} below {args.min_thread_rows}")
     for index, row in enumerate(data["hit_costs"]):
         validate_hit_cost(row, index)
+    max_threads = 0
     for index, row in enumerate(data["thread_scaling"]):
         validate_thread_row(row, index)
+        max_threads = max(max_threads, row["threads"])
+    if args.min_max_threads is not None and max_threads < args.min_max_threads:
+        fail(f"max thread count {max_threads} below {args.min_max_threads}")
 
     checks = data["checks"]
     missing_checks = REQUIRED_CHECKS.difference(checks)
@@ -176,6 +181,7 @@ def main() -> int:
     print(
         "OK matrixcache read-scaling report: "
         f"hit_costs={len(data['hit_costs'])} thread_rows={len(data['thread_scaling'])} "
+        f"max_threads={max(row['threads'] for row in data['thread_scaling'])} "
         f"repeats={data['repeats']} "
         f"best_sharded_mops={float(summary['best_sharded_mops']):.2f} "
         f"worst_speedup={float(summary['worst_sharded_speedup']):.2f}x "

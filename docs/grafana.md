@@ -123,12 +123,13 @@ concurrency:
 
 ```bash
 cargo run --release --no-default-features --example cache_scaling_bench -- 4096 --json-output /tmp/matrixcache-read-scaling.json --require-passed --min-sharded-speedup 0.25 --max-single-thread-ns 1000000
-tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json --min-hit-costs 1 --min-thread-rows 4 --min-worst-sharded-speedup 0.25 --max-first-hit-ns 1000000 --min-repeats 5
+tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json --min-hit-costs 1 --min-thread-rows 4 --min-max-threads 8 --min-worst-sharded-speedup 0.25 --max-first-hit-ns 1000000 --min-repeats 5
 tools/compare_read_scaling_reports.py /tmp/matrixcache-read-scaling-baseline.json /tmp/matrixcache-read-scaling.json --max-latency-regression 1.35 --min-throughput-ratio 0.80
 ```
 
-The read-scaling validator also checks the repeat count, so single lucky
-samples cannot stand in for a real sharded-read comparison.
+The read-scaling validator also checks the repeat count and requires the
+report to reach the eight-reader row, so single lucky samples or truncated
+low-concurrency runs cannot stand in for a real sharded-read comparison.
 
 For low-level hit-path bookkeeping checks, archive `read_path_cost`. This report
 captures the peek, no-promotion, and full read paths plus the measured overhead
