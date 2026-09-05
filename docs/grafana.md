@@ -172,6 +172,7 @@ For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 ```bash
 cargo run --release --example rocksdb_backend_bench -- --iterations 5000 --json-output /tmp/matrixcache-rocksdb-backend.json --require-passed
 tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --min-memory-evictions 1 --min-pmem-evictions 1 --min-disk-fills 1 --min-async-writeback-backpressure 1 --max-refill-failures 0
+tools/compare_backend_reports.py /tmp/matrixcache-rocksdb-backend-baseline.json /tmp/matrixcache-rocksdb-backend.json --max-put-p99-regression 1.35 --max-hot-get-p99-regression 1.35 --max-cold-refill-p99-regression 1.50 --min-put-qps-ratio 0.80 --min-hot-get-qps-ratio 0.80 --min-cold-refill-qps-ratio 0.75 --min-counter-ratio 0.90 --max-replacement-max-regression 1.50
 ```
 
 CI also runs the same report contract against the file-backed compatibility
@@ -181,7 +182,7 @@ full RocksDB native build cost on every tiny backend-report iteration. The
 replacement-soak evidence also records max latency for read-through, refill,
 writeback, eviction, and compaction so backend pressure runs carry the same
 tail-latency signal as the Prometheus dashboard.
-The backend validator also enforces a minimum replacement-soak iteration count, so SSD-cache evidence cannot pass from a short run that only exercised the hot/cold refill shape.
+The backend validator also enforces a minimum replacement-soak iteration count, so SSD-cache evidence cannot pass from a short run that only exercised the hot/cold refill shape. The backend comparator keeps archived runs honest against a baseline by checking workload identity, p99 latency regression, QPS ratios, tier movement counters, refill-failure growth, and replacement-soak max latency.
 It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement.
 
 
