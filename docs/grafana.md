@@ -121,6 +121,12 @@ bytes, and cumulative writes. The validator cross-checks those samples against
 the aggregate interval best/worst and peak memory fields, which makes it much
 harder for a truncated or hand-edited scale archive to hide throughput decay or
 resident-memory growth.
+The soak comparator also consumes `interval_samples`: it checks interval sample
+count, worst sampled interval throughput, and final sampled resident memory in
+addition to aggregate p99, throughput ceiling, and peak memory. Tighten
+`--min-interval-sample-ratio`, `--min-worst-interval-throughput-ratio`, and
+`--max-final-interval-memory-growth` when comparing release soak evidence from
+the same host.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for

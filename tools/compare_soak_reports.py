@@ -72,6 +72,24 @@ def parse_args() -> argparse.Namespace:
             "skipped read-through/refill/writeback/eviction/compaction work."
         ),
     )
+    parser.add_argument(
+        "--min-interval-sample-ratio",
+        type=float,
+        default=0.90,
+        help="Minimum allowed current/baseline ratio for archived interval samples",
+    )
+    parser.add_argument(
+        "--min-worst-interval-throughput-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum allowed current/baseline ratio for the worst sampled interval Kops/s",
+    )
+    parser.add_argument(
+        "--max-final-interval-memory-growth",
+        type=float,
+        default=1.10,
+        help="Maximum allowed current/baseline final interval resident-memory ratio",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +129,31 @@ def latency(data: dict[str, Any], field: str) -> float:
     if not isinstance(value, (int, float)):
         fail(f"latency field {field!r} must be numeric")
     return float(value)
+
+
+def interval_samples(data: dict[str, Any]) -> list[dict[str, Any]]:
+    samples = data.get("interval_samples")
+    if not isinstance(samples, list) or not samples:
+        fail("missing non-empty interval_samples")
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            fail(f"interval_samples[{index}] must be an object")
+    return samples
+
+
+def sample_number(sample: dict[str, Any], field: str) -> float:
+    value = sample.get(field)
+    if not isinstance(value, (int, float)):
+        fail(f"interval sample field {field!r} must be numeric")
+    return float(value)
+
+
+def worst_interval_kops(data: dict[str, Any]) -> float:
+    return min(sample_number(sample, "kops") for sample in interval_samples(data))
+
+
+def final_interval_memory_bytes(data: dict[str, Any]) -> float:
+    return sample_number(interval_samples(data)[-1], "memory_bytes")
 
 
 def ratio(current: float, baseline: float) -> float:
@@ -173,6 +216,18 @@ def main() -> int:
             "compaction_count",
         )
     }
+    interval_sample_ratio = ratio(
+        float(len(interval_samples(current))),
+        float(len(interval_samples(baseline))),
+    )
+    worst_interval_throughput_ratio = ratio(
+        worst_interval_kops(current),
+        worst_interval_kops(baseline),
+    )
+    final_interval_memory_ratio = ratio(
+        final_interval_memory_bytes(current),
+        final_interval_memory_bytes(baseline),
+    )
 
     check_ratio("get p99", get_p99_ratio, args.max_get_p99_regression, "max")
     check_ratio("put p99", put_p99_ratio, args.max_put_p99_regression, "max")
@@ -199,6 +254,24 @@ def main() -> int:
         )
     check_ratio("peak memory", memory_ratio, args.max_memory_growth, "max")
     check_ratio("best throughput", throughput_ratio, args.min_throughput_ratio, "min")
+    check_ratio(
+        "interval sample count",
+        interval_sample_ratio,
+        args.min_interval_sample_ratio,
+        "min",
+    )
+    check_ratio(
+        "worst interval throughput",
+        worst_interval_throughput_ratio,
+        args.min_worst_interval_throughput_ratio,
+        "min",
+    )
+    check_ratio(
+        "final interval memory",
+        final_interval_memory_ratio,
+        args.max_final_interval_memory_growth,
+        "max",
+    )
     if hit_rate_delta < args.min_hit_rate_delta:
         fail(
             f"hit-rate delta {hit_rate_delta:.4f}pp below "
@@ -211,6 +284,9 @@ def main() -> int:
         f"put_p99_ratio={put_p99_ratio:.3f} "
         f"throughput_ratio={throughput_ratio:.3f} "
         f"memory_ratio={memory_ratio:.3f} "
+        f"interval_sample_ratio={interval_sample_ratio:.3f} "
+        f"worst_interval_throughput_ratio={worst_interval_throughput_ratio:.3f} "
+        f"final_interval_memory_ratio={final_interval_memory_ratio:.3f} "
         f"hit_rate_delta={hit_rate_delta:.2f}pp "
         "operation_p99_ratios="
         + ",".join(f"{name}={value:.3f}" for name, value in operation_p99_ratios.items())
