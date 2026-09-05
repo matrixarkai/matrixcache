@@ -47,11 +47,11 @@ FIELDS = cache_stats_fields(STATS)
 LATENCY_FAMILIES = [
     ("get_latency", "get_latency_total_micros", "get_latency_max_micros"),
     ("put_latency", "put_latency_total_micros", "put_latency_max_micros"),
-    ("read_through_latency", "read_through_latency_total_micros", None),
-    ("refill_latency", "refill_latency_total_micros", None),
-    ("writeback_latency", "writeback_latency_total_micros", None),
-    ("eviction_latency", "eviction_latency_total_micros", None),
-    ("compaction_latency", "compaction_latency_total_micros", None),
+    ("read_through_latency", "read_through_latency_total_micros", "read_through_latency_max_micros"),
+    ("refill_latency", "refill_latency_total_micros", "refill_latency_max_micros"),
+    ("writeback_latency", "writeback_latency_total_micros", "writeback_latency_max_micros"),
+    ("eviction_latency", "eviction_latency_total_micros", "eviction_latency_max_micros"),
+    ("compaction_latency", "compaction_latency_total_micros", "compaction_latency_max_micros"),
     ("sharded_batch_latency", "sharded_batch_latency_total_micros", "sharded_batch_latency_max_micros"),
 ]
 BUCKETS = [("le_10us", "1e-05"), ("le_100us", "0.0001"), ("le_1ms", "0.001"),

@@ -779,6 +779,51 @@
           "expr": "matrixcache_writeback_latency_p99_seconds",
           "legendFormat": "writeback p99",
           "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_read_through_latency_max_seconds",
+          "legendFormat": "read-through max",
+          "refId": "I"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_refill_latency_max_seconds",
+          "legendFormat": "refill max",
+          "refId": "J"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_eviction_latency_max_seconds",
+          "legendFormat": "eviction max",
+          "refId": "K"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_writeback_latency_max_seconds",
+          "legendFormat": "writeback max",
+          "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "matrixcache_compaction_latency_max_seconds",
+          "legendFormat": "compaction max",
+          "refId": "M"
         }
       ],
       "title": "Tier Movement Latency",

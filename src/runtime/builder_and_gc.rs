@@ -2437,6 +2437,8 @@ impl CacheInner {
             .stats
             .writeback_latency_total_micros
             .saturating_add(micros);
+        self.stats.writeback_latency_max_micros =
+            self.stats.writeback_latency_max_micros.max(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.writeback_latency_samples,
@@ -2454,6 +2456,8 @@ impl CacheInner {
             .stats
             .eviction_latency_total_micros
             .saturating_add(micros);
+        self.stats.eviction_latency_max_micros =
+            self.stats.eviction_latency_max_micros.max(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.eviction_latency_samples,
@@ -2470,6 +2474,8 @@ impl CacheInner {
             .stats
             .compaction_latency_total_micros
             .saturating_add(micros);
+        self.stats.compaction_latency_max_micros =
+            self.stats.compaction_latency_max_micros.max(micros);
         observe_latency_bucket(
             micros,
             &mut self.stats.compaction_latency_samples,

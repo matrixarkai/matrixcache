@@ -4384,6 +4384,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         put_latency_gt_10ms,
         read_through_latency_samples,
         read_through_latency_total_micros,
+        read_through_latency_max_micros,
         read_through_latency_le_10us,
         read_through_latency_le_100us,
         read_through_latency_le_1ms,
@@ -4391,6 +4392,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         read_through_latency_gt_10ms,
         refill_latency_samples,
         refill_latency_total_micros,
+        refill_latency_max_micros,
         refill_latency_le_10us,
         refill_latency_le_100us,
         refill_latency_le_1ms,
@@ -4398,6 +4400,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         refill_latency_gt_10ms,
         writeback_latency_samples,
         writeback_latency_total_micros,
+        writeback_latency_max_micros,
         writeback_latency_le_10us,
         writeback_latency_le_100us,
         writeback_latency_le_1ms,
@@ -4405,6 +4408,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         writeback_latency_gt_10ms,
         eviction_latency_samples,
         eviction_latency_total_micros,
+        eviction_latency_max_micros,
         eviction_latency_le_10us,
         eviction_latency_le_100us,
         eviction_latency_le_1ms,
@@ -4412,6 +4416,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         eviction_latency_gt_10ms,
         compaction_latency_samples,
         compaction_latency_total_micros,
+        compaction_latency_max_micros,
         compaction_latency_le_10us,
         compaction_latency_le_100us,
         compaction_latency_le_1ms,
@@ -4553,6 +4558,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.put_latency_gt_10ms = total.put_latency_gt_10ms.saturating_add(put_latency_gt_10ms);
     total.read_through_latency_samples = total.read_through_latency_samples.saturating_add(read_through_latency_samples);
     total.read_through_latency_total_micros = total.read_through_latency_total_micros.saturating_add(read_through_latency_total_micros);
+    total.read_through_latency_max_micros = total
+        .read_through_latency_max_micros
+        .max(read_through_latency_max_micros);
     total.read_through_latency_le_10us = total.read_through_latency_le_10us.saturating_add(read_through_latency_le_10us);
     total.read_through_latency_le_100us = total.read_through_latency_le_100us.saturating_add(read_through_latency_le_100us);
     total.read_through_latency_le_1ms = total.read_through_latency_le_1ms.saturating_add(read_through_latency_le_1ms);
@@ -4560,6 +4568,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.read_through_latency_gt_10ms = total.read_through_latency_gt_10ms.saturating_add(read_through_latency_gt_10ms);
     total.refill_latency_samples = total.refill_latency_samples.saturating_add(refill_latency_samples);
     total.refill_latency_total_micros = total.refill_latency_total_micros.saturating_add(refill_latency_total_micros);
+    total.refill_latency_max_micros = total.refill_latency_max_micros.max(refill_latency_max_micros);
     total.refill_latency_le_10us = total.refill_latency_le_10us.saturating_add(refill_latency_le_10us);
     total.refill_latency_le_100us = total.refill_latency_le_100us.saturating_add(refill_latency_le_100us);
     total.refill_latency_le_1ms = total.refill_latency_le_1ms.saturating_add(refill_latency_le_1ms);
@@ -4567,6 +4576,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.refill_latency_gt_10ms = total.refill_latency_gt_10ms.saturating_add(refill_latency_gt_10ms);
     total.writeback_latency_samples = total.writeback_latency_samples.saturating_add(writeback_latency_samples);
     total.writeback_latency_total_micros = total.writeback_latency_total_micros.saturating_add(writeback_latency_total_micros);
+    total.writeback_latency_max_micros = total
+        .writeback_latency_max_micros
+        .max(writeback_latency_max_micros);
     total.writeback_latency_le_10us = total.writeback_latency_le_10us.saturating_add(writeback_latency_le_10us);
     total.writeback_latency_le_100us = total.writeback_latency_le_100us.saturating_add(writeback_latency_le_100us);
     total.writeback_latency_le_1ms = total.writeback_latency_le_1ms.saturating_add(writeback_latency_le_1ms);
@@ -4574,6 +4586,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.writeback_latency_gt_10ms = total.writeback_latency_gt_10ms.saturating_add(writeback_latency_gt_10ms);
     total.eviction_latency_samples = total.eviction_latency_samples.saturating_add(eviction_latency_samples);
     total.eviction_latency_total_micros = total.eviction_latency_total_micros.saturating_add(eviction_latency_total_micros);
+    total.eviction_latency_max_micros = total
+        .eviction_latency_max_micros
+        .max(eviction_latency_max_micros);
     total.eviction_latency_le_10us = total.eviction_latency_le_10us.saturating_add(eviction_latency_le_10us);
     total.eviction_latency_le_100us = total.eviction_latency_le_100us.saturating_add(eviction_latency_le_100us);
     total.eviction_latency_le_1ms = total.eviction_latency_le_1ms.saturating_add(eviction_latency_le_1ms);
@@ -4581,6 +4596,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.eviction_latency_gt_10ms = total.eviction_latency_gt_10ms.saturating_add(eviction_latency_gt_10ms);
     total.compaction_latency_samples = total.compaction_latency_samples.saturating_add(compaction_latency_samples);
     total.compaction_latency_total_micros = total.compaction_latency_total_micros.saturating_add(compaction_latency_total_micros);
+    total.compaction_latency_max_micros = total
+        .compaction_latency_max_micros
+        .max(compaction_latency_max_micros);
     total.compaction_latency_le_10us = total.compaction_latency_le_10us.saturating_add(compaction_latency_le_10us);
     total.compaction_latency_le_100us = total.compaction_latency_le_100us.saturating_add(compaction_latency_le_100us);
     total.compaction_latency_le_1ms = total.compaction_latency_le_1ms.saturating_add(compaction_latency_le_1ms);
@@ -5300,14 +5318,19 @@ impl ShardedMultiLayerCache {
         let mut put_max_us = 0u64;
         let mut read_through_count = 0u64;
         let mut read_through_total_us = 0u64;
+        let mut read_through_max_us = 0u64;
         let mut refill_count = 0u64;
         let mut refill_total_us = 0u64;
+        let mut refill_max_us = 0u64;
         let mut writeback_count = 0u64;
         let mut writeback_total_us = 0u64;
+        let mut writeback_max_us = 0u64;
         let mut eviction_count = 0u64;
         let mut eviction_total_us = 0u64;
+        let mut eviction_max_us = 0u64;
         let mut compaction_count = 0u64;
         let mut compaction_total_us = 0u64;
+        let mut compaction_max_us = 0u64;
         let mut histogram_ready = false;
 
         for shard in self.shards.iter() {
@@ -5326,24 +5349,29 @@ impl ShardedMultiLayerCache {
                     .read_through_count
                     .saturating_mul(report.read_through_avg_us),
             );
+            read_through_max_us = read_through_max_us.max(report.read_through_max_us);
             refill_count = refill_count.saturating_add(report.refill_count);
             refill_total_us = refill_total_us
                 .saturating_add(report.refill_count.saturating_mul(report.refill_avg_us));
+            refill_max_us = refill_max_us.max(report.refill_max_us);
             writeback_count = writeback_count.saturating_add(report.writeback_count);
             writeback_total_us = writeback_total_us.saturating_add(
                 report
                     .writeback_count
                     .saturating_mul(report.writeback_avg_us),
             );
+            writeback_max_us = writeback_max_us.max(report.writeback_max_us);
             eviction_count = eviction_count.saturating_add(report.eviction_count);
             eviction_total_us = eviction_total_us
                 .saturating_add(report.eviction_count.saturating_mul(report.eviction_avg_us));
+            eviction_max_us = eviction_max_us.max(report.eviction_max_us);
             compaction_count = compaction_count.saturating_add(report.compaction_count);
             compaction_total_us = compaction_total_us.saturating_add(
                 report
                     .compaction_count
                     .saturating_mul(report.compaction_avg_us),
             );
+            compaction_max_us = compaction_max_us.max(report.compaction_max_us);
             histogram_ready |= report.histogram_ready;
         }
 
@@ -5365,26 +5393,31 @@ impl ShardedMultiLayerCache {
             read_through_p50_us: 0,
             read_through_p95_us: 0,
             read_through_p99_us: 0,
+            read_through_max_us,
             refill_count,
             refill_avg_us: average_latency_us(refill_total_us, refill_count),
             refill_p50_us: 0,
             refill_p95_us: 0,
             refill_p99_us: 0,
+            refill_max_us,
             writeback_count,
             writeback_avg_us: average_latency_us(writeback_total_us, writeback_count),
             writeback_p50_us: 0,
             writeback_p95_us: 0,
             writeback_p99_us: 0,
+            writeback_max_us,
             eviction_count,
             eviction_avg_us: average_latency_us(eviction_total_us, eviction_count),
             eviction_p50_us: 0,
             eviction_p95_us: 0,
             eviction_p99_us: 0,
+            eviction_max_us,
             compaction_count,
             compaction_avg_us: average_latency_us(compaction_total_us, compaction_count),
             compaction_p50_us: 0,
             compaction_p95_us: 0,
             compaction_p99_us: 0,
+            compaction_max_us,
             histogram_ready,
         }
     }
@@ -8315,6 +8348,11 @@ impl MultiLayerCache {
                 .read_through_latency
                 .total_micros
                 .load(Ordering::Relaxed),
+            read_through_latency_max_micros: inner
+                .read_counters
+                .read_through_latency
+                .max_micros
+                .load(Ordering::Relaxed),
             read_through_latency_le_10us: inner
                 .read_counters
                 .read_through_latency
@@ -8345,6 +8383,11 @@ impl MultiLayerCache {
                 .read_counters
                 .refill_latency
                 .total_micros
+                .load(Ordering::Relaxed),
+            refill_latency_max_micros: inner
+                .read_counters
+                .refill_latency
+                .max_micros
                 .load(Ordering::Relaxed),
             refill_latency_le_10us: inner
                 .read_counters
@@ -8514,7 +8557,7 @@ impl MultiLayerCache {
                 stats.read_through_latency_le_1ms,
                 stats.read_through_latency_le_10ms,
                 stats.read_through_latency_gt_10ms,
-                0,
+                stats.read_through_latency_max_micros,
                 50,
             ),
             read_through_p95_us: latency_percentile_us(
@@ -8524,7 +8567,7 @@ impl MultiLayerCache {
                 stats.read_through_latency_le_1ms,
                 stats.read_through_latency_le_10ms,
                 stats.read_through_latency_gt_10ms,
-                0,
+                stats.read_through_latency_max_micros,
                 95,
             ),
             read_through_p99_us: latency_percentile_us(
@@ -8534,9 +8577,10 @@ impl MultiLayerCache {
                 stats.read_through_latency_le_1ms,
                 stats.read_through_latency_le_10ms,
                 stats.read_through_latency_gt_10ms,
-                0,
+                stats.read_through_latency_max_micros,
                 99,
             ),
+            read_through_max_us: stats.read_through_latency_max_micros,
             refill_count: stats.refill_latency_samples,
             refill_avg_us: average_latency_us(
                 stats.refill_latency_total_micros,
@@ -8549,7 +8593,7 @@ impl MultiLayerCache {
                 stats.refill_latency_le_1ms,
                 stats.refill_latency_le_10ms,
                 stats.refill_latency_gt_10ms,
-                0,
+                stats.refill_latency_max_micros,
                 50,
             ),
             refill_p95_us: latency_percentile_us(
@@ -8559,7 +8603,7 @@ impl MultiLayerCache {
                 stats.refill_latency_le_1ms,
                 stats.refill_latency_le_10ms,
                 stats.refill_latency_gt_10ms,
-                0,
+                stats.refill_latency_max_micros,
                 95,
             ),
             refill_p99_us: latency_percentile_us(
@@ -8569,9 +8613,10 @@ impl MultiLayerCache {
                 stats.refill_latency_le_1ms,
                 stats.refill_latency_le_10ms,
                 stats.refill_latency_gt_10ms,
-                0,
+                stats.refill_latency_max_micros,
                 99,
             ),
+            refill_max_us: stats.refill_latency_max_micros,
             writeback_count: stats.writeback_latency_samples,
             writeback_avg_us: average_latency_us(
                 stats.writeback_latency_total_micros,
@@ -8584,7 +8629,7 @@ impl MultiLayerCache {
                 stats.writeback_latency_le_1ms,
                 stats.writeback_latency_le_10ms,
                 stats.writeback_latency_gt_10ms,
-                0,
+                stats.writeback_latency_max_micros,
                 50,
             ),
             writeback_p95_us: latency_percentile_us(
@@ -8594,7 +8639,7 @@ impl MultiLayerCache {
                 stats.writeback_latency_le_1ms,
                 stats.writeback_latency_le_10ms,
                 stats.writeback_latency_gt_10ms,
-                0,
+                stats.writeback_latency_max_micros,
                 95,
             ),
             writeback_p99_us: latency_percentile_us(
@@ -8604,9 +8649,10 @@ impl MultiLayerCache {
                 stats.writeback_latency_le_1ms,
                 stats.writeback_latency_le_10ms,
                 stats.writeback_latency_gt_10ms,
-                0,
+                stats.writeback_latency_max_micros,
                 99,
             ),
+            writeback_max_us: stats.writeback_latency_max_micros,
             eviction_count: stats.eviction_latency_samples,
             eviction_avg_us: average_latency_us(
                 stats.eviction_latency_total_micros,
@@ -8619,7 +8665,7 @@ impl MultiLayerCache {
                 stats.eviction_latency_le_1ms,
                 stats.eviction_latency_le_10ms,
                 stats.eviction_latency_gt_10ms,
-                0,
+                stats.eviction_latency_max_micros,
                 50,
             ),
             eviction_p95_us: latency_percentile_us(
@@ -8629,7 +8675,7 @@ impl MultiLayerCache {
                 stats.eviction_latency_le_1ms,
                 stats.eviction_latency_le_10ms,
                 stats.eviction_latency_gt_10ms,
-                0,
+                stats.eviction_latency_max_micros,
                 95,
             ),
             eviction_p99_us: latency_percentile_us(
@@ -8639,9 +8685,10 @@ impl MultiLayerCache {
                 stats.eviction_latency_le_1ms,
                 stats.eviction_latency_le_10ms,
                 stats.eviction_latency_gt_10ms,
-                0,
+                stats.eviction_latency_max_micros,
                 99,
             ),
+            eviction_max_us: stats.eviction_latency_max_micros,
             compaction_count: stats.compaction_latency_samples,
             compaction_avg_us: average_latency_us(
                 stats.compaction_latency_total_micros,
@@ -8654,7 +8701,7 @@ impl MultiLayerCache {
                 stats.compaction_latency_le_1ms,
                 stats.compaction_latency_le_10ms,
                 stats.compaction_latency_gt_10ms,
-                0,
+                stats.compaction_latency_max_micros,
                 50,
             ),
             compaction_p95_us: latency_percentile_us(
@@ -8664,7 +8711,7 @@ impl MultiLayerCache {
                 stats.compaction_latency_le_1ms,
                 stats.compaction_latency_le_10ms,
                 stats.compaction_latency_gt_10ms,
-                0,
+                stats.compaction_latency_max_micros,
                 95,
             ),
             compaction_p99_us: latency_percentile_us(
@@ -8674,9 +8721,10 @@ impl MultiLayerCache {
                 stats.compaction_latency_le_1ms,
                 stats.compaction_latency_le_10ms,
                 stats.compaction_latency_gt_10ms,
-                0,
+                stats.compaction_latency_max_micros,
                 99,
             ),
+            compaction_max_us: stats.compaction_latency_max_micros,
             histogram_ready: stats.get_latency_le_10us
                 + stats.get_latency_le_100us
                 + stats.get_latency_le_1ms

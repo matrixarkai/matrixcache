@@ -257,6 +257,8 @@ pub struct CacheLatencyMetricsReport {
     #[serde(default)]
     pub read_through_p99_us: u64,
     #[serde(default)]
+    pub read_through_max_us: u64,
+    #[serde(default)]
     pub refill_count: u64,
     #[serde(default)]
     pub refill_avg_us: u64,
@@ -266,6 +268,8 @@ pub struct CacheLatencyMetricsReport {
     pub refill_p95_us: u64,
     #[serde(default)]
     pub refill_p99_us: u64,
+    #[serde(default)]
+    pub refill_max_us: u64,
     #[serde(default)]
     pub writeback_count: u64,
     #[serde(default)]
@@ -277,6 +281,8 @@ pub struct CacheLatencyMetricsReport {
     #[serde(default)]
     pub writeback_p99_us: u64,
     #[serde(default)]
+    pub writeback_max_us: u64,
+    #[serde(default)]
     pub eviction_count: u64,
     #[serde(default)]
     pub eviction_avg_us: u64,
@@ -287,6 +293,8 @@ pub struct CacheLatencyMetricsReport {
     #[serde(default)]
     pub eviction_p99_us: u64,
     #[serde(default)]
+    pub eviction_max_us: u64,
+    #[serde(default)]
     pub compaction_count: u64,
     #[serde(default)]
     pub compaction_avg_us: u64,
@@ -296,6 +304,8 @@ pub struct CacheLatencyMetricsReport {
     pub compaction_p95_us: u64,
     #[serde(default)]
     pub compaction_p99_us: u64,
+    #[serde(default)]
+    pub compaction_max_us: u64,
     pub histogram_ready: bool,
 }
 

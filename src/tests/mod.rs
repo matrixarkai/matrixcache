@@ -9589,6 +9589,9 @@ mod tests {
         assert!(stats.read_through_latency_total_micros > 0);
         assert!(stats.writeback_latency_total_micros > 0);
         assert_eq!(stats.compaction_latency_total_micros, 1_500);
+        assert!(stats.read_through_latency_max_micros > 0);
+        assert!(stats.writeback_latency_max_micros > 0);
+        assert_eq!(stats.compaction_latency_max_micros, 1_500);
         let latency = cache.latency_metrics_report();
         assert_eq!(
             latency.read_through_count,
@@ -9599,6 +9602,12 @@ mod tests {
         assert_eq!(latency.eviction_count, stats.eviction_latency_samples);
         assert_eq!(latency.compaction_count, stats.compaction_latency_samples);
         assert_eq!(latency.compaction_avg_us, 1_500);
+        assert_eq!(
+            latency.read_through_max_us,
+            stats.read_through_latency_max_micros
+        );
+        assert_eq!(latency.writeback_max_us, stats.writeback_latency_max_micros);
+        assert_eq!(latency.compaction_max_us, 1_500);
         assert!(latency.get_p50_us > 0);
         assert!(latency.get_p95_us >= latency.get_p50_us);
         assert!(latency.get_p99_us >= latency.get_p95_us);
@@ -15233,30 +15242,37 @@ mod tests {
         }
         for gauge in [
             "matrixcache_get_latency_avg_seconds",
+            "matrixcache_get_latency_max_seconds",
             "matrixcache_get_latency_p50_seconds",
             "matrixcache_get_latency_p95_seconds",
             "matrixcache_get_latency_p99_seconds",
             "matrixcache_put_latency_avg_seconds",
+            "matrixcache_put_latency_max_seconds",
             "matrixcache_put_latency_p50_seconds",
             "matrixcache_put_latency_p95_seconds",
             "matrixcache_put_latency_p99_seconds",
             "matrixcache_read_through_latency_avg_seconds",
+            "matrixcache_read_through_latency_max_seconds",
             "matrixcache_read_through_latency_p50_seconds",
             "matrixcache_read_through_latency_p95_seconds",
             "matrixcache_read_through_latency_p99_seconds",
             "matrixcache_refill_latency_avg_seconds",
+            "matrixcache_refill_latency_max_seconds",
             "matrixcache_refill_latency_p50_seconds",
             "matrixcache_refill_latency_p95_seconds",
             "matrixcache_refill_latency_p99_seconds",
             "matrixcache_writeback_latency_avg_seconds",
+            "matrixcache_writeback_latency_max_seconds",
             "matrixcache_writeback_latency_p50_seconds",
             "matrixcache_writeback_latency_p95_seconds",
             "matrixcache_writeback_latency_p99_seconds",
             "matrixcache_eviction_latency_avg_seconds",
+            "matrixcache_eviction_latency_max_seconds",
             "matrixcache_eviction_latency_p50_seconds",
             "matrixcache_eviction_latency_p95_seconds",
             "matrixcache_eviction_latency_p99_seconds",
             "matrixcache_compaction_latency_avg_seconds",
+            "matrixcache_compaction_latency_max_seconds",
             "matrixcache_compaction_latency_p50_seconds",
             "matrixcache_compaction_latency_p95_seconds",
             "matrixcache_compaction_latency_p99_seconds",
@@ -15293,6 +15309,26 @@ mod tests {
             sharded_batch_latency_total_micros: 3_000_000,
             sharded_batch_latency_max_micros: 2_750_000,
             sharded_batch_latency_gt_10ms: 1,
+            read_through_latency_samples: 1,
+            read_through_latency_total_micros: 1_250_000,
+            read_through_latency_max_micros: 1_250_000,
+            read_through_latency_gt_10ms: 1,
+            refill_latency_samples: 1,
+            refill_latency_total_micros: 1_750_000,
+            refill_latency_max_micros: 1_750_000,
+            refill_latency_gt_10ms: 1,
+            writeback_latency_samples: 1,
+            writeback_latency_total_micros: 2_250_000,
+            writeback_latency_max_micros: 2_250_000,
+            writeback_latency_gt_10ms: 1,
+            eviction_latency_samples: 1,
+            eviction_latency_total_micros: 2_500_000,
+            eviction_latency_max_micros: 2_500_000,
+            eviction_latency_gt_10ms: 1,
+            compaction_latency_samples: 1,
+            compaction_latency_total_micros: 3_250_000,
+            compaction_latency_max_micros: 3_250_000,
+            compaction_latency_gt_10ms: 1,
             ..CacheStats::default()
         };
         let text = prometheus_text(&stats, &[("cache", "latency-units")]);
@@ -15308,6 +15344,34 @@ mod tests {
         assert_eq!(
             prometheus_value(&text, "matrixcache_sharded_batch_latency_max_seconds"),
             Some("2.750000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_read_through_latency_max_seconds"),
+            Some("1.250000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_refill_latency_max_seconds"),
+            Some("1.750000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_writeback_latency_max_seconds"),
+            Some("2.250000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_eviction_latency_max_seconds"),
+            Some("2.500000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_compaction_latency_max_seconds"),
+            Some("3.250000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_read_through_latency_p99_seconds"),
+            Some("1.250000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_compaction_latency_p99_seconds"),
+            Some("3.250000")
         );
     }
 

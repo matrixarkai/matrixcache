@@ -809,7 +809,7 @@ impl CacheInstance {
     pub fn latency_summary_line(&self, comments: impl AsRef<str>) -> String {
         let report = self.cache.latency_metrics_report();
         format!(
-            "matrixcache_latency comments={} get_count={} get_avg_us={} get_p50_us={} get_p95_us={} get_p99_us={} get_max_us={} put_count={} put_avg_us={} put_p50_us={} put_p95_us={} put_p99_us={} put_max_us={} read_through_count={} read_through_avg_us={} read_through_p50_us={} read_through_p95_us={} read_through_p99_us={} refill_count={} refill_avg_us={} refill_p50_us={} refill_p95_us={} refill_p99_us={} writeback_count={} writeback_avg_us={} writeback_p50_us={} writeback_p95_us={} writeback_p99_us={} eviction_count={} eviction_avg_us={} eviction_p50_us={} eviction_p95_us={} eviction_p99_us={} compaction_count={} compaction_avg_us={} compaction_p50_us={} compaction_p95_us={} compaction_p99_us={} histogram_ready={}",
+            "matrixcache_latency comments={} get_count={} get_avg_us={} get_p50_us={} get_p95_us={} get_p99_us={} get_max_us={} put_count={} put_avg_us={} put_p50_us={} put_p95_us={} put_p99_us={} put_max_us={} read_through_count={} read_through_avg_us={} read_through_p50_us={} read_through_p95_us={} read_through_p99_us={} read_through_max_us={} refill_count={} refill_avg_us={} refill_p50_us={} refill_p95_us={} refill_p99_us={} refill_max_us={} writeback_count={} writeback_avg_us={} writeback_p50_us={} writeback_p95_us={} writeback_p99_us={} writeback_max_us={} eviction_count={} eviction_avg_us={} eviction_p50_us={} eviction_p95_us={} eviction_p99_us={} eviction_max_us={} compaction_count={} compaction_avg_us={} compaction_p50_us={} compaction_p95_us={} compaction_p99_us={} compaction_max_us={} histogram_ready={}",
             comments.as_ref(),
             report.get_count,
             report.get_avg_us,
@@ -828,26 +828,31 @@ impl CacheInstance {
             report.read_through_p50_us,
             report.read_through_p95_us,
             report.read_through_p99_us,
+            report.read_through_max_us,
             report.refill_count,
             report.refill_avg_us,
             report.refill_p50_us,
             report.refill_p95_us,
             report.refill_p99_us,
+            report.refill_max_us,
             report.writeback_count,
             report.writeback_avg_us,
             report.writeback_p50_us,
             report.writeback_p95_us,
             report.writeback_p99_us,
+            report.writeback_max_us,
             report.eviction_count,
             report.eviction_avg_us,
             report.eviction_p50_us,
             report.eviction_p95_us,
             report.eviction_p99_us,
+            report.eviction_max_us,
             report.compaction_count,
             report.compaction_avg_us,
             report.compaction_p50_us,
             report.compaction_p95_us,
             report.compaction_p99_us,
+            report.compaction_max_us,
             report.histogram_ready
         )
     }
@@ -3067,7 +3072,7 @@ impl MultiTierCache {
     pub fn latency_summary_line(&self, comments: impl AsRef<str>) -> String {
         let report = self.cache.latency_metrics_report();
         format!(
-            "matrixcache_latency comments={} get_count={} get_avg_us={} get_p50_us={} get_p95_us={} get_p99_us={} get_max_us={} put_count={} put_avg_us={} put_p50_us={} put_p95_us={} put_p99_us={} put_max_us={} read_through_count={} read_through_avg_us={} read_through_p50_us={} read_through_p95_us={} read_through_p99_us={} refill_count={} refill_avg_us={} refill_p50_us={} refill_p95_us={} refill_p99_us={} writeback_count={} writeback_avg_us={} writeback_p50_us={} writeback_p95_us={} writeback_p99_us={} eviction_count={} eviction_avg_us={} eviction_p50_us={} eviction_p95_us={} eviction_p99_us={} compaction_count={} compaction_avg_us={} compaction_p50_us={} compaction_p95_us={} compaction_p99_us={} histogram_ready={}",
+            "matrixcache_latency comments={} get_count={} get_avg_us={} get_p50_us={} get_p95_us={} get_p99_us={} get_max_us={} put_count={} put_avg_us={} put_p50_us={} put_p95_us={} put_p99_us={} put_max_us={} read_through_count={} read_through_avg_us={} read_through_p50_us={} read_through_p95_us={} read_through_p99_us={} read_through_max_us={} refill_count={} refill_avg_us={} refill_p50_us={} refill_p95_us={} refill_p99_us={} refill_max_us={} writeback_count={} writeback_avg_us={} writeback_p50_us={} writeback_p95_us={} writeback_p99_us={} writeback_max_us={} eviction_count={} eviction_avg_us={} eviction_p50_us={} eviction_p95_us={} eviction_p99_us={} eviction_max_us={} compaction_count={} compaction_avg_us={} compaction_p50_us={} compaction_p95_us={} compaction_p99_us={} compaction_max_us={} histogram_ready={}",
             comments.as_ref(),
             report.get_count,
             report.get_avg_us,
@@ -3086,26 +3091,31 @@ impl MultiTierCache {
             report.read_through_p50_us,
             report.read_through_p95_us,
             report.read_through_p99_us,
+            report.read_through_max_us,
             report.refill_count,
             report.refill_avg_us,
             report.refill_p50_us,
             report.refill_p95_us,
             report.refill_p99_us,
+            report.refill_max_us,
             report.writeback_count,
             report.writeback_avg_us,
             report.writeback_p50_us,
             report.writeback_p95_us,
             report.writeback_p99_us,
+            report.writeback_max_us,
             report.eviction_count,
             report.eviction_avg_us,
             report.eviction_p50_us,
             report.eviction_p95_us,
             report.eviction_p99_us,
+            report.eviction_max_us,
             report.compaction_count,
             report.compaction_avg_us,
             report.compaction_p50_us,
             report.compaction_p95_us,
             report.compaction_p99_us,
+            report.compaction_max_us,
             report.histogram_ready
         )
     }
