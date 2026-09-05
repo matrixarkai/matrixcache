@@ -14,6 +14,22 @@ struct BlockCacheInner {
     blockcache_clear_ssd_folder: bool,
 }
 
+fn ratio_percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64 * 100.0
+    }
+}
+
+fn cache_facade_per_resident_mib(value: u64, resident_bytes: u64) -> f64 {
+    if resident_bytes == 0 {
+        0.0
+    } else {
+        value as f64 / (resident_bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 impl BlockCache {
     pub fn new() -> Self {
         Self::default()
@@ -3132,8 +3148,29 @@ impl MultiTierCache {
         let stats = self.cache.stats();
         let eviction = self.cache.eviction_report();
         let writeback = self.cache.writeback_backpressure_report();
+        let total_hits = stats
+            .memory_hits
+            .saturating_add(stats.pmem_hits)
+            .saturating_add(stats.disk_hits);
+        let total_requests = total_hits.saturating_add(stats.misses);
+        let total_ops = total_requests.saturating_add(stats.puts);
+        let resident_bytes = stats
+            .memory_bytes
+            .saturating_add(stats.pmem_bytes)
+            .saturating_add(stats.disk_bytes);
+        let resident_mib = resident_bytes as f64 / (1024.0 * 1024.0);
+        let hit_rate_percent = ratio_percent(total_hits, total_requests);
+        let memory_hit_share_percent = ratio_percent(stats.memory_hits, total_hits);
+        let total_ops_per_resident_mib = cache_facade_per_resident_mib(total_ops, resident_bytes);
+        let evictions_per_resident_mib = cache_facade_per_resident_mib(
+            eviction
+                .memory_evictions
+                .saturating_add(eviction.pmem_evictions)
+                .saturating_add(eviction.ssd_evictions),
+            resident_bytes,
+        );
         format!(
-            "matrixcache_stats metrics={} comments={} policy={} ssd_engine={} placement={} eviction_enabled={} memory_bytes={} pmem_bytes={} disk_bytes={} pinned_entries={} pinned_bytes={} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_admission_rejections={} async_writeback_queue_depth={} async_writeback_queue_bytes={} writeback_backpressure_events={}",
+            "matrixcache_stats metrics={} comments={} policy={} ssd_engine={} placement={} eviction_enabled={} memory_bytes={} pmem_bytes={} disk_bytes={} resident_bytes={} resident_mib={:.4} hit_rate_percent={:.4} memory_hit_share_percent={:.4} total_ops_per_resident_mib={:.4} evictions_per_resident_mib={:.4} pinned_entries={} pinned_bytes={} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_admission_rejections={} async_writeback_queue_depth={} async_writeback_queue_bytes={} writeback_backpressure_events={}",
             metrics.as_ref(),
             comments.as_ref(),
             self.policy.as_config_name(),
@@ -3143,6 +3180,12 @@ impl MultiTierCache {
             stats.memory_bytes,
             stats.pmem_bytes,
             stats.disk_bytes,
+            resident_bytes,
+            resident_mib,
+            hit_rate_percent,
+            memory_hit_share_percent,
+            total_ops_per_resident_mib,
+            evictions_per_resident_mib,
             stats.pinned_entries,
             stats.pinned_bytes,
             eviction.memory_evictions,

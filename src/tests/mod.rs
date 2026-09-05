@@ -8130,6 +8130,12 @@ mod tests {
         assert!(stats.contains("memory_bytes="));
         assert!(stats.contains("pmem_bytes="));
         assert!(stats.contains("disk_bytes="));
+        assert!(stats.contains("resident_bytes="));
+        assert!(stats.contains("resident_mib="));
+        assert!(stats.contains("hit_rate_percent="));
+        assert!(stats.contains("memory_hit_share_percent="));
+        assert!(stats.contains("total_ops_per_resident_mib="));
+        assert!(stats.contains("evictions_per_resident_mib="));
         let measurement = cache.measurement_summary_line();
         assert!(measurement.contains("matrixcache_stats"));
         assert!(measurement.contains("matrixcache_latency"));
