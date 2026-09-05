@@ -401,6 +401,13 @@ fn main() {
         } else {
             peak_memory_bytes as f64 / memory_capacity_bytes as f64 * 100.0
         };
+        let peak_memory_mib = (peak_memory_bytes as f64 / (1024.0 * 1024.0)).max(0.001);
+        let total_ops = final_reads + final_writes;
+        let total_ops_per_peak_mib = total_ops as f64 / peak_memory_mib;
+        let reads_per_peak_mib = final_reads as f64 / peak_memory_mib;
+        let writes_per_peak_mib = final_writes as f64 / peak_memory_mib;
+        let best_kops_per_peak_mib = best_rate / peak_memory_mib;
+        let evictions_per_peak_mib = stats.memory_evictions as f64 / peak_memory_mib;
         let get_p99_within_budget = max_get_p99_us
             .map(|budget| latency.get_p99_us <= budget)
             .unwrap_or(true);
@@ -640,6 +647,38 @@ fn main() {
         )
         .expect("format report");
         writeln!(&mut report, "    \"bounded_memory\": {bounded_memory}").expect("format report");
+        writeln!(&mut report, "  }},").expect("format report");
+        writeln!(&mut report, "  \"efficiency\": {{").expect("format report");
+        writeln!(
+            &mut report,
+            "    \"peak_memory_mib\": {peak_memory_mib:.6},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"total_ops_per_peak_mib\": {total_ops_per_peak_mib:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"reads_per_peak_mib\": {reads_per_peak_mib:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writes_per_peak_mib\": {writes_per_peak_mib:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"best_kops_per_peak_mib\": {best_kops_per_peak_mib:.4},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"evictions_per_peak_mib\": {evictions_per_peak_mib:.4}"
+        )
+        .expect("format report");
         writeln!(&mut report, "  }},").expect("format report");
         writeln!(&mut report, "  \"latency\": {{").expect("format report");
         writeln!(&mut report, "    \"get_count\": {},", latency.get_count).expect("format report");

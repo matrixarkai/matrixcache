@@ -27,6 +27,7 @@ REQUIRED_TOP_LEVEL = {
     "interval_samples": list,
     "throughput": dict,
     "memory_pressure": dict,
+    "efficiency": dict,
     "latency": dict,
     "latency_budgets": dict,
     "checks": dict,
@@ -68,6 +69,15 @@ REQUIRED_MEMORY_PRESSURE = {
     "final_utilization_percent": (int, float),
     "peak_utilization_percent": (int, float),
     "bounded_memory": bool,
+}
+
+REQUIRED_EFFICIENCY = {
+    "peak_memory_mib": (int, float),
+    "total_ops_per_peak_mib": (int, float),
+    "reads_per_peak_mib": (int, float),
+    "writes_per_peak_mib": (int, float),
+    "best_kops_per_peak_mib": (int, float),
+    "evictions_per_peak_mib": (int, float),
 }
 
 REQUIRED_LATENCY = {
@@ -264,6 +274,36 @@ def require_memory_pressure_consistency(data: dict[str, Any]) -> None:
         fail("memory_pressure.peak_utilization_percent disagrees with bytes/capacity")
 
 
+def require_efficiency_consistency(data: dict[str, Any]) -> None:
+    efficiency = data["efficiency"]
+    for field, expected in REQUIRED_EFFICIENCY.items():
+        if field not in efficiency:
+            fail(f"missing efficiency field {field!r}")
+        if not isinstance(efficiency[field], expected):
+            fail(
+                f"efficiency.{field} has type "
+                f"{type(efficiency[field]).__name__}, not {expected}"
+            )
+        if float(efficiency[field]) < 0.0:
+            fail(f"efficiency.{field} must be non-negative")
+
+    peak_memory_mib = max(data["peak_memory_bytes"] / (1024.0 * 1024.0), 0.001)
+    expected = {
+        "peak_memory_mib": peak_memory_mib,
+        "total_ops_per_peak_mib": (data["reads"] + data["writes"]) / peak_memory_mib,
+        "reads_per_peak_mib": data["reads"] / peak_memory_mib,
+        "writes_per_peak_mib": data["writes"] / peak_memory_mib,
+        "best_kops_per_peak_mib": float(data["interval_best_kops"]) / peak_memory_mib,
+        "evictions_per_peak_mib": data.get("memory_evictions", 0) / peak_memory_mib,
+    }
+    for field, expected_value in expected.items():
+        reported = float(efficiency[field])
+        if abs(reported - expected_value) > max(
+            FLOAT_ABSOLUTE_TOLERANCE, expected_value * QPS_RELATIVE_TOLERANCE
+        ):
+            fail(f"efficiency.{field} disagrees with report counts")
+
+
 def require_interval_sample_consistency(data: dict[str, Any], args: argparse.Namespace) -> None:
     samples = data["interval_samples"]
     if not samples:
@@ -417,6 +457,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
     require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
     require_memory_pressure_consistency(data)
+    require_efficiency_consistency(data)
     require_latency_budget_consistency(data)
     require_interval_sample_consistency(data, args)
     return data

@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
         default=1.10,
         help="Maximum allowed current/baseline final interval resident-memory ratio",
     )
+    parser.add_argument(
+        "--min-efficiency-ratio",
+        type=float,
+        default=0.90,
+        help="Minimum allowed current/baseline throughput-per-resident-memory ratio",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +169,16 @@ def memory_pressure(data: dict[str, Any], field: str) -> float:
     value = pressure.get(field)
     if not isinstance(value, (int, float)):
         fail(f"memory_pressure field {field!r} must be numeric")
+    return float(value)
+
+
+def efficiency(data: dict[str, Any], field: str) -> float:
+    values = data.get("efficiency")
+    if not isinstance(values, dict):
+        fail("missing efficiency object")
+    value = values.get(field)
+    if not isinstance(value, (int, float)):
+        fail(f"efficiency field {field!r} must be numeric")
     return float(value)
 
 
@@ -246,6 +262,14 @@ def main() -> int:
         final_interval_memory_bytes(current),
         final_interval_memory_bytes(baseline),
     )
+    total_ops_efficiency_ratio = ratio(
+        efficiency(current, "total_ops_per_peak_mib"),
+        efficiency(baseline, "total_ops_per_peak_mib"),
+    )
+    best_kops_efficiency_ratio = ratio(
+        efficiency(current, "best_kops_per_peak_mib"),
+        efficiency(baseline, "best_kops_per_peak_mib"),
+    )
 
     check_ratio("get p99", get_p99_ratio, args.max_get_p99_regression, "max")
     check_ratio("put p99", put_p99_ratio, args.max_put_p99_regression, "max")
@@ -302,6 +326,18 @@ def main() -> int:
         args.max_final_interval_memory_growth,
         "max",
     )
+    check_ratio(
+        "total ops per peak MiB",
+        total_ops_efficiency_ratio,
+        args.min_efficiency_ratio,
+        "min",
+    )
+    check_ratio(
+        "best Kops per peak MiB",
+        best_kops_efficiency_ratio,
+        args.min_efficiency_ratio,
+        "min",
+    )
     if hit_rate_delta < args.min_hit_rate_delta:
         fail(
             f"hit-rate delta {hit_rate_delta:.4f}pp below "
@@ -316,6 +352,8 @@ def main() -> int:
         f"memory_ratio={memory_ratio:.3f} "
         f"memory_pressure_peak_ratio={memory_pressure_peak_ratio:.3f} "
         f"memory_pressure_final_ratio={memory_pressure_final_ratio:.3f} "
+        f"total_ops_efficiency_ratio={total_ops_efficiency_ratio:.3f} "
+        f"best_kops_efficiency_ratio={best_kops_efficiency_ratio:.3f} "
         f"interval_sample_ratio={interval_sample_ratio:.3f} "
         f"worst_interval_throughput_ratio={worst_interval_throughput_ratio:.3f} "
         f"final_interval_memory_ratio={final_interval_memory_ratio:.3f} "

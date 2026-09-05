@@ -118,7 +118,11 @@ without losing schema honesty.
 The archived `memory_pressure` object records resident capacity, final bytes,
 peak bytes, final utilization, peak utilization, and the bounded-memory result.
 The validator checks its byte and percent math, and the comparator compares
-peak and final utilization between baseline and current runs.
+peak and final utilization between baseline and current runs. The companion
+`efficiency` object normalizes total operations, reads, writes, best interval
+Kops/s, and eviction pressure by peak resident MiB. This keeps cachelib-style
+scale evidence honest when two runs have similar latency but one spends more
+resident memory to do the same amount of useful work.
 The archived `interval_samples` array keeps the per-sample drift trace:
 elapsed time, interval Kops/s, interval hit rate, resident entries, memory
 bytes, and cumulative writes. The validator cross-checks those samples against
@@ -133,7 +137,8 @@ count, worst sampled interval throughput, and final sampled resident memory in
 addition to aggregate p99, throughput ceiling, and peak memory. Tighten
 `--min-interval-sample-ratio`, `--min-worst-interval-throughput-ratio`, and
 `--max-final-interval-memory-growth` when comparing release soak evidence from
-the same host.
+the same host. Tighten `--min-efficiency-ratio` when a release comparison
+should fail if current throughput per resident MiB falls behind the baseline.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for
