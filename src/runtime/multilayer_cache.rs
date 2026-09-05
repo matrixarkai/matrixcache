@@ -2088,8 +2088,10 @@ impl MultiLayerCache {
     /// allocation, every hit. For a store fetching one record per retrieval candidate that is a
     /// copy per candidate.
     ///
-    /// Only the memory tier can share; the others materialise their bytes on the way out, so there
-    /// is nothing to point at and this falls back to `get`. Always correct, sometimes free.
+    /// The memory and PMEM resident tiers already hold `Arc<[u8]>`, so they can
+    /// be returned without a caller-side allocation. SSD still materialises a
+    /// block during decode, but this path avoids falling through a second
+    /// public read and keeps the bookkeeping single-counted.
     ///
     /// The value is immutable once cached: a write replaces the entry rather than editing it, so a
     /// holder of one of these keeps reading the bytes it asked for even if the key is overwritten or
@@ -2108,55 +2110,122 @@ impl MultiLayerCache {
             if inner.ssd_instance_only || expired {
                 None
             } else {
-                inner.memory.get(key).cloned()
+                inner
+                    .memory
+                    .get(key)
+                    .cloned()
+                    .map(|value| (value, CacheReadTier::Memory))
+                    .or_else(|| {
+                        inner
+                            .pmem
+                            .get(key)
+                            .cloned()
+                            .map(|value| (value, CacheReadTier::Pmem))
+                    })
             }
         };
 
         // An expired entry is noticed on the read that would have been served, exactly as `get`
-        // notices it. Falling through to `get` here would report a miss twice.
+        // notices it. Falling through to `get` here would emit another access record.
         if expired {
-            return self.get(key).map(|value| value.map(std::sync::Arc::from));
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if inner.entry_expired(key, now_millis) {
+                inner.remove_expired_entry(key);
+                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            inner.record_get_latency(started);
+            inner.record_read_through_latency(started);
+            return Ok(None);
         }
 
-        let Some(value) = probe else {
-            // Every other tier materialises its bytes on the way out, so there is nothing to share
-            // and the copy is unavoidable. Fall through to `get`, which also covers the miss.
-            return Ok(self.get(key)?.map(std::sync::Arc::from));
-        };
-
-        // The accounting a memory hit does, without the copy it does it alongside. `record_hit`
-        // wants the entry's length, which the shared buffer knows without being copied.
-        let length = value.len();
-        let outcome = {
-            let inner = self.inner.read().expect("cache lock poisoned");
-            inner
-                .read_counters
-                .memory_hits
-                .fetch_add(1, Ordering::Relaxed);
-            let outcome = if inner.memory.contains_key(key) {
-                inner.record_hit_shared(key)
-            } else {
-                HitOutcome::Accounted
-            };
-            let micros = elapsed_micros(started);
-            inner.record_get_latency_micros(micros);
-            inner.record_read_through_latency_micros(micros);
-            outcome
-        };
-        match outcome {
-            HitOutcome::Accounted => {}
-            HitOutcome::NeedsAccessOrderRefresh => {
-                let mut inner = self.inner.write().expect("cache lock poisoned");
-                inner.refresh_access_order(key);
-            }
-            HitOutcome::NeedsMetadata => {
-                let mut inner = self.inner.write().expect("cache lock poisoned");
-                if inner.memory.contains_key(key) {
-                    inner.record_hit(key, length);
+        if let Some((value, tier)) = probe {
+            let length = value.len();
+            match tier {
+                CacheReadTier::Memory => {
+                    let outcome = {
+                        let inner = self.inner.read().expect("cache lock poisoned");
+                        inner
+                            .read_counters
+                            .memory_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = if inner.memory.contains_key(key) {
+                            inner.record_hit_shared(key)
+                        } else {
+                            HitOutcome::Accounted
+                        };
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros(micros);
+                        inner.record_read_through_latency_micros(micros);
+                        outcome
+                    };
+                    match outcome {
+                        HitOutcome::Accounted => {}
+                        HitOutcome::NeedsAccessOrderRefresh => {
+                            let mut inner = self.inner.write().expect("cache lock poisoned");
+                            inner.refresh_access_order(key);
+                        }
+                        HitOutcome::NeedsMetadata => {
+                            let mut inner = self.inner.write().expect("cache lock poisoned");
+                            if inner.memory.contains_key(key) {
+                                inner.record_hit(key, length);
+                            }
+                        }
+                    }
                 }
+                CacheReadTier::Pmem => {
+                    let mut inner = self.inner.write().expect("cache lock poisoned");
+                    inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                    if inner.pmem.contains_key(key) {
+                        inner.record_hit(key, length);
+                    }
+                    if !inner.put_memory(key.clone(), value.to_vec()) {
+                        inner.stats.refill_failures =
+                            inner.stats.refill_failures.saturating_add(1);
+                    }
+                    inner.record_get_latency(started);
+                    inner.record_read_through_latency(started);
+                    inner.record_refill_latency(started);
+                    drop(inner);
+                    self.drain_eviction_records();
+                }
+                CacheReadTier::Ssd => unreachable!("resident probe never returns SSD"),
+            }
+            return Ok(Some(value));
+        }
+
+        let block = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.read_ssd_block(key)?
+        };
+        match block {
+            Some(block) => {
+                let decoded = decode_cache_block(&block)?;
+                let value = Arc::<[u8]>::from(decoded.clone());
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                if is_encoded_compressed_block(&block) {
+                    inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
+                }
+                inner.record_hit(key, value.len());
+                if !inner.ssd_instance_only && !inner.refill_from_ssd(key.clone(), decoded) {
+                    inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
+                }
+                inner.record_get_latency(started);
+                inner.record_read_through_latency(started);
+                inner.record_refill_latency(started);
+                drop(inner);
+                self.drain_eviction_records();
+                Ok(Some(value))
+            }
+            None => {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                inner.record_get_latency(started);
+                inner.record_read_through_latency(started);
+                Ok(None)
             }
         }
-        Ok(Some(value))
     }
 
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {

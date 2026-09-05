@@ -15884,8 +15884,69 @@ fn a_shared_read_counts_as_a_read() {
         "a shared read must register as a memory hit ({before} -> {after}), or the policy stops seeing \
          reads of whatever uses it"
     );
+}
 
+#[test]
+fn a_shared_read_from_pmem_refills_memory_without_copying_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let key = CacheKey::page_with_slot(1, 8, 0, 32, Some(4));
+    let payload = b"pmem-shared-block".to_vec();
 
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Pmem, key.clone(), payload.clone())
+        .unwrap();
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+
+    let before = cache.stats();
+    let shared = cache
+        .get_shared(&key)
+        .expect("get_shared")
+        .expect("pmem value");
+    let after = cache.stats();
+
+    assert_eq!(&*shared, payload.as_slice());
+    assert_eq!(after.pmem_hits - before.pmem_hits, 1);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert!(after.refill_latency_samples > before.refill_latency_samples);
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+}
+
+#[test]
+fn a_shared_read_from_ssd_refills_memory_and_records_one_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let key = CacheKey::page_with_slot(1, 9, 0, 32, Some(5));
+    let payload = b"ssd-shared-block".to_vec();
+
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Ssd, key.clone(), payload.clone())
+        .unwrap();
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+    let gets = Arc::new(AtomicU64::new(0));
+    let callback_gets = gets.clone();
+    cache.register_access_record_callback(move |record| {
+        if record.record_type == CacheAccessRecordKind::Get {
+            callback_gets.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let before = cache.stats();
+    let shared = cache
+        .get_shared(&key)
+        .expect("get_shared")
+        .expect("ssd value");
+    let after = cache.stats();
+
+    assert_eq!(&*shared, payload.as_slice());
+    assert_eq!(after.disk_hits - before.disk_hits, 1);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert!(after.refill_latency_samples > before.refill_latency_samples);
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+    assert_eq!(gets.load(Ordering::Relaxed), 1);
 }
 
 
