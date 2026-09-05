@@ -135,6 +135,9 @@ jobs:
             --max-ns-per-write 2000000 \
             --max-groups-per-eviction 128 \
             --min-hit-rate-percent 70
+          tools/compare_eviction_reports.py \
+            /tmp/matrixcache-eviction.json \
+            /tmp/matrixcache-eviction.json
 
       - name: Doc
         run: cargo doc --no-deps --locked
