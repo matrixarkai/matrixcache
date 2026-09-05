@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-overhead-percent", type=float)
     parser.add_argument("--max-spread-percent", type=float)
     parser.add_argument("--min-passes", type=int, default=1)
+    parser.add_argument("--min-entries", type=int, default=1)
     return parser.parse_args()
 
 
@@ -82,6 +83,8 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"unexpected report_version {data['report_version']!r}")
     if data["entries"] <= 0 or data["value_bytes"] <= 0:
         fail("entries and value_bytes must be positive")
+    if data["entries"] < args.min_entries:
+        fail(f"entries={data['entries']} below minimum {args.min_entries}")
     if data["passes"] < args.min_passes:
         fail(f"passes={data['passes']} below minimum {args.min_passes}")
     for field in ("peek_ns_per_op", "no_promotion_ns_per_op", "full_ns_per_op"):

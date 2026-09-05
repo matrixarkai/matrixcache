@@ -133,7 +133,8 @@ jobs:
             --max-full-ns 1000000 \
             --max-overhead-percent 1000000 \
             --max-spread-percent 1000000 \
-            --min-passes 7
+            --min-passes 7 \
+            --min-entries 1024
           tools/compare_read_path_reports.py \
             /tmp/matrixcache-read-path.json \
             /tmp/matrixcache-read-path.json
