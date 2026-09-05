@@ -92,10 +92,12 @@ tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 -
 Compare a current archive with a known-good baseline before accepting a scale
 run as an optimization result. In addition to get/put p99, the comparator checks
 read-through, refill, writeback, eviction, and compaction p99 plus max-latency
-regression:
+regression. It also requires comparable latency sample coverage, so a shorter
+or partial run cannot pass only because it skipped operational read-through,
+refill, writeback, eviction, or compaction work:
 
 ```bash
-tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --max-operation-p99-regression 1.25 --max-operation-max-regression 1.50 --min-throughput-ratio 0.95
+tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --max-operation-p99-regression 1.25 --max-operation-max-regression 1.50 --min-throughput-ratio 0.95 --min-sample-ratio 0.90
 ```
 
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate

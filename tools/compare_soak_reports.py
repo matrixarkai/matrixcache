@@ -62,6 +62,16 @@ def parse_args() -> argparse.Namespace:
         default=-2.0,
         help="Minimum allowed current minus baseline hit-rate percentage points",
     )
+    parser.add_argument(
+        "--min-sample-ratio",
+        type=float,
+        default=0.90,
+        help=(
+            "Minimum allowed current/baseline ratio for latency sample counts. "
+            "This prevents a short or partial run from passing only because it "
+            "skipped read-through/refill/writeback/eviction/compaction work."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -151,6 +161,18 @@ def main() -> int:
             "compaction_p99_us",
         )
     }
+    sample_ratios = {
+        field: ratio(latency(current, field), latency(baseline, field))
+        for field in (
+            "get_count",
+            "put_count",
+            "read_through_count",
+            "refill_count",
+            "writeback_count",
+            "eviction_count",
+            "compaction_count",
+        )
+    }
 
     check_ratio("get p99", get_p99_ratio, args.max_get_p99_regression, "max")
     check_ratio("put p99", put_p99_ratio, args.max_put_p99_regression, "max")
@@ -167,6 +189,13 @@ def main() -> int:
             field_ratio,
             args.max_operation_p99_regression,
             "max",
+        )
+    for field, field_ratio in sample_ratios.items():
+        check_ratio(
+            field.replace("_", " "),
+            field_ratio,
+            args.min_sample_ratio,
+            "min",
         )
     check_ratio("peak memory", memory_ratio, args.max_memory_growth, "max")
     check_ratio("best throughput", throughput_ratio, args.min_throughput_ratio, "min")
@@ -185,6 +214,9 @@ def main() -> int:
         f"hit_rate_delta={hit_rate_delta:.2f}pp "
         "operation_p99_ratios="
         + ",".join(f"{name}={value:.3f}" for name, value in operation_p99_ratios.items())
+        + " "
+        "sample_ratios="
+        + ",".join(f"{name}={value:.3f}" for name, value in sample_ratios.items())
         + " "
         "operation_max_ratios="
         + ",".join(f"{name}={value:.3f}" for name, value in operation_max_ratios.items())
