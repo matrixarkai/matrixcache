@@ -135,6 +135,60 @@ fn coalesce_release_counts(handles: Vec<CachePinnedHandle>) -> (usize, Vec<(Cach
     (released, counts_by_key.into_iter().collect())
 }
 
+fn coalesce_key_indexes(entries: Vec<(usize, CacheKey)>) -> Vec<(CacheKey, Vec<usize>)> {
+    if entries.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut grouped = Vec::<(CacheKey, Vec<usize>)>::new();
+        for (index, key) in entries {
+            if let Some((_, indexes)) = grouped.iter_mut().find(|(existing, _)| existing == &key) {
+                indexes.push(index);
+            } else {
+                grouped.push((key, vec![index]));
+            }
+        }
+        return grouped;
+    }
+
+    let mut positions_by_key = HashMap::<CacheKey, usize>::new();
+    let mut grouped = Vec::<(CacheKey, Vec<usize>)>::new();
+    for (index, key) in entries {
+        if let Some(position) = positions_by_key.get(&key).copied() {
+            grouped[position].1.push(index);
+        } else {
+            positions_by_key.insert(key.clone(), grouped.len());
+            grouped.push((key, vec![index]));
+        }
+    }
+    grouped
+}
+
+fn coalesce_key_timed_indexes(
+    entries: Vec<(usize, CacheKey, Instant)>,
+) -> Vec<(CacheKey, Vec<(usize, Instant)>)> {
+    if entries.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut grouped = Vec::<(CacheKey, Vec<(usize, Instant)>)>::new();
+        for (index, key, started) in entries {
+            if let Some((_, indexes)) = grouped.iter_mut().find(|(existing, _)| existing == &key) {
+                indexes.push((index, started));
+            } else {
+                grouped.push((key, vec![(index, started)]));
+            }
+        }
+        return grouped;
+    }
+
+    let mut positions_by_key = HashMap::<CacheKey, usize>::new();
+    let mut grouped = Vec::<(CacheKey, Vec<(usize, Instant)>)>::new();
+    for (index, key, started) in entries {
+        if let Some(position) = positions_by_key.get(&key).copied() {
+            grouped[position].1.push((index, started));
+        } else {
+            positions_by_key.insert(key.clone(), grouped.len());
+            grouped.push((key, vec![(index, started)]));
+        }
+    }
+    grouped
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -2585,16 +2639,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut unique_ssd_candidates = Vec::<(CacheKey, Vec<usize>)>::new();
-        let mut unique_ssd_positions = HashMap::<CacheKey, usize>::new();
-        for (index, key) in ssd_candidates {
-            if let Some(position) = unique_ssd_positions.get(&key).copied() {
-                unique_ssd_candidates[position].1.push(index);
-            } else {
-                unique_ssd_positions.insert(key.clone(), unique_ssd_candidates.len());
-                unique_ssd_candidates.push((key, vec![index]));
-            }
-        }
+        let unique_ssd_candidates = coalesce_key_indexes(ssd_candidates);
 
         let candidate_keys = unique_ssd_candidates
             .iter()
@@ -2956,16 +3001,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut unique_ssd_candidates = Vec::<(CacheKey, Vec<(usize, Instant)>)>::new();
-        let mut unique_ssd_positions = HashMap::<CacheKey, usize>::new();
-        for (index, key, started) in ssd_candidates {
-            if let Some(position) = unique_ssd_positions.get(&key).copied() {
-                unique_ssd_candidates[position].1.push((index, started));
-            } else {
-                unique_ssd_positions.insert(key.clone(), unique_ssd_candidates.len());
-                unique_ssd_candidates.push((key, vec![(index, started)]));
-            }
-        }
+        let unique_ssd_candidates = coalesce_key_timed_indexes(ssd_candidates);
         // Pointers, not copies: these keys are read and nothing more.
         let candidate_keys = unique_ssd_candidates
             .iter()
