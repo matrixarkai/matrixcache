@@ -97,6 +97,7 @@ batch and refill counters:
 
 ```bash
 cargo run --release --no-default-features --example batch_write_cost -- --json-output /tmp/matrixcache-batch-control.json --require-passed
+tools/validate_batch_control_report.py /tmp/matrixcache-batch-control.json --min-batches 2 --min-disk-hits 1 --min-zero-copy-hits 1 --min-refill-samples 1
 ```
 
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
