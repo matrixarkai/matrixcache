@@ -75,7 +75,7 @@ requires the operational max-latency fields so old archives cannot silently pass
 as current soak evidence:
 
 ```bash
-tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
+tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-eviction-samples 1
 ```
 
 Compare a current archive with a known-good baseline before accepting a scale
@@ -88,6 +88,11 @@ tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-so
 
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate
 budgets so a scale run can fail for the exact reason that moved.
+
+The minimum read/write/eviction sample options are intentionally separate from
+latency budgets. Use low floors for CI smoke and production-sized floors for
+release soak archives so an empty or mostly idle run cannot become cache parity
+evidence.
 
 For the batch control path TemporalStore uses to warm, pin, release, and rewrite
 groups of block entries, archive `batch_write_cost` too. The report captures

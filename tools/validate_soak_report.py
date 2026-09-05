@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-get-p99-us", type=int)
     parser.add_argument("--max-put-p99-us", type=int)
     parser.add_argument("--max-eviction-p99-us", type=int)
+    parser.add_argument("--min-reads", type=int, default=1)
+    parser.add_argument("--min-writes", type=int, default=0)
+    parser.add_argument("--min-memory-evictions", type=int, default=0)
+    parser.add_argument("--min-get-samples", type=int, default=1)
+    parser.add_argument("--min-put-samples", type=int, default=0)
+    parser.add_argument("--min-eviction-samples", type=int, default=0)
     return parser.parse_args()
 
 
@@ -115,8 +121,15 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
 
     if data["report_version"] != "matrixcache_soak_v1":
         fail(f"unexpected report_version {data['report_version']!r}")
-    if data["reads"] <= 0:
-        fail("reads must be positive")
+    if data["reads"] < args.min_reads:
+        fail(f"reads={data['reads']} below minimum {args.min_reads}")
+    if data["writes"] < args.min_writes:
+        fail(f"writes={data['writes']} below minimum {args.min_writes}")
+    if data.get("memory_evictions", 0) < args.min_memory_evictions:
+        fail(
+            f"memory_evictions={data.get('memory_evictions', 0)} below minimum "
+            f"{args.min_memory_evictions}"
+        )
     if data["peak_entries"] < 0 or data["peak_memory_bytes"] < 0:
         fail("peak entry and memory counts must be non-negative")
 
@@ -134,6 +147,15 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"missing latency fields: {', '.join(sorted(missing_latency))}")
     if latency["histogram_ready"] is not True:
         fail("latency histogram is not ready")
+    if latency.get("get_count", 0) < args.min_get_samples:
+        fail(f"get_count={latency.get('get_count', 0)} below minimum {args.min_get_samples}")
+    if latency.get("put_count", 0) < args.min_put_samples:
+        fail(f"put_count={latency.get('put_count', 0)} below minimum {args.min_put_samples}")
+    if latency.get("eviction_count", 0) < args.min_eviction_samples:
+        fail(
+            f"eviction_count={latency.get('eviction_count', 0)} below minimum "
+            f"{args.min_eviction_samples}"
+        )
 
     if not args.allow_failed and data["passed"] is not True:
         fail("report passed=false")
@@ -154,6 +176,7 @@ def main() -> int:
     print(
         "OK matrixcache soak report: "
         f"reads={data['reads']} writes={data['writes']} "
+        f"evictions={data.get('memory_evictions', 0)} "
         f"hit_rate={float(data['observed_hit_rate_percent']):.2f}% "
         f"get_p99={data['latency']['get_p99_us']}us "
         f"put_p99={data['latency']['put_p99_us']}us"
