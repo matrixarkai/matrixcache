@@ -15949,6 +15949,82 @@ fn a_shared_read_from_ssd_refills_memory_and_records_one_access() {
     assert_eq!(gets.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn shared_batch_coalesces_duplicate_ssd_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let repeated = CacheKey::page_with_slot(1, 11, 0, 16, Some(7));
+    let other = CacheKey::page_with_slot(1, 12, 0, 16, Some(8));
+
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Ssd, repeated.clone(), b"repeat".to_vec())
+        .unwrap();
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Ssd, other.clone(), b"other".to_vec())
+        .unwrap();
+
+    let before = cache.stats();
+    let values = cache
+        .get_shared_batch(&[repeated.clone(), other.clone(), repeated.clone()])
+        .expect("shared batch");
+    let after = cache.stats();
+
+    assert_eq!(values.len(), 3);
+    assert_eq!(&**values[0].as_ref().unwrap(), b"repeat");
+    assert_eq!(&**values[1].as_ref().unwrap(), b"other");
+    assert_eq!(&**values[2].as_ref().unwrap(), b"repeat");
+    assert!(Arc::ptr_eq(
+        values[0].as_ref().unwrap(),
+        values[2].as_ref().unwrap()
+    ));
+    assert_eq!(after.disk_hits - before.disk_hits, 2);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(cache.peek_tier(&repeated), Some(CacheReadTier::Memory));
+    assert_eq!(cache.peek_tier(&other), Some(CacheReadTier::Memory));
+}
+
+#[test]
+fn sharded_shared_batch_preserves_order_and_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardedMultiLayerCache::with_options(
+        CacheOptions {
+            dram_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        },
+        4,
+    );
+
+    let keys = (0..8)
+        .map(|idx| CacheKey::string(idx % 4, &format!("shared-batch-{idx}")))
+        .collect::<Vec<_>>();
+    for (idx, key) in keys.iter().enumerate() {
+        cache
+            .put(key.clone(), format!("value-{idx}").into_bytes())
+            .unwrap();
+    }
+
+    let requested = vec![
+        keys[3].clone(),
+        keys[0].clone(),
+        keys[7].clone(),
+        keys[3].clone(),
+        CacheKey::string(99, "missing-shared-batch"),
+    ];
+    let values = cache.GetSharedBatch(&requested).expect("sharded shared batch");
+
+    assert_eq!(&**values[0].as_ref().unwrap(), b"value-3");
+    assert_eq!(&**values[1].as_ref().unwrap(), b"value-0");
+    assert_eq!(&**values[2].as_ref().unwrap(), b"value-7");
+    assert_eq!(&**values[3].as_ref().unwrap(), b"value-3");
+    assert!(values[4].is_none());
+    assert!(Arc::ptr_eq(
+        values[0].as_ref().unwrap(),
+        values[3].as_ref().unwrap()
+    ));
+}
+
 
 #[test]
 fn sharded_batch_fanout_metrics_are_exported() {

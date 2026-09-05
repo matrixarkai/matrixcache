@@ -2228,6 +2228,46 @@ impl MultiLayerCache {
         }
     }
 
+    /// Batched shared reads with duplicate coalescing.
+    ///
+    /// Retrieval paths often ask for overlapping evidence windows. Calling
+    /// `get_shared` once per key is correct, but repeated cold keys decode,
+    /// refill and count as independent SSD reads. This keeps the public order
+    /// and duplicates while doing the cache work once per unique key.
+    pub fn get_shared_batch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
+        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(results);
+        }
+
+        let mut unique_positions = HashMap::<CacheKey, usize>::new();
+        let mut unique_keys = Vec::<CacheKey>::new();
+        let mut requested_positions = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().cloned().enumerate() {
+            let unique_position = if let Some(position) = unique_positions.get(&key).copied() {
+                position
+            } else {
+                let position = unique_keys.len();
+                unique_positions.insert(key.clone(), position);
+                unique_keys.push(key);
+                position
+            };
+            requested_positions.push((position, unique_position));
+        }
+
+        let unique_values = unique_keys
+            .iter()
+            .map(|key| self.get_shared(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (position, unique_position) in requested_positions {
+            results[position] = unique_values[unique_position].clone();
+        }
+        Ok(results)
+    }
+
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         self.get(key)
     }
@@ -4148,6 +4188,19 @@ impl MultiLayerCache {
     }
 
     #[allow(non_snake_case)]
+    pub fn GetShared(&self, key: &CacheKey) -> Result<Option<std::sync::Arc<[u8]>>, CacheError> {
+        self.get_shared(key)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn GetSharedBatch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
+        self.get_shared_batch(keys)
+    }
+
+    #[allow(non_snake_case)]
     pub fn Remove(&self, key: &CacheKey) -> Result<(), CacheError> {
         self.remove(key)
     }
@@ -5949,6 +6002,14 @@ impl ShardedMultiLayerCache {
         self.shard_for_key(key).get_shared(key)
     }
 
+    /// Batched shared reads, preserving input order and duplicate positions.
+    pub fn get_shared_batch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
+        self.get_batch_with_shard_reader(keys, MultiLayerCache::get_shared_batch)
+    }
+
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         self.get(key)
     }
@@ -7315,6 +7376,14 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         self.acquire_batch(keys)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn GetSharedBatch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
+        self.get_shared_batch(keys)
     }
 
     #[allow(non_snake_case)]
