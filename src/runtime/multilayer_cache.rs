@@ -4496,8 +4496,12 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.writeback_backpressure_events = total.writeback_backpressure_events.saturating_add(writeback_backpressure_events);
     total.async_writeback_queue_depth = total.async_writeback_queue_depth.saturating_add(async_writeback_queue_depth);
     total.async_writeback_queue_bytes = total.async_writeback_queue_bytes.saturating_add(async_writeback_queue_bytes);
-    total.async_writeback_max_queue_depth = total.async_writeback_max_queue_depth.saturating_add(async_writeback_max_queue_depth);
-    total.async_writeback_max_queue_bytes = total.async_writeback_max_queue_bytes.saturating_add(async_writeback_max_queue_bytes);
+    total.async_writeback_max_queue_depth = total
+        .async_writeback_max_queue_depth
+        .max(async_writeback_max_queue_depth);
+    total.async_writeback_max_queue_bytes = total
+        .async_writeback_max_queue_bytes
+        .max(async_writeback_max_queue_bytes);
     total.sharded_batch_fanout_operations = total
         .sharded_batch_fanout_operations
         .saturating_add(sharded_batch_fanout_operations);
@@ -4535,8 +4539,8 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.put_latency_samples = total.put_latency_samples.saturating_add(put_latency_samples);
     total.get_latency_total_micros = total.get_latency_total_micros.saturating_add(get_latency_total_micros);
     total.put_latency_total_micros = total.put_latency_total_micros.saturating_add(put_latency_total_micros);
-    total.get_latency_max_micros = total.get_latency_max_micros.saturating_add(get_latency_max_micros);
-    total.put_latency_max_micros = total.put_latency_max_micros.saturating_add(put_latency_max_micros);
+    total.get_latency_max_micros = total.get_latency_max_micros.max(get_latency_max_micros);
+    total.put_latency_max_micros = total.put_latency_max_micros.max(put_latency_max_micros);
     total.get_latency_le_10us = total.get_latency_le_10us.saturating_add(get_latency_le_10us);
     total.get_latency_le_100us = total.get_latency_le_100us.saturating_add(get_latency_le_100us);
     total.get_latency_le_1ms = total.get_latency_le_1ms.saturating_add(get_latency_le_1ms);
@@ -4593,10 +4597,10 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.compression_bytes_saved = total.compression_bytes_saved.saturating_add(compression_bytes_saved);
     total.get_latency_count = total.get_latency_count.saturating_add(get_latency_count);
     total.get_latency_total_us = total.get_latency_total_us.saturating_add(get_latency_total_us);
-    total.get_latency_max_us = total.get_latency_max_us.saturating_add(get_latency_max_us);
+    total.get_latency_max_us = total.get_latency_max_us.max(get_latency_max_us);
     total.put_latency_count = total.put_latency_count.saturating_add(put_latency_count);
     total.put_latency_total_us = total.put_latency_total_us.saturating_add(put_latency_total_us);
-    total.put_latency_max_us = total.put_latency_max_us.saturating_add(put_latency_max_us);
+    total.put_latency_max_us = total.put_latency_max_us.max(put_latency_max_us);
     total.memory_bytes = total.memory_bytes.saturating_add(memory_bytes);
     total.pmem_bytes = total.pmem_bytes.saturating_add(pmem_bytes);
     total.disk_bytes = total.disk_bytes.saturating_add(disk_bytes);
@@ -4604,6 +4608,66 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     // Named above to prove the pattern is complete, combined after the loop
     // where the whole set of shards is in hand.
     let _ = ssd_write_budget_share;
+}
+
+#[cfg(test)]
+mod sharded_stats_fold_tests {
+    use super::*;
+
+    #[test]
+    fn sharded_stats_fold_keeps_high_water_marks_as_maxima() {
+        let mut total = CacheStats {
+            get_latency_samples: 2,
+            get_latency_total_micros: 20,
+            get_latency_max_micros: 11,
+            put_latency_samples: 2,
+            put_latency_total_micros: 30,
+            put_latency_max_micros: 17,
+            get_latency_count: 2,
+            get_latency_total_us: 20,
+            get_latency_max_us: 13,
+            put_latency_count: 2,
+            put_latency_total_us: 30,
+            put_latency_max_us: 19,
+            async_writeback_max_queue_depth: 4,
+            async_writeback_max_queue_bytes: 40,
+            ..CacheStats::default()
+        };
+        let shard = CacheStats {
+            get_latency_samples: 3,
+            get_latency_total_micros: 90,
+            get_latency_max_micros: 23,
+            put_latency_samples: 3,
+            put_latency_total_micros: 120,
+            put_latency_max_micros: 29,
+            get_latency_count: 3,
+            get_latency_total_us: 90,
+            get_latency_max_us: 31,
+            put_latency_count: 3,
+            put_latency_total_us: 120,
+            put_latency_max_us: 37,
+            async_writeback_max_queue_depth: 6,
+            async_writeback_max_queue_bytes: 60,
+            ..CacheStats::default()
+        };
+
+        fold_shard_stats(&mut total, shard);
+
+        assert_eq!(total.get_latency_samples, 5);
+        assert_eq!(total.get_latency_total_micros, 110);
+        assert_eq!(total.get_latency_max_micros, 23);
+        assert_eq!(total.put_latency_samples, 5);
+        assert_eq!(total.put_latency_total_micros, 150);
+        assert_eq!(total.put_latency_max_micros, 29);
+        assert_eq!(total.get_latency_count, 5);
+        assert_eq!(total.get_latency_total_us, 110);
+        assert_eq!(total.get_latency_max_us, 31);
+        assert_eq!(total.put_latency_count, 5);
+        assert_eq!(total.put_latency_total_us, 150);
+        assert_eq!(total.put_latency_max_us, 37);
+        assert_eq!(total.async_writeback_max_queue_depth, 6);
+        assert_eq!(total.async_writeback_max_queue_bytes, 60);
+    }
 }
 
 /// A [`MultiLayerCache`] split into independent shards, chosen by key hash.
