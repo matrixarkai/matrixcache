@@ -60,6 +60,8 @@ families directly, including:
 - sharded batch fan-out/local decisions from `matrixcache_sharded_batch_fanout_operations`,
   `matrixcache_sharded_batch_local_operations`, `matrixcache_sharded_batch_fanout_shards`,
   `matrixcache_sharded_batch_latency_p95_seconds`, and `matrixcache_sharded_batch_latency_p99_seconds`
+- operation throughput from the per-path histogram count rates for get, put,
+  read-through, refill, writeback, eviction, and compaction
 - p50, p95, p99, and average latency for get, put, read-through, refill, writeback,
   and eviction
 - Prometheus histogram sample counts for get, put, read-through, refill,

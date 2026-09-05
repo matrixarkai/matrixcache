@@ -51,6 +51,9 @@ DEFAULT_REQUIRED = (
     "matrixcache_sharded_batch_latency_p95_seconds",
     "matrixcache_sharded_batch_latency_p99_seconds",
 )
+DEFAULT_REQUIRED_PANEL_TITLES = (
+    "Operation Throughput",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,7 +120,7 @@ def iter_targets(value: Any) -> list[str]:
     return expressions
 
 
-def dashboard_metrics(path: Path) -> tuple[set[str], int]:
+def dashboard_metrics(path: Path) -> tuple[set[str], set[str], int]:
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
@@ -128,15 +131,20 @@ def dashboard_metrics(path: Path) -> tuple[set[str], int]:
     metrics: set[str] = set()
     for expr in expressions:
         metrics.update(METRIC_RE.findall(expr))
+    panel_titles = {
+        title
+        for title in (panel.get("title") for panel in data.get("panels", []))
+        if isinstance(title, str)
+    }
     if not expressions:
         fail(f"{path} has no Prometheus expressions")
-    return metrics, len(expressions)
+    return metrics, panel_titles, len(expressions)
 
 
 def main() -> int:
     args = parse_args()
     exported = exported_metrics(args.metrics_source)
-    referenced, expression_count = dashboard_metrics(args.dashboard)
+    referenced, panel_titles, expression_count = dashboard_metrics(args.dashboard)
     unknown = sorted(referenced - exported)
     if unknown:
         fail("dashboard references metrics not exported by prometheus_text: " + ", ".join(unknown))
@@ -147,6 +155,9 @@ def main() -> int:
     missing_required = sorted(required - referenced)
     if missing_required:
         fail("dashboard is missing required cache panels/queries: " + ", ".join(missing_required))
+    missing_panels = sorted(set(DEFAULT_REQUIRED_PANEL_TITLES) - panel_titles)
+    if missing_panels:
+        fail("dashboard is missing required cache panels: " + ", ".join(missing_panels))
 
     print(
         "OK matrixcache Grafana dashboard: "
