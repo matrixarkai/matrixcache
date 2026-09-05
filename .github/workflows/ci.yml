@@ -116,6 +116,9 @@ jobs:
             --max-full-ns 1000000 \
             --max-overhead-percent 1000000 \
             --max-spread-percent 1000000
+          tools/compare_read_path_reports.py \
+            /tmp/matrixcache-read-path.json \
+            /tmp/matrixcache-read-path.json
 
       - name: Doc
         run: cargo doc --no-deps --locked
