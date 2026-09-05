@@ -36,6 +36,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-operation-p99-regression",
+        type=float,
+        default=1.50,
+        help=(
+            "Maximum allowed current/baseline ratio for read-through/refill/"
+            "writeback/eviction/compaction p99 latency fields"
+        ),
+    )
+    parser.add_argument(
         "--max-memory-growth",
         type=float,
         default=1.10,
@@ -132,6 +141,16 @@ def main() -> int:
             "compaction_max_us",
         )
     }
+    operation_p99_ratios = {
+        field: ratio(latency(current, field), latency(baseline, field))
+        for field in (
+            "read_through_p99_us",
+            "refill_p99_us",
+            "writeback_p99_us",
+            "eviction_p99_us",
+            "compaction_p99_us",
+        )
+    }
 
     check_ratio("get p99", get_p99_ratio, args.max_get_p99_regression, "max")
     check_ratio("put p99", put_p99_ratio, args.max_put_p99_regression, "max")
@@ -140,6 +159,13 @@ def main() -> int:
             field.replace("_", " "),
             field_ratio,
             args.max_operation_max_regression,
+            "max",
+        )
+    for field, field_ratio in operation_p99_ratios.items():
+        check_ratio(
+            field.replace("_", " "),
+            field_ratio,
+            args.max_operation_p99_regression,
             "max",
         )
     check_ratio("peak memory", memory_ratio, args.max_memory_growth, "max")
@@ -157,6 +183,9 @@ def main() -> int:
         f"throughput_ratio={throughput_ratio:.3f} "
         f"memory_ratio={memory_ratio:.3f} "
         f"hit_rate_delta={hit_rate_delta:.2f}pp "
+        "operation_p99_ratios="
+        + ",".join(f"{name}={value:.3f}" for name, value in operation_p99_ratios.items())
+        + " "
         "operation_max_ratios="
         + ",".join(f"{name}={value:.3f}" for name, value in operation_max_ratios.items())
     )
