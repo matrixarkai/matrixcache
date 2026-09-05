@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-best-sharded-mops", type=float)
     parser.add_argument("--min-worst-sharded-speedup", type=float)
     parser.add_argument("--max-first-hit-ns", type=float)
+    parser.add_argument("--min-repeats", type=int, default=1)
     return parser.parse_args()
 
 
@@ -125,8 +126,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         require_type(data, field, expected)
     if data["report_version"] != "matrixcache_read_scaling_v1":
         fail(f"unexpected report_version {data['report_version']!r}")
-    if data["max_entries"] <= 0 or data["value_bytes"] <= 0 or data["repeats"] <= 0:
-        fail("max_entries, value_bytes, and repeats must be positive")
+    if data["max_entries"] <= 0 or data["value_bytes"] <= 0:
+        fail("max_entries and value_bytes must be positive")
+    if data["repeats"] < args.min_repeats:
+        fail(f"repeats={data['repeats']} below minimum {args.min_repeats}")
     if data["shards"] <= 0:
         fail("shards must be positive")
     if len(data["hit_costs"]) < args.min_hit_costs:
@@ -173,6 +176,7 @@ def main() -> int:
     print(
         "OK matrixcache read-scaling report: "
         f"hit_costs={len(data['hit_costs'])} thread_rows={len(data['thread_scaling'])} "
+        f"repeats={data['repeats']} "
         f"best_sharded_mops={float(summary['best_sharded_mops']):.2f} "
         f"worst_speedup={float(summary['worst_sharded_speedup']):.2f}x "
         f"first_hit_ns={float(summary['first_hit_ns_per_op']):.1f}"
