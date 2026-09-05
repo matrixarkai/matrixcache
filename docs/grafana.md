@@ -112,6 +112,16 @@ tools/validate_read_scaling_report.py /tmp/matrixcache-read-scaling.json --min-h
 tools/compare_read_scaling_reports.py /tmp/matrixcache-read-scaling-baseline.json /tmp/matrixcache-read-scaling.json --max-latency-regression 1.35 --min-throughput-ratio 0.80
 ```
 
+For low-level hit-path bookkeeping checks, archive `read_path_cost`. This report
+captures the peek, no-promotion, and full read paths plus the measured overhead
+and pass-to-pass spread, so cache hit latency work can be compared without
+manually reading console tables:
+
+```bash
+cargo run --release --no-default-features --example read_path_cost -- 4096 --json-output /tmp/matrixcache-read-path.json --require-passed --max-full-ns 1000000 --max-overhead-percent 1000000 --max-spread-percent 1000000
+tools/validate_read_path_report.py /tmp/matrixcache-read-path.json --max-full-ns 1000000 --max-overhead-percent 1000000 --max-spread-percent 1000000
+```
+
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash

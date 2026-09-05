@@ -34,9 +34,12 @@
 //! ```text
 //! cargo run --release --no-default-features --example read_path_cost
 //! cargo run --release --no-default-features --example read_path_cost -- 16384
+//! cargo run --release --no-default-features --example read_path_cost -- 4096 --json-output /tmp/matrixcache-read-path.json --require-passed
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::Instant;
 
 const VALUE_BYTES: usize = 64;
@@ -85,9 +88,155 @@ struct PassTimings {
     full: f64,
 }
 
+fn option_f64_json(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn write_json_report(
+    path: Option<&PathBuf>,
+    entries: usize,
+    peek_ns: f64,
+    no_promotion_ns: f64,
+    full_ns: f64,
+    overhead_ns: f64,
+    overhead_median_percent: f64,
+    overhead_low_percent: f64,
+    overhead_high_percent: f64,
+    max_full_ns: Option<f64>,
+    max_overhead_percent: Option<f64>,
+    max_spread_percent: Option<f64>,
+    passed: bool,
+) -> String {
+    let spread_percent = overhead_high_percent - overhead_low_percent;
+    let mut report = String::new();
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_read_path_v1\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"entries\": {entries},").expect("format report");
+    writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+    writeln!(&mut report, "  \"passes\": {PASSES},").expect("format report");
+    writeln!(&mut report, "  \"peek_ns_per_op\": {peek_ns:.4},").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"no_promotion_ns_per_op\": {no_promotion_ns:.4},"
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"full_ns_per_op\": {full_ns:.4},").expect("format report");
+    writeln!(&mut report, "  \"overhead_ns_per_op\": {overhead_ns:.4},").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"overhead_median_percent\": {overhead_median_percent:.4},"
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"overhead_low_percent\": {overhead_low_percent:.4},"
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"overhead_high_percent\": {overhead_high_percent:.4},"
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"spread_percent\": {spread_percent:.4},").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"max_full_ns\": {},",
+        option_f64_json(max_full_ns)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"max_overhead_percent\": {},",
+        option_f64_json(max_overhead_percent)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"max_spread_percent\": {},",
+        option_f64_json(max_spread_percent)
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"checks\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"positive_timings\": {},",
+        peek_ns > 0.0 && no_promotion_ns > 0.0 && full_ns > 0.0
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"full_hit_within_budget\": {},",
+        max_full_ns.map(|limit| full_ns <= limit).unwrap_or(true)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"overhead_within_budget\": {},",
+        max_overhead_percent
+            .map(|limit| overhead_median_percent <= limit)
+            .unwrap_or(true)
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"spread_within_budget\": {}",
+        max_spread_percent
+            .map(|limit| spread_percent <= limit)
+            .unwrap_or(true)
+    )
+    .expect("format report");
+    writeln!(&mut report, "  }},").expect("format report");
+    writeln!(&mut report, "  \"passed\": {passed}").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+    if let Some(path) = path {
+        std::fs::write(path, &report).expect("write json report");
+    }
+    report
+}
+
 fn main() {
-    let entries: usize = std::env::args()
-        .nth(1)
+    let mut positional = Vec::new();
+    let mut emit_json = false;
+    let mut json_output: Option<PathBuf> = None;
+    let mut require_passed = false;
+    let mut max_full_ns: Option<f64> = None;
+    let mut max_overhead_percent: Option<f64> = None;
+    let mut max_spread_percent: Option<f64> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => emit_json = true,
+            "--json-output" => json_output = args.next().map(PathBuf::from),
+            "--require-passed" => require_passed = true,
+            "--max-full-ns" => {
+                max_full_ns = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0.0);
+            }
+            "--max-overhead-percent" => {
+                max_overhead_percent = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value >= 0.0);
+            }
+            "--max-spread-percent" => {
+                max_spread_percent = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value >= 0.0);
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let entries: usize = positional
+        .first()
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(4096);
 
@@ -210,6 +359,48 @@ fn main() {
             ""
         }
     );
+
+    let spread_percent = overhead_high - overhead_low;
+    let passed = peek > 0.0
+        && no_promotion > 0.0
+        && full > 0.0
+        && max_full_ns.map(|limit| full <= limit).unwrap_or(true)
+        && max_overhead_percent
+            .map(|limit| overhead_median <= limit)
+            .unwrap_or(true)
+        && max_spread_percent
+            .map(|limit| spread_percent <= limit)
+            .unwrap_or(true);
+    if emit_json || json_output.is_some() || require_passed {
+        let report = write_json_report(
+            json_output.as_ref(),
+            entries,
+            peek,
+            no_promotion,
+            full,
+            overhead_ns,
+            overhead_median,
+            overhead_low,
+            overhead_high,
+            max_full_ns,
+            max_overhead_percent,
+            max_spread_percent,
+            passed,
+        );
+        if emit_json {
+            print!("{report}");
+        }
+        if let Some(path) = &json_output {
+            println!("wrote {}", path.display());
+        }
+        println!(
+            "read path gate: {}",
+            if passed { "passed" } else { "failed" }
+        );
+        if require_passed && !passed {
+            std::process::exit(1);
+        }
+    }
 
     drop(cache);
     let _ = std::fs::remove_dir_all(&dir);

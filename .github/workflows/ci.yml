@@ -103,6 +103,20 @@ jobs:
             /tmp/matrixcache-read-scaling.json \
             /tmp/matrixcache-read-scaling.json
 
+      - name: Read path report smoke
+        run: |
+          cargo run --locked --no-default-features --example read_path_cost -- \
+            1024 \
+            --json-output /tmp/matrixcache-read-path.json \
+            --require-passed \
+            --max-full-ns 1000000 \
+            --max-overhead-percent 1000000 \
+            --max-spread-percent 1000000
+          tools/validate_read_path_report.py /tmp/matrixcache-read-path.json \
+            --max-full-ns 1000000 \
+            --max-overhead-percent 1000000 \
+            --max-spread-percent 1000000
+
       - name: Doc
         run: cargo doc --no-deps --locked
 
