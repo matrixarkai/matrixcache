@@ -266,6 +266,11 @@
           "expr": "sum(matrixcache_async_writeback_queue_depth)",
           "legendFormat": "queued jobs",
           "refId": "A"
+        },
+        {
+          "expr": "sum(matrixcache_async_writeback_queue_bytes)",
+          "legendFormat": "queue bytes",
+          "refId": "B"
         }
       ],
       "title": "Writeback Queue",
@@ -626,6 +631,11 @@
           "expr": "sum(rate(matrixcache_async_writeback_backpressure_rejections[5m]))",
           "legendFormat": "backpressure rejects",
           "refId": "C"
+        },
+        {
+          "expr": "sum(rate(matrixcache_writeback_backpressure_events[5m]))",
+          "legendFormat": "pressure events",
+          "refId": "D"
         }
       ],
       "title": "Async Writeback",
