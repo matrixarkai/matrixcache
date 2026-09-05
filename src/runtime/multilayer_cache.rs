@@ -3195,20 +3195,137 @@ impl MultiLayerCache {
             }
         }
 
-        for (key, positions) in remaining {
-            let Some(handle) = self.acquire(&key)? else {
-                continue;
-            };
-            let first_position = positions[0];
-            results[first_position] = Some(handle);
-            for position in positions.into_iter().skip(1) {
-                let cloned = self.clone_handle(
-                    results[first_position]
-                        .as_ref()
-                        .expect("first batch handle is installed"),
-                );
-                results[position] = Some(cloned);
+        let mut ssd_candidates = Vec::<(CacheKey, Vec<usize>, Instant)>::new();
+        let mut needs_eviction_drain = false;
+        {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
             }
+            let mut pin_counts = Vec::<(CacheKey, usize, usize, usize)>::new();
+            for (key, positions) in remaining {
+                let started = Instant::now();
+                if inner.entry_expired(&key, now_millis) {
+                    inner.remove_expired_entry(&key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                    inner.record_get_latency(started);
+                    inner.record_read_through_latency(started);
+                    continue;
+                }
+                if !inner.ssd_instance_only {
+                    if let Some(value) = inner.memory.get(&key).cloned() {
+                        inner
+                            .read_counters
+                            .memory_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        inner.record_hit(&key, value.len());
+                        inner.record_get_latency(started);
+                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        for position in positions {
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Memory,
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(value) = inner.pmem.get(&key).cloned() {
+                        let decoded = value.to_vec();
+                        if !inner.put_memory(key.clone(), decoded.clone()) {
+                            inner.stats.refill_failures =
+                                inner.stats.refill_failures.saturating_add(1);
+                        }
+                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                        inner.record_hit(&key, value.len());
+                        inner.record_get_latency(started);
+                        inner.record_read_through_latency(started);
+                        inner.record_refill_latency(started);
+                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        for position in positions {
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Pmem,
+                            });
+                        }
+                        needs_eviction_drain = true;
+                        continue;
+                    }
+                }
+                ssd_candidates.push((key, positions, started));
+            }
+            inner.increment_pin_handle_counts(&pin_counts);
+        }
+
+        if !ssd_candidates.is_empty() {
+            let candidate_keys = ssd_candidates
+                .iter()
+                .map(|(key, _, _)| key)
+                .collect::<Vec<_>>();
+            let blocks = {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                inner.read_ssd_blocks(&candidate_keys)?
+            };
+            let mut decoded = Vec::with_capacity(ssd_candidates.len());
+            for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
+                let value = match block {
+                    Some(block) => Some((
+                        Arc::<[u8]>::from(decode_cache_block(&block)?),
+                        is_encoded_compressed_block(&block),
+                    )),
+                    None => None,
+                };
+                decoded.push((key, positions, started, value));
+            }
+
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            let mut pin_counts = Vec::<(CacheKey, usize, usize, usize)>::new();
+            for (key, positions, started, value) in decoded {
+                match value {
+                    Some((value, compressed)) => {
+                        if !inner.ssd_instance_only
+                            && !inner.refill_from_ssd(key.clone(), value.to_vec())
+                        {
+                            inner.stats.refill_failures =
+                                inner.stats.refill_failures.saturating_add(1);
+                        }
+                        inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                        if compressed {
+                            inner.stats.compressed_hits =
+                                inner.stats.compressed_hits.saturating_add(1);
+                        }
+                        inner.record_hit(&key, value.len());
+                        inner.record_get_latency(started);
+                        inner.record_read_through_latency(started);
+                        inner.record_refill_latency(started);
+                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        for position in positions {
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Ssd,
+                            });
+                        }
+                        needs_eviction_drain = true;
+                    }
+                    None => {
+                        inner.stats.zero_copy_handle_misses =
+                            inner.stats.zero_copy_handle_misses.saturating_add(1);
+                        inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                        inner.record_get_latency(started);
+                        inner.record_read_through_latency(started);
+                    }
+                }
+            }
+            inner.increment_pin_handle_counts(&pin_counts);
+        }
+        if needs_eviction_drain {
+            self.drain_eviction_records();
         }
         Ok(results)
     }

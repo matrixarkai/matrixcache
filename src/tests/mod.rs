@@ -9178,7 +9178,7 @@ mod tests {
         let cache = MultiLayerCache::with_tiering_policy(
             unique_temp_path("zero-copy-batch-acquire"),
             CacheTieringPolicy {
-                memory_capacity_bytes: 1,
+                memory_capacity_bytes: 64,
                 pmem_capacity_bytes: 0,
                 ssd_capacity_bytes: 4096,
                 data_placement: CacheDataPlacement::Tiered,
@@ -9186,7 +9186,7 @@ mod tests {
                 memory_hotness_threshold: u32::MAX,
                 pmem_admit_hotness_threshold: u32::MAX,
                 ssd_admit_hotness_threshold: 0,
-                max_memory_block_bytes: 1,
+                max_memory_block_bytes: 64,
                 max_pmem_block_bytes: 0,
                 max_ssd_block_bytes: 4096,
                 ssd_write_through: true,
@@ -9200,6 +9200,7 @@ mod tests {
         cache.clear_memory_for_test();
 
         let zero_copy: &dyn ZeroCopyCacheApi = &cache;
+        let before = cache.stats();
         let handles = zero_copy
             .acquire_batch_cache(&[repeated.clone(), other.clone(), repeated.clone()])
             .unwrap();
@@ -9208,8 +9209,14 @@ mod tests {
         assert_eq!(handles[1].as_ref().unwrap().value(), b"other");
         assert_eq!(handles[2].as_ref().unwrap().value(), b"dup");
         assert_eq!(cache.stats().pinned_entries, 2);
-        assert_eq!(cache.stats().pin_operations, 3);
-        assert_eq!(cache.stats().disk_hits, 2);
+        let after = cache.stats();
+        assert_eq!(after.pin_operations - before.pin_operations, 3);
+        assert_eq!(after.zero_copy_handle_hits - before.zero_copy_handle_hits, 2);
+        assert_eq!(after.disk_hits - before.disk_hits, 2);
+        assert_eq!(after.refill_latency_samples - before.refill_latency_samples, 2);
+        assert_eq!(after.get_latency_samples - before.get_latency_samples, 2);
+        assert_eq!(cache.get_memory(&repeated), Some(b"dup".to_vec()));
+        assert_eq!(cache.get_memory(&other), Some(b"other".to_vec()));
 
         let handles = handles.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(zero_copy.release_batch_cache(handles), 3);
