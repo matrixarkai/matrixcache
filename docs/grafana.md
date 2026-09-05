@@ -89,6 +89,16 @@ tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-so
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate
 budgets so a scale run can fail for the exact reason that moved.
 
+For the batch control path TemporalStore uses to warm, pin, release, and rewrite
+groups of block entries, archive `batch_write_cost` too. The report captures
+colocated and fan-out batch costs for `put_batch`, `insert_pinned_batch_sized`
+plus release, and zero-copy `acquire_batch` plus release, along with sharded
+batch and refill counters:
+
+```bash
+cargo run --release --no-default-features --example batch_write_cost -- --json-output /tmp/matrixcache-batch-control.json --require-passed
+```
+
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash

@@ -5027,6 +5027,13 @@ impl ShardedMultiLayerCache {
         self.shards.len()
     }
 
+    #[doc(hidden)]
+    pub fn clear_memory_for_test(&self) {
+        for shard in self.shards.iter() {
+            shard.clear_memory_for_test();
+        }
+    }
+
     pub fn shard_index_for_key(&self, key: &CacheKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);

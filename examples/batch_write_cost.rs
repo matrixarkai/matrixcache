@@ -11,9 +11,13 @@
 //!
 //! ```text
 //! cargo run --release --no-default-features --example batch_write_cost
+//! cargo run --release --no-default-features --example batch_write_cost -- --json-output /tmp/matrixcache-batch-control.json --require-passed
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, ShardedMultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::process;
 use std::time::{Duration, Instant};
 
 const VALUE_BYTES: usize = 64;
@@ -29,6 +33,48 @@ fn median(mut samples: Vec<f64>) -> f64 {
 
 fn ns_per_entry(elapsed: Duration, entries: usize) -> f64 {
     elapsed.as_nanos() as f64 / entries.max(1) as f64
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchConfig {
+    json_output: Option<PathBuf>,
+    require_passed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchCost {
+    batch: usize,
+    put_colocated_ns: f64,
+    put_fanout_ns: f64,
+    insert_pinned_release_colocated_ns: f64,
+    insert_pinned_release_fanout_ns: f64,
+    acquire_release_colocated_ns: f64,
+    acquire_release_fanout_ns: f64,
+}
+
+fn parse_config() -> BenchConfig {
+    let mut config = BenchConfig::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json-output" => {
+                config.json_output = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --json-output");
+                    process::exit(2);
+                })));
+            }
+            "--require-passed" => config.require_passed = true,
+            "--help" | "-h" => {
+                println!("usage: batch_write_cost [--json-output PATH] [--require-passed]");
+                process::exit(0);
+            }
+            _ => {
+                eprintln!("unknown argument: {arg}");
+                process::exit(2);
+            }
+        }
+    }
+    config
 }
 
 fn bench_dir() -> std::path::PathBuf {
@@ -133,6 +179,7 @@ fn bench_acquire_release(cache: &ShardedMultiLayerCache, local: bool, batch: usi
     median(
         (0..PASSES)
             .map(|_| {
+                cache.clear_memory_for_test();
                 let started = Instant::now();
                 let handles = cache.acquire_batch(&keys).expect("acquire_batch");
                 assert!(handles.iter().all(Option::is_some));
@@ -144,7 +191,92 @@ fn bench_acquire_release(cache: &ShardedMultiLayerCache, local: bool, batch: usi
     )
 }
 
+fn write_json_report(
+    path: &PathBuf,
+    rows: &[BatchCost],
+    stats: &matrixcache::CacheStats,
+    passed: bool,
+) {
+    let mut report = String::new();
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_batch_control_v1\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"shards\": {SHARDS},").expect("format report");
+    writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+    writeln!(&mut report, "  \"passes\": {PASSES},").expect("format report");
+    writeln!(&mut report, "  \"passed\": {passed},").expect("format report");
+    writeln!(&mut report, "  \"batches\": [").expect("format report");
+    for (index, row) in rows.iter().enumerate() {
+        let comma = if index + 1 == rows.len() { "" } else { "," };
+        writeln!(
+            &mut report,
+            "    {{\"batch\": {}, \"put_colocated_ns_per_entry\": {:.1}, \"put_fanout_ns_per_entry\": {:.1}, \"insert_pinned_release_colocated_ns_per_entry\": {:.1}, \"insert_pinned_release_fanout_ns_per_entry\": {:.1}, \"acquire_release_colocated_ns_per_entry\": {:.1}, \"acquire_release_fanout_ns_per_entry\": {:.1}}}{}",
+            row.batch,
+            row.put_colocated_ns,
+            row.put_fanout_ns,
+            row.insert_pinned_release_colocated_ns,
+            row.insert_pinned_release_fanout_ns,
+            row.acquire_release_colocated_ns,
+            row.acquire_release_fanout_ns,
+            comma
+        )
+        .expect("format report");
+    }
+    writeln!(&mut report, "  ],").expect("format report");
+    writeln!(&mut report, "  \"stats\": {{").expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_batch_local_operations\": {},",
+        stats.sharded_batch_local_operations
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_batch_fanout_operations\": {},",
+        stats.sharded_batch_fanout_operations
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_batch_fanout_shards\": {},",
+        stats.sharded_batch_fanout_shards
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_batch_latency_samples\": {},",
+        stats.sharded_batch_latency_samples
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"sharded_batch_latency_max_micros\": {},",
+        stats.sharded_batch_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(&mut report, "    \"disk_hits\": {},", stats.disk_hits).expect("format report");
+    writeln!(
+        &mut report,
+        "    \"zero_copy_handle_hits\": {},",
+        stats.zero_copy_handle_hits
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"refill_latency_samples\": {}",
+        stats.refill_latency_samples
+    )
+    .expect("format report");
+    writeln!(&mut report, "  }}").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+    std::fs::write(path, report).expect("write JSON report");
+}
+
 fn main() {
+    let config = parse_config();
     let dir = bench_dir();
     let _ = std::fs::remove_dir_all(&dir);
     let cache = ShardedMultiLayerCache::try_with_options(
@@ -163,28 +295,59 @@ fn main() {
         "{:<26}{:>12}{:>14}{:>14}",
         "operation", "batch", "colocated", "fanout"
     );
+    let mut rows = Vec::new();
     for batch in [SMALL_BATCH, LARGE_BATCH] {
+        let put_colocated_ns = bench_put(&cache, true, batch);
+        let put_fanout_ns = bench_put(&cache, false, batch);
+        let insert_pinned_release_colocated_ns = bench_insert_pinned_release(&cache, true, batch);
+        let insert_pinned_release_fanout_ns = bench_insert_pinned_release(&cache, false, batch);
+        let acquire_release_colocated_ns = bench_acquire_release(&cache, true, batch);
+        let acquire_release_fanout_ns = bench_acquire_release(&cache, false, batch);
+        rows.push(BatchCost {
+            batch,
+            put_colocated_ns,
+            put_fanout_ns,
+            insert_pinned_release_colocated_ns,
+            insert_pinned_release_fanout_ns,
+            acquire_release_colocated_ns,
+            acquire_release_fanout_ns,
+        });
         println!(
             "{:<26}{batch:>12}{:>14.1}{:>14.1}",
-            "put_batch",
-            bench_put(&cache, true, batch),
-            bench_put(&cache, false, batch)
+            "put_batch", put_colocated_ns, put_fanout_ns
         );
         println!(
             "{:<26}{batch:>12}{:>14.1}{:>14.1}",
             "insert_pinned+release",
-            bench_insert_pinned_release(&cache, true, batch),
-            bench_insert_pinned_release(&cache, false, batch)
+            insert_pinned_release_colocated_ns,
+            insert_pinned_release_fanout_ns
         );
         println!(
             "{:<26}{batch:>12}{:>14.1}{:>14.1}",
-            "acquire+release",
-            bench_acquire_release(&cache, true, batch),
-            bench_acquire_release(&cache, false, batch)
+            "acquire+release", acquire_release_colocated_ns, acquire_release_fanout_ns
         );
     }
 
     let stats = cache.stats();
+    let passed = stats.sharded_batch_local_operations > 0
+        && stats.sharded_batch_fanout_operations > 0
+        && stats.sharded_batch_latency_samples > 0
+        && stats.zero_copy_handle_hits > 0
+        && stats.disk_hits > 0
+        && rows.iter().all(|row| {
+            row.put_colocated_ns.is_finite()
+                && row.put_fanout_ns.is_finite()
+                && row.insert_pinned_release_colocated_ns.is_finite()
+                && row.insert_pinned_release_fanout_ns.is_finite()
+                && row.acquire_release_colocated_ns.is_finite()
+                && row.acquire_release_fanout_ns.is_finite()
+                && row.put_colocated_ns > 0.0
+                && row.put_fanout_ns > 0.0
+                && row.insert_pinned_release_colocated_ns > 0.0
+                && row.insert_pinned_release_fanout_ns > 0.0
+                && row.acquire_release_colocated_ns > 0.0
+                && row.acquire_release_fanout_ns > 0.0
+        });
     println!();
     println!(
         "sharded batch stats: local={} fanout={} fanout_shards={} latency_samples={} latency_max_us={}",
@@ -194,6 +357,18 @@ fn main() {
         stats.sharded_batch_latency_samples,
         stats.sharded_batch_latency_max_micros
     );
+    println!(
+        "batch control gate: {}",
+        if passed { "passed" } else { "failed" }
+    );
+
+    if let Some(path) = &config.json_output {
+        write_json_report(path, &rows, &stats, passed);
+        println!("wrote {}", path.display());
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
+    if config.require_passed && !passed {
+        process::exit(1);
+    }
 }
