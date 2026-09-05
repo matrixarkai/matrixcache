@@ -38,7 +38,17 @@ docker run --rm -p 9090:9090 \
 ## Grafana
 
 Import [docs/grafana/matrixcache-dashboard.json](grafana/matrixcache-dashboard.json)
-and select the Prometheus datasource. The dashboard uses the generated metric
+and select the Prometheus datasource. Validate the dashboard after changing cache metrics or panel queries:
+
+```bash
+tools/validate_grafana_dashboard.py
+```
+
+The validator compares panel PromQL metric names against the generated
+`prometheus_text` exporter and also requires the core memory, tier movement,
+writeback, read-path, eviction, and sharded-batch latency panels.
+
+The dashboard uses the generated metric
 families directly, including:
 
 - memory hit rate from `matrixcache_memory_hits` and `matrixcache_misses`

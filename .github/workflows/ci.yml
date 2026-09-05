@@ -43,6 +43,9 @@ jobs:
       - name: Test (no default features / compatibility store)
         run: cargo test --locked --no-default-features
 
+      - name: Grafana dashboard validation
+        run: tools/validate_grafana_dashboard.py
+
       - name: Soak report smoke
         run: |
           cargo run --locked --no-default-features --example soak -- 1 1 \
