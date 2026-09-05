@@ -35,7 +35,7 @@
 //! this machine shares.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--json-output PATH] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--min-hit-rate-percent N]
+//! cargo run --release --no-default-features --example soak -- <minutes> <threads> [--json] [--json-output PATH] [--require-passed] [--sample-seconds N] [--duration-seconds N] [--max-get-p99-us N] [--max-put-p99-us N] [--max-read-through-p99-us N] [--max-refill-p99-us N] [--max-writeback-p99-us N] [--max-eviction-p99-us N] [--max-compaction-p99-us N] [--min-hit-rate-percent N]
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
@@ -70,6 +70,11 @@ fn main() {
     let mut duration_seconds = None;
     let mut max_get_p99_us = None;
     let mut max_put_p99_us = None;
+    let mut max_read_through_p99_us = None;
+    let mut max_refill_p99_us = None;
+    let mut max_writeback_p99_us = None;
+    let mut max_eviction_p99_us = None;
+    let mut max_compaction_p99_us = None;
     let mut min_hit_rate_percent = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -100,6 +105,36 @@ fn main() {
             }
             "--max-put-p99-us" => {
                 max_put_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-read-through-p99-us" => {
+                max_read_through_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-refill-p99-us" => {
+                max_refill_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-writeback-p99-us" => {
+                max_writeback_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-eviction-p99-us" => {
+                max_eviction_p99_us = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0);
+            }
+            "--max-compaction-p99-us" => {
+                max_compaction_p99_us = args
                     .next()
                     .and_then(|value| value.parse().ok())
                     .filter(|value| *value > 0);
@@ -325,6 +360,21 @@ fn main() {
         let put_p99_within_budget = max_put_p99_us
             .map(|budget| latency.put_p99_us <= budget)
             .unwrap_or(true);
+        let read_through_p99_within_budget = max_read_through_p99_us
+            .map(|budget| latency.read_through_p99_us <= budget)
+            .unwrap_or(true);
+        let refill_p99_within_budget = max_refill_p99_us
+            .map(|budget| latency.refill_p99_us <= budget)
+            .unwrap_or(true);
+        let writeback_p99_within_budget = max_writeback_p99_us
+            .map(|budget| latency.writeback_p99_us <= budget)
+            .unwrap_or(true);
+        let eviction_p99_within_budget = max_eviction_p99_us
+            .map(|budget| latency.eviction_p99_us <= budget)
+            .unwrap_or(true);
+        let compaction_p99_within_budget = max_compaction_p99_us
+            .map(|budget| latency.compaction_p99_us <= budget)
+            .unwrap_or(true);
         let hit_rate_within_budget = min_hit_rate_percent
             .map(|budget| observed_hit_rate >= budget)
             .unwrap_or(true);
@@ -340,6 +390,11 @@ fn main() {
             && steady_throughput
             && get_p99_within_budget
             && put_p99_within_budget
+            && read_through_p99_within_budget
+            && refill_p99_within_budget
+            && writeback_p99_within_budget
+            && eviction_p99_within_budget
+            && compaction_p99_within_budget
             && hit_rate_within_budget;
 
         let mut report = String::new();
@@ -372,6 +427,36 @@ fn main() {
             &mut report,
             "  \"max_put_p99_us\": {},",
             option_u64_json(max_put_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_read_through_p99_us\": {},",
+            option_u64_json(max_read_through_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_refill_p99_us\": {},",
+            option_u64_json(max_refill_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_writeback_p99_us\": {},",
+            option_u64_json(max_writeback_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_eviction_p99_us\": {},",
+            option_u64_json(max_eviction_p99_us)
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "  \"max_compaction_p99_us\": {},",
+            option_u64_json(max_compaction_p99_us)
         )
         .expect("format report");
         writeln!(
@@ -658,6 +743,31 @@ fn main() {
         writeln!(
             &mut report,
             "    \"put_p99_within_budget\": {put_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"read_through_p99_within_budget\": {read_through_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_p99_within_budget\": {refill_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"writeback_p99_within_budget\": {writeback_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"eviction_p99_within_budget\": {eviction_p99_within_budget},"
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_p99_within_budget\": {compaction_p99_within_budget},"
         )
         .expect("format report");
         writeln!(

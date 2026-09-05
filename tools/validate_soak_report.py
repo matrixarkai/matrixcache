@@ -35,6 +35,11 @@ REQUIRED_CHECKS = {
     "steady_throughput_ceiling",
     "get_p99_within_budget",
     "put_p99_within_budget",
+    "read_through_p99_within_budget",
+    "refill_p99_within_budget",
+    "writeback_p99_within_budget",
+    "eviction_p99_within_budget",
+    "compaction_p99_within_budget",
     "hit_rate_within_budget",
 }
 
