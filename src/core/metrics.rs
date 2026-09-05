@@ -12,6 +12,8 @@
 
 use std::fmt::Write as _;
 
+pub const PROMETHEUS_TEXT_CAPACITY_BYTES: usize = 32 * 1024;
+
 /// Renders a snapshot in Prometheus text exposition format (version 0.0.4).
 ///
 /// `labels` are appended to every series, so several caches in one process
@@ -22,7 +24,7 @@ use std::fmt::Write as _;
 /// loose counters, so `histogram_quantile` works on them. Their buckets are
 /// cumulative, as the format requires.
 pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
-    let mut out = String::with_capacity(8 * 1024);
+    let mut out = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
     let tags = render_labels(labels);
 
     metric(&mut out, "matrixcache_memory_hits", "Reads served from the memory tier", "counter", &tags, stats.memory_hits);

@@ -15239,6 +15239,20 @@ mod tests {
         cache.get(&CacheKey::string(0, "metrics-absent")).unwrap();
 
         let text = prometheus_text(&cache.stats(), &[("cache", "unit")]);
+        assert!(
+            text.len() > 8 * 1024,
+            "the exporter should prove the old 8KiB scrape buffer was undersized"
+        );
+        assert!(
+            text.len() <= PROMETHEUS_TEXT_CAPACITY_BYTES,
+            "the full scrape should fit the preallocated Grafana scrape buffer: len={} cap={}",
+            text.len(),
+            PROMETHEUS_TEXT_CAPACITY_BYTES
+        );
+        assert!(
+            text.capacity() >= PROMETHEUS_TEXT_CAPACITY_BYTES,
+            "prometheus_text should reserve its scrape-sized buffer up front"
+        );
 
         // Every series must be typed and documented: an untyped series makes
         // rate() on a gauge look reasonable to whoever builds the dashboard.

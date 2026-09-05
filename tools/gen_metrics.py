@@ -132,6 +132,8 @@ out.append("// Regenerate with `tools/gen_metrics.py` after changing `CacheStats
 out.append("")
 out.append("use std::fmt::Write as _;")
 out.append("")
+out.append("pub const PROMETHEUS_TEXT_CAPACITY_BYTES: usize = 32 * 1024;")
+out.append("")
 out.append("/// Renders a snapshot in Prometheus text exposition format (version 0.0.4).")
 out.append("///")
 out.append("/// `labels` are appended to every series, so several caches in one process")
@@ -142,7 +144,7 @@ out.append("/// The latency families are exported as real histograms rather than
 out.append("/// loose counters, so `histogram_quantile` works on them. Their buckets are")
 out.append("/// cumulative, as the format requires.")
 out.append("pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {")
-out.append("    let mut out = String::with_capacity(8 * 1024);")
+out.append("    let mut out = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);")
 out.append("    let tags = render_labels(labels);")
 out.append("")
 
