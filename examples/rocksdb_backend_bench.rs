@@ -510,6 +510,36 @@ fn main() {
     writeln!(&mut report, "      \"iterations\": {},", soak_iterations).expect("format report");
     writeln!(
         &mut report,
+        "      \"read_through_latency_max_micros\": {},",
+        soak.read_through_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"refill_latency_max_micros\": {},",
+        soak.refill_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"writeback_latency_max_micros\": {},",
+        soak.writeback_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"eviction_latency_max_micros\": {},",
+        soak.eviction_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"compaction_latency_max_micros\": {},",
+        soak.compaction_latency_max_micros
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "      \"reasons\": {}",
         json_string_array(&soak.reasons)
     )

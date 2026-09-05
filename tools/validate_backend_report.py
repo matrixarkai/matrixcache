@@ -62,6 +62,14 @@ REQUIRED_CONTRACT = {
     "passed",
 }
 
+REQUIRED_REPLACEMENT_SOAK_EVIDENCE = {
+    "read_through_latency_max_micros",
+    "refill_latency_max_micros",
+    "writeback_latency_max_micros",
+    "eviction_latency_max_micros",
+    "compaction_latency_max_micros",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -152,6 +160,19 @@ def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
             fail(f"evidence observed value disagrees with contract field {name!r}")
         if "source" not in item or "metric" not in item:
             fail(f"evidence object for {name!r} must include source and metric")
+        if name == "replacement_soak":
+            missing = REQUIRED_REPLACEMENT_SOAK_EVIDENCE.difference(item)
+            if missing:
+                fail(
+                    "replacement_soak evidence missing fields: "
+                    + ", ".join(sorted(missing))
+                )
+            for field in REQUIRED_REPLACEMENT_SOAK_EVIDENCE:
+                value = item[field]
+                if not isinstance(value, int):
+                    fail(f"replacement_soak.{field} must be an integer")
+                if value <= 0:
+                    fail(f"replacement_soak.{field} must be positive")
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:

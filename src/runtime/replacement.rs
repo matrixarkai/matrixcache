@@ -41,13 +41,23 @@ pub struct CacheReplacementPolicySoakReport {
     #[serde(default)]
     pub read_through_latency_samples: u64,
     #[serde(default)]
+    pub read_through_latency_max_micros: u64,
+    #[serde(default)]
     pub refill_latency_samples: u64,
+    #[serde(default)]
+    pub refill_latency_max_micros: u64,
     #[serde(default)]
     pub writeback_latency_samples: u64,
     #[serde(default)]
+    pub writeback_latency_max_micros: u64,
+    #[serde(default)]
     pub eviction_latency_samples: u64,
     #[serde(default)]
+    pub eviction_latency_max_micros: u64,
+    #[serde(default)]
     pub compaction_latency_samples: u64,
+    #[serde(default)]
+    pub compaction_latency_max_micros: u64,
     #[serde(default)]
     pub read_through_latency_bucketed: bool,
     #[serde(default)]

@@ -5484,18 +5484,33 @@ impl ShardedMultiLayerCache {
             aggregate.read_through_latency_samples = aggregate
                 .read_through_latency_samples
                 .saturating_add(report.read_through_latency_samples);
+            aggregate.read_through_latency_max_micros = aggregate
+                .read_through_latency_max_micros
+                .max(report.read_through_latency_max_micros);
             aggregate.refill_latency_samples = aggregate
                 .refill_latency_samples
                 .saturating_add(report.refill_latency_samples);
+            aggregate.refill_latency_max_micros = aggregate
+                .refill_latency_max_micros
+                .max(report.refill_latency_max_micros);
             aggregate.writeback_latency_samples = aggregate
                 .writeback_latency_samples
                 .saturating_add(report.writeback_latency_samples);
+            aggregate.writeback_latency_max_micros = aggregate
+                .writeback_latency_max_micros
+                .max(report.writeback_latency_max_micros);
             aggregate.eviction_latency_samples = aggregate
                 .eviction_latency_samples
                 .saturating_add(report.eviction_latency_samples);
+            aggregate.eviction_latency_max_micros = aggregate
+                .eviction_latency_max_micros
+                .max(report.eviction_latency_max_micros);
             aggregate.compaction_latency_samples = aggregate
                 .compaction_latency_samples
                 .saturating_add(report.compaction_latency_samples);
+            aggregate.compaction_latency_max_micros = aggregate
+                .compaction_latency_max_micros
+                .max(report.compaction_latency_max_micros);
             aggregate.read_through_latency_bucketed &= report.read_through_latency_bucketed;
             aggregate.refill_latency_bucketed &= report.refill_latency_bucketed;
             aggregate.writeback_latency_bucketed &= report.writeback_latency_bucketed;
@@ -8860,10 +8875,15 @@ impl MultiLayerCache {
             get_latency_samples: stats.get_latency_samples,
             put_latency_samples: stats.put_latency_samples,
             read_through_latency_samples: stats.read_through_latency_samples,
+            read_through_latency_max_micros: stats.read_through_latency_max_micros,
             refill_latency_samples: stats.refill_latency_samples,
+            refill_latency_max_micros: stats.refill_latency_max_micros,
             writeback_latency_samples: stats.writeback_latency_samples,
+            writeback_latency_max_micros: stats.writeback_latency_max_micros,
             eviction_latency_samples: stats.eviction_latency_samples,
+            eviction_latency_max_micros: stats.eviction_latency_max_micros,
             compaction_latency_samples: stats.compaction_latency_samples,
+            compaction_latency_max_micros: stats.compaction_latency_max_micros,
             read_through_latency_bucketed,
             refill_latency_bucketed,
             writeback_latency_bucketed,

@@ -99,7 +99,10 @@ tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-
 CI also runs the same report contract against the file-backed compatibility
 backend with `--no-default-features`. That smoke test proves the report schema,
 eviction/refill evidence fields, and fail-closed contract without paying the
-full RocksDB native build cost on every tiny backend-report iteration.
+full RocksDB native build cost on every tiny backend-report iteration. The
+replacement-soak evidence also records max latency for read-through, refill,
+writeback, eviction, and compaction so backend pressure runs carry the same
+tail-latency signal as the Prometheus dashboard.
 
 ## Scale Report Pairing
 

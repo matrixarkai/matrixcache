@@ -8497,10 +8497,15 @@ mod tests {
         assert!(report.get_latency_samples > 0);
         assert!(report.put_latency_samples > 0);
         assert!(report.read_through_latency_samples > 0);
+        assert!(report.read_through_latency_max_micros > 0);
         assert!(report.refill_latency_samples > 0);
+        assert!(report.refill_latency_max_micros > 0);
         assert!(report.writeback_latency_samples > 0);
+        assert!(report.writeback_latency_max_micros > 0);
         assert!(report.eviction_latency_samples > 0);
+        assert!(report.eviction_latency_max_micros > 0);
         assert!(report.compaction_latency_samples > 0);
+        assert!(report.compaction_latency_max_micros > 0);
         assert!(report.read_through_latency_bucketed);
         assert!(report.refill_latency_bucketed);
         assert!(report.writeback_latency_bucketed);
@@ -8532,6 +8537,11 @@ mod tests {
         assert!(report.observed_async_writeback_backpressure > 0);
         assert!(report.get_latency_samples > 0);
         assert!(report.put_latency_samples > 0);
+        assert!(report.read_through_latency_max_micros > 0);
+        assert!(report.refill_latency_max_micros > 0);
+        assert!(report.writeback_latency_max_micros > 0);
+        assert!(report.eviction_latency_max_micros > 0);
+        assert!(report.compaction_latency_max_micros > 0);
         assert!(report.read_through_latency_bucketed);
         assert!(report.refill_latency_bucketed);
         assert!(report.writeback_latency_bucketed);
