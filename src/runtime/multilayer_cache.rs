@@ -2765,7 +2765,8 @@ impl MultiLayerCache {
         // past their time to live, entries whose access order needs moving,
         // entries with no metadata yet, and everything below the memory tier.
         let mut deferred: Vec<(usize, &CacheKey, Instant)> = Vec::new();
-        let mut memory_hits: Vec<(usize, &CacheKey, Arc<[u8]>, Instant)> = Vec::new();
+        let mut memory_hits: Vec<(usize, Arc<[u8]>)> = Vec::new();
+        let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -2780,7 +2781,20 @@ impl MultiLayerCache {
                     continue;
                 }
                 match inner.memory.get(key).cloned() {
-                    Some(value) => memory_hits.push((index, key, value, started)),
+                    Some(value) => {
+                        inner
+                            .read_counters
+                            .memory_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = inner.record_hit_shared(key);
+                        if !matches!(outcome, HitOutcome::Accounted) {
+                            needs_exclusive.push((key, outcome, value.len()));
+                        }
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros(micros);
+                        inner.record_read_through_latency_micros(micros);
+                        memory_hits.push((index, value));
+                    }
                     None => deferred.push((index, key, started)),
                 }
             }
@@ -2788,40 +2802,8 @@ impl MultiLayerCache {
 
         // The copy that turns the shared buffer into the returned `Vec` is the
         // expensive part of a hit, and it is done here with no lock held.
-        let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
-        if !memory_hits.is_empty() {
-            let decoded: Vec<Vec<u8>> = memory_hits
-                .iter()
-                .map(|(_, _, value, _)| value.to_vec())
-                .collect();
-            {
-                let inner = self.inner.read().expect("cache lock poisoned");
-                for ((index, key, _, started), value) in memory_hits.iter().zip(decoded.iter()) {
-                    inner
-                        .read_counters
-                        .memory_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    // An entry can be evicted between the probe and here. What
-                    // was read was resident when it was read, so it is still a
-                    // hit; only the per-entry bookkeeping is conditional.
-                    let outcome = if inner.memory.contains_key(key) {
-                        inner.record_hit_shared(key)
-                    } else {
-                        HitOutcome::Accounted
-                    };
-                    if !matches!(outcome, HitOutcome::Accounted) {
-                        needs_exclusive.push((key, outcome, value.len()));
-                    }
-                    // One interval, two histograms: read the clock once.
-                    let micros = elapsed_micros(*started);
-                    inner.record_get_latency_micros(micros);
-                    inner.record_read_through_latency_micros(micros);
-                    let _ = index;
-                }
-            }
-            for ((index, _, _, _), value) in memory_hits.iter().zip(decoded) {
-                results[*index] = Some(value);
-            }
+        for (index, value) in memory_hits {
+            results[index] = Some(value.to_vec());
         }
 
         // One exclusive acquisition for the whole batch's leftovers, rather
