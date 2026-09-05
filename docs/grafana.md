@@ -54,7 +54,9 @@ families directly, including:
 
 
 The `soak` example can also emit JSON with optional scale gates for p99 get/put
-latency and hit rate:
+latency and hit rate. The archived `latency` object includes p50/p95/p99 plus
+max observed latency for read-through, refill, writeback, eviction, and
+compaction so tail spikes stay visible outside Prometheus:
 
 ```text
 cargo run --release --no-default-features --example soak -- 10 8 --json --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
@@ -68,17 +70,20 @@ same report should be archived without scraping the console stream:
 cargo run --release --no-default-features --example soak -- 10 8 --json-output /tmp/matrixcache-soak.json --require-passed --sample-seconds 10 --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
 ```
 
-Validate archived reports before publishing or comparing them:
+Validate archived reports before publishing or comparing them. The validator
+requires the operational max-latency fields so old archives cannot silently pass
+as current soak evidence:
 
 ```bash
 tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --min-hit-rate-percent 80
 ```
 
 Compare a current archive with a known-good baseline before accepting a scale
-run as an optimization result:
+run as an optimization result. In addition to get/put p99, the comparator checks
+read-through, refill, writeback, eviction, and compaction max-latency regression:
 
 ```bash
-tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --min-throughput-ratio 0.95
+tools/compare_soak_reports.py /tmp/matrixcache-baseline.json /tmp/matrixcache-soak.json --max-get-p99-regression 1.10 --max-put-p99-regression 1.10 --max-operation-max-regression 1.50 --min-throughput-ratio 0.95
 ```
 
 The JSON report keeps memory-bound checks separate from optional latency and hit-rate

@@ -27,6 +27,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum allowed current/baseline put p99 ratio",
     )
     parser.add_argument(
+        "--max-operation-max-regression",
+        type=float,
+        default=2.0,
+        help=(
+            "Maximum allowed current/baseline ratio for read-through/refill/"
+            "writeback/eviction/compaction max latency fields"
+        ),
+    )
+    parser.add_argument(
         "--max-memory-growth",
         type=float,
         default=1.10,
@@ -113,9 +122,26 @@ def main() -> int:
     hit_rate_delta = number(current, "observed_hit_rate_percent") - number(
         baseline, "observed_hit_rate_percent"
     )
+    operation_max_ratios = {
+        field: ratio(latency(current, field), latency(baseline, field))
+        for field in (
+            "read_through_max_us",
+            "refill_max_us",
+            "writeback_max_us",
+            "eviction_max_us",
+            "compaction_max_us",
+        )
+    }
 
     check_ratio("get p99", get_p99_ratio, args.max_get_p99_regression, "max")
     check_ratio("put p99", put_p99_ratio, args.max_put_p99_regression, "max")
+    for field, field_ratio in operation_max_ratios.items():
+        check_ratio(
+            field.replace("_", " "),
+            field_ratio,
+            args.max_operation_max_regression,
+            "max",
+        )
     check_ratio("peak memory", memory_ratio, args.max_memory_growth, "max")
     check_ratio("best throughput", throughput_ratio, args.min_throughput_ratio, "min")
     if hit_rate_delta < args.min_hit_rate_delta:
@@ -130,7 +156,9 @@ def main() -> int:
         f"put_p99_ratio={put_p99_ratio:.3f} "
         f"throughput_ratio={throughput_ratio:.3f} "
         f"memory_ratio={memory_ratio:.3f} "
-        f"hit_rate_delta={hit_rate_delta:.2f}pp"
+        f"hit_rate_delta={hit_rate_delta:.2f}pp "
+        "operation_max_ratios="
+        + ",".join(f"{name}={value:.3f}" for name, value in operation_max_ratios.items())
     )
     return 0
 

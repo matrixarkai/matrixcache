@@ -46,10 +46,15 @@ REQUIRED_LATENCY = {
     "put_p95_us",
     "put_p99_us",
     "read_through_p99_us",
+    "read_through_max_us",
     "refill_p99_us",
+    "refill_max_us",
     "writeback_p99_us",
+    "writeback_max_us",
     "eviction_p99_us",
+    "eviction_max_us",
     "compaction_p99_us",
+    "compaction_max_us",
     "histogram_ready",
 }
 

@@ -486,6 +486,12 @@ fn main() {
         .expect("format report");
         writeln!(
             &mut report,
+            "    \"read_through_max_us\": {},",
+            latency.read_through_max_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"refill_count\": {},",
             latency.refill_count
         )
@@ -512,6 +518,12 @@ fn main() {
             &mut report,
             "    \"refill_p99_us\": {},",
             latency.refill_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"refill_max_us\": {},",
+            latency.refill_max_us
         )
         .expect("format report");
         writeln!(
@@ -546,6 +558,12 @@ fn main() {
         .expect("format report");
         writeln!(
             &mut report,
+            "    \"writeback_max_us\": {},",
+            latency.writeback_max_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"eviction_count\": {},",
             latency.eviction_count
         )
@@ -576,6 +594,12 @@ fn main() {
         .expect("format report");
         writeln!(
             &mut report,
+            "    \"eviction_max_us\": {},",
+            latency.eviction_max_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "    \"compaction_count\": {},",
             latency.compaction_count
         )
@@ -602,6 +626,12 @@ fn main() {
             &mut report,
             "    \"compaction_p99_us\": {},",
             latency.compaction_p99_us
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    \"compaction_max_us\": {},",
+            latency.compaction_max_us
         )
         .expect("format report");
         writeln!(
