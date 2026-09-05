@@ -47,6 +47,12 @@ fn latency_percentile_us(
 
 const SMALL_BATCH_DEDUP_LIMIT: usize = 64;
 
+fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
+    let mut results = Vec::with_capacity(len);
+    results.resize_with(len, || None);
+    results
+}
+
 fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>) {
     let mut unique_keys = Vec::<CacheKey>::new();
     let mut requested_positions = Vec::with_capacity(keys.len());
@@ -2382,7 +2388,7 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         if keys.is_empty() {
             return Ok(results);
         }
@@ -2393,7 +2399,7 @@ impl MultiLayerCache {
             self.emit_access_record(CacheAccessRecordKind::Get, key);
         }
 
-        let mut unique_values = (0..unique_keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut unique_values = empty_batch_results(unique_keys.len());
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
         let mut pmem_refills = Vec::<(usize, CacheKey, Arc<[u8]>, Instant)>::new();
         let mut ssd_candidates = Vec::<(usize, CacheKey, Instant)>::new();
@@ -2599,7 +2605,7 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CacheReadResult>>, CacheError> {
-        let mut results = vec![None; keys.len()];
+        let mut results = empty_batch_results(keys.len());
         if keys.is_empty() {
             return Ok(results);
         }
@@ -2864,7 +2870,7 @@ impl MultiLayerCache {
             self.emit_access_record(CacheAccessRecordKind::Get, key);
         }
 
-        let mut results = vec![None; keys.len()];
+        let mut results = empty_batch_results(keys.len());
         let mut ssd_candidates = Vec::new();
         let mut needs_eviction_drain = false;
         // One clock read for the batch. `get` reads it once per call for the
@@ -3327,7 +3333,7 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         if keys.is_empty() {
             return Ok(results);
         }
@@ -3460,7 +3466,7 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         if keys.is_empty() {
             return Ok(results);
         }
@@ -6267,7 +6273,7 @@ impl ShardedMultiLayerCache {
             for (position, key) in keys.iter().cloned().enumerate() {
                 grouped[self.shard_index_for_key(&key)].push((position, key));
             }
-            let mut results = vec![None; keys.len()];
+            let mut results = empty_batch_results(keys.len());
             for (index, group) in grouped.into_iter().enumerate() {
                 if group.is_empty() {
                     continue;
@@ -6350,7 +6356,7 @@ impl ShardedMultiLayerCache {
             Ok(merged)
         })?;
 
-        let mut results = vec![None; keys.len()];
+        let mut results = empty_batch_results(keys.len());
         for (position, value) in shard_results {
             results[position] = value;
         }
@@ -6589,7 +6595,7 @@ impl ShardedMultiLayerCache {
         }
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<(usize, CacheKey)>::new())
             .collect::<Vec<_>>();
@@ -6642,7 +6648,7 @@ impl ShardedMultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         let positions_by_key = coalesce_batch_positions(keys);
         for (key, positions) in positions_by_key {
             let Some(handle) = self.acquire_no_promotion(&key)? else {
@@ -6681,7 +6687,7 @@ impl ShardedMultiLayerCache {
         }
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         let mut groups = (0..self.shard_count())
             .map(|_| Vec::<(usize, CacheKey)>::new())
             .collect::<Vec<_>>();
@@ -6734,7 +6740,7 @@ impl ShardedMultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
-        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(keys.len());
         let positions_by_key = coalesce_batch_positions(keys);
         for (key, positions) in positions_by_key {
             let Some(handle) = self.acquire(&key)? else {
@@ -6998,7 +7004,7 @@ impl ShardedMultiLayerCache {
             groups[self.shard_index_for_key(&key)].push((position, key, value, size));
         }
         if entry_count < Self::BATCH_FANOUT_THRESHOLD {
-            let mut results = (0..entry_count).map(|_| None).collect::<Vec<_>>();
+            let mut results = empty_batch_results(entry_count);
             for (index, group) in groups.into_iter().enumerate() {
                 for (position, key, value, size) in group {
                     results[position] = self.shards[index].insert_pinned_sized(key, value, size)?;
@@ -7043,7 +7049,7 @@ impl ShardedMultiLayerCache {
             }),
         )?;
 
-        let mut results = (0..entry_count).map(|_| None).collect::<Vec<_>>();
+        let mut results = empty_batch_results(entry_count);
         for (position, handle) in shard_results {
             results[position] = handle;
         }
