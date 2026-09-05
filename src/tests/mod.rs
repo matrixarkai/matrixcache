@@ -15756,6 +15756,28 @@ fn sharded_batch_fanout_metrics_are_exported() {
     cache.release_batch(colocated_handles.into_iter().flatten().collect());
     let large_handles = cache.acquire_batch(&large).unwrap();
     cache.release_batch(large_handles.into_iter().flatten().collect());
+    let before_release_stats = cache.stats();
+    let small_handles = cache.acquire_batch(&small).unwrap();
+    assert_eq!(
+        cache.release_batch(small_handles.into_iter().flatten().collect()),
+        small.len()
+    );
+    let large_handles = cache.acquire_batch(&large).unwrap();
+    assert_eq!(
+        cache.release_batch(large_handles.into_iter().flatten().collect()),
+        large.len()
+    );
+    let after_release_stats = cache.stats();
+    assert!(
+        after_release_stats.sharded_batch_local_operations
+            > before_release_stats.sharded_batch_local_operations,
+        "small release batches should record local sharded batch metrics: before={before_release_stats:?} after={after_release_stats:?}"
+    );
+    assert!(
+        after_release_stats.sharded_batch_fanout_operations
+            > before_release_stats.sharded_batch_fanout_operations,
+        "large release batches should record fan-out sharded batch metrics: before={before_release_stats:?} after={after_release_stats:?}"
+    );
 
     let before_write_stats = cache.stats();
     let small_write_entries = small

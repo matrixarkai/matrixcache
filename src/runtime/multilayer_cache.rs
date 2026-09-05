@@ -6123,12 +6123,16 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn release_batch(&self, handles: Vec<CachePinnedHandle>) -> usize {
+        let started = Instant::now();
         if handles.is_empty() {
+            self.sharded_stats.record_latency(started);
             return 0;
         }
         if let Some(shard_index) = self.single_shard_for_handles(&handles) {
             let released = handles.len();
             self.shards[shard_index].release_batch(handles);
+            self.sharded_stats.record_local();
+            self.sharded_stats.record_latency(started);
             return released;
         }
         let mut groups = (0..self.shard_count())
@@ -6144,8 +6148,11 @@ impl ShardedMultiLayerCache {
                     self.shards[index].release_batch(group);
                 }
             }
+            self.sharded_stats.record_local();
+            self.sharded_stats.record_latency(started);
             return released;
         }
+        let fanout = groups.iter().filter(|group| !group.is_empty()).count();
         std::thread::scope(|scope| {
             let workers = groups
                 .into_iter()
@@ -6165,6 +6172,8 @@ impl ShardedMultiLayerCache {
                     .expect("sharded cache batch release worker panicked");
             }
         });
+        self.sharded_stats.record_fanout(fanout);
+        self.sharded_stats.record_latency(started);
         released
     }
 
