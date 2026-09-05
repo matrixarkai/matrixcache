@@ -135,6 +135,10 @@ and says what the number means:
   and see [`docs/grafana.md`](docs/grafana.md) for a local scrape setup. The
   exporter includes direct p50/p95/p99 latency gauges alongside Prometheus
   histograms.
+- `batch_write_cost` -- bounded sharded write/control-path benchmark for
+  `put_batch`, pinned insert/release, and acquire/release. It compares
+  colocated batches against fanout batches and prints the sharded batch
+  counters used by the Grafana/Prometheus path.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather
