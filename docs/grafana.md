@@ -147,11 +147,11 @@ being accepted from a truncated read-path run.
 
 For eviction-cost checks, archive `eviction_bench`. It records steady-state
 write cost while the cache is full, candidate groups sampled per eviction, and
-whether the skewed hot-set workload keeps its hit rate under scan pressure:
+whether the skewed hot-set workload keeps its hit rate under scan pressure. The validator can also require minimum write/read pressure counts so tiny runs do not stand in for eviction evidence:
 
 ```bash
 cargo run --release --no-default-features --example eviction_bench -- --json-output /tmp/matrixcache-eviction.json --require-passed --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
-tools/validate_eviction_report.py /tmp/matrixcache-eviction.json --min-steady-rows 6 --min-hit-rate-rows 3 --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
+tools/validate_eviction_report.py /tmp/matrixcache-eviction.json --min-steady-rows 6 --min-hit-rate-rows 3 --min-write-pressure-writes 10000 --min-read-pressure-reads 10000 --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
 tools/compare_eviction_reports.py /tmp/matrixcache-eviction-baseline.json /tmp/matrixcache-eviction.json --max-latency-regression 1.35 --max-candidate-regression 1.10 --min-hit-rate-ratio 0.95
 
 # CI smoke profile:

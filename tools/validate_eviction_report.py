@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-failed", action="store_true")
     parser.add_argument("--min-steady-rows", type=int, default=1)
     parser.add_argument("--min-hit-rate-rows", type=int, default=1)
+    parser.add_argument("--min-write-pressure-writes", type=int, default=1)
+    parser.add_argument("--min-read-pressure-reads", type=int, default=1)
     parser.add_argument("--max-ns-per-write", type=float)
     parser.add_argument("--max-groups-per-eviction", type=float)
     parser.add_argument("--min-hit-rate-percent", type=float)
@@ -98,6 +100,16 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"unexpected report_version {data['report_version']!r}")
     if data["value_bytes"] <= 0 or data["write_pressure_writes"] <= 0 or data["read_pressure_reads"] <= 0:
         fail("value_bytes and workload counts must be positive")
+    if data["write_pressure_writes"] < args.min_write_pressure_writes:
+        fail(
+            "write_pressure_writes="
+            f"{data['write_pressure_writes']} below {args.min_write_pressure_writes}"
+        )
+    if data["read_pressure_reads"] < args.min_read_pressure_reads:
+        fail(
+            "read_pressure_reads="
+            f"{data['read_pressure_reads']} below {args.min_read_pressure_reads}"
+        )
 
     summary = data["summary"]
     for field, expected in REQUIRED_SUMMARY.items():
@@ -153,6 +165,8 @@ def main() -> int:
     print(
         "OK matrixcache eviction report: "
         f"steady_rows={len(data['steady_state'])} hit_rows={len(data['hit_rates'])} "
+        f"write_pressure_writes={data['write_pressure_writes']} "
+        f"read_pressure_reads={data['read_pressure_reads']} "
         f"max_ns={float(summary['max_ns_per_write']):.1f} "
         f"groups={float(summary['max_groups_per_eviction']):.1f} "
         f"min_hit={float(summary['min_hit_rate_percent']):.2f}%"

@@ -150,6 +150,8 @@ jobs:
           tools/validate_eviction_report.py /tmp/matrixcache-eviction.json \
             --min-steady-rows 3 \
             --min-hit-rate-rows 2 \
+            --min-write-pressure-writes 256 \
+            --min-read-pressure-reads 20000 \
             --max-ns-per-write 2000000 \
             --max-groups-per-eviction 128 \
             --min-hit-rate-percent 70
