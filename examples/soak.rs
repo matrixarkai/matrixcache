@@ -788,6 +788,64 @@ fn main() {
         )
         .expect("format report");
         writeln!(&mut report, "  }},").expect("format report");
+        writeln!(&mut report, "  \"latency_budgets\": {{").expect("format report");
+        write_latency_budget(
+            &mut report,
+            "get",
+            latency.get_p99_us,
+            max_get_p99_us,
+            get_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "put",
+            latency.put_p99_us,
+            max_put_p99_us,
+            put_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "read_through",
+            latency.read_through_p99_us,
+            max_read_through_p99_us,
+            read_through_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "refill",
+            latency.refill_p99_us,
+            max_refill_p99_us,
+            refill_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "writeback",
+            latency.writeback_p99_us,
+            max_writeback_p99_us,
+            writeback_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "eviction",
+            latency.eviction_p99_us,
+            max_eviction_p99_us,
+            eviction_p99_within_budget,
+            true,
+        );
+        write_latency_budget(
+            &mut report,
+            "compaction",
+            latency.compaction_p99_us,
+            max_compaction_p99_us,
+            compaction_p99_within_budget,
+            false,
+        );
+        writeln!(&mut report, "  }},").expect("format report");
         writeln!(&mut report, "  \"checks\": {{").expect("format report");
         writeln!(&mut report, "    \"bounded_entries\": {bounded_entries},")
             .expect("format report");
@@ -887,4 +945,21 @@ fn option_f64_json(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.4}"))
         .unwrap_or_else(|| "null".to_string())
+}
+
+fn write_latency_budget(
+    report: &mut String,
+    path: &str,
+    observed_p99_us: u64,
+    max_p99_us: Option<u64>,
+    within_budget: bool,
+    trailing_comma: bool,
+) {
+    let comma = if trailing_comma { "," } else { "" };
+    writeln!(
+        report,
+        "    \"{path}\": {{\"observed_p99_us\": {observed_p99_us}, \"max_p99_us\": {}, \"within_budget\": {within_budget}}}{comma}",
+        option_u64_json(max_p99_us)
+    )
+    .expect("format report");
 }

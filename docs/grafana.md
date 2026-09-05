@@ -110,6 +110,11 @@ The JSON report keeps memory-bound checks separate from optional latency,
 hit-rate, and throughput budgets so a scale run can fail for the exact reason
 that moved. The archived `throughput` object records total, read, and write
 QPS derived from the same duration and operation counters as the run itself.
+The archived `latency_budgets` object records, for each cache path, the
+observed p99, configured p99 ceiling, and pass/fail result. The validator
+cross-checks that object against the raw latency fields and built-in checks so
+dashboards and scale reports can consume one compact latency budget summary
+without losing schema honesty.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for

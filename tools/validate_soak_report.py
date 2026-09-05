@@ -26,6 +26,7 @@ REQUIRED_TOP_LEVEL = {
     "interval_best_kops": (int, float),
     "throughput": dict,
     "latency": dict,
+    "latency_budgets": dict,
     "checks": dict,
     "passed": bool,
 }
@@ -74,6 +75,32 @@ REQUIRED_LATENCY = {
     "compaction_p99_us",
     "compaction_max_us",
     "histogram_ready",
+}
+
+REQUIRED_LATENCY_BUDGETS = {
+    "get": ("get_p99_us", "max_get_p99_us", "get_p99_within_budget"),
+    "put": ("put_p99_us", "max_put_p99_us", "put_p99_within_budget"),
+    "read_through": (
+        "read_through_p99_us",
+        "max_read_through_p99_us",
+        "read_through_p99_within_budget",
+    ),
+    "refill": ("refill_p99_us", "max_refill_p99_us", "refill_p99_within_budget"),
+    "writeback": (
+        "writeback_p99_us",
+        "max_writeback_p99_us",
+        "writeback_p99_within_budget",
+    ),
+    "eviction": (
+        "eviction_p99_us",
+        "max_eviction_p99_us",
+        "eviction_p99_within_budget",
+    ),
+    "compaction": (
+        "compaction_p99_us",
+        "max_compaction_p99_us",
+        "compaction_p99_within_budget",
+    ),
 }
 
 
@@ -151,6 +178,41 @@ def require_numeric_at_least(data: dict[str, Any], field: str, minimum: float | 
         fail(f"throughput field {field!r} must be numeric")
     if float(value) < minimum:
         fail(f"{field}={float(value):.4f} below minimum {minimum:.4f}")
+
+
+def require_latency_budget_consistency(data: dict[str, Any]) -> None:
+    latency = data["latency"]
+    checks = data["checks"]
+    budgets = data["latency_budgets"]
+    missing = REQUIRED_LATENCY_BUDGETS.keys() - budgets.keys()
+    if missing:
+        fail(f"missing latency budget paths: {', '.join(sorted(missing))}")
+    for path, (latency_field, budget_field, check_field) in REQUIRED_LATENCY_BUDGETS.items():
+        budget = budgets.get(path)
+        if not isinstance(budget, dict):
+            fail(f"latency_budgets.{path} must be an object")
+        observed = budget.get("observed_p99_us")
+        if not isinstance(observed, int):
+            fail(f"latency_budgets.{path}.observed_p99_us must be an integer")
+        if observed != latency[latency_field]:
+            fail(
+                f"latency_budgets.{path}.observed_p99_us={observed} disagrees with "
+                f"latency.{latency_field}={latency[latency_field]}"
+            )
+        configured = budget.get("max_p99_us")
+        if configured is not None and not isinstance(configured, int):
+            fail(f"latency_budgets.{path}.max_p99_us must be an integer or null")
+        if configured != data[budget_field]:
+            fail(
+                f"latency_budgets.{path}.max_p99_us={configured!r} disagrees with "
+                f"{budget_field}={data[budget_field]!r}"
+            )
+        within_budget = budget.get("within_budget")
+        if within_budget is not checks[check_field]:
+            fail(
+                f"latency_budgets.{path}.within_budget={within_budget!r} disagrees with "
+                f"checks.{check_field}={checks[check_field]!r}"
+            )
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
@@ -239,6 +301,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     require_numeric_at_most(latency, "writeback_p99_us", args.max_writeback_p99_us)
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
     require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
+    require_latency_budget_consistency(data)
     return data
 
 
