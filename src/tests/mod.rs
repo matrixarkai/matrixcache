@@ -15275,6 +15275,48 @@ mod tests {
             awkward.lines().take(3).collect::<Vec<_>>().join("\n")
         );
     }
+
+    #[test]
+    fn prometheus_latency_max_gauges_are_seconds() {
+        let stats = CacheStats {
+            get_latency_samples: 2,
+            get_latency_total_micros: 2_000_000,
+            get_latency_max_micros: 1_500_000,
+            get_latency_le_10us: 1,
+            get_latency_gt_10ms: 1,
+            put_latency_samples: 2,
+            put_latency_total_micros: 4_000_000,
+            put_latency_max_micros: 2_500_000,
+            put_latency_le_100us: 1,
+            put_latency_gt_10ms: 1,
+            sharded_batch_latency_samples: 1,
+            sharded_batch_latency_total_micros: 3_000_000,
+            sharded_batch_latency_max_micros: 2_750_000,
+            sharded_batch_latency_gt_10ms: 1,
+            ..CacheStats::default()
+        };
+        let text = prometheus_text(&stats, &[("cache", "latency-units")]);
+
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_get_latency_max_seconds"),
+            Some("1.500000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_put_latency_max_seconds"),
+            Some("2.500000")
+        );
+        assert_eq!(
+            prometheus_value(&text, "matrixcache_sharded_batch_latency_max_seconds"),
+            Some("2.750000")
+        );
+    }
+
+    fn prometheus_value<'a>(text: &'a str, metric: &str) -> Option<&'a str> {
+        text.lines()
+            .find(|line| line.starts_with(metric) && !line.starts_with("# "))
+            .and_then(|line| line.rsplit_once(' ').map(|(_, value)| value))
+    }
+
     #[test]
     fn access_order_survives_a_storm_of_operations_at_every_insertion_spec() {
         // Incrementally maintaining a pointer into a linked list is subtly

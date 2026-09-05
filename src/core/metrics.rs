@@ -123,7 +123,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_get_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_get_latency_avg_seconds", "get average latency", "gauge", &tags, average_seconds(stats.get_latency_total_micros, stats.get_latency_samples));
-    metric(&mut out, "matrixcache_get_latency_max_seconds", "get peak latency", "gauge", &tags, stats.get_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_get_latency_max_seconds", "get peak latency", "gauge", &tags, stats.get_latency_max_micros as f64 / 1_000_000.0);
     metric_f64(&mut out, "matrixcache_get_latency_p50_seconds", "get p50 latency", "gauge", &tags, percentile_seconds(stats.get_latency_samples, stats.get_latency_le_10us, stats.get_latency_le_100us, stats.get_latency_le_1ms, stats.get_latency_le_10ms, stats.get_latency_gt_10ms, stats.get_latency_max_micros, 50));
     metric_f64(&mut out, "matrixcache_get_latency_p95_seconds", "get p95 latency", "gauge", &tags, percentile_seconds(stats.get_latency_samples, stats.get_latency_le_10us, stats.get_latency_le_100us, stats.get_latency_le_1ms, stats.get_latency_le_10ms, stats.get_latency_gt_10ms, stats.get_latency_max_micros, 95));
     metric_f64(&mut out, "matrixcache_get_latency_p99_seconds", "get p99 latency", "gauge", &tags, percentile_seconds(stats.get_latency_samples, stats.get_latency_le_10us, stats.get_latency_le_100us, stats.get_latency_le_1ms, stats.get_latency_le_10ms, stats.get_latency_gt_10ms, stats.get_latency_max_micros, 99));
@@ -151,7 +151,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_put_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_put_latency_avg_seconds", "put average latency", "gauge", &tags, average_seconds(stats.put_latency_total_micros, stats.put_latency_samples));
-    metric(&mut out, "matrixcache_put_latency_max_seconds", "put peak latency", "gauge", &tags, stats.put_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_put_latency_max_seconds", "put peak latency", "gauge", &tags, stats.put_latency_max_micros as f64 / 1_000_000.0);
     metric_f64(&mut out, "matrixcache_put_latency_p50_seconds", "put p50 latency", "gauge", &tags, percentile_seconds(stats.put_latency_samples, stats.put_latency_le_10us, stats.put_latency_le_100us, stats.put_latency_le_1ms, stats.put_latency_le_10ms, stats.put_latency_gt_10ms, stats.put_latency_max_micros, 50));
     metric_f64(&mut out, "matrixcache_put_latency_p95_seconds", "put p95 latency", "gauge", &tags, percentile_seconds(stats.put_latency_samples, stats.put_latency_le_10us, stats.put_latency_le_100us, stats.put_latency_le_1ms, stats.put_latency_le_10ms, stats.put_latency_gt_10ms, stats.put_latency_max_micros, 95));
     metric_f64(&mut out, "matrixcache_put_latency_p99_seconds", "put p99 latency", "gauge", &tags, percentile_seconds(stats.put_latency_samples, stats.put_latency_le_10us, stats.put_latency_le_100us, stats.put_latency_le_1ms, stats.put_latency_le_10ms, stats.put_latency_gt_10ms, stats.put_latency_max_micros, 99));
@@ -314,7 +314,7 @@ pub fn prometheus_text(stats: &CacheStats, labels: &[(&str, &str)]) -> String {
         let _ = writeln!(out, "matrixcache_sharded_batch_latency_seconds_count{tags} {cumulative}");
     }
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_avg_seconds", "sharded batch average latency", "gauge", &tags, average_seconds(stats.sharded_batch_latency_total_micros, stats.sharded_batch_latency_samples));
-    metric(&mut out, "matrixcache_sharded_batch_latency_max_seconds", "sharded batch peak latency", "gauge", &tags, stats.sharded_batch_latency_max_micros);
+    metric_f64(&mut out, "matrixcache_sharded_batch_latency_max_seconds", "sharded batch peak latency", "gauge", &tags, stats.sharded_batch_latency_max_micros as f64 / 1_000_000.0);
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_p50_seconds", "sharded batch p50 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 50));
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_p95_seconds", "sharded batch p95 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 95));
     metric_f64(&mut out, "matrixcache_sharded_batch_latency_p99_seconds", "sharded batch p99 latency", "gauge", &tags, percentile_seconds(stats.sharded_batch_latency_samples, stats.sharded_batch_latency_le_10us, stats.sharded_batch_latency_le_100us, stats.sharded_batch_latency_le_1ms, stats.sharded_batch_latency_le_10ms, stats.sharded_batch_latency_gt_10ms, stats.sharded_batch_latency_max_micros, 99));

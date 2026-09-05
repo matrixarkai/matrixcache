@@ -177,7 +177,7 @@ for family, total, mx in LATENCY_FAMILIES:
         out.append('    metric_f64(&mut out, "matrixcache_%s_avg_seconds", "%s average latency", "gauge", &tags, average_seconds(stats.%s, stats.%s_samples));'
                    % (family, pretty, total, family))
     if mx:
-        out.append('    metric(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", &tags, stats.%s);'
+        out.append('    metric_f64(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", &tags, stats.%s as f64 / 1_000_000.0);'
                    % (family, pretty, mx))
     max_expr = "stats.%s" % mx if mx else "0"
     out.append('    metric_f64(&mut out, "matrixcache_%s_p50_seconds", "%s p50 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 50));'
