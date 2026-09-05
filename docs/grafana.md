@@ -92,7 +92,7 @@ requires the operational max-latency fields so old archives cannot silently pass
 as current soak evidence:
 
 ```bash
-tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-total-qps 1000 --min-read-qps 500 --min-write-qps 1 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-get-samples 100000 --min-put-samples 1 --min-read-through-samples 100000 --min-refill-samples 1 --min-writeback-samples 1 --min-eviction-samples 1 --min-compaction-samples 1
+tools/validate_soak_report.py /tmp/matrixcache-soak.json --max-get-p99-us 5000 --max-put-p99-us 8000 --max-read-through-p99-us 5000 --max-refill-p99-us 8000 --max-writeback-p99-us 8000 --max-eviction-p99-us 8000 --max-compaction-p99-us 8000 --min-hit-rate-percent 80 --min-total-qps 1000 --min-read-qps 500 --min-write-qps 1 --min-reads 100000 --min-writes 1 --min-memory-evictions 1 --min-interval-samples 6 --max-peak-memory-bytes 2300000 --max-final-interval-memory-bytes 2300000 --min-get-samples 100000 --min-put-samples 1 --min-read-through-samples 100000 --min-refill-samples 1 --min-writeback-samples 1 --min-eviction-samples 1 --min-compaction-samples 1
 ```
 
 Compare a current archive with a known-good baseline before accepting a scale
@@ -121,6 +121,9 @@ bytes, and cumulative writes. The validator cross-checks those samples against
 the aggregate interval best/worst and peak memory fields, which makes it much
 harder for a truncated or hand-edited scale archive to hide throughput decay or
 resident-memory growth.
+Use `--min-interval-samples`, `--max-peak-memory-bytes`, and
+`--max-final-interval-memory-bytes` to make release soak archives prove enough
+sample coverage and stay within the expected resident-memory envelope.
 The soak comparator also consumes `interval_samples`: it checks interval sample
 count, worst sampled interval throughput, and final sampled resident memory in
 addition to aggregate p99, throughput ceiling, and peak memory. Tighten

@@ -128,6 +128,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-read-qps", type=float)
     parser.add_argument("--min-write-qps", type=float)
     parser.add_argument("--min-memory-evictions", type=int, default=0)
+    parser.add_argument("--min-interval-samples", type=int, default=1)
+    parser.add_argument("--max-peak-memory-bytes", type=int)
+    parser.add_argument("--max-final-interval-memory-bytes", type=int)
     parser.add_argument("--min-get-samples", type=int, default=1)
     parser.add_argument("--min-put-samples", type=int, default=0)
     parser.add_argument("--min-read-through-samples", type=int, default=0)
@@ -217,10 +220,12 @@ def require_latency_budget_consistency(data: dict[str, Any]) -> None:
             )
 
 
-def require_interval_sample_consistency(data: dict[str, Any]) -> None:
+def require_interval_sample_consistency(data: dict[str, Any], args: argparse.Namespace) -> None:
     samples = data["interval_samples"]
     if not samples:
         fail("interval_samples must not be empty")
+    if len(samples) < args.min_interval_samples:
+        fail(f"interval_samples={len(samples)} below minimum {args.min_interval_samples}")
     last_elapsed = -1
     best_kops = 0.0
     worst_kops = float("inf")
@@ -265,6 +270,20 @@ def require_interval_sample_consistency(data: dict[str, Any]) -> None:
         fail("peak_entries disagrees with interval_samples")
     if peak_memory_bytes != data["peak_memory_bytes"]:
         fail("peak_memory_bytes disagrees with interval_samples")
+    if args.max_peak_memory_bytes is not None and peak_memory_bytes > args.max_peak_memory_bytes:
+        fail(
+            f"peak_memory_bytes={peak_memory_bytes} exceeds "
+            f"{args.max_peak_memory_bytes}"
+        )
+    final_memory_bytes = samples[-1]["memory_bytes"]
+    if (
+        args.max_final_interval_memory_bytes is not None
+        and final_memory_bytes > args.max_final_interval_memory_bytes
+    ):
+        fail(
+            f"final interval memory_bytes={final_memory_bytes} exceeds "
+            f"{args.max_final_interval_memory_bytes}"
+        )
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
@@ -354,7 +373,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     require_numeric_at_most(latency, "eviction_p99_us", args.max_eviction_p99_us)
     require_numeric_at_most(latency, "compaction_p99_us", args.max_compaction_p99_us)
     require_latency_budget_consistency(data)
-    require_interval_sample_consistency(data)
+    require_interval_sample_consistency(data, args)
     return data
 
 
