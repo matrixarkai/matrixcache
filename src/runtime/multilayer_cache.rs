@@ -3120,6 +3120,10 @@ impl MultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(results);
+        }
+
         let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
         let mut unique_positions = HashMap::<CacheKey, usize>::new();
         for (position, key) in keys.iter().cloned().enumerate() {
@@ -3130,7 +3134,68 @@ impl MultiLayerCache {
                 positions_by_key.push((key, vec![position]));
             }
         }
-        for (key, positions) in positions_by_key {
+
+        let mut remaining = Vec::<(CacheKey, Vec<usize>)>::new();
+        let mut exclusive_work = Vec::<(CacheKey, HitOutcome, usize)>::new();
+        let now_millis = CoarseClock::now_millis();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            let mut pin_counts = Vec::<(CacheKey, usize, usize, usize)>::new();
+            for (key, positions) in positions_by_key {
+                let started = Instant::now();
+                if inner.ssd_instance_only || inner.entry_expired(&key, now_millis) {
+                    remaining.push((key, positions));
+                    continue;
+                }
+                let Some(value) = inner.memory.get(&key).cloned() else {
+                    remaining.push((key, positions));
+                    continue;
+                };
+
+                inner
+                    .read_counters
+                    .memory_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                let outcome = if inner.memory.contains_key(&key) {
+                    inner.record_hit_shared(&key)
+                } else {
+                    HitOutcome::Accounted
+                };
+                if !matches!(outcome, HitOutcome::Accounted) {
+                    exclusive_work.push((key.clone(), outcome, value.len()));
+                }
+                inner.record_get_latency_micros(elapsed_micros(started));
+                pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                for position in positions {
+                    results[position] = Some(CachePinnedHandle {
+                        key: key.clone(),
+                        value: value.clone(),
+                        tier: CacheReadTier::Memory,
+                    });
+                }
+            }
+            inner.increment_pin_handle_counts(&pin_counts);
+        }
+
+        if !exclusive_work.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (key, outcome, len) in exclusive_work {
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
+                    HitOutcome::NeedsMetadata => {
+                        if inner.memory.contains_key(&key) {
+                            inner.record_hit(&key, len);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, positions) in remaining {
             let Some(handle) = self.acquire(&key)? else {
                 continue;
             };

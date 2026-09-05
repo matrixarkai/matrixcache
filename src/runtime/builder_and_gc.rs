@@ -2275,6 +2275,36 @@ impl CacheInner {
         }
     }
 
+    fn increment_pin_handle_counts(&self, counts: &[(CacheKey, usize, usize, usize)]) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut by_stripe = (0..self.pins.len())
+            .map(|_| Vec::<usize>::new())
+            .collect::<Vec<_>>();
+        for (index, (key, _, handles, _)) in counts.iter().enumerate() {
+            if *handles == 0 {
+                continue;
+            }
+            by_stripe[self.pin_stripe_index(key)].push(index);
+        }
+        for (stripe, indexes) in by_stripe.into_iter().enumerate() {
+            if indexes.is_empty() {
+                continue;
+            }
+            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+            for index in indexes {
+                let (key, bytes, handles, handle_hits) = &counts[index];
+                let entry = pins.entries.entry(key.clone()).or_default();
+                entry.handles = entry.handles.saturating_add(*handles as u64);
+                entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
+                pins.zero_copy_handle_hits =
+                    pins.zero_copy_handle_hits.saturating_add(*handle_hits as u64);
+            }
+        }
+    }
+
     /// Pin, and count the handle, under a single acquisition.
     ///
     /// The two used to be separate locks a line apart on the read path. They

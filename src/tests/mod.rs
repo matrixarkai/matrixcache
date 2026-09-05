@@ -9218,6 +9218,36 @@ mod tests {
     }
 
     #[test]
+    fn acquire_batch_memory_hits_share_one_probe_per_unique_key() {
+        let cache = MultiLayerCache::new(1024, unique_temp_path("zero-copy-memory-batch"));
+        let repeated = CacheKey::string(1, "zero-copy-memory-dup");
+        let other = CacheKey::string(1, "zero-copy-memory-other");
+        cache.put(repeated.clone(), b"dup".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+
+        let before = cache.stats();
+        let handles = cache
+            .acquire_batch(&[repeated.clone(), other.clone(), repeated.clone()])
+            .unwrap();
+
+        assert_eq!(handles.len(), 3);
+        assert_eq!(handles[0].as_ref().unwrap().tier(), CacheReadTier::Memory);
+        assert_eq!(handles[0].as_ref().unwrap().value(), b"dup");
+        assert_eq!(handles[1].as_ref().unwrap().value(), b"other");
+        assert_eq!(handles[2].as_ref().unwrap().value(), b"dup");
+        let after = cache.stats();
+        assert_eq!(after.memory_hits - before.memory_hits, 2);
+        assert_eq!(after.disk_hits - before.disk_hits, 0);
+        assert_eq!(after.pin_operations - before.pin_operations, 3);
+        assert_eq!(after.zero_copy_handle_hits - before.zero_copy_handle_hits, 2);
+        assert_eq!(after.get_latency_samples - before.get_latency_samples, 2);
+        assert_eq!(after.pinned_entries, 2);
+
+        assert_eq!(cache.release_batch(handles.into_iter().flatten().collect()), 3);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
     fn update_cached_value_if_current_matches_cache_instance_update_guard() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::new(64, dir.path());
