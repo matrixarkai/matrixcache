@@ -15,6 +15,54 @@ use std::fmt::Write as _;
 pub const PROMETHEUS_TEXT_CAPACITY_BYTES: usize = 32 * 1024;
 pub const PROMETHEUS_LABELS_CAPACITY_BYTES: usize = 256;
 
+/// Reusable buffers for a MatrixCache Prometheus scrape.
+///
+/// Long-running metrics endpoints can keep one of these per handler thread
+/// and avoid rebuilding the exposition body and label scratch allocation on
+/// each scrape.
+#[derive(Debug, Clone)]
+pub struct PrometheusScrapeBuffer {
+    body: String,
+    labels: String,
+}
+
+impl Default for PrometheusScrapeBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrometheusScrapeBuffer {
+    pub fn new() -> Self {
+        Self {
+            body: String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES),
+            labels: String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES),
+        }
+    }
+
+    pub fn render(&mut self, stats: &CacheStats, labels: &[(&str, &str)]) -> &str {
+        prometheus_text_into_with_label_scratch(stats, labels, &mut self.body, &mut self.labels);
+        self.body.as_str()
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.body.as_str()
+    }
+
+    pub fn body_capacity(&self) -> usize {
+        self.body.capacity()
+    }
+
+    pub fn label_capacity(&self) -> usize {
+        self.labels.capacity()
+    }
+
+    pub fn clear(&mut self) {
+        self.body.clear();
+        self.labels.clear();
+    }
+}
+
 /// Renders a snapshot in Prometheus text exposition format (version 0.0.4).
 ///
 /// `labels` are appended to every series, so several caches in one process

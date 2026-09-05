@@ -15430,6 +15430,43 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_scrape_buffer_reuses_body_and_label_capacity() {
+        let mut stats = CacheStats {
+            memory_hits: 7,
+            pmem_hits: 3,
+            ..CacheStats::default()
+        };
+        let mut scrape = PrometheusScrapeBuffer::new();
+
+        {
+            let text = scrape.render(&stats, &[("cache", "buffer")]);
+            assert!(
+                text.contains("matrixcache_memory_hits{cache=\"buffer\"} 7"),
+                "scrape buffer should render metrics:\n{text}"
+            );
+        }
+        let body_capacity = scrape.body_capacity();
+        let label_capacity = scrape.label_capacity();
+
+        stats.memory_hits = 11;
+        {
+            let text = scrape.render(&stats, &[("cache", "buffer")]);
+            assert!(
+                text.contains("matrixcache_memory_hits{cache=\"buffer\"} 11"),
+                "scrape buffer should render fresh metrics:\n{text}"
+            );
+        }
+        assert_eq!(scrape.body_capacity(), body_capacity);
+        assert_eq!(scrape.label_capacity(), label_capacity);
+        assert!(scrape.as_str().contains("matrixcache_pmem_hits"));
+
+        scrape.clear();
+        assert_eq!(scrape.as_str(), "");
+        assert_eq!(scrape.body_capacity(), body_capacity);
+        assert_eq!(scrape.label_capacity(), label_capacity);
+    }
+
+    #[test]
     fn prometheus_latency_max_gauges_are_seconds() {
         let stats = CacheStats {
             get_latency_samples: 2,

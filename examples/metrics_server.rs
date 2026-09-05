@@ -31,10 +31,7 @@
 //!       - targets: ["localhost:9184"]
 //! ```
 
-use matrixcache::{
-    prometheus_text_into_with_label_scratch, CacheKey, CacheOptions, ShardedMultiLayerCache,
-    PROMETHEUS_LABELS_CAPACITY_BYTES, PROMETHEUS_TEXT_CAPACITY_BYTES,
-};
+use matrixcache::{CacheKey, CacheOptions, PrometheusScrapeBuffer, ShardedMultiLayerCache};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,39 +128,31 @@ fn main() {
     println!("matrixcache metrics on http://127.0.0.1:{PORT}/metrics");
     println!("three workers are driving skewed single-key and sharded batch workloads");
 
+    let mut scrape_buffer = PrometheusScrapeBuffer::new();
+    let mut line = String::with_capacity(256);
+
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let cache = Arc::clone(&cache);
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let peeked = stream.try_clone().expect("clone stream");
-            if BufReader::new(peeked).read_line(&mut line).is_err() {
-                return;
+        line.clear();
+        let peeked = stream.try_clone().expect("clone stream");
+        if BufReader::new(peeked).read_line(&mut line).is_err() {
+            continue;
+        }
+        // "GET /metrics HTTP/1.1" -- the middle field is all that matters.
+        match line.split_whitespace().nth(1).unwrap_or("/") {
+            "/metrics" => {
+                let body = scrape_buffer.render(&cache.stats(), &[("cache", "example")]);
+                respond(stream, "200 OK", "text/plain; version=0.0.4", body);
             }
-            // "GET /metrics HTTP/1.1" -- the middle field is all that matters.
-            let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-            match path.as_str() {
-                "/metrics" => {
-                    let mut body = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
-                    let mut label_scratch = String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES);
-                    prometheus_text_into_with_label_scratch(
-                        &cache.stats(),
-                        &[("cache", "example")],
-                        &mut body,
-                        &mut label_scratch,
-                    );
-                    respond(stream, "200 OK", "text/plain; version=0.0.4", &body);
-                }
-                "/healthz" => respond(stream, "200 OK", "text/plain", "ok\n"),
-                "/" => respond(
-                    stream,
-                    "200 OK",
-                    "text/plain",
-                    "matrixcache exporter\n\n  /metrics   Prometheus exposition\n  \
-                     /healthz   liveness\n",
-                ),
-                _ => respond(stream, "404 Not Found", "text/plain", "not found\n"),
-            }
-        });
+            "/healthz" => respond(stream, "200 OK", "text/plain", "ok\n"),
+            "/" => respond(
+                stream,
+                "200 OK",
+                "text/plain",
+                "matrixcache exporter\n\n  /metrics   Prometheus exposition\n  \
+                 /healthz   liveness\n",
+            ),
+            _ => respond(stream, "404 Not Found", "text/plain", "not found\n"),
+        }
     }
 }
