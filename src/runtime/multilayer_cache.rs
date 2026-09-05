@@ -6643,16 +6643,7 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-        let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
-        let mut unique_positions = HashMap::<CacheKey, usize>::new();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            if let Some(unique_position) = unique_positions.get(&key).copied() {
-                positions_by_key[unique_position].1.push(position);
-            } else {
-                unique_positions.insert(key.clone(), positions_by_key.len());
-                positions_by_key.push((key, vec![position]));
-            }
-        }
+        let positions_by_key = coalesce_batch_positions(keys);
         for (key, positions) in positions_by_key {
             let Some(handle) = self.acquire_no_promotion(&key)? else {
                 continue;
@@ -6744,16 +6735,7 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-        let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
-        let mut unique_positions = HashMap::<CacheKey, usize>::new();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            if let Some(unique_position) = unique_positions.get(&key).copied() {
-                positions_by_key[unique_position].1.push(position);
-            } else {
-                unique_positions.insert(key.clone(), positions_by_key.len());
-                positions_by_key.push((key, vec![position]));
-            }
-        }
+        let positions_by_key = coalesce_batch_positions(keys);
         for (key, positions) in positions_by_key {
             let Some(handle) = self.acquire(&key)? else {
                 continue;
