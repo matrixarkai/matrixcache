@@ -78,6 +78,7 @@ REQUIRED_WORKLOAD = {
     "placement_threshold_bytes",
     "replacement_soak_iterations",
 }
+QPS_RELATIVE_TOLERANCE = 0.01
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,8 +163,27 @@ def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> No
         fail(f"{field!r}.count={int(count)} does not match expected {expected_count}")
     if require_numeric_field(timing, "qps") <= 0:
         fail(f"{field!r}.qps must be positive")
-    if require_numeric_field(timing, "total_us") <= 0:
+    total_us = require_numeric_field(timing, "total_us")
+    if total_us <= 0:
         fail(f"{field!r}.total_us must be positive")
+    total_ms = require_numeric_field(timing, "total_ms")
+    if total_ms < 0:
+        fail(f"{field!r}.total_ms must be non-negative")
+    expected_total_us = total_ms * 1000.0
+    total_delta = abs(total_us - expected_total_us)
+    if total_delta > max(1_000.0, total_us * QPS_RELATIVE_TOLERANCE):
+        fail(
+            f"{field!r}.total_us={total_us:.0f} disagrees with "
+            f"total_ms={total_ms:.3f}"
+        )
+    expected_qps = count / (total_us / 1_000_000.0)
+    reported_qps = require_numeric_field(timing, "qps")
+    qps_delta = abs(reported_qps - expected_qps)
+    if qps_delta > max(0.01, expected_qps * QPS_RELATIVE_TOLERANCE):
+        fail(
+            f"{field!r}.qps={reported_qps:.2f} disagrees with "
+            f"count/total_us={expected_qps:.2f}"
+        )
     if require_numeric_field(timing, "p99_us") < require_numeric_field(timing, "p95_us"):
         fail(f"{field!r}.p99_us must be >= p95_us")
     if require_numeric_field(timing, "p95_us") < require_numeric_field(timing, "p50_us"):
