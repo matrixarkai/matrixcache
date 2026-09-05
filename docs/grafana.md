@@ -123,6 +123,18 @@ tools/validate_read_path_report.py /tmp/matrixcache-read-path.json --max-full-ns
 tools/compare_read_path_reports.py /tmp/matrixcache-read-path-baseline.json /tmp/matrixcache-read-path.json --max-latency-regression 1.35 --max-overhead-regression 1.35 --max-spread-regression 1.50
 ```
 
+For eviction-cost checks, archive `eviction_bench`. It records steady-state
+write cost while the cache is full, candidate groups sampled per eviction, and
+whether the skewed hot-set workload keeps its hit rate under scan pressure:
+
+```bash
+cargo run --release --no-default-features --example eviction_bench -- --json-output /tmp/matrixcache-eviction.json --require-passed --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
+tools/validate_eviction_report.py /tmp/matrixcache-eviction.json --min-steady-rows 6 --min-hit-rate-rows 3 --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
+
+# CI smoke profile:
+cargo run --locked --no-default-features --example eviction_bench -- --smoke --json-output /tmp/matrixcache-eviction-smoke.json --require-passed --max-ns-per-write 2000000 --max-groups-per-eviction 128 --min-hit-rate-percent 70
+```
+
 For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash

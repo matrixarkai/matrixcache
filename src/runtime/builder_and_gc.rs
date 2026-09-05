@@ -1915,7 +1915,7 @@ impl CacheInner {
             }
             // One lookup, both answers. Scoring and grouping ask the same
             // map about the same key, and hashing a CacheKey hashes three
-            // Strings -- doing it twice per candidate, up to 512 candidates
+            // Strings -- doing it twice per candidate, up to 128 candidates
             // per eviction, is the bulk of choosing a victim.
             let meta = self.metadata.get(key);
             let score = eviction_score_of(meta);
@@ -2604,7 +2604,7 @@ fn infer_block_kind(key: &CacheKey) -> CacheBlockKind {
 /// keeps that cost flat as the cache grows. The window is wider than the
 /// working set of a small cache, so those keep weighing everything and choose
 /// exactly what they chose before.
-const EVICTION_CANDIDATE_WINDOW: usize = 512;
+const EVICTION_CANDIDATE_WINDOW: usize = 128;
 
 /// How many of the coldest entries a write looks at for expiry.
 ///

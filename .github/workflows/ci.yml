@@ -120,6 +120,22 @@ jobs:
             /tmp/matrixcache-read-path.json \
             /tmp/matrixcache-read-path.json
 
+      - name: Eviction report smoke
+        run: |
+          cargo run --locked --no-default-features --example eviction_bench -- \
+            --smoke \
+            --json-output /tmp/matrixcache-eviction.json \
+            --require-passed \
+            --max-ns-per-write 2000000 \
+            --max-groups-per-eviction 128 \
+            --min-hit-rate-percent 70
+          tools/validate_eviction_report.py /tmp/matrixcache-eviction.json \
+            --min-steady-rows 3 \
+            --min-hit-rate-rows 2 \
+            --max-ns-per-write 2000000 \
+            --max-groups-per-eviction 128 \
+            --min-hit-rate-percent 70
+
       - name: Doc
         run: cargo doc --no-deps --locked
 
