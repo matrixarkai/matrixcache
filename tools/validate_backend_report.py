@@ -70,6 +70,15 @@ REQUIRED_REPLACEMENT_SOAK_EVIDENCE = {
     "compaction_latency_max_micros",
 }
 
+REQUIRED_WORKLOAD = {
+    "value_bytes",
+    "dram_capacity_bytes",
+    "pmem_capacity_bytes",
+    "ssd_capacity_bytes",
+    "placement_threshold_bytes",
+    "replacement_soak_iterations",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -128,17 +137,33 @@ def require_numeric_field(data: dict[str, Any], field: str) -> float:
     return float(value)
 
 
-def validate_timing(data: dict[str, Any], field: str) -> None:
+def require_int_field(data: dict[str, Any], field: str) -> int:
+    value = data.get(field)
+    if not isinstance(value, int):
+        fail(f"field {field!r} must be an integer")
+    return value
+
+
+def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> None:
     timing = data.get(field)
     if not isinstance(timing, dict):
         fail(f"{field!r} must be an object")
     missing = REQUIRED_TIMING.difference(timing)
     if missing:
         fail(f"{field!r} missing timing fields: {', '.join(sorted(missing))}")
-    if require_numeric_field(timing, "count") <= 0:
+    count = require_numeric_field(timing, "count")
+    if count <= 0:
         fail(f"{field!r}.count must be positive")
+    if int(count) != expected_count:
+        fail(f"{field!r}.count={int(count)} does not match expected {expected_count}")
     if require_numeric_field(timing, "qps") <= 0:
         fail(f"{field!r}.qps must be positive")
+    if require_numeric_field(timing, "total_us") <= 0:
+        fail(f"{field!r}.total_us must be positive")
+    if require_numeric_field(timing, "p99_us") < require_numeric_field(timing, "p95_us"):
+        fail(f"{field!r}.p99_us must be >= p95_us")
+    if require_numeric_field(timing, "p95_us") < require_numeric_field(timing, "p50_us"):
+        fail(f"{field!r}.p95_us must be >= p50_us")
 
 
 def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
@@ -178,6 +203,12 @@ def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
                     fail(f"replacement_soak.{field} must be an integer")
                 if value <= 0:
                     fail(f"replacement_soak.{field} must be positive")
+            if item.get("iterations") != data["replacement_soak_iterations"]:
+                fail(
+                    "replacement_soak evidence iterations="
+                    f"{item.get('iterations')!r} does not match "
+                    f"replacement_soak_iterations={data['replacement_soak_iterations']}"
+                )
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
@@ -193,6 +224,21 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"backend {data['backend']!r} does not match expected {args.expect_backend!r}")
     if data["iterations"] <= 0:
         fail("iterations must be positive")
+    workload = data["workload"]
+    missing_workload = REQUIRED_WORKLOAD.difference(workload)
+    if missing_workload:
+        fail(f"workload missing fields: {', '.join(sorted(missing_workload))}")
+    for field in REQUIRED_WORKLOAD:
+        if not isinstance(workload.get(field), int):
+            fail(f"workload.{field} must be an integer")
+        if workload[field] <= 0:
+            fail(f"workload.{field} must be positive")
+    if workload["replacement_soak_iterations"] != data["replacement_soak_iterations"]:
+        fail(
+            "workload.replacement_soak_iterations="
+            f"{workload['replacement_soak_iterations']} does not match "
+            f"replacement_soak_iterations={data['replacement_soak_iterations']}"
+        )
     if args.min_iterations is not None and data["iterations"] < args.min_iterations:
         fail(f"iterations={data['iterations']} below {args.min_iterations}")
     if (
@@ -224,8 +270,25 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_refill_failures is not None and data["refill_failures"] > args.max_refill_failures:
         fail(f"refill_failures={data['refill_failures']} exceeds {args.max_refill_failures}")
 
-    for field in ("put", "resident_hot_get", "hot_get", "cold_ssd_refill_get"):
-        validate_timing(data, field)
+    validate_timing(data, "put", data["iterations"])
+    validate_timing(data, "hot_get", data["iterations"])
+    validate_timing(data, "cold_ssd_refill_get", data["iterations"])
+    resident_hot_key_count = require_int_field(data, "resident_hot_key_count")
+    validate_timing(data, "resident_hot_get", resident_hot_key_count)
+
+    if data["cold_ssd_refills"] > data["iterations"]:
+        fail("cold_ssd_refills cannot exceed iterations")
+    if data["main_pressure_passed"] != (
+        data["memory_evictions"] > 0
+        and data["pmem_evictions"] > 0
+        and data["cold_ssd_refills"] > 0
+        and data["refill_failures"] == 0
+    ):
+        fail("main_pressure_passed disagrees with pressure/refill counters")
+    if data["replacement_soak_passed"] != data["matrixcache_contract"]["replacement_soak"]:
+        fail("replacement_soak_passed disagrees with matrixcache_contract.replacement_soak")
+    if data["restart_disk_refill_ready"] != data["matrixcache_contract"]["restart_disk_refill"]:
+        fail("restart_disk_refill_ready disagrees with matrixcache_contract.restart_disk_refill")
     if args.max_hot_get_p99_us is not None:
         hot_p99 = require_numeric_field(data["hot_get"], "p99_us")
         if hot_p99 > args.max_hot_get_p99_us:
