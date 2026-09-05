@@ -103,6 +103,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-refill-failures", type=int)
     parser.add_argument("--max-hot-get-p99-us", type=int)
     parser.add_argument("--max-cold-refill-p99-us", type=int)
+    parser.add_argument("--min-put-qps", type=float)
+    parser.add_argument("--min-resident-hot-get-qps", type=float)
+    parser.add_argument("--min-hot-get-qps", type=float)
+    parser.add_argument("--min-cold-refill-qps", type=float)
     return parser.parse_args()
 
 
@@ -164,6 +168,19 @@ def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> No
         fail(f"{field!r}.p99_us must be >= p95_us")
     if require_numeric_field(timing, "p95_us") < require_numeric_field(timing, "p50_us"):
         fail(f"{field!r}.p95_us must be >= p50_us")
+
+
+def validate_min_qps(data: dict[str, Any], field: str, minimum: float | None) -> None:
+    if minimum is None:
+        return
+    if minimum <= 0:
+        fail(f"{field}.qps minimum must be positive")
+    timing = data.get(field)
+    if not isinstance(timing, dict):
+        fail(f"{field!r} must be an object")
+    qps = require_numeric_field(timing, "qps")
+    if qps < minimum:
+        fail(f"{field}.qps={qps:.2f} below {minimum:.2f}")
 
 
 def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
@@ -348,6 +365,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
                 f"cold_ssd_refill_get.p99_us={cold_p99:.0f} "
                 f"exceeds {args.max_cold_refill_p99_us}"
             )
+    validate_min_qps(data, "put", args.min_put_qps)
+    validate_min_qps(data, "resident_hot_get", args.min_resident_hot_get_qps)
+    validate_min_qps(data, "hot_get", args.min_hot_get_qps)
+    validate_min_qps(data, "cold_ssd_refill_get", args.min_cold_refill_qps)
 
     validate_contract(data, args.allow_failed)
     return data
@@ -359,7 +380,10 @@ def main() -> int:
     print(
         "OK matrixcache backend report: "
         f"backend={data['backend']} iterations={data['iterations']} "
+        f"put_qps={data['put']['qps']:.2f} "
+        f"hot_get_qps={data['hot_get']['qps']:.2f} "
         f"hot_get_p99={data['hot_get']['p99_us']}us "
+        f"cold_refill_qps={data['cold_ssd_refill_get']['qps']:.2f} "
         f"replacement_soak_iterations={data['replacement_soak_iterations']} "
         f"cold_refill_p99={data['cold_ssd_refill_get']['p99_us']}us "
         f"memory_evictions={data['memory_evictions']} "

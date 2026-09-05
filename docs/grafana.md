@@ -171,7 +171,7 @@ For RocksDB-backed SSD-cache scale checks, archive the backend report too:
 
 ```bash
 cargo run --release --example rocksdb_backend_bench -- --iterations 5000 --json-output /tmp/matrixcache-rocksdb-backend.json --require-passed
-tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --min-memory-evictions 1 --min-pmem-evictions 1 --min-disk-fills 1 --min-async-writeback-backpressure 1 --max-refill-failures 0
+tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --min-memory-evictions 1 --min-pmem-evictions 1 --min-disk-fills 1 --min-async-writeback-backpressure 1 --max-refill-failures 0 --min-put-qps 100 --min-hot-get-qps 500 --min-cold-refill-qps 500 --min-resident-hot-get-qps 1000
 tools/compare_backend_reports.py /tmp/matrixcache-rocksdb-backend-baseline.json /tmp/matrixcache-rocksdb-backend.json --max-put-p99-regression 1.35 --max-hot-get-p99-regression 1.35 --max-cold-refill-p99-regression 1.50 --min-put-qps-ratio 0.80 --min-hot-get-qps-ratio 0.80 --min-cold-refill-qps-ratio 0.75 --min-counter-ratio 0.90 --max-replacement-max-regression 1.50
 ```
 
@@ -182,7 +182,7 @@ full RocksDB native build cost on every tiny backend-report iteration. The
 replacement-soak evidence also records max latency for read-through, refill,
 writeback, eviction, and compaction so backend pressure runs carry the same
 tail-latency signal as the Prometheus dashboard.
-The backend validator also enforces a minimum replacement-soak iteration count and checks that timing sample counts, resident-hot keys, workload fields, nested evidence counters, tier-hit/refill accounting, and replacement-soak evidence all agree with the reported workload, so SSD-cache evidence cannot pass from a short or internally inconsistent run. It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement. The backend comparator keeps archived runs honest against a baseline by checking workload identity, p99 latency regression, QPS ratios, tier movement counters, refill-failure growth, and replacement-soak max latency.
+The backend validator also enforces a minimum replacement-soak iteration count and checks that timing sample counts, resident-hot keys, workload fields, nested evidence counters, tier-hit/refill accounting, and replacement-soak evidence all agree with the reported workload, so SSD-cache evidence cannot pass from a short or internally inconsistent run. It also supports absolute QPS floors for put, resident-hot get, hot get, and cold SSD refill paths, so a run cannot satisfy tail-latency ceilings while delivering unusable throughput. It also requires observed DRAM eviction, PMEM eviction, disk fills, and writeback backpressure, which keeps the multi-tier cache contract tied to real counter movement. The backend comparator keeps archived runs honest against a baseline by checking workload identity, p99 latency regression, QPS ratios, tier movement counters, refill-failure growth, and replacement-soak max latency.
 
 
 ## Scale Report Pairing
