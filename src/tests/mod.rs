@@ -15381,25 +15381,47 @@ mod tests {
             ..CacheStats::default()
         };
         let mut text = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
+        let mut labels = String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES);
 
-        prometheus_text_into(&stats, &[("cache", "reuse")], &mut text);
+        prometheus_text_into_with_label_scratch(
+            &stats,
+            &[("cache", "reuse")],
+            &mut text,
+            &mut labels,
+        );
         let first_capacity = text.capacity();
+        let first_label_capacity = labels.capacity();
         assert!(
             text.contains("matrixcache_memory_hits{cache=\"reuse\"} 1"),
             "first scrape should render the requested stats:\n{text}"
         );
 
         text.push_str("stale text that must be cleared");
+        labels.push_str("stale labels");
         stats.memory_hits = 2;
-        prometheus_text_into(&stats, &[("cache", "reuse")], &mut text);
+        prometheus_text_into_with_label_scratch(
+            &stats,
+            &[("cache", "reuse")],
+            &mut text,
+            &mut labels,
+        );
         assert_eq!(
             text.capacity(),
             first_capacity,
             "caller-owned scrape buffer should not reallocate when capacity is sufficient"
         );
+        assert_eq!(
+            labels.capacity(),
+            first_label_capacity,
+            "caller-owned label buffer should not reallocate when capacity is sufficient"
+        );
         assert!(
             !text.contains("stale text"),
             "reused scrape buffer should be cleared before rendering"
+        );
+        assert!(
+            !labels.contains("stale labels"),
+            "reused label buffer should be cleared before rendering"
         );
         assert!(
             text.contains("matrixcache_memory_hits{cache=\"reuse\"} 2"),

@@ -133,6 +133,7 @@ out.append("")
 out.append("use std::fmt::Write as _;")
 out.append("")
 out.append("pub const PROMETHEUS_TEXT_CAPACITY_BYTES: usize = 32 * 1024;")
+out.append("pub const PROMETHEUS_LABELS_CAPACITY_BYTES: usize = 256;")
 out.append("")
 out.append("/// Renders a snapshot in Prometheus text exposition format (version 0.0.4).")
 out.append("///")
@@ -155,18 +156,30 @@ out.append("/// Reusing the same buffer avoids allocating a new 32 KiB scrape bo
 out.append("/// every pull while keeping the one-shot `prometheus_text` API available for")
 out.append("/// tests and small tools.")
 out.append("pub fn prometheus_text_into(stats: &CacheStats, labels: &[(&str, &str)], out: &mut String) {")
+out.append("    let mut label_scratch = String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES);")
+out.append("    prometheus_text_into_with_label_scratch(stats, labels, out, &mut label_scratch);")
+out.append("}")
+out.append("")
+out.append("/// Renders a snapshot into caller-owned body and label scratch buffers.")
+out.append("pub fn prometheus_text_into_with_label_scratch(")
+out.append("    stats: &CacheStats,")
+out.append("    labels: &[(&str, &str)],")
+out.append("    out: &mut String,")
+out.append("    label_scratch: &mut String,")
+out.append(") {")
 out.append("    out.clear();")
 out.append("    if out.capacity() < PROMETHEUS_TEXT_CAPACITY_BYTES {")
 out.append("        out.reserve(PROMETHEUS_TEXT_CAPACITY_BYTES - out.capacity());")
 out.append("    }")
 out.append("    let mut out = out;")
-out.append("    let tags = render_labels(labels);")
+out.append("    render_labels_into(labels, label_scratch);")
+out.append("    let tags = label_scratch.as_str();")
 out.append("")
 
 for field in scalars:
     metric = "matrixcache_%s" % field
     help_text = HELP.get(field) or field.replace("_", " ").capitalize()
-    out.append('    metric(&mut out, "%s", "%s", "%s", &tags, stats.%s);'
+    out.append('    metric(&mut out, "%s", "%s", "%s", tags, stats.%s);'
                % (metric, help_text, kind(field), field))
 
 out.append("")
@@ -180,15 +193,15 @@ out.append("    let resident_bytes = stats")
 out.append("        .memory_bytes")
 out.append("        .saturating_add(stats.pmem_bytes)")
 out.append("        .saturating_add(stats.disk_bytes);")
-out.append('    metric(&mut out, "matrixcache_total_hits", "Reads served from any cache tier", "counter", &tags, total_hits);')
-out.append('    metric(&mut out, "matrixcache_total_requests", "Cache read requests across hits and misses", "counter", &tags, total_requests);')
-out.append('    metric(&mut out, "matrixcache_total_operations", "Cache reads plus writes", "counter", &tags, total_ops);')
-out.append('    metric(&mut out, "matrixcache_resident_bytes", "Bytes resident across memory, PMEM and SSD tiers", "gauge", &tags, resident_bytes);')
-out.append('    metric_f64(&mut out, "matrixcache_hit_rate_ratio", "Read hit ratio across all cache tiers", "gauge", &tags, ratio(total_hits, total_requests));')
-out.append('    metric_f64(&mut out, "matrixcache_memory_hit_share_ratio", "Share of hits served by memory", "gauge", &tags, ratio(stats.memory_hits, total_hits));')
-out.append('    metric_f64(&mut out, "matrixcache_total_ops_per_resident_mib", "Cumulative cache operations per resident MiB", "gauge", &tags, per_resident_mib(total_ops, resident_bytes));')
-out.append('    metric_f64(&mut out, "matrixcache_evictions_per_resident_mib", "Cumulative tier evictions per resident MiB", "gauge", &tags, per_resident_mib(stats.memory_evictions.saturating_add(stats.pmem_evictions).saturating_add(stats.ssd_evictions), resident_bytes));')
-out.append('    metric_f64(&mut out, "matrixcache_writeback_queue_bytes_per_resident_mib", "Async writeback queue bytes per resident MiB", "gauge", &tags, per_resident_mib(stats.async_writeback_queue_bytes, resident_bytes));')
+out.append('    metric(&mut out, "matrixcache_total_hits", "Reads served from any cache tier", "counter", tags, total_hits);')
+out.append('    metric(&mut out, "matrixcache_total_requests", "Cache read requests across hits and misses", "counter", tags, total_requests);')
+out.append('    metric(&mut out, "matrixcache_total_operations", "Cache reads plus writes", "counter", tags, total_ops);')
+out.append('    metric(&mut out, "matrixcache_resident_bytes", "Bytes resident across memory, PMEM and SSD tiers", "gauge", tags, resident_bytes);')
+out.append('    metric_f64(&mut out, "matrixcache_hit_rate_ratio", "Read hit ratio across all cache tiers", "gauge", tags, ratio(total_hits, total_requests));')
+out.append('    metric_f64(&mut out, "matrixcache_memory_hit_share_ratio", "Share of hits served by memory", "gauge", tags, ratio(stats.memory_hits, total_hits));')
+out.append('    metric_f64(&mut out, "matrixcache_total_ops_per_resident_mib", "Cumulative cache operations per resident MiB", "gauge", tags, per_resident_mib(total_ops, resident_bytes));')
+out.append('    metric_f64(&mut out, "matrixcache_evictions_per_resident_mib", "Cumulative tier evictions per resident MiB", "gauge", tags, per_resident_mib(stats.memory_evictions.saturating_add(stats.pmem_evictions).saturating_add(stats.ssd_evictions), resident_bytes));')
+out.append('    metric_f64(&mut out, "matrixcache_writeback_queue_bytes_per_resident_mib", "Async writeback queue bytes per resident MiB", "gauge", tags, per_resident_mib(stats.async_writeback_queue_bytes, resident_bytes));')
 out.append("")
 for family, total, mx in LATENCY_FAMILIES:
     metric = "matrixcache_%s_seconds" % family
@@ -200,7 +213,7 @@ for family, total, mx in LATENCY_FAMILIES:
     out.append("        let mut cumulative = 0_u64;")
     for suffix, le in BUCKETS:
         out.append("        cumulative = cumulative.saturating_add(stats.%s_%s);" % (family, suffix))
-        out.append('        bucket(&mut out, "%s", &tags, "%s", cumulative);' % (metric, le))
+        out.append('        bucket(&mut out, "%s", tags, "%s", cumulative);' % (metric, le))
     if total:
         out.append('        let _ = writeln!(')
         out.append('            out,')
@@ -214,27 +227,34 @@ for family, total, mx in LATENCY_FAMILIES:
     out.append('        let _ = writeln!(out, "%s_count{tags} {cumulative}");' % metric)
     out.append("    }")
     if total:
-        out.append('    metric_f64(&mut out, "matrixcache_%s_avg_seconds", "%s average latency", "gauge", &tags, average_seconds(stats.%s, stats.%s_samples));'
+        out.append('    metric_f64(&mut out, "matrixcache_%s_avg_seconds", "%s average latency", "gauge", tags, average_seconds(stats.%s, stats.%s_samples));'
                    % (family, pretty, total, family))
     if mx:
-        out.append('    metric_f64(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", &tags, stats.%s as f64 / 1_000_000.0);'
+        out.append('    metric_f64(&mut out, "matrixcache_%s_max_seconds", "%s peak latency", "gauge", tags, stats.%s as f64 / 1_000_000.0);'
                    % (family, pretty, mx))
     max_expr = "stats.%s" % mx if mx else "0"
-    out.append('    metric_f64(&mut out, "matrixcache_%s_p50_seconds", "%s p50 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 50));'
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p50_seconds", "%s p50 latency", "gauge", tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 50));'
                % (family, pretty, family, family, family, family, family, family, max_expr))
-    out.append('    metric_f64(&mut out, "matrixcache_%s_p95_seconds", "%s p95 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 95));'
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p95_seconds", "%s p95 latency", "gauge", tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 95));'
                % (family, pretty, family, family, family, family, family, family, max_expr))
-    out.append('    metric_f64(&mut out, "matrixcache_%s_p99_seconds", "%s p99 latency", "gauge", &tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 99));'
+    out.append('    metric_f64(&mut out, "matrixcache_%s_p99_seconds", "%s p99 latency", "gauge", tags, percentile_seconds(stats.%s_samples, stats.%s_le_10us, stats.%s_le_100us, stats.%s_le_1ms, stats.%s_le_10ms, stats.%s_gt_10ms, %s, 99));'
                % (family, pretty, family, family, family, family, family, family, max_expr))
     out.append("")
 
 out.append("}")
 out.append("")
 out.append("fn render_labels(labels: &[(&str, &str)]) -> String {")
+out.append("    let mut rendered = String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES);")
+out.append("    render_labels_into(labels, &mut rendered);")
+out.append("    rendered")
+out.append("}")
+out.append("")
+out.append("fn render_labels_into(labels: &[(&str, &str)], rendered: &mut String) {")
+out.append("    rendered.clear();")
 out.append("    if labels.is_empty() {")
-out.append('        return String::new();')
+out.append("        return;")
 out.append("    }")
-out.append("    let mut rendered = String::from(\"{\");")
+out.append("    rendered.push('{');")
 out.append("    for (index, (name, value)) in labels.iter().enumerate() {")
 out.append("        if index > 0 {")
 out.append("            rendered.push(',');")
@@ -242,7 +262,6 @@ out.append("        }")
 out.append('        let _ = write!(rendered, "{}=\\"{}\\"", name, escape(value));')
 out.append("    }")
 out.append("    rendered.push('}');")
-out.append("    rendered")
 out.append("}")
 out.append("")
 out.append("/// Backslash, double quote and newline are the three characters the text")

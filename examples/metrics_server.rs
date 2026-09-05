@@ -32,8 +32,8 @@
 //! ```
 
 use matrixcache::{
-    prometheus_text_into, CacheKey, CacheOptions, ShardedMultiLayerCache,
-    PROMETHEUS_TEXT_CAPACITY_BYTES,
+    prometheus_text_into_with_label_scratch, CacheKey, CacheOptions, ShardedMultiLayerCache,
+    PROMETHEUS_LABELS_CAPACITY_BYTES, PROMETHEUS_TEXT_CAPACITY_BYTES,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -145,7 +145,13 @@ fn main() {
             match path.as_str() {
                 "/metrics" => {
                     let mut body = String::with_capacity(PROMETHEUS_TEXT_CAPACITY_BYTES);
-                    prometheus_text_into(&cache.stats(), &[("cache", "example")], &mut body);
+                    let mut label_scratch = String::with_capacity(PROMETHEUS_LABELS_CAPACITY_BYTES);
+                    prometheus_text_into_with_label_scratch(
+                        &cache.stats(),
+                        &[("cache", "example")],
+                        &mut body,
+                        &mut label_scratch,
+                    );
                     respond(stream, "200 OK", "text/plain; version=0.0.4", &body);
                 }
                 "/healthz" => respond(stream, "200 OK", "text/plain", "ok\n"),
