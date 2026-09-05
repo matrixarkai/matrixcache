@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-full-ns", type=float)
     parser.add_argument("--max-overhead-percent", type=float)
     parser.add_argument("--max-spread-percent", type=float)
+    parser.add_argument("--min-passes", type=int, default=1)
     return parser.parse_args()
 
 
@@ -79,8 +80,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         require_type(data, field, expected)
     if data["report_version"] != "matrixcache_read_path_v1":
         fail(f"unexpected report_version {data['report_version']!r}")
-    if data["entries"] <= 0 or data["value_bytes"] <= 0 or data["passes"] <= 0:
-        fail("entries, value_bytes, and passes must be positive")
+    if data["entries"] <= 0 or data["value_bytes"] <= 0:
+        fail("entries and value_bytes must be positive")
+    if data["passes"] < args.min_passes:
+        fail(f"passes={data['passes']} below minimum {args.min_passes}")
     for field in ("peek_ns_per_op", "no_promotion_ns_per_op", "full_ns_per_op"):
         if number(data, field) <= 0:
             fail(f"{field} must be positive")
@@ -107,7 +110,8 @@ def main() -> int:
     data = validate(args)
     print(
         "OK matrixcache read-path report: "
-        f"entries={data['entries']} full_ns={float(data['full_ns_per_op']):.1f} "
+        f"entries={data['entries']} passes={data['passes']} "
+        f"full_ns={float(data['full_ns_per_op']):.1f} "
         f"overhead_ns={float(data['overhead_ns_per_op']):.1f} "
         f"overhead={float(data['overhead_median_percent']):.1f}% "
         f"spread={float(data['spread_percent']):.1f}%"

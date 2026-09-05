@@ -134,9 +134,12 @@ manually reading console tables:
 
 ```bash
 cargo run --release --no-default-features --example read_path_cost -- 4096 --json-output /tmp/matrixcache-read-path.json --require-passed --max-full-ns 1000000 --max-overhead-percent 1000000 --max-spread-percent 1000000
-tools/validate_read_path_report.py /tmp/matrixcache-read-path.json --max-full-ns 1000000 --max-overhead-percent 1000000 --max-spread-percent 1000000
+tools/validate_read_path_report.py /tmp/matrixcache-read-path.json --max-full-ns 1000000 --max-overhead-percent 1000000 --max-spread-percent 1000000 --min-passes 7
 tools/compare_read_path_reports.py /tmp/matrixcache-read-path-baseline.json /tmp/matrixcache-read-path.json --max-latency-regression 1.35 --max-overhead-regression 1.35 --max-spread-regression 1.50
 ```
+
+The `--min-passes` guard keeps the median overhead and spread numbers from
+being accepted from a truncated read-path run.
 
 For eviction-cost checks, archive `eviction_bench`. It records steady-state
 write cost while the cache is full, candidate groups sampled per eviction, and
