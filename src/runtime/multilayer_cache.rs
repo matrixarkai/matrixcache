@@ -80,6 +80,34 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>
     (unique_keys, requested_positions)
 }
 
+fn coalesce_batch_positions(keys: &[CacheKey]) -> Vec<(CacheKey, Vec<usize>)> {
+    let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
+    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        for (position, key) in keys.iter().enumerate() {
+            if let Some((_, positions)) = positions_by_key
+                .iter_mut()
+                .find(|(existing, _)| existing == key)
+            {
+                positions.push(position);
+            } else {
+                positions_by_key.push((key.clone(), vec![position]));
+            }
+        }
+        return positions_by_key;
+    }
+
+    let mut unique_positions = HashMap::<CacheKey, usize>::new();
+    for (position, key) in keys.iter().cloned().enumerate() {
+        if let Some(unique_position) = unique_positions.get(&key).copied() {
+            positions_by_key[unique_position].1.push(position);
+        } else {
+            unique_positions.insert(key.clone(), positions_by_key.len());
+            positions_by_key.push((key, vec![position]));
+        }
+    }
+    positions_by_key
+}
+
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -3241,16 +3269,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
-        let mut unique_positions = HashMap::<CacheKey, usize>::new();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            if let Some(unique_position) = unique_positions.get(&key).copied() {
-                positions_by_key[unique_position].1.push(position);
-            } else {
-                unique_positions.insert(key.clone(), positions_by_key.len());
-                positions_by_key.push((key, vec![position]));
-            }
-        }
+        let positions_by_key = coalesce_batch_positions(keys);
 
         let now_millis = CoarseClock::now_millis();
         let mut expired_keys = Vec::new();
@@ -3388,16 +3407,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
-        let mut unique_positions = HashMap::<CacheKey, usize>::new();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            if let Some(unique_position) = unique_positions.get(&key).copied() {
-                positions_by_key[unique_position].1.push(position);
-            } else {
-                unique_positions.insert(key.clone(), positions_by_key.len());
-                positions_by_key.push((key, vec![position]));
-            }
-        }
+        let positions_by_key = coalesce_batch_positions(keys);
 
         let mut remaining = Vec::<(CacheKey, Vec<usize>)>::new();
         let mut exclusive_work = Vec::<(CacheKey, HitOutcome, usize)>::new();
