@@ -3573,6 +3573,10 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
+        if let Some(key) = keys.first().filter(|_| keys.len() == 1) {
+            return self.acquire(key).map(|handle| vec![handle]);
+        }
+
         let mut results = empty_batch_results(keys.len());
         if keys.is_empty() {
             return Ok(results);
