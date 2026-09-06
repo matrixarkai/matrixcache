@@ -177,7 +177,8 @@ and says what the number means:
   `tools/validate_hit_concurrency_report.py`.
 - `tools/run_scale_reports.py` -- runs the read/retrieval scale benchmarks
   above, validates each JSON report, and writes a manifest that points to the
-  archived reports.
+  archived reports. Add `--markdown-output <path>` when the same run should
+  also leave an operator/Grafana-friendly summary.
 - `tools/compare_scale_reports.py` -- compares two scale report manifests and
   fails on configured latency or throughput regressions.
 
