@@ -9132,6 +9132,31 @@ mod tests {
     }
 
     #[test]
+    fn acquire_memory_hit_records_read_through_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "zero-copy-hot-latency");
+        cache.put(key.clone(), b"hot-value".to_vec()).unwrap();
+
+        let before = cache.stats();
+        let handle = cache
+            .acquire(&key)
+            .unwrap()
+            .expect("memory handle should be served");
+        assert_eq!(handle.tier(), CacheReadTier::Memory);
+        assert_eq!(handle.value(), b"hot-value");
+        cache.release(handle);
+
+        let after = cache.stats();
+        assert_eq!(after.memory_hits, before.memory_hits + 1);
+        assert_eq!(after.get_latency_samples, before.get_latency_samples + 1);
+        assert_eq!(
+            after.read_through_latency_samples,
+            before.read_through_latency_samples + 1
+        );
+    }
+
+    #[test]
     fn acquire_no_promotion_pins_ssd_without_refilling_memory() {
         let cache = MultiLayerCache::with_tiering_policy(
             unique_temp_path("zero-copy-no-promotion-acquire"),
@@ -9281,7 +9306,6 @@ mod tests {
         let handles = cache
             .acquire_batch(&[repeated.clone(), other.clone(), repeated.clone()])
             .unwrap();
-
         assert_eq!(handles.len(), 3);
         assert_eq!(handles[0].as_ref().unwrap().tier(), CacheReadTier::Memory);
         assert_eq!(handles[0].as_ref().unwrap().value(), b"dup");
@@ -9293,6 +9317,10 @@ mod tests {
         assert_eq!(after.pin_operations - before.pin_operations, 3);
         assert_eq!(after.zero_copy_handle_hits - before.zero_copy_handle_hits, 2);
         assert_eq!(after.get_latency_samples - before.get_latency_samples, 2);
+        assert_eq!(
+            after.read_through_latency_samples - before.read_through_latency_samples,
+            2
+        );
         assert_eq!(after.pinned_entries, 2);
 
         assert_eq!(cache.release_batch(handles.into_iter().flatten().collect()), 3);
