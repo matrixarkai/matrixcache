@@ -10,9 +10,11 @@
 //!
 //! Two other cases are sensitive to it, and this measures those.
 //!
-//! * **Large hits.** The copy that turns the stored `Arc<[u8]>` into the
+//! * **Large copied hits.** The copy that turns the stored `Arc<[u8]>` into the
 //!   returned `Vec` grows with the value. If it is made inside the exclusive
 //!   section, readers copy one at a time; outside it, they copy in parallel.
+//! * **Large shared hits.** `get_shared` returns the stored `Arc<[u8]>` and
+//!   shows the CacheLib-style read shape that avoids copying large values.
 //! * **Misses.** A read that finds nothing in memory has no bookkeeping to do
 //!   at all, so any exclusivity it takes is pure serialisation.
 //!
@@ -38,21 +40,19 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 /// Aggregate reads per second across `threads` readers.
-fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, hit: bool) -> f64 {
+fn copied_hit_throughput(cache: &Arc<MultiLayerCache>, threads: usize) -> f64 {
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
             std::thread::spawn(move || {
                 let started = Instant::now();
+                let mut bytes = 0_usize;
                 for round in 0..READS_PER_THREAD {
                     let index = (worker * 31 + round * 7) % RESIDENT;
-                    let key = if hit {
-                        CacheKey::string(0, &format!("resident-{index:05}"))
-                    } else {
-                        CacheKey::string(0, &format!("absent-{index:05}"))
-                    };
-                    let _ = cache.get(&key).expect("get");
+                    let key = CacheKey::string(0, &format!("resident-{index:05}"));
+                    bytes += cache.get(&key).expect("get").expect("resident hit").len();
                 }
+                assert_eq!(bytes, READS_PER_THREAD * LARGE_VALUE_BYTES);
                 started.elapsed().as_secs_f64()
             })
         })
@@ -60,6 +60,54 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, hit: bool) -> f64 {
     // Each worker times only its own run, so a thread descheduled by other
     // load inflates its own elapsed time rather than everyone's. Summing the
     // per-thread rates is the aggregate the cache actually delivered.
+    workers
+        .into_iter()
+        .map(|worker| READS_PER_THREAD as f64 / worker.join().expect("worker"))
+        .sum()
+}
+
+fn shared_hit_throughput(cache: &Arc<MultiLayerCache>, threads: usize) -> f64 {
+    let workers = (0..threads)
+        .map(|worker| {
+            let cache = Arc::clone(cache);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let mut bytes = 0_usize;
+                for round in 0..READS_PER_THREAD {
+                    let index = (worker * 31 + round * 7) % RESIDENT;
+                    let key = CacheKey::string(0, &format!("resident-{index:05}"));
+                    bytes += cache
+                        .get_shared(&key)
+                        .expect("get_shared")
+                        .expect("resident shared hit")
+                        .len();
+                }
+                assert_eq!(bytes, READS_PER_THREAD * LARGE_VALUE_BYTES);
+                started.elapsed().as_secs_f64()
+            })
+        })
+        .collect::<Vec<_>>();
+    workers
+        .into_iter()
+        .map(|worker| READS_PER_THREAD as f64 / worker.join().expect("worker"))
+        .sum()
+}
+
+fn miss_throughput(cache: &Arc<MultiLayerCache>, threads: usize) -> f64 {
+    let workers = (0..threads)
+        .map(|worker| {
+            let cache = Arc::clone(cache);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                for round in 0..READS_PER_THREAD {
+                    let index = (worker * 31 + round * 7) % RESIDENT;
+                    let key = CacheKey::string(0, &format!("absent-{index:05}"));
+                    assert!(cache.get(&key).expect("get").is_none());
+                }
+                started.elapsed().as_secs_f64()
+            })
+        })
+        .collect::<Vec<_>>();
     workers
         .into_iter()
         .map(|worker| READS_PER_THREAD as f64 / worker.join().expect("worker"))
@@ -85,18 +133,31 @@ fn main() {
         "{RESIDENT} resident values of {} KiB, {READS_PER_THREAD} reads/thread, median of {REPEATS}\n",
         LARGE_VALUE_BYTES / 1024
     );
-    println!("{:<10}{:>16}{:>16}", "threads", "hit Mops/s", "miss Mops/s");
+    println!(
+        "{:<10}{:>20}{:>20}{:>16}",
+        "threads", "copied hit Mops/s", "shared hit Mops/s", "miss Mops/s"
+    );
     for threads in [1_usize, 2, 4, 8] {
         let hit = median(
             (0..REPEATS)
-                .map(|_| throughput(&cache, threads, true))
+                .map(|_| copied_hit_throughput(&cache, threads))
+                .collect(),
+        );
+        let shared = median(
+            (0..REPEATS)
+                .map(|_| shared_hit_throughput(&cache, threads))
                 .collect(),
         );
         let miss = median(
             (0..REPEATS)
-                .map(|_| throughput(&cache, threads, false))
+                .map(|_| miss_throughput(&cache, threads))
                 .collect(),
         );
-        println!("{threads:<10}{:>16.4}{:>16.4}", hit / 1e6, miss / 1e6);
+        println!(
+            "{threads:<10}{:>20.4}{:>20.4}{:>16.4}",
+            hit / 1e6,
+            shared / 1e6,
+            miss / 1e6
+        );
     }
 }
