@@ -178,34 +178,6 @@ fn coalesce_key_indexes(entries: Vec<(usize, CacheKey)>) -> Vec<(CacheKey, Vec<u
     grouped
 }
 
-fn coalesce_key_timed_indexes(
-    entries: Vec<(usize, CacheKey, Instant)>,
-) -> Vec<(CacheKey, Vec<(usize, Instant)>)> {
-    if entries.len() <= SMALL_BATCH_DEDUP_LIMIT {
-        let mut grouped = Vec::<(CacheKey, Vec<(usize, Instant)>)>::new();
-        for (index, key, started) in entries {
-            if let Some((_, indexes)) = grouped.iter_mut().find(|(existing, _)| existing == &key) {
-                indexes.push((index, started));
-            } else {
-                grouped.push((key, vec![(index, started)]));
-            }
-        }
-        return grouped;
-    }
-
-    let mut positions_by_key = HashMap::<CacheKey, usize>::new();
-    let mut grouped = Vec::<(CacheKey, Vec<(usize, Instant)>)>::new();
-    for (index, key, started) in entries {
-        if let Some(position) = positions_by_key.get(&key).copied() {
-            grouped[position].1.push((index, started));
-        } else {
-            positions_by_key.insert(key.clone(), grouped.len());
-            grouped.push((key, vec![(index, started)]));
-        }
-    }
-    grouped
-}
-
 /// The byte-valued cache interface, implemented by every cache in this crate.
 ///
 /// Implemented by [`MultiLayerCache`], [`ShardedMultiLayerCache`],
@@ -2714,7 +2686,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut ssd_candidates = Vec::new();
+        let mut ssd_candidates = Vec::<(usize, CacheKey)>::new();
         let now_millis = CoarseClock::now_millis();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -3127,7 +3099,7 @@ impl MultiLayerCache {
         // Only what genuinely needs the cache exclusively is deferred: entries
         // past their time to live, entries whose access order needs moving,
         // entries with no metadata yet, and everything below the memory tier.
-        let mut deferred: Vec<(usize, CacheKey, Instant)> = Vec::new();
+        let mut deferred: Vec<(CacheKey, Vec<usize>, Instant)> = Vec::new();
         let mut memory_hits: Vec<(Vec<usize>, Arc<[u8]>)> = Vec::new();
         let mut needs_exclusive: Vec<(CacheKey, HitOutcome, usize)> = Vec::new();
         let positions_by_key = coalesce_batch_positions(keys);
@@ -3143,11 +3115,7 @@ impl MultiLayerCache {
                 // Checked under the same shared lock as the lookup, so an
                 // entry cannot be judged live and then read after it expired.
                 if inner.entry_expired(&key, now_millis) || inner.ssd_instance_only {
-                    deferred.extend(
-                        positions
-                            .into_iter()
-                            .map(|position| (position, key.clone(), started)),
-                    );
+                    deferred.push((key, positions, started));
                     continue;
                 }
                 match inner.memory.get(&key).cloned() {
@@ -3166,11 +3134,7 @@ impl MultiLayerCache {
                         inner.record_read_through_latency_micros_many(micros, positions.len());
                         memory_hits.push((positions, value));
                     }
-                    None => deferred.extend(
-                        positions
-                            .into_iter()
-                            .map(|position| (position, key.clone(), started)),
-                    ),
+                    None => deferred.push((key, positions, started)),
                 }
             }
         }
@@ -3210,43 +3174,64 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (index, key, started) in deferred {
+            for (key, positions, started) in deferred {
                 // Expiry is noticed on the read that would have been served.
                 // Re-checked here: another reader may have dropped it since
                 // the probe, or it may have been rewritten with a fresh life.
                 if inner.entry_expired(&key, now_millis) {
                     inner.remove_expired_entry(&key);
                     inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                    inner.record_get_latency(started);
+                    let occurrences = positions.len();
+                    inner
+                        .read_counters
+                        .misses
+                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    let micros = elapsed_micros(started);
+                    inner.record_get_latency_micros_many(micros, occurrences);
+                    inner.record_read_through_latency_micros_many(micros, occurrences);
                     continue;
                 }
                 if !inner.ssd_instance_only {
                     if let Some(value) = inner.memory.get(&key).cloned() {
-                        inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                        let occurrences = positions.len();
+                        inner
+                            .read_counters
+                            .memory_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit_metadata(&key, value.len());
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
-                        results[index] = Some(value.to_vec());
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
+                        let decoded = value.to_vec();
+                        for index in positions {
+                            results[index] = Some(decoded.clone());
+                        }
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
-                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                        let occurrences = positions.len();
+                        inner
+                            .read_counters
+                            .pmem_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit_metadata(&key, value.len());
                         let decoded = value.to_vec();
                         if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
-                        results[index] = Some(decoded);
+                        for index in positions {
+                            results[index] = Some(decoded.clone());
+                        }
                         needs_eviction_drain = true;
                         continue;
                     }
                 }
-                ssd_candidates.push((index, key.clone(), started));
+                ssd_candidates.push((key, positions, started));
             }
         }
 
@@ -3257,20 +3242,18 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let unique_ssd_candidates = coalesce_key_timed_indexes(ssd_candidates);
         // Pointers, not copies: these keys are read and nothing more.
-        let candidate_keys = unique_ssd_candidates
+        let candidate_keys = ssd_candidates
             .iter()
-            .map(|(key, _)| key)
+            .map(|(key, _, _)| key)
             .collect::<Vec<_>>();
         let refill_started = Instant::now();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
             inner.read_ssd_blocks(&candidate_keys)?
         };
-        let mut ssd_reads = Vec::with_capacity(unique_ssd_candidates.len());
-        for ((key, occurrences), block) in unique_ssd_candidates.into_iter().zip(blocks)
-        {
+        let mut ssd_reads = Vec::with_capacity(ssd_candidates.len());
+        for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
             let decoded = match block {
                 Some(block) => Some((
                     decode_cache_block(&block)?,
@@ -3278,7 +3261,7 @@ impl MultiLayerCache {
                 )),
                 None => None,
             };
-            ssd_reads.push((key, occurrences, refill_started, decoded));
+            ssd_reads.push((key, positions, started, refill_started, decoded));
         }
 
         {
@@ -3286,7 +3269,7 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (key, occurrences, refill_started, decoded) in ssd_reads {
+            for (key, positions, started, refill_started, decoded) in ssd_reads {
                 match decoded {
                     Some((value, compressed)) => {
                         if !inner.ssd_instance_only
@@ -3295,26 +3278,34 @@ impl MultiLayerCache {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
-                        for (index, started) in occurrences {
-                            inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
-                            if compressed {
-                                inner.stats.compressed_hits =
-                                    inner.stats.compressed_hits.saturating_add(1);
-                            }
-                            inner.record_hit_metadata(&key, value.len());
-                            inner.record_get_latency(started);
-                            inner.record_read_through_latency(started);
-                            inner.record_refill_latency(refill_started);
+                        let occurrences = positions.len();
+                        inner
+                            .read_counters
+                            .disk_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        if compressed {
+                            inner.stats.compressed_hits =
+                                inner.stats.compressed_hits.saturating_add(occurrences as u64);
+                        }
+                        inner.record_hit_metadata(&key, value.len());
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
+                        inner.record_refill_latency(refill_started);
+                        for index in positions {
                             results[index] = Some(value.clone());
                         }
                         needs_eviction_drain = true;
                     }
                     None => {
-                        for (_index, started) in occurrences {
-                            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                            inner.record_get_latency(started);
-                            inner.record_read_through_latency(started);
-                        }
+                        let occurrences = positions.len();
+                        inner
+                            .read_counters
+                            .misses
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
                     }
                 }
             }
