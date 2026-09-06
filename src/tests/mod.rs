@@ -15260,6 +15260,17 @@ mod tests {
         let types = text.lines().filter(|l| l.starts_with("# TYPE ")).count();
         assert_eq!(helps, types, "every metric needs both HELP and TYPE");
         assert!(helps > 50, "expected the whole of CacheStats, got {helps} metrics");
+        let mut documented_families = std::collections::HashSet::new();
+        for line in text.lines().filter(|l| l.starts_with("# HELP ")) {
+            let family = line
+                .split_whitespace()
+                .nth(2)
+                .expect("HELP line includes a metric family");
+            assert!(
+                documented_families.insert(family),
+                "duplicate metric family documentation for {family}"
+            );
+        }
 
         // Something must actually have been counted, or the rest of this
         // passes on an empty response.
