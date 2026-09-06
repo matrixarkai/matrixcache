@@ -543,6 +543,40 @@ pub struct CacheBuffer {
     handle: Option<CachePinnedHandle>,
 }
 
+const STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS: usize = 64;
+
+fn coalesce_storage_batch_keys(keys: &[String]) -> (Vec<String>, Vec<usize>) {
+    if keys.len() <= STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS {
+        let mut unique_keys = Vec::<String>::with_capacity(keys.len());
+        let mut output_positions = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(position) = unique_keys.iter().position(|existing| existing == key) {
+                output_positions.push(position);
+            } else {
+                output_positions.push(unique_keys.len());
+                unique_keys.push(key.clone());
+            }
+        }
+        return (unique_keys, output_positions);
+    }
+
+    let mut unique_keys = Vec::<String>::with_capacity(keys.len());
+    let mut unique_positions = HashMap::<String, usize>::with_capacity(keys.len());
+    let mut output_positions = Vec::with_capacity(keys.len());
+    for key in keys {
+        let position = if let Some(position) = unique_positions.get(key).copied() {
+            position
+        } else {
+            let position = unique_keys.len();
+            unique_positions.insert(key.clone(), position);
+            unique_keys.push(key.clone());
+            position
+        };
+        output_positions.push(position);
+    }
+    (unique_keys, output_positions)
+}
+
 impl CacheBuffer {
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -2352,20 +2386,7 @@ impl StorageEngineRocksDb {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let mut unique_keys = Vec::<String>::new();
-        let mut unique_positions = HashMap::<String, usize>::new();
-        let mut output_positions = Vec::with_capacity(keys.len());
-        for key in keys {
-            let position = if let Some(position) = unique_positions.get(key).copied() {
-                position
-            } else {
-                let position = unique_keys.len();
-                unique_positions.insert(key.clone(), position);
-                unique_keys.push(key.clone());
-                position
-            };
-            output_positions.push(position);
-        }
+        let (unique_keys, output_positions) = coalesce_storage_batch_keys(keys);
         #[cfg(feature = "rocksdb-ssd")]
         let unique_values = {
             self.rocksdb()?
@@ -2995,6 +3016,96 @@ impl StorageEngineMultiSsd {
 
     pub fn ssdcache_type(&self) -> StorageEngineKind {
         self.ssdcache_type
+    }
+
+    pub fn get_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        if !self.initialized || self.storages.is_empty() {
+            return Err(CacheError::Stopped);
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (unique_keys, output_positions) = coalesce_storage_batch_keys(keys);
+
+        let mut routed = vec![Vec::<(usize, String)>::new(); self.storages.len()];
+        for (unique_index, key) in unique_keys.iter().enumerate() {
+            let storage_index = Self::hash(key) as usize % self.storages.len();
+            routed[storage_index].push((unique_index, key.clone()));
+        }
+
+        let mut unique_values = vec![None; unique_keys.len()];
+        for (storage_index, entries) in routed.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let storage_keys = entries
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            let storage_values = self.storages[storage_index].get_batch(&storage_keys)?;
+            for ((unique_index, _), value) in entries.into_iter().zip(storage_values) {
+                unique_values[unique_index] = value;
+            }
+        }
+
+        Ok(output_positions
+            .into_iter()
+            .map(|position| unique_values[position].clone())
+            .collect())
+    }
+
+    pub fn put_batch(&mut self, entries: Vec<(String, Vec<u8>)>) -> Result<usize, CacheError> {
+        if !self.initialized || self.storages.is_empty() {
+            return Err(CacheError::Stopped);
+        }
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let count = entries.len();
+        let mut routed = vec![Vec::<(String, Vec<u8>)>::new(); self.storages.len()];
+        for (key, value) in entries {
+            let storage_index = Self::hash(&key) as usize % self.storages.len();
+            routed[storage_index].push((key, value));
+        }
+
+        for (storage_index, entries) in routed.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            self.storages[storage_index].put_batch(entries)?;
+        }
+
+        Ok(count)
+    }
+
+    pub fn delete_batch(&mut self, keys: &[String]) -> Result<usize, CacheError> {
+        if !self.initialized || self.storages.is_empty() {
+            return Err(CacheError::Stopped);
+        }
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut routed = vec![Vec::<String>::new(); self.storages.len()];
+        let mut seen = HashSet::<String>::new();
+        for key in keys {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let storage_index = Self::hash(key) as usize % self.storages.len();
+            routed[storage_index].push(key.clone());
+        }
+
+        let mut deleted = 0usize;
+        for (storage_index, keys) in routed.into_iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            deleted = deleted.saturating_add(self.storages[storage_index].delete_batch(&keys)?);
+        }
+        Ok(deleted)
     }
 
     #[cfg(feature = "rocksdb-ssd")]
@@ -3701,4 +3812,3 @@ impl StringViewBuffer {
         self.size()
     }
 }
-
