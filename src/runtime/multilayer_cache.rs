@@ -2381,7 +2381,7 @@ impl MultiLayerCache {
                     if inner.pmem.contains_key(key) {
                         inner.record_hit(key, length);
                     }
-                    if !inner.put_memory(key.clone(), value.to_vec()) {
+                    if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                         inner.stats.refill_failures =
                             inner.stats.refill_failures.saturating_add(1);
                     }
@@ -3457,9 +3457,8 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             if let Some(value) = inner.pmem.get(key).cloned() {
-                let decoded = value.to_vec();
                 inner.increment_pin_for_handle(key, value.len());
-                if !inner.put_memory(key.clone(), decoded) {
+                if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
@@ -3484,7 +3483,8 @@ impl MultiLayerCache {
                 let decoded = Arc::<[u8]>::from(decode_cache_block(&block)?);
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.increment_pin_for_handle(key, decoded.len());
-                if !inner.ssd_instance_only && !inner.refill_from_ssd(key.clone(), decoded.to_vec())
+                if !inner.ssd_instance_only
+                    && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&decoded))
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
@@ -3900,7 +3900,7 @@ impl MultiLayerCache {
                     Some((value, compressed)) => {
                         let occurrences = positions.len();
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd(key.clone(), value.to_vec())
+                            && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&value))
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
