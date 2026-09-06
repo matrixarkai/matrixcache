@@ -1414,6 +1414,28 @@
           "legendFormat": "compaction/s",
           "range": true,
           "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "rate(matrixcache_shared_buffer_hits[1m])",
+          "legendFormat": "shared-buffer hits/s",
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "rate(matrixcache_shared_buffer_misses[1m])",
+          "legendFormat": "shared-buffer misses/s",
+          "range": true,
+          "refId": "I"
         }
       ],
       "title": "Operation Throughput",

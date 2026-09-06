@@ -740,6 +740,8 @@ struct ReadPathCounters {
     pmem_hits: AtomicU64,
     disk_hits: AtomicU64,
     misses: AtomicU64,
+    shared_buffer_hits: AtomicU64,
+    shared_buffer_misses: AtomicU64,
     hotness_promotions: AtomicU64,
     access_order_refreshes: AtomicU64,
     get_latency: AtomicLatencyHistogram,
@@ -753,6 +755,8 @@ impl ReadPathCounters {
         self.pmem_hits.store(0, Ordering::Relaxed);
         self.disk_hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+        self.shared_buffer_hits.store(0, Ordering::Relaxed);
+        self.shared_buffer_misses.store(0, Ordering::Relaxed);
         self.hotness_promotions.store(0, Ordering::Relaxed);
         self.access_order_refreshes.store(0, Ordering::Relaxed);
         self.get_latency.reset();
@@ -2319,6 +2323,10 @@ impl MultiLayerCache {
                 inner.remove_expired_entry(key);
                 inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
                 inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .read_counters
+                    .shared_buffer_misses
+                    .fetch_add(1, Ordering::Relaxed);
             }
             inner.record_get_latency(started);
             inner.record_read_through_latency(started);
@@ -2334,6 +2342,10 @@ impl MultiLayerCache {
                         inner
                             .read_counters
                             .memory_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .shared_buffer_hits
                             .fetch_add(1, Ordering::Relaxed);
                         let outcome = if inner.memory.contains_key(key) {
                             inner.record_hit_shared(key)
@@ -2362,6 +2374,10 @@ impl MultiLayerCache {
                 CacheReadTier::Pmem => {
                     let mut inner = self.inner.write().expect("cache lock poisoned");
                     inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .read_counters
+                        .shared_buffer_hits
+                        .fetch_add(1, Ordering::Relaxed);
                     if inner.pmem.contains_key(key) {
                         inner.record_hit(key, length);
                     }
@@ -2390,6 +2406,10 @@ impl MultiLayerCache {
                 let value = Arc::<[u8]>::from(decoded.clone());
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .read_counters
+                    .shared_buffer_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 if is_encoded_compressed_block(&block) {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
@@ -2407,6 +2427,10 @@ impl MultiLayerCache {
             None => {
                 let inner = self.inner.read().expect("cache lock poisoned");
                 inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .read_counters
+                    .shared_buffer_misses
+                    .fetch_add(1, Ordering::Relaxed);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 Ok(None)
@@ -2595,8 +2619,27 @@ impl MultiLayerCache {
             self.drain_eviction_records();
         }
 
+        let mut shared_hits = 0u64;
+        let mut shared_misses = 0u64;
         for (position, unique_position) in requested_positions {
-            results[position] = unique_values[unique_position].clone();
+            let value = unique_values[unique_position].clone();
+            if value.is_some() {
+                shared_hits = shared_hits.saturating_add(1);
+            } else {
+                shared_misses = shared_misses.saturating_add(1);
+            }
+            results[position] = value;
+        }
+        if shared_hits != 0 || shared_misses != 0 {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner
+                .read_counters
+                .shared_buffer_hits
+                .fetch_add(shared_hits, Ordering::Relaxed);
+            inner
+                .read_counters
+                .shared_buffer_misses
+                .fetch_add(shared_misses, Ordering::Relaxed);
         }
         Ok(results)
     }
@@ -2768,6 +2811,10 @@ impl MultiLayerCache {
             inner.reconfigure_refresh_window(epoch);
             for (key, value, started) in &memory_hits {
                 inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .read_counters
+                    .shared_buffer_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 let outcome = inner.record_hit_shared_at(key, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
                     needs_exclusive.push(((*key).clone(), outcome, value.len()));
@@ -5101,6 +5148,8 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         eviction_pinned_skips,
         zero_copy_handle_hits,
         zero_copy_handle_misses,
+        shared_buffer_hits,
+        shared_buffer_misses,
         async_writeback_enqueued,
         async_writeback_drained,
         async_writeback_backpressure_rejections,
@@ -5249,6 +5298,10 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.eviction_pinned_skips = total.eviction_pinned_skips.saturating_add(eviction_pinned_skips);
     total.zero_copy_handle_hits = total.zero_copy_handle_hits.saturating_add(zero_copy_handle_hits);
     total.zero_copy_handle_misses = total.zero_copy_handle_misses.saturating_add(zero_copy_handle_misses);
+    total.shared_buffer_hits = total.shared_buffer_hits.saturating_add(shared_buffer_hits);
+    total.shared_buffer_misses = total
+        .shared_buffer_misses
+        .saturating_add(shared_buffer_misses);
     total.async_writeback_enqueued = total.async_writeback_enqueued.saturating_add(async_writeback_enqueued);
     total.async_writeback_drained = total.async_writeback_drained.saturating_add(async_writeback_drained);
     total.async_writeback_backpressure_rejections = total.async_writeback_backpressure_rejections.saturating_add(async_writeback_backpressure_rejections);
@@ -9078,6 +9131,14 @@ impl MultiLayerCache {
             pin_operations,
             unpin_operations,
             zero_copy_handle_hits,
+            shared_buffer_hits: inner
+                .read_counters
+                .shared_buffer_hits
+                .load(Ordering::Relaxed),
+            shared_buffer_misses: inner
+                .read_counters
+                .shared_buffer_misses
+                .load(Ordering::Relaxed),
             pinned_bytes: inner.pinned_memory_bytes(),
             async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
             async_writeback_queue_bytes: inner.async_writeback_queue_bytes,

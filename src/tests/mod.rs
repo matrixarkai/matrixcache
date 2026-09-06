@@ -9436,7 +9436,39 @@ mod tests {
             "duplicate positions should reuse the same memory buffer"
         );
         assert_eq!(after.memory_hits.saturating_sub(before.memory_hits), 2);
+        assert_eq!(
+            after
+                .shared_buffer_hits
+                .saturating_sub(before.shared_buffer_hits),
+            3
+        );
         assert_eq!(after.disk_hits.saturating_sub(before.disk_hits), 0);
+    }
+
+    #[test]
+    fn shared_buffer_stats_count_hits_and_misses() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let present = CacheKey::string(7, "shared-buffer-stats-present");
+        let missing = CacheKey::string(7, "shared-buffer-stats-missing");
+        cache.put(present.clone(), b"present".to_vec()).unwrap();
+
+        let before = cache.stats();
+        assert_eq!(cache.get_shared(&present).unwrap().as_deref(), Some(&b"present"[..]));
+        assert!(cache.get_shared(&missing).unwrap().is_none());
+        let after = cache.stats();
+
+        assert_eq!(
+            after
+                .shared_buffer_hits
+                .saturating_sub(before.shared_buffer_hits),
+            1
+        );
+        assert_eq!(
+            after
+                .shared_buffer_misses
+                .saturating_sub(before.shared_buffer_misses),
+            1
+        );
     }
 
     #[test]
@@ -16613,6 +16645,8 @@ fn sharded_batch_fanout_metrics_are_exported() {
         "matrixcache_sharded_batch_latency_seconds",
         "matrixcache_sharded_batch_latency_p95_seconds",
         "matrixcache_sharded_batch_latency_p99_seconds",
+        "matrixcache_shared_buffer_hits",
+        "matrixcache_shared_buffer_misses",
     ] {
         assert!(
             exported.contains(metric),

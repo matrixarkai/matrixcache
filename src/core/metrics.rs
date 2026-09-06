@@ -154,6 +154,8 @@ pub fn prometheus_text_into_with_label_scratch(
     metric(&mut out, "matrixcache_eviction_pinned_skips", "Eviction pinned skips", "counter", tags, stats.eviction_pinned_skips);
     metric(&mut out, "matrixcache_zero_copy_handle_hits", "Zero copy handle hits", "counter", tags, stats.zero_copy_handle_hits);
     metric(&mut out, "matrixcache_zero_copy_handle_misses", "Zero copy handle misses", "counter", tags, stats.zero_copy_handle_misses);
+    metric(&mut out, "matrixcache_shared_buffer_hits", "Read positions served through shared-buffer reads without value copies", "counter", tags, stats.shared_buffer_hits);
+    metric(&mut out, "matrixcache_shared_buffer_misses", "Shared-buffer read positions that missed all tiers", "counter", tags, stats.shared_buffer_misses);
     metric(&mut out, "matrixcache_async_writeback_enqueued", "Async writeback enqueued", "counter", tags, stats.async_writeback_enqueued);
     metric(&mut out, "matrixcache_async_writeback_drained", "Async writeback drained", "counter", tags, stats.async_writeback_drained);
     metric(&mut out, "matrixcache_async_writeback_backpressure_rejections", "Async writeback backpressure rejections", "counter", tags, stats.async_writeback_backpressure_rejections);

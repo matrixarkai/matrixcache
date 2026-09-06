@@ -1112,6 +1112,14 @@ pub struct CacheStats {
     pub zero_copy_handle_hits: u64,
     #[serde(default)]
     pub zero_copy_handle_misses: u64,
+    /// Caller-visible read positions served by shared-buffer APIs without
+    /// copying into a new value buffer.
+    #[serde(default)]
+    pub shared_buffer_hits: u64,
+    /// Caller-visible read positions requested through shared-buffer APIs that
+    /// missed all tiers.
+    #[serde(default)]
+    pub shared_buffer_misses: u64,
     #[serde(default)]
     pub async_writeback_enqueued: u64,
     #[serde(default)]
