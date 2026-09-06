@@ -325,6 +325,18 @@ pub trait ZeroCopyCacheApi: CacheApi {
         }
         released
     }
+    fn release_batch_iter_cache<I>(&self, handles: I) -> usize
+    where
+        Self: Sized,
+        I: IntoIterator<Item = CachePinnedHandle>,
+    {
+        let mut released = 0usize;
+        for handle in handles {
+            self.release_cache(handle);
+            released = released.saturating_add(1);
+        }
+        released
+    }
     fn insert_pinned_cache(
         &self,
         key: CacheKey,
@@ -8096,6 +8108,13 @@ impl ZeroCopyCacheApi for ShardedMultiLayerCache {
 
     fn release_batch_cache(&self, handles: Vec<CachePinnedHandle>) -> usize {
         self.release_batch(handles)
+    }
+
+    fn release_batch_iter_cache<I>(&self, handles: I) -> usize
+    where
+        I: IntoIterator<Item = CachePinnedHandle>,
+    {
+        self.release_batch_iter(handles)
     }
 
     fn insert_pinned_cache(
