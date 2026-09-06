@@ -2693,6 +2693,68 @@ impl MultiLayerCache {
         self.get_no_promotion(key)
     }
 
+    fn try_get_memory_batch(
+        &self,
+        keys: &[CacheKey],
+        now_millis: u64,
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>, CacheError> {
+        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>, Instant)>::with_capacity(keys.len());
+        let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if inner.ssd_instance_only {
+                return Ok(None);
+            }
+            for key in keys {
+                let started = Instant::now();
+                if inner.entry_expired(key, now_millis) {
+                    return Ok(None);
+                }
+                let Some(value) = inner.memory.get(key).cloned() else {
+                    return Ok(None);
+                };
+                memory_hits.push((key, value, started));
+            }
+
+            let epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(epoch);
+            for (key, value, started) in &memory_hits {
+                inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                let outcome = inner.record_hit_shared_at(key, epoch);
+                if !matches!(outcome, HitOutcome::Accounted) {
+                    needs_exclusive.push(((*key).clone(), outcome, value.len()));
+                }
+                let micros = elapsed_micros(*started);
+                inner.record_get_latency_micros(micros);
+                inner.record_read_through_latency_micros(micros);
+            }
+        }
+
+        if !needs_exclusive.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (key, outcome, len) in needs_exclusive {
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
+                    HitOutcome::NeedsMetadata => {
+                        if inner.memory.contains_key(&key) {
+                            inner.record_hit(&key, len);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(keys.len());
+        for (_, value, _) in memory_hits {
+            results.push(Some(value.to_vec()));
+        }
+        Ok(Some(results))
+    }
+
     pub fn get_with_tier(&self, key: &CacheKey) -> Result<Option<CacheReadResult>, CacheError> {
         self.emit_access_record(CacheAccessRecordKind::Get, key);
         let started = Instant::now();
@@ -2878,6 +2940,9 @@ impl MultiLayerCache {
         // judged live at the top of a batch cannot expire far enough through
         // it to matter.
         let now_millis = CoarseClock::now_millis();
+        if let Some(results) = self.try_get_memory_batch(keys, now_millis)? {
+            return Ok(results);
+        }
 
         // The memory hits are served under a *shared* lock, the way a single
         // `get` serves them, and the way the model this follows never takes a
