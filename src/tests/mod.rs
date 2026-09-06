@@ -11535,6 +11535,27 @@ mod tests {
     }
 
     #[test]
+    fn sharded_release_batch_iter_drains_pins_across_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::new(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir.path().join("ssd")]),
+            4,
+        );
+        let first = CacheKey::string(1, "sharded-release-iter-a");
+        let second = CacheKey::string(2, "sharded-release-iter-b");
+        cache.put(first.clone(), b"alpha".to_vec()).unwrap();
+        cache.put(second.clone(), b"bravo".to_vec()).unwrap();
+
+        let handles = cache.acquire_batch(&[first, second]).unwrap();
+        assert_eq!(cache.stats().pinned_entries, 2);
+
+        let released = cache.release_batch_iter(handles.into_iter().flatten());
+        assert_eq!(released, 2);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 2);
+    }
+
+    #[test]
     fn storage_config_buffer_manager_ops() {
         let mut mgr = BufferManager::with_config(4096, 0.75, 1024);
         assert_eq!(mgr.capacity_per_buf(), 4096);

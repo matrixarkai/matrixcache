@@ -7121,6 +7121,35 @@ impl ShardedMultiLayerCache {
         for handle in handles {
             groups[self.shard_index_for_key(&handle.key)].push(handle);
         }
+        self.release_shard_groups(groups, released, started)
+    }
+
+    pub fn release_batch_iter<I>(&self, handles: I) -> usize
+    where
+        I: IntoIterator<Item = CachePinnedHandle>,
+    {
+        let started = Instant::now();
+        let mut groups = (0..self.shard_count())
+            .map(|_| Vec::<CachePinnedHandle>::new())
+            .collect::<Vec<_>>();
+        let mut released = 0usize;
+        for handle in handles {
+            groups[self.shard_index_for_key(&handle.key)].push(handle);
+            released = released.saturating_add(1);
+        }
+        self.release_shard_groups(groups, released, started)
+    }
+
+    fn release_shard_groups(
+        &self,
+        groups: Vec<Vec<CachePinnedHandle>>,
+        released: usize,
+        started: Instant,
+    ) -> usize {
+        if released == 0 {
+            self.sharded_stats.record_latency(started);
+            return 0;
+        }
         if released < Self::BATCH_FANOUT_THRESHOLD {
             for (index, group) in groups.into_iter().enumerate() {
                 if !group.is_empty() {
