@@ -6545,6 +6545,36 @@ impl ShardedMultiLayerCache {
         self.get_batch_with_shard_reader(keys, MultiLayerCache::get_shared_batch)
     }
 
+    /// Batched shared reads into a caller-owned result buffer.
+    ///
+    /// Colocated batches delegate straight to the owning shard, so scan and
+    /// retrieval loops that route by shard avoid an extra merge allocation.
+    /// Cross-shard batches preserve the same behavior as `get_shared_batch`
+    /// while still letting the caller keep the output buffer across calls.
+    pub fn get_shared_batch_into(
+        &self,
+        keys: &[CacheKey],
+        results: &mut Vec<Option<std::sync::Arc<[u8]>>>,
+    ) -> Result<(), CacheError> {
+        results.clear();
+        let started = Instant::now();
+        if keys.is_empty() {
+            self.sharded_stats.record_latency(started);
+            return Ok(());
+        }
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.sharded_stats.record_local();
+            let result = self.shards[shard_index].get_shared_batch_into(keys, results);
+            self.sharded_stats.record_latency(started);
+            return result;
+        }
+
+        let values = self.get_shared_batch(keys)?;
+        results.reserve(values.len());
+        results.extend(values);
+        Ok(())
+    }
+
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         self.get(key)
     }
