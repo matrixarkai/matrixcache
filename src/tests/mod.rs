@@ -11518,6 +11518,23 @@ mod tests {
     }
 
     #[test]
+    fn release_batch_iter_drains_pins_without_collecting_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+        cache.put(k("a"), b"alpha".to_vec()).unwrap();
+        cache.put(k("b"), b"bravo".to_vec()).unwrap();
+
+        let handles = cache.acquire_batch(&[k("a"), k("b")]).unwrap();
+        assert_eq!(cache.stats().pinned_entries, 2);
+
+        let released = cache.release_batch_iter(handles.into_iter().flatten());
+        assert_eq!(released, 2);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.stats().unpin_operations, 2);
+    }
+
+    #[test]
     fn storage_config_buffer_manager_ops() {
         let mut mgr = BufferManager::with_config(4096, 0.75, 1024);
         assert_eq!(mgr.capacity_per_buf(), 4096);
