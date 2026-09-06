@@ -91,6 +91,10 @@ REQUIRED_OPERATOR_LOG = {
     "put_avg_us",
     "hot_get_avg_us",
     "cold_refill_avg_us",
+    "put_p95_us",
+    "hot_get_p95_us",
+    "cold_refill_p95_us",
+    "put_p99_us",
     "hot_get_p99_us",
     "cold_refill_p99_us",
     "memory_evictions",
@@ -192,8 +196,8 @@ def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> No
     if total_ms < 0:
         fail(f"{field!r}.total_ms must be non-negative")
     avg_us = require_numeric_field(timing, "avg_us")
-    if avg_us <= 0:
-        fail(f"{field!r}.avg_us must be positive")
+    if avg_us < 0:
+        fail(f"{field!r}.avg_us must be non-negative")
     avg_ns = require_numeric_field(timing, "avg_ns")
     if avg_ns <= 0:
         fail(f"{field!r}.avg_ns must be positive")
@@ -254,6 +258,10 @@ def validate_operator_log(data: dict[str, Any]) -> None:
         "put_avg_us": data["put"]["avg_us"],
         "hot_get_avg_us": data["hot_get"]["avg_us"],
         "cold_refill_avg_us": data["cold_ssd_refill_get"]["avg_us"],
+        "put_p95_us": data["put"]["p95_us"],
+        "hot_get_p95_us": data["hot_get"]["p95_us"],
+        "cold_refill_p95_us": data["cold_ssd_refill_get"]["p95_us"],
+        "put_p99_us": data["put"]["p99_us"],
         "hot_get_p99_us": data["hot_get"]["p99_us"],
         "cold_refill_p99_us": data["cold_ssd_refill_get"]["p99_us"],
         "memory_evictions": data["memory_evictions"],

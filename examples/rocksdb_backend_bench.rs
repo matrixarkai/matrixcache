@@ -807,6 +807,15 @@ fn append_operator_log(
         cold_refill_timing.avg_us
     )
     .expect("format report");
+    writeln!(report, "    \"put_p95_us\": {},", put_timing.p95_us).expect("format report");
+    writeln!(report, "    \"hot_get_p95_us\": {},", hot_timing.p95_us).expect("format report");
+    writeln!(
+        report,
+        "    \"cold_refill_p95_us\": {},",
+        cold_refill_timing.p95_us
+    )
+    .expect("format report");
+    writeln!(report, "    \"put_p99_us\": {},", put_timing.p99_us).expect("format report");
     writeln!(report, "    \"hot_get_p99_us\": {},", hot_timing.p99_us).expect("format report");
     writeln!(
         report,
@@ -847,10 +856,12 @@ fn operator_logfmt_line(
 ) -> String {
     format!(
         "{} report_version=matrixcache_rocksdb_backend_v1 backend={} iterations={} \
-         replacement_soak_iterations={} passed={} \
+        replacement_soak_iterations={} passed={} \
          put_qps={:.2} resident_hot_get_qps={:.2} hot_get_qps={:.2} cold_refill_qps={:.2} \
-         put_avg_us={} hot_get_avg_us={} cold_refill_avg_us={} hot_get_p99_us={} \
-         cold_refill_p99_us={} memory_evictions={} pmem_evictions={} ssd_evictions={} \
+         put_avg_us={} hot_get_avg_us={} cold_refill_avg_us={} put_p95_us={} \
+         hot_get_p95_us={} cold_refill_p95_us={} put_p99_us={} hot_get_p99_us={} \
+         cold_refill_p99_us={} \
+         memory_evictions={} pmem_evictions={} ssd_evictions={} \
          disk_fills={} cold_ssd_refills={} async_writeback_backpressure={}",
         logfmt_value(prefix),
         if cfg!(feature = "rocksdb-ssd") {
@@ -868,6 +879,10 @@ fn operator_logfmt_line(
         put_timing.avg_us,
         hot_timing.avg_us,
         cold_refill_timing.avg_us,
+        put_timing.p95_us,
+        hot_timing.p95_us,
+        cold_refill_timing.p95_us,
+        put_timing.p99_us,
         hot_timing.p99_us,
         cold_refill_timing.p99_us,
         stats.memory_evictions,
