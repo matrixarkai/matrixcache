@@ -2449,8 +2449,24 @@ impl MultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, CacheError> {
         let mut results = empty_batch_results(keys.len());
+        self.get_shared_batch_into(keys, &mut results)?;
+        Ok(results)
+    }
+
+    /// Batched shared reads into a caller-owned result buffer.
+    ///
+    /// This is the hot retrieval/scan variant: callers that issue many
+    /// fixed-size batches can reuse the same allocation while preserving the
+    /// ordinary `get_shared_batch` accounting and duplicate coalescing.
+    pub fn get_shared_batch_into(
+        &self,
+        keys: &[CacheKey],
+        results: &mut Vec<Option<Arc<[u8]>>>,
+    ) -> Result<(), CacheError> {
+        results.clear();
+        results.resize_with(keys.len(), || None);
         if keys.is_empty() {
-            return Ok(results);
+            return Ok(());
         }
 
         let now_millis = CoarseClock::now_millis();
@@ -2458,8 +2474,11 @@ impl MultiLayerCache {
             for key in keys {
                 self.emit_access_record(CacheAccessRecordKind::Get, key);
             }
-            if let Some(results) = self.try_get_shared_memory_batch(keys, now_millis)? {
-                return Ok(results);
+            if let Some(memory_results) = self.try_get_shared_memory_batch(keys, now_millis)? {
+                for (position, value) in memory_results.into_iter().enumerate() {
+                    results[position] = value;
+                }
+                return Ok(());
             }
         }
 
@@ -2641,7 +2660,7 @@ impl MultiLayerCache {
                 .shared_buffer_misses
                 .fetch_add(shared_misses, Ordering::Relaxed);
         }
-        Ok(results)
+        Ok(())
     }
 
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {

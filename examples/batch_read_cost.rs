@@ -145,8 +145,11 @@ fn main() {
                 .map(|_| {
                     let started = Instant::now();
                     let mut served = 0_usize;
+                    let mut values = Vec::with_capacity(batch);
                     for chunk in keys.chunks(batch) {
-                        let values = cache.get_shared_batch(chunk).expect("get_shared_batch");
+                        cache
+                            .get_shared_batch_into(chunk, &mut values)
+                            .expect("get_shared_batch_into");
                         served += values.iter().filter(|value| value.is_some()).count();
                     }
                     assert_eq!(served, RESIDENT, "every key should have hit memory");
