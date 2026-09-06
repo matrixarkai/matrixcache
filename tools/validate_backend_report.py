@@ -44,9 +44,11 @@ REQUIRED_TIMING = {
     "total_ms",
     "total_us",
     "qps",
+    "avg_us",
     "p50_us",
     "p95_us",
     "p99_us",
+    "avg_ns",
     "p50_ns",
     "p95_ns",
     "p99_ns",
@@ -169,12 +171,25 @@ def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> No
     total_ms = require_numeric_field(timing, "total_ms")
     if total_ms < 0:
         fail(f"{field!r}.total_ms must be non-negative")
+    avg_us = require_numeric_field(timing, "avg_us")
+    if avg_us <= 0:
+        fail(f"{field!r}.avg_us must be positive")
+    avg_ns = require_numeric_field(timing, "avg_ns")
+    if avg_ns <= 0:
+        fail(f"{field!r}.avg_ns must be positive")
     expected_total_us = total_ms * 1000.0
     total_delta = abs(total_us - expected_total_us)
     if total_delta > max(1_000.0, total_us * QPS_RELATIVE_TOLERANCE):
         fail(
             f"{field!r}.total_us={total_us:.0f} disagrees with "
             f"total_ms={total_ms:.3f}"
+        )
+    expected_avg_us = total_us / count
+    avg_delta = abs(avg_us - expected_avg_us)
+    if avg_delta > max(1.0, expected_avg_us * QPS_RELATIVE_TOLERANCE):
+        fail(
+            f"{field!r}.avg_us={avg_us:.0f} disagrees with "
+            f"total_us/count={expected_avg_us:.0f}"
         )
     expected_qps = count / (total_us / 1_000_000.0)
     reported_qps = require_numeric_field(timing, "qps")

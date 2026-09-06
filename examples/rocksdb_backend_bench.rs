@@ -11,9 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 struct Timing {
     count: usize,
     total: Duration,
+    avg_us: u128,
     p50_us: u128,
     p95_us: u128,
     p99_us: u128,
+    avg_ns: u128,
     p50_ns: u128,
     p95_ns: u128,
     p99_ns: u128,
@@ -43,9 +45,19 @@ fn summarize(mut samples: Vec<Duration>, total: Duration) -> Timing {
     Timing {
         count,
         total,
+        avg_us: if count == 0 {
+            0
+        } else {
+            total.as_micros() / count as u128
+        },
         p50_us: percentile(&micros, 0.50),
         p95_us: percentile(&micros, 0.95),
         p99_us: percentile(&micros, 0.99),
+        avg_ns: if count == 0 {
+            0
+        } else {
+            total.as_nanos() / count as u128
+        },
         p50_ns: percentile(&nanos, 0.50),
         p95_ns: percentile(&nanos, 0.95),
         p99_ns: percentile(&nanos, 0.99),
@@ -707,9 +719,11 @@ fn append_timing(report: &mut String, name: &str, timing: Timing, trailing_comma
     writeln!(report, "    \"total_ms\": {},", timing.total.as_millis()).expect("format report");
     writeln!(report, "    \"total_us\": {},", timing.total.as_micros()).expect("format report");
     writeln!(report, "    \"qps\": {:.2},", timing.qps).expect("format report");
+    writeln!(report, "    \"avg_us\": {},", timing.avg_us).expect("format report");
     writeln!(report, "    \"p50_us\": {},", timing.p50_us).expect("format report");
     writeln!(report, "    \"p95_us\": {},", timing.p95_us).expect("format report");
     writeln!(report, "    \"p99_us\": {},", timing.p99_us).expect("format report");
+    writeln!(report, "    \"avg_ns\": {},", timing.avg_ns).expect("format report");
     writeln!(report, "    \"p50_ns\": {},", timing.p50_ns).expect("format report");
     writeln!(report, "    \"p95_ns\": {},", timing.p95_ns).expect("format report");
     writeln!(report, "    \"p99_ns\": {}", timing.p99_ns).expect("format report");
