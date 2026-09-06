@@ -9328,6 +9328,38 @@ mod tests {
     }
 
     #[test]
+    fn acquire_batch_single_key_uses_pinned_read_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(1, "zero-copy-single-batch");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+
+        let before = cache.stats();
+        let handles = cache.acquire_batch(std::slice::from_ref(&key)).unwrap();
+        assert_eq!(handles.len(), 1);
+        let handle = handles
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("single-key batch acquire should hit");
+        assert_eq!(handle.tier(), CacheReadTier::Memory);
+        assert_eq!(handle.value(), b"value");
+
+        let after = cache.stats();
+        assert_eq!(after.memory_hits, before.memory_hits + 1);
+        assert_eq!(after.get_latency_samples, before.get_latency_samples + 1);
+        assert_eq!(
+            after.read_through_latency_samples,
+            before.read_through_latency_samples + 1
+        );
+        assert_eq!(after.pin_operations, before.pin_operations + 1);
+        assert_eq!(after.pinned_entries, before.pinned_entries + 1);
+
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, before.pinned_entries);
+    }
+
+    #[test]
     fn acquire_batch_counts_duplicate_positions_as_reads() {
         let memory_cache =
             MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
