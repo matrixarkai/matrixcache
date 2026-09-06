@@ -172,6 +172,9 @@ and says what the number means:
 - `batch_concurrency_bench` -- concurrent batch-read throughput benchmark.
   Add `--json-output <path>` to archive scale evidence and validate it with
   `tools/validate_batch_concurrency_report.py`.
+- `hit_concurrency_bench` -- concurrent memory-hit throughput benchmark. Add
+  `--json-output <path>` to archive scale evidence and validate it with
+  `tools/validate_hit_concurrency_report.py`.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather

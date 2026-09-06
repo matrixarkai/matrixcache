@@ -27,10 +27,13 @@
 //! hides the locking, which is the thing under test here.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example hit_concurrency_bench
+//! cargo run --release --no-default-features --example hit_concurrency_bench -- --json-output /tmp/matrixcache-hit-concurrency.json
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +43,43 @@ const READS_PER_THREAD: usize = 20_000;
 const REPEATS: usize = 5;
 /// Longer than any run here, so no hit ever finds its entry stale.
 const NEVER_MOVES: Duration = Duration::from_secs(3_600);
+
+#[derive(Debug, Default)]
+struct BenchConfig {
+    json_output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HitConcurrencyRow {
+    threads: usize,
+    get_refresh_distance_zero_mops_per_s: f64,
+    get_no_move_mops_per_s: f64,
+    acquire_mops_per_s: f64,
+}
+
+fn parse_config() -> BenchConfig {
+    let mut config = BenchConfig::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json-output" => {
+                config.json_output = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --json-output");
+                    process::exit(2);
+                })));
+            }
+            "--help" | "-h" => {
+                println!("usage: hit_concurrency_bench [--json-output PATH]");
+                process::exit(0);
+            }
+            _ => {
+                eprintln!("unknown argument: {arg}");
+                process::exit(2);
+            }
+        }
+    }
+    config
+}
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
@@ -107,6 +147,7 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) ->
 }
 
 fn main() {
+    let config = parse_config();
     println!(
         "{RESIDENT} resident values of {VALUE_BYTES} bytes, \
          {READS_PER_THREAD} hits/thread, median of {REPEATS}\n"
@@ -117,6 +158,7 @@ fn main() {
     );
     let always_moves = build(Duration::ZERO);
     let mostly_still = build(NEVER_MOVES);
+    let mut rows = Vec::new();
     for threads in [1_usize, 2, 4, 8] {
         // All three arms inside each repeat, rotating which goes first.
         // Measuring one arm for every repeat and then the next compares
@@ -159,12 +201,16 @@ fn main() {
             stills.push(still);
             acquires.push(acquire);
         }
-        println!(
-            "{threads:<10}{:>18.4}{:>18.4}{:>18.4}",
-            median(zeros) / 1e6,
-            median(stills) / 1e6,
-            median(acquires) / 1e6
-        );
+        let zero = median(zeros) / 1e6;
+        let still = median(stills) / 1e6;
+        let acquire = median(acquires) / 1e6;
+        println!("{threads:<10}{zero:>18.4}{still:>18.4}{acquire:>18.4}");
+        rows.push(HitConcurrencyRow {
+            threads,
+            get_refresh_distance_zero_mops_per_s: zero,
+            get_no_move_mops_per_s: still,
+            acquire_mops_per_s: acquire,
+        });
     }
 
     println!(
@@ -173,4 +219,65 @@ fn main() {
          instead of a copy. A zero-copy read that scales worse than the copying\n\
          one is not doing what it is for."
     );
+
+    if let Some(path) = config.json_output {
+        let report = render_json_report(&rows);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).expect("create JSON report parent");
+        }
+        std::fs::write(&path, report).expect("write JSON report");
+        eprintln!(
+            "matrixcache hit concurrency report written to {}",
+            path.display()
+        );
+    }
+}
+
+fn render_json_report(rows: &[HitConcurrencyRow]) -> String {
+    let mut report = String::new();
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_hit_concurrency_v1\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"resident_values\": {RESIDENT},").expect("format report");
+    writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+    writeln!(&mut report, "  \"reads_per_thread\": {READS_PER_THREAD},").expect("format report");
+    writeln!(&mut report, "  \"passes\": {REPEATS},").expect("format report");
+    writeln!(&mut report, "  \"rows\": [").expect("format report");
+    for (index, row) in rows.iter().enumerate() {
+        writeln!(&mut report, "    {{").expect("format report");
+        writeln!(&mut report, "      \"threads\": {},", row.threads).expect("format report");
+        writeln!(
+            &mut report,
+            "      \"get_refresh_distance_zero_mops_per_s\": {:.4},",
+            row.get_refresh_distance_zero_mops_per_s
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"get_no_move_mops_per_s\": {:.4},",
+            row.get_no_move_mops_per_s
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"acquire_mops_per_s\": {:.4}",
+            row.acquire_mops_per_s
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    }}{}",
+            if index + 1 == rows.len() { "" } else { "," }
+        )
+        .expect("format report");
+    }
+    writeln!(&mut report, "  ]").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+    report
 }
