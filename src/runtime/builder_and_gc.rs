@@ -1480,8 +1480,13 @@ impl CacheInner {
     }
 
     fn put_memory(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+        self.put_memory_shared(key, Arc::<[u8]>::from(value))
+    }
+
+    fn put_memory_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
         let eviction_started = Instant::now();
-        if self.memory_capacity_bytes == 0 || value.len() > self.memory_capacity_bytes {
+        let value_len = value.len();
+        if self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes {
             self.stats.memory_admission_rejected += 1;
             self.stats.eviction_oversize += 1;
             return false;
@@ -1490,31 +1495,43 @@ impl CacheInner {
         // able to earn its way in, or the filter is a permanent ban rather than
         // a comparison.
         self.access_frequency.record(&key);
-        if !self.candidate_beats_the_victim(&key, value.len()) {
+        if !self.candidate_beats_the_victim(&key, value_len) {
             self.stats.memory_admission_rejected += 1;
             return false;
         }
         self.stats.memory_admission_accepted += 1;
         self.stats.memory_fills += 1;
-        let value = Arc::<[u8]>::from(value);
         if let Some(old) = self.memory.insert(key.clone(), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
         } else {
             self.memory_order.push_back_if_absent(key);
         }
-        self.memory_bytes += value.len();
+        self.memory_bytes += value_len;
         self.evict_memory_to_capacity_since(eviction_started);
         true
     }
 
     fn put_pmem(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
-        self.put_pmem_with_persistence(key, value, true)
+        self.put_pmem_shared_with_persistence(key, Arc::<[u8]>::from(value), true)
     }
 
     fn put_pmem_with_persistence(
         &mut self,
         key: CacheKey,
         value: Vec<u8>,
+        persist: bool,
+    ) -> bool {
+        self.put_pmem_shared_with_persistence(key, Arc::<[u8]>::from(value), persist)
+    }
+
+    fn put_pmem_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
+        self.put_pmem_shared_with_persistence(key, value, true)
+    }
+
+    fn put_pmem_shared_with_persistence(
+        &mut self,
+        key: CacheKey,
+        value: Arc<[u8]>,
         persist: bool,
     ) -> bool {
         let eviction_started = Instant::now();
@@ -1530,7 +1547,6 @@ impl CacheInner {
         }
         self.stats.pmem_admission_accepted = self.stats.pmem_admission_accepted.saturating_add(1);
         self.stats.pmem_fills = self.stats.pmem_fills.saturating_add(1);
-        let value = Arc::<[u8]>::from(value);
         if let Some(old) = self.pmem.insert(key.clone(), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
@@ -1646,15 +1662,19 @@ impl CacheInner {
     }
 
     fn refill_from_ssd(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+        self.refill_from_ssd_shared(key, Arc::<[u8]>::from(value))
+    }
+
+    fn refill_from_ssd_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
         if matches!(
             self.tiering_policy.data_placement,
             CacheDataPlacement::SideBySide
         ) && self.pmem_capacity_bytes > 0
             && value.len() > self.tiering_policy.data_placement_threshold_bytes
         {
-            return self.put_pmem(key, value);
+            return self.put_pmem_shared(key, value);
         }
-        self.put_memory(key, value)
+        self.put_memory_shared(key, value)
     }
 
     fn evict_memory_to_capacity(&mut self) {
