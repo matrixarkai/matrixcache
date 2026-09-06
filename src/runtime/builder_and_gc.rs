@@ -1250,6 +1250,10 @@ impl CacheInner {
         self.record_hit_shared_occurrences_at(key, 1, epoch)
     }
 
+    fn record_hit_shared_at(&self, key: &CacheKey, epoch: u64) -> HitOutcome {
+        self.record_hit_shared_occurrences_at(key, 1, epoch)
+    }
+
     fn record_hit_shared_occurrences_at(
         &self,
         key: &CacheKey,
