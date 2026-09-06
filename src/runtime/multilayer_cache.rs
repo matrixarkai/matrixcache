@@ -3041,7 +3041,7 @@ impl MultiLayerCache {
             if inner.pmem.contains_key(key) {
                 inner.record_hit(key, decoded.len());
             }
-            if !inner.put_memory(key.clone(), decoded.clone()) {
+            if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                 inner.stats.refill_failures += 1;
             }
             inner.record_get_latency(started);
@@ -3234,7 +3234,7 @@ impl MultiLayerCache {
                         inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
                         inner.record_hit_metadata(&key, value.len());
                         let decoded = value.to_vec();
-                        if !inner.put_memory(key.clone(), decoded.clone()) {
+                        if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
@@ -3838,8 +3838,7 @@ impl MultiLayerCache {
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
                         let occurrences = positions.len();
-                        let decoded = value.to_vec();
-                        if !inner.put_memory(key.clone(), decoded.clone()) {
+                        if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
