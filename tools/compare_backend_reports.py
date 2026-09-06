@@ -49,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("current", type=Path)
+    parser.add_argument("--max-put-p95-regression", type=float, default=1.30)
+    parser.add_argument("--max-resident-hot-get-p95-regression", type=float, default=1.30)
+    parser.add_argument("--max-hot-get-p95-regression", type=float, default=1.30)
+    parser.add_argument("--max-cold-refill-p95-regression", type=float, default=1.45)
     parser.add_argument("--max-put-p99-regression", type=float, default=1.35)
     parser.add_argument("--max-resident-hot-get-p99-regression", type=float, default=1.35)
     parser.add_argument("--max-hot-get-p99-regression", type=float, default=1.35)
@@ -127,16 +131,20 @@ def compare_latency(
     baseline: dict[str, Any],
     current: dict[str, Any],
     field: str,
+    percentile: str,
     limit: float,
 ) -> tuple[str, float]:
-    ratio = positive_ratio(
-        number_at(current, f"{field}.p99_us"),
-        number_at(baseline, f"{field}.p99_us"),
-        f"{field}.p99_us",
-    )
+    path = f"{field}.{percentile}_us"
+    current_value = number_at(current, path)
+    baseline_value = number_at(baseline, path)
+    if baseline_value <= 0 or current_value <= 0:
+        path = f"{field}.{percentile}_ns"
+        current_value = number_at(current, path)
+        baseline_value = number_at(baseline, path)
+    ratio = positive_ratio(current_value, baseline_value, path)
     if ratio > limit:
-        fail(f"{field}.p99_us regressed {ratio:.3f}x above limit {limit:.3f}x")
-    return field, ratio
+        fail(f"{path} regressed {ratio:.3f}x above limit {limit:.3f}x")
+    return path, ratio
 
 
 def compare_average_latency(
@@ -145,14 +153,17 @@ def compare_average_latency(
     field: str,
     limit: float,
 ) -> tuple[str, float]:
-    ratio = positive_ratio(
-        number_at(current, f"{field}.avg_us"),
-        number_at(baseline, f"{field}.avg_us"),
-        f"{field}.avg_us",
-    )
+    path = f"{field}.avg_us"
+    current_value = number_at(current, path)
+    baseline_value = number_at(baseline, path)
+    if baseline_value <= 0 or current_value <= 0:
+        path = f"{field}.avg_ns"
+        current_value = number_at(current, path)
+        baseline_value = number_at(baseline, path)
+    ratio = positive_ratio(current_value, baseline_value, path)
     if ratio > limit:
-        fail(f"{field}.avg_us regressed {ratio:.3f}x above limit {limit:.3f}x")
-    return field, ratio
+        fail(f"{path} regressed {ratio:.3f}x above limit {limit:.3f}x")
+    return path, ratio
 
 
 def compare_qps(
@@ -214,7 +225,13 @@ def main() -> int:
     for field in WORKLOAD_INVARIANTS:
         compare_equal(baseline, current, f"workload.{field}")
 
-    latency_limits = {
+    p95_latency_limits = {
+        "put": args.max_put_p95_regression,
+        "resident_hot_get": args.max_resident_hot_get_p95_regression,
+        "hot_get": args.max_hot_get_p95_regression,
+        "cold_ssd_refill_get": args.max_cold_refill_p95_regression,
+    }
+    p99_latency_limits = {
         "put": args.max_put_p99_regression,
         "resident_hot_get": args.max_resident_hot_get_p99_regression,
         "hot_get": args.max_hot_get_p99_regression,
@@ -233,8 +250,12 @@ def main() -> int:
         "cold_ssd_refill_get": args.min_cold_refill_qps_ratio,
     }
 
-    latency_ratios = [
-        compare_latency(baseline, current, field, latency_limits[field])
+    p95_latency_ratios = [
+        compare_latency(baseline, current, field, "p95", p95_latency_limits[field])
+        for field in TIMING_FIELDS
+    ]
+    p99_latency_ratios = [
+        compare_latency(baseline, current, field, "p99", p99_latency_limits[field])
         for field in TIMING_FIELDS
     ]
     avg_latency_ratios = [
@@ -269,7 +290,8 @@ def main() -> int:
         for field in REPLACEMENT_SOAK_MAX_FIELDS
     ]
 
-    worst_latency = max(latency_ratios, key=lambda item: item[1])
+    worst_p95_latency = max(p95_latency_ratios, key=lambda item: item[1])
+    worst_p99_latency = max(p99_latency_ratios, key=lambda item: item[1])
     worst_avg_latency = max(avg_latency_ratios, key=lambda item: item[1])
     weakest_qps = min(qps_ratios, key=lambda item: item[1])
     weakest_counter = min(counter_ratios, key=lambda item: item[1])
@@ -277,7 +299,8 @@ def main() -> int:
     print(
         "OK matrixcache backend comparison: "
         f"backend={current['backend']} iterations={current['iterations']} "
-        f"worst_p99={worst_latency[0]}:{worst_latency[1]:.3f}x "
+        f"worst_p95={worst_p95_latency[0]}:{worst_p95_latency[1]:.3f}x "
+        f"worst_p99={worst_p99_latency[0]}:{worst_p99_latency[1]:.3f}x "
         f"worst_avg={worst_avg_latency[0]}:{worst_avg_latency[1]:.3f}x "
         f"weakest_qps={weakest_qps[0]}:{weakest_qps[1]:.3f}x "
         f"weakest_counter={weakest_counter[0]}:{weakest_counter[1]:.3f}x "

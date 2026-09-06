@@ -51,8 +51,25 @@ hot key count, cold SSD refills, PMEM soak activity, pressure and
 replacement-soak status, p99 latency, average latency, and QPS) that is useful
 as local performance/behavior evidence.
 Each archive also includes an `operator_log` object with the compact fields most
-useful in build logs and scale dashboards: pass/fail, QPS, average and p99
-latency, tier evictions, refills, and write-back backpressure.
+useful in build logs and scale dashboards: pass/fail, QPS, average, p95 and p99
+latency, tier evictions, refills, and write-back backpressure. Validate
+archived reports before publishing or comparing them. The validator checks
+report shape, cache evidence counters, QPS math, average latency math, and that
+`operator_log` agrees with the detailed report:
+
+```bash
+tools/validate_backend_report.py /tmp/matrixcache-rocksdb-backend.json --expect-backend rocksdb --min-iterations 5000 --min-replacement-soak-iterations 5000 --min-cold-ssd-refills 1 --min-memory-evictions 1 --min-pmem-evictions 1 --min-disk-fills 1 --min-async-writeback-backpressure 1 --max-refill-failures 0
+tools/emit_backend_operator_log.py /tmp/matrixcache-rocksdb-backend.json
+```
+
+Compare a new backend archive with a known-good run before accepting a cache
+optimization as a scale improvement. The comparator checks p95/p99 latency,
+average latency, QPS, replacement-loop max latency, and required cache evidence
+counters:
+
+```bash
+tools/compare_backend_reports.py /tmp/matrixcache-rocksdb-backend-baseline.json /tmp/matrixcache-rocksdb-backend.json --max-hot-get-p95-regression 1.30 --max-cold-refill-p95-regression 1.45 --max-hot-get-p99-regression 1.35 --max-cold-refill-p99-regression 1.50 --max-hot-get-avg-regression 1.35 --max-cold-refill-avg-regression 1.50 --min-hot-get-qps-ratio 0.80 --min-cold-refill-qps-ratio 0.75 --min-counter-ratio 0.90
+```
 
 ## Durability
 
