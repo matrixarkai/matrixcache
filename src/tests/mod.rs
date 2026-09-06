@@ -9472,6 +9472,57 @@ mod tests {
     }
 
     #[test]
+    fn get_shared_batch_into_reuses_result_buffer() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let repeated = CacheKey::string(7, "shared-batch-into-repeated");
+        let other = CacheKey::string(7, "shared-batch-into-other");
+        cache.put(repeated.clone(), b"repeated".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+
+        let mut values = Vec::with_capacity(16);
+        let original_capacity = values.capacity();
+        let before = cache.stats();
+        cache
+            .get_shared_batch_into(&[repeated.clone(), other.clone(), repeated.clone()], &mut values)
+            .unwrap();
+        let after = cache.stats();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values[0].as_deref(), Some(&b"repeated"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"other"[..]));
+        assert_eq!(values[2].as_deref(), Some(&b"repeated"[..]));
+        assert!(
+            std::sync::Arc::ptr_eq(
+                values[0].as_ref().expect("first repeated"),
+                values[2].as_ref().expect("second repeated"),
+            ),
+            "duplicate positions should still share the same memory buffer"
+        );
+        assert_eq!(
+            after
+                .shared_buffer_hits
+                .saturating_sub(before.shared_buffer_hits),
+            3
+        );
+
+        cache
+            .get_shared_batch_into(std::slice::from_ref(&other), &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values[0].as_deref(), Some(&b"other"[..]));
+
+        cache
+            .get_shared_batch_into(&[repeated.clone(), other.clone()], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values[0].as_deref(), Some(&b"repeated"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"other"[..]));
+    }
+
+    #[test]
     fn sharded_get_shared_batch_preserves_order() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
         let first = CacheKey::string(1, "shared-sharded-a");
