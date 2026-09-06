@@ -72,6 +72,13 @@ families directly, including:
   writeback, eviction, and compaction, so soak dashboards show whether the run
   actually exercised every cache path being compared
 
+The public dashboard/exporter layout is the source of truth for MatrixArkAI
+publishing. It intentionally keeps the primary cache latency sync points from
+the private optimization tree as public metrics: operational latency totals,
+average gauges, and peak gauges are all exported in seconds, and the Grafana
+queries consume those generated series directly rather than applying a second
+unit conversion in dashboard JSON.
+
 
 The `soak` example can also emit JSON with optional scale gates for hit rate
 and p99 latency across get, put, read-through, refill, writeback, eviction,
