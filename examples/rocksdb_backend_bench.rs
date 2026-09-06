@@ -282,12 +282,18 @@ fn main() {
     let pmem_to_ssd_eviction = stats.pmem_evictions > 0 && stats.disk_fills > 0;
     let ssd_read_through_refill = cold_ssd_refills > 0 && stats.refill_failures == 0;
     let replacement_soak_ready = soak.passed;
+    let pmem_soak_ready = !soak.pmem_tier_configured
+        || (soak.observed_pmem_hits > 0
+            && soak.observed_pmem_fills > 0
+            && soak.observed_pmem_evictions > 0
+            && soak.observed_pmem_admissions > 0);
     let async_writeback_backpressure_ready = soak.observed_async_writeback_backpressure > 0;
     let restart_disk_refill_ready = soak.restart_disk_refill_ready;
     let contract_passed = dram_to_pmem_eviction
         && pmem_to_ssd_eviction
         && ssd_read_through_refill
         && replacement_soak_ready
+        && pmem_soak_ready
         && async_writeback_backpressure_ready
         && restart_disk_refill_ready;
 
@@ -407,6 +413,36 @@ fn main() {
     .expect("format report");
     writeln!(
         &mut report,
+        "  \"replacement_soak_pmem_tier_configured\": {},",
+        soak.pmem_tier_configured
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_pmem_hits\": {},",
+        soak.observed_pmem_hits
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_pmem_fills\": {},",
+        soak.observed_pmem_fills
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_pmem_evictions\": {},",
+        soak.observed_pmem_evictions
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "  \"replacement_soak_pmem_admissions\": {},",
+        soak.observed_pmem_admissions
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"async_writeback_backpressure\": {},",
         soak.observed_async_writeback_backpressure
     )
@@ -440,6 +476,12 @@ fn main() {
         &mut report,
         "    \"replacement_soak\": {},",
         replacement_soak_ready
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "    \"pmem_soak_activity\": {},",
+        pmem_soak_ready
     )
     .expect("format report");
     writeln!(
@@ -542,6 +584,49 @@ fn main() {
         &mut report,
         "      \"reasons\": {}",
         json_string_array(&soak.reasons)
+    )
+    .expect("format report");
+    writeln!(&mut report, "    }},").expect("format report");
+    writeln!(&mut report, "    \"pmem_soak_activity\": {{").expect("format report");
+    writeln!(&mut report, "      \"observed\": {},", pmem_soak_ready).expect("format report");
+    writeln!(
+        &mut report,
+        "      \"source\": \"matrixcache_rocksdb_backend_bench\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"metric\": \"replacement_policy_soak PMEM hits/fills/evictions/admissions\","
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"pmem_tier_configured\": {},",
+        soak.pmem_tier_configured
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"pmem_hits\": {},",
+        soak.observed_pmem_hits
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"pmem_fills\": {},",
+        soak.observed_pmem_fills
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"pmem_evictions\": {},",
+        soak.observed_pmem_evictions
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
+        "      \"pmem_admissions\": {}",
+        soak.observed_pmem_admissions
     )
     .expect("format report");
     writeln!(&mut report, "    }},").expect("format report");
