@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 MatrixArkAI
 """Validate MatrixCache Grafana panels against exported Prometheus metrics."""
 
 from __future__ import annotations
@@ -126,6 +128,20 @@ def iter_targets(value: Any) -> list[str]:
     return expressions
 
 
+def iter_panel_titles(value: Any) -> set[str]:
+    titles: set[str] = set()
+    if isinstance(value, dict):
+        title = value.get("title")
+        if isinstance(title, str):
+            titles.add(title)
+        for child in value.values():
+            titles.update(iter_panel_titles(child))
+    elif isinstance(value, list):
+        for child in value:
+            titles.update(iter_panel_titles(child))
+    return titles
+
+
 def dashboard_metrics(path: Path) -> tuple[set[str], set[str], int]:
     try:
         data = json.loads(path.read_text())
@@ -137,11 +153,7 @@ def dashboard_metrics(path: Path) -> tuple[set[str], set[str], int]:
     metrics: set[str] = set()
     for expr in expressions:
         metrics.update(METRIC_RE.findall(expr))
-    panel_titles = {
-        title
-        for title in (panel.get("title") for panel in data.get("panels", []))
-        if isinstance(title, str)
-    }
+    panel_titles = iter_panel_titles(data.get("panels", []))
     if not expressions:
         fail(f"{path} has no Prometheus expressions")
     return metrics, panel_titles, len(expressions)
