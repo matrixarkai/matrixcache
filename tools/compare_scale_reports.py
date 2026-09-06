@@ -88,7 +88,7 @@ def compare_lower(
             f"{report_name}.{field} regressed {ratio:.3f}x above "
             f"limit {limit:.3f}x"
         )
-    return field, ratio
+    return f"{report_name}.{field}", ratio
 
 
 def compare_higher(
@@ -106,7 +106,7 @@ def compare_higher(
             f"{report_name}.{field} ratio {ratio:.3f} below "
             f"limit {limit:.3f}"
         )
-    return field, ratio
+    return f"{report_name}.{field}", ratio
 
 
 def numeric_fields(row: dict[str, Any]) -> list[str]:
@@ -233,6 +233,16 @@ def main() -> int:
     parser.add_argument("current", type=Path)
     parser.add_argument("--max-latency-regression", type=float, default=1.50)
     parser.add_argument("--min-throughput-ratio", type=float, default=0.65)
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        help="Optional path for a machine-readable comparison report.",
+    )
+    parser.add_argument(
+        "--markdown-output",
+        type=Path,
+        help="Optional path for a human-readable comparison report.",
+    )
     args = parser.parse_args()
 
     baseline_manifest = load_manifest(args.baseline)
@@ -260,6 +270,31 @@ def main() -> int:
 
     worst_latency = max((ratio for _, ratio in latency_ratios), default=1.0)
     worst_throughput = min((ratio for _, ratio in throughput_ratios), default=1.0)
+    summary = {
+        "report_version": "matrixcache_scale_report_comparison_v1",
+        "baseline_manifest": str(args.baseline),
+        "current_manifest": str(args.current),
+        "reports": len(baseline_reports),
+        "latency_fields": len(latency_ratios),
+        "throughput_fields": len(throughput_ratios),
+        "worst_latency_ratio": worst_latency,
+        "worst_throughput_ratio": worst_throughput,
+        "max_latency_regression": args.max_latency_regression,
+        "min_throughput_ratio": args.min_throughput_ratio,
+        "latency_ratios": [
+            {"metric": metric, "ratio": ratio} for metric, ratio in latency_ratios
+        ],
+        "throughput_ratios": [
+            {"metric": metric, "ratio": ratio} for metric, ratio in throughput_ratios
+        ],
+        "passed": True,
+    }
+    if args.json_output:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(json.dumps(summary, indent=2) + "\n")
+    if args.markdown_output:
+        args.markdown_output.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown_output.write_text(render_markdown(summary))
     print(
         "OK matrixcache scale report comparison: "
         f"reports={len(baseline_reports)} "
@@ -269,6 +304,30 @@ def main() -> int:
         f"worst_throughput={worst_throughput:.3f}x"
     )
     return 0
+
+
+def render_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# MatrixCache Scale Report Comparison",
+        "",
+        f"- Baseline manifest: `{summary['baseline_manifest']}`",
+        f"- Current manifest: `{summary['current_manifest']}`",
+        f"- Reports compared: `{summary['reports']}`",
+        f"- Worst latency ratio: `{summary['worst_latency_ratio']:.3f}x`",
+        f"- Worst throughput ratio: `{summary['worst_throughput_ratio']:.3f}x`",
+        f"- Passed: `{str(summary['passed']).lower()}`",
+        "",
+        "## Latency",
+        "",
+        "| Metric | Current / baseline |",
+        "| --- | ---: |",
+    ]
+    for item in summary["latency_ratios"]:
+        lines.append(f"| `{item['metric']}` | {item['ratio']:.3f}x |")
+    lines.extend(["", "## Throughput", "", "| Metric | Current / baseline |", "| --- | ---: |"])
+    for item in summary["throughput_ratios"]:
+        lines.append(f"| `{item['metric']}` | {item['ratio']:.3f}x |")
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
