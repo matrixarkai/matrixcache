@@ -178,7 +178,7 @@ and says what the number means:
 - `tools/run_scale_reports.py` -- runs the read/retrieval scale benchmarks
   above, validates each JSON report, and writes a manifest that points to the
   archived reports. Add `--markdown-output <path>` when the same run should
-  also leave an operator/Grafana-friendly summary.
+  also leave an operator/Grafana-friendly summary. Validate the resulting manifest with `tools/validate_scale_report_manifest.py`.
 - `tools/compare_scale_reports.py` -- compares two scale report manifests and
   fails on configured latency or throughput regressions. Add
   `--json-output <path>` or `--markdown-output <path>` to archive the
