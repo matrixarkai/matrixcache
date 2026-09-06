@@ -165,6 +165,10 @@ and says what the number means:
   `put_batch`, pinned insert/release, and acquire/release. It compares
   colocated batches against fanout batches and prints the sharded batch
   counters used by the Grafana/Prometheus path.
+- `batch_read_cost` -- bounded read/retrieval benchmark for copied reads,
+  shared-buffer reads, no-promotion scans, pinned acquire reads, and sharded
+  colocated reads. Add `--json-output <path>` to archive a machine-readable
+  report, then validate it with `tools/validate_batch_read_report.py`.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather

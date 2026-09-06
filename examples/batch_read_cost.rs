@@ -31,16 +31,61 @@
 //! process; measure a specific removal by measuring that removal.
 //!
 //! ```text
-//! cargo run --release --no-default-features --example batch_read_cost
+//! cargo run --release --no-default-features --example batch_read_cost -- --json-output /tmp/matrixcache-batch-read-cost.json
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache, ShardedMultiLayerCache};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::process;
 use std::time::Instant;
 
 const VALUE_BYTES: usize = 64;
 const RESIDENT: usize = 4096;
 const COLOCATED_RESIDENT: usize = 1024;
 const PASSES: usize = 9;
+
+#[derive(Debug, Default)]
+struct BenchConfig {
+    json_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchReadRow {
+    batch_size: usize,
+    get_batch_ns: f64,
+    sharded_get_ns: f64,
+    sharded_colocated_ns: f64,
+    shared_batch_ns: f64,
+    get_batch_no_promotion_ns: f64,
+    acquire_no_promotion_ns: f64,
+    sharded_acquire_colocated_ns: f64,
+    sharded_acquire_no_promotion_ns: f64,
+}
+
+fn parse_config() -> BenchConfig {
+    let mut config = BenchConfig::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json-output" => {
+                config.json_output = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --json-output");
+                    process::exit(2);
+                })));
+            }
+            "--help" | "-h" => {
+                println!("usage: batch_read_cost [--json-output PATH]");
+                process::exit(0);
+            }
+            _ => {
+                eprintln!("unknown argument: {arg}");
+                process::exit(2);
+            }
+        }
+    }
+    config
+}
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
@@ -67,6 +112,7 @@ fn colocated_page_keys(cache: &ShardedMultiLayerCache, count: usize) -> Vec<Cach
 }
 
 fn main() {
+    let config = parse_config();
     let dir = bench_dir();
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -125,6 +171,7 @@ fn main() {
         "sharded_acquire_no_prom"
     );
 
+    let mut rows = Vec::new();
     for batch in [64_usize, 1024] {
         let regular_ns = median(
             (0..PASSES)
@@ -263,7 +310,113 @@ fn main() {
         println!(
             "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{shared_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
+        rows.push(BatchReadRow {
+            batch_size: batch,
+            get_batch_ns: regular_ns,
+            sharded_get_ns: sharded_regular_ns,
+            sharded_colocated_ns,
+            shared_batch_ns: shared_ns,
+            get_batch_no_promotion_ns: no_promotion_ns,
+            acquire_no_promotion_ns,
+            sharded_acquire_colocated_ns,
+            sharded_acquire_no_promotion_ns,
+        });
+    }
+
+    if let Some(path) = config.json_output {
+        let report = render_json_report(&rows);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).expect("create JSON report parent");
+        }
+        std::fs::write(&path, report).expect("write JSON report");
+        eprintln!(
+            "matrixcache batch read report written to {}",
+            path.display()
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn render_json_report(rows: &[BatchReadRow]) -> String {
+    let mut report = String::new();
+    writeln!(&mut report, "{{").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"report_version\": \"matrixcache_batch_read_cost_v1\","
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"resident_values\": {RESIDENT},").expect("format report");
+    writeln!(
+        &mut report,
+        "  \"colocated_resident_values\": {COLOCATED_RESIDENT},"
+    )
+    .expect("format report");
+    writeln!(&mut report, "  \"value_bytes\": {VALUE_BYTES},").expect("format report");
+    writeln!(&mut report, "  \"passes\": {PASSES},").expect("format report");
+    writeln!(&mut report, "  \"rows\": [").expect("format report");
+    for (index, row) in rows.iter().enumerate() {
+        writeln!(&mut report, "    {{").expect("format report");
+        writeln!(&mut report, "      \"batch_size\": {},", row.batch_size).expect("format report");
+        writeln!(
+            &mut report,
+            "      \"get_batch_ns\": {:.1},",
+            row.get_batch_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"sharded_get_ns\": {:.1},",
+            row.sharded_get_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"sharded_colocated_ns\": {:.1},",
+            row.sharded_colocated_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"shared_batch_ns\": {:.1},",
+            row.shared_batch_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"get_batch_no_promotion_ns\": {:.1},",
+            row.get_batch_no_promotion_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"acquire_no_promotion_ns\": {:.1},",
+            row.acquire_no_promotion_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"sharded_acquire_colocated_ns\": {:.1},",
+            row.sharded_acquire_colocated_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"sharded_acquire_no_promotion_ns\": {:.1}",
+            row.sharded_acquire_no_promotion_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "    }}{}",
+            if index + 1 == rows.len() { "" } else { "," }
+        )
+        .expect("format report");
+    }
+    writeln!(&mut report, "  ]").expect("format report");
+    writeln!(&mut report, "}}").expect("format report");
+    report
 }
