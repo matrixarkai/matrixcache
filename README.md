@@ -41,7 +41,8 @@ sudo apt-get install -y build-essential pkg-config libssl-dev clang libclang-dev
 cargo build
 cargo test
 cargo test --no-default-features       # file-backed compatibility store
-cargo run --release --example rocksdb_backend_bench -- 5000
+cargo run --release --example rocksdb_backend_bench -- --iterations 5000 --json-output /tmp/matrixcache-rocksdb-backend.json --emit-operator-log --require-passed
+cargo run --release --no-default-features --example metrics_server
 ```
 
 The `rocksdb_backend_bench` example drives the multi-tier cache against the

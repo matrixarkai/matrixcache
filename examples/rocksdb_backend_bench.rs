@@ -84,6 +84,8 @@ struct BenchConfig {
     replacement_soak_iterations: usize,
     json_output: Option<PathBuf>,
     require_passed: bool,
+    emit_operator_log: bool,
+    operator_log_prefix: String,
 }
 
 impl Default for BenchConfig {
@@ -98,6 +100,8 @@ impl Default for BenchConfig {
             replacement_soak_iterations: 0,
             json_output: None,
             require_passed: false,
+            emit_operator_log: false,
+            operator_log_prefix: "matrixcache_backend_operator".to_string(),
         }
     }
 }
@@ -144,6 +148,13 @@ fn parse_config() -> BenchConfig {
                 })));
             }
             "--require-passed" => config.require_passed = true,
+            "--emit-operator-log" => config.emit_operator_log = true,
+            "--operator-log-prefix" => {
+                config.operator_log_prefix = args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --operator-log-prefix");
+                    process::exit(2);
+                });
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: rocksdb_backend_bench [iterations] [--iterations N] \
@@ -151,7 +162,8 @@ fn parse_config() -> BenchConfig {
                      [--pmem-capacity-bytes N] [--ssd-capacity-bytes N] \
                      [--placement-threshold-bytes N] \
                      [--replacement-soak-iterations N] [--json-output PATH] \
-                     [--require-passed]"
+                     [--require-passed] [--emit-operator-log] \
+                     [--operator-log-prefix PREFIX]"
                 );
                 process::exit(0);
             }
@@ -719,6 +731,23 @@ fn main() {
             path.display()
         );
     }
+    if config.emit_operator_log {
+        eprintln!(
+            "{}",
+            operator_logfmt_line(
+                &config.operator_log_prefix,
+                contract_passed,
+                put_timing,
+                resident_hot_timing,
+                hot_timing,
+                cold_timing,
+                soak_iterations,
+                cold_ssd_refills,
+                &stats,
+                soak.observed_async_writeback_backpressure
+            )
+        );
+    }
     if config.require_passed && !contract_passed {
         eprintln!("matrixcache RocksDB backend contract failed; see JSON report");
         process::exit(1);
@@ -802,6 +831,63 @@ fn append_operator_log(
     )
     .expect("format report");
     writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
+}
+
+fn operator_logfmt_line(
+    prefix: &str,
+    passed: bool,
+    put_timing: Timing,
+    resident_hot_timing: Timing,
+    hot_timing: Timing,
+    cold_refill_timing: Timing,
+    replacement_soak_iterations: usize,
+    cold_ssd_refills: usize,
+    stats: &matrixcache::CacheStats,
+    async_writeback_backpressure: u64,
+) -> String {
+    format!(
+        "{} report_version=matrixcache_rocksdb_backend_v1 backend={} iterations={} \
+         replacement_soak_iterations={} passed={} \
+         put_qps={:.2} resident_hot_get_qps={:.2} hot_get_qps={:.2} cold_refill_qps={:.2} \
+         put_avg_us={} hot_get_avg_us={} cold_refill_avg_us={} hot_get_p99_us={} \
+         cold_refill_p99_us={} memory_evictions={} pmem_evictions={} ssd_evictions={} \
+         disk_fills={} cold_ssd_refills={} async_writeback_backpressure={}",
+        logfmt_value(prefix),
+        if cfg!(feature = "rocksdb-ssd") {
+            "rocksdb"
+        } else {
+            "file-compat"
+        },
+        put_timing.count,
+        replacement_soak_iterations,
+        if passed { "true" } else { "false" },
+        put_timing.qps,
+        resident_hot_timing.qps,
+        hot_timing.qps,
+        cold_refill_timing.qps,
+        put_timing.avg_us,
+        hot_timing.avg_us,
+        cold_refill_timing.avg_us,
+        hot_timing.p99_us,
+        cold_refill_timing.p99_us,
+        stats.memory_evictions,
+        stats.pmem_evictions,
+        stats.ssd_evictions,
+        stats.disk_fills,
+        cold_ssd_refills,
+        async_writeback_backpressure
+    )
+}
+
+fn logfmt_value(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-' | '/'))
+    {
+        return value.to_string();
+    }
+    format!("\"{}\"", json_escape(value))
 }
 
 fn append_evidence(
