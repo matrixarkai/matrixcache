@@ -180,7 +180,9 @@ and says what the number means:
   archived reports. Add `--markdown-output <path>` when the same run should
   also leave an operator/Grafana-friendly summary.
 - `tools/compare_scale_reports.py` -- compares two scale report manifests and
-  fails on configured latency or throughput regressions.
+  fails on configured latency or throughput regressions. Add
+  `--json-output <path>` or `--markdown-output <path>` to archive the
+  comparison.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather
