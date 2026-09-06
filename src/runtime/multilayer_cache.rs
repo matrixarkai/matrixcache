@@ -3171,7 +3171,9 @@ impl MultiLayerCache {
                 } else {
                     HitOutcome::Accounted
                 };
-                inner.record_get_latency_micros(elapsed_micros(started));
+                let micros = elapsed_micros(started);
+                inner.record_get_latency_micros(micros);
+                inner.record_read_through_latency_micros(micros);
                 outcome
             };
             // Only these two need the cache exclusively, and a hit on a
@@ -3505,7 +3507,9 @@ impl MultiLayerCache {
                 if !matches!(outcome, HitOutcome::Accounted) {
                     exclusive_work.push((key.clone(), outcome, value.len()));
                 }
-                inner.record_get_latency_micros(elapsed_micros(started));
+                let micros = elapsed_micros(started);
+                inner.record_get_latency_micros(micros);
+                inner.record_read_through_latency_micros(micros);
                 pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                 for position in positions {
                     results[position] = Some(CachePinnedHandle {
