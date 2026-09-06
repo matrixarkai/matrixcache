@@ -88,6 +88,9 @@ jobs:
             --min-disk-fills 1 \
             --min-async-writeback-backpressure 1 \
             --max-refill-failures 0
+          tools/compare_backend_reports.py \
+            /tmp/matrixcache-backend-compat.json \
+            /tmp/matrixcache-backend-compat.json
 
       - name: Batch control report smoke
         run: |
