@@ -88,6 +88,7 @@ jobs:
             --min-disk-fills 1 \
             --min-async-writeback-backpressure 1 \
             --max-refill-failures 0
+          tools/emit_backend_operator_log.py /tmp/matrixcache-backend-current.json
           tools/compare_backend_reports.py \
             /tmp/matrixcache-backend-compat.json \
             /tmp/matrixcache-backend-compat.json

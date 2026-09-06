@@ -121,7 +121,9 @@ and says what the number means:
   fail the process when the cache contract is not satisfied. Validate archived
   reports with `tools/validate_backend_report.py`; CI uses the same validator
   against the lightweight `--no-default-features` compatibility backend, while
-  production evidence should use the default RocksDB backend.
+  production evidence should use the default RocksDB backend. Use
+  `tools/emit_backend_operator_log.py <report.json>` to print the compact
+  log-friendly summary.
 - `scan_resistance_bench`, `admission_filter_bench` -- what the admission
   policy is worth against a scan
 - `soak` -- long-running memory-pressure and latency stability. Add `--json`
