@@ -3577,12 +3577,13 @@ impl MultiLayerCache {
                     continue;
                 };
 
+                let occurrences = positions.len();
                 inner
                     .read_counters
                     .memory_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(occurrences as u64, Ordering::Relaxed);
                 let outcome = if inner.memory.contains_key(&key) {
-                    inner.record_hit_shared(&key)
+                    inner.record_hit_shared_occurrences_at(&key, occurrences, CoarseClock::now_millis())
                 } else {
                     HitOutcome::Accounted
                 };
@@ -3590,8 +3591,10 @@ impl MultiLayerCache {
                     exclusive_work.push((key.clone(), outcome, value.len()));
                 }
                 let micros = elapsed_micros(started);
-                inner.record_get_latency_micros(micros);
-                inner.record_read_through_latency_micros(micros);
+                for _ in 0..occurrences {
+                    inner.record_get_latency_micros(micros);
+                    inner.record_read_through_latency_micros(micros);
+                }
                 pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                 for position in positions {
                     results[position] = Some(CachePinnedHandle {
@@ -3632,19 +3635,30 @@ impl MultiLayerCache {
                 if inner.entry_expired(&key, now_millis) {
                     inner.remove_expired_entry(&key);
                     inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                    inner.record_get_latency(started);
-                    inner.record_read_through_latency(started);
+                    let occurrences = positions.len();
+                    inner
+                        .read_counters
+                        .misses
+                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    let micros = elapsed_micros(started);
+                    for _ in 0..occurrences {
+                        inner.record_get_latency_micros(micros);
+                        inner.record_read_through_latency_micros(micros);
+                    }
                     continue;
                 }
                 if !inner.ssd_instance_only {
                     if let Some(value) = inner.memory.get(&key).cloned() {
+                        let occurrences = positions.len();
                         inner
                             .read_counters
                             .memory_hits
-                            .fetch_add(1, Ordering::Relaxed);
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit(&key, value.len());
-                        inner.record_get_latency(started);
+                        let micros = elapsed_micros(started);
+                        for _ in 0..occurrences {
+                            inner.record_get_latency_micros(micros);
+                        }
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -3656,15 +3670,22 @@ impl MultiLayerCache {
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
+                        let occurrences = positions.len();
                         let decoded = value.to_vec();
                         if !inner.put_memory(key.clone(), decoded.clone()) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
-                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .pmem_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit(&key, value.len());
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
+                        let micros = elapsed_micros(started);
+                        for _ in 0..occurrences {
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                        }
                         inner.record_refill_latency(started);
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
@@ -3712,20 +3733,27 @@ impl MultiLayerCache {
             for (key, positions, started, value) in decoded {
                 match value {
                     Some((value, compressed)) => {
+                        let occurrences = positions.len();
                         if !inner.ssd_instance_only
                             && !inner.refill_from_ssd(key.clone(), value.to_vec())
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
-                        inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .disk_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         if compressed {
                             inner.stats.compressed_hits =
-                                inner.stats.compressed_hits.saturating_add(1);
+                                inner.stats.compressed_hits.saturating_add(occurrences as u64);
                         }
                         inner.record_hit(&key, value.len());
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
+                        let micros = elapsed_micros(started);
+                        for _ in 0..occurrences {
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                        }
                         inner.record_refill_latency(started);
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
@@ -3738,11 +3766,20 @@ impl MultiLayerCache {
                         needs_eviction_drain = true;
                     }
                     None => {
-                        inner.stats.zero_copy_handle_misses =
-                            inner.stats.zero_copy_handle_misses.saturating_add(1);
-                        inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
+                        let occurrences = positions.len();
+                        inner.stats.zero_copy_handle_misses = inner
+                            .stats
+                            .zero_copy_handle_misses
+                            .saturating_add(occurrences as u64);
+                        inner
+                            .read_counters
+                            .misses
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        let micros = elapsed_micros(started);
+                        for _ in 0..occurrences {
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                        }
                     }
                 }
             }

@@ -9282,9 +9282,9 @@ mod tests {
         let after = cache.stats();
         assert_eq!(after.pin_operations - before.pin_operations, 3);
         assert_eq!(after.zero_copy_handle_hits - before.zero_copy_handle_hits, 2);
-        assert_eq!(after.disk_hits - before.disk_hits, 2);
+        assert_eq!(after.disk_hits - before.disk_hits, 3);
         assert_eq!(after.refill_latency_samples - before.refill_latency_samples, 2);
-        assert_eq!(after.get_latency_samples - before.get_latency_samples, 2);
+        assert_eq!(after.get_latency_samples - before.get_latency_samples, 3);
         assert_eq!(cache.get_memory(&repeated), Some(b"dup".to_vec()));
         assert_eq!(cache.get_memory(&other), Some(b"other".to_vec()));
 
@@ -9312,19 +9312,101 @@ mod tests {
         assert_eq!(handles[1].as_ref().unwrap().value(), b"other");
         assert_eq!(handles[2].as_ref().unwrap().value(), b"dup");
         let after = cache.stats();
-        assert_eq!(after.memory_hits - before.memory_hits, 2);
+        assert_eq!(after.memory_hits - before.memory_hits, 3);
         assert_eq!(after.disk_hits - before.disk_hits, 0);
         assert_eq!(after.pin_operations - before.pin_operations, 3);
         assert_eq!(after.zero_copy_handle_hits - before.zero_copy_handle_hits, 2);
-        assert_eq!(after.get_latency_samples - before.get_latency_samples, 2);
+        assert_eq!(after.get_latency_samples - before.get_latency_samples, 3);
         assert_eq!(
             after.read_through_latency_samples - before.read_through_latency_samples,
-            2
+            3
         );
         assert_eq!(after.pinned_entries, 2);
 
         assert_eq!(cache.release_batch(handles.into_iter().flatten().collect()), 3);
         assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
+    fn acquire_batch_counts_duplicate_positions_as_reads() {
+        let memory_cache =
+            MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let memory_key = CacheKey::string(7, "duplicate-memory-handle");
+        memory_cache
+            .put(memory_key.clone(), b"memory".to_vec())
+            .unwrap();
+        let before = memory_cache.stats();
+        let handles = memory_cache
+            .acquire_batch(&[memory_key.clone(), memory_key.clone(), memory_key.clone()])
+            .unwrap();
+        let after = memory_cache.stats();
+        assert_eq!(handles.iter().filter(|handle| handle.is_some()).count(), 3);
+        assert_eq!(after.memory_hits.saturating_sub(before.memory_hits), 3);
+        assert_eq!(
+            after
+                .get_latency_samples
+                .saturating_sub(before.get_latency_samples),
+            3
+        );
+        assert_eq!(
+            after
+                .read_through_latency_samples
+                .saturating_sub(before.read_through_latency_samples),
+            3
+        );
+        memory_cache.release_batch(handles.into_iter().flatten().collect());
+
+        let ssd_cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("batch-acquire-counts-duplicate-ssd"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        let ssd_key = CacheKey::string(7, "duplicate-ssd-handle");
+        ssd_cache.put(ssd_key.clone(), b"ssd".to_vec()).unwrap();
+        ssd_cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        assert_eq!(ssd_cache.size_for_tier(CacheTier::Memory), 0);
+        ssd_cache.set_capacity_for_tier(CacheTier::Memory, 64);
+        let before = ssd_cache.stats();
+        let handles = ssd_cache
+            .acquire_batch(&[ssd_key.clone(), ssd_key.clone(), ssd_key.clone()])
+            .unwrap();
+        let after = ssd_cache.stats();
+        assert_eq!(handles.iter().filter(|handle| handle.is_some()).count(), 3);
+        assert!(handles
+            .iter()
+            .flatten()
+            .all(|handle| handle.tier() == CacheReadTier::Ssd));
+        assert_eq!(after.disk_hits.saturating_sub(before.disk_hits), 3);
+        assert_eq!(after.memory_fills.saturating_sub(before.memory_fills), 1);
+        ssd_cache.release_batch(handles.into_iter().flatten().collect());
+
+        let before = ssd_cache.stats();
+        let missing = CacheKey::string(7, "duplicate-missing-handle");
+        let handles = ssd_cache
+            .acquire_batch(&[missing.clone(), missing.clone(), missing])
+            .unwrap();
+        let after = ssd_cache.stats();
+        assert!(handles.iter().all(Option::is_none));
+        assert_eq!(after.misses.saturating_sub(before.misses), 3);
+        assert_eq!(
+            after
+                .zero_copy_handle_misses
+                .saturating_sub(before.zero_copy_handle_misses),
+            3
+        );
     }
 
     #[test]
