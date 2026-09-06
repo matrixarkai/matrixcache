@@ -15716,6 +15716,38 @@ mod tests {
     }
 
     #[test]
+    fn grafana_dashboard_tracks_p95_latency_gates() {
+        let dashboard = include_str!("../../docs/grafana/matrixcache-dashboard.json");
+        for metric in [
+            "matrixcache_get_latency_p95_seconds",
+            "matrixcache_put_latency_p95_seconds",
+            "matrixcache_read_through_latency_p95_seconds",
+            "matrixcache_refill_latency_p95_seconds",
+            "matrixcache_writeback_latency_p95_seconds",
+            "matrixcache_eviction_latency_p95_seconds",
+            "matrixcache_compaction_latency_p95_seconds",
+        ] {
+            assert!(
+                dashboard.contains(metric),
+                "Grafana dashboard should expose p95 latency metric {metric}"
+            );
+        }
+        for legend in [
+            r#""legendFormat": "get p95""#,
+            r#""legendFormat": "put p95""#,
+            r#""legendFormat": "refill p95""#,
+            r#""legendFormat": "writeback p95""#,
+            r#""legendFormat": "eviction p95""#,
+            r#""legendFormat": "compaction p95""#,
+        ] {
+            assert!(
+                dashboard.contains(legend),
+                "Grafana dashboard should label p95 latency series: {legend}"
+            );
+        }
+    }
+
+    #[test]
     fn access_order_survives_a_storm_of_operations_at_every_insertion_spec() {
         // Incrementally maintaining a pointer into a linked list is subtly
         // wrong rather than obviously wrong, and a corrupted eviction order
