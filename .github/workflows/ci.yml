@@ -168,6 +168,29 @@ jobs:
             /tmp/matrixcache-eviction.json \
             /tmp/matrixcache-eviction.json
 
+      - name: Scale report smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/run_scale_reports.py \
+            --debug-build \
+            --output-dir /tmp/matrixcache-scale-ci \
+            --markdown-output /tmp/matrixcache-scale-ci/matrixcache-scale-report.md
+          tools/validate_scale_report_manifest.py \
+            /tmp/matrixcache-scale-ci/matrixcache-scale-report-manifest.json \
+            --require-markdown
+          tools/compare_scale_reports.py \
+            /tmp/matrixcache-scale-ci/matrixcache-scale-report-manifest.json \
+            /tmp/matrixcache-scale-ci/matrixcache-scale-report-manifest.json \
+            --json-output /tmp/matrixcache-scale-ci/matrixcache-scale-comparison.json \
+            --markdown-output /tmp/matrixcache-scale-ci/matrixcache-scale-comparison.md \
+            --emit-operator-log
+          tools/validate_scale_comparison_report.py \
+            /tmp/matrixcache-scale-ci/matrixcache-scale-comparison.json \
+            --min-reports 4 \
+            --min-latency-fields 1 \
+            --min-throughput-fields 1
+
       - name: Doc
         run: cargo doc --no-deps --locked
 
