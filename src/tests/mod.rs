@@ -9540,6 +9540,39 @@ mod tests {
     }
 
     #[test]
+    fn sharded_get_shared_batch_into_reuses_colocated_result_buffer() {
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
+        let colocated_a = CacheKey::string(9, "shared-sharded-into-a");
+        let colocated_b = CacheKey::string(9, "shared-sharded-into-b");
+        let remote = CacheKey::string(10, "shared-sharded-into-c");
+        cache.put(colocated_a.clone(), b"a".to_vec()).unwrap();
+        cache.put(colocated_b.clone(), b"b".to_vec()).unwrap();
+        cache.put(remote.clone(), b"c".to_vec()).unwrap();
+
+        let mut values = Vec::with_capacity(16);
+        let original_capacity = values.capacity();
+        cache
+            .get_shared_batch_into(&[colocated_b.clone(), colocated_a.clone()], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values[0].as_deref(), Some(&b"b"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"a"[..]));
+
+        cache
+            .get_shared_batch_into(&[remote.clone(), colocated_a.clone(), remote.clone()], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 3);
+        assert!(
+            values.capacity() >= original_capacity,
+            "cross-shard fallback should keep the caller-owned allocation available"
+        );
+        assert_eq!(values[0].as_deref(), Some(&b"c"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"a"[..]));
+        assert_eq!(values[2].as_deref(), Some(&b"c"[..]));
+    }
+
+    #[test]
     fn acquire_batch_counts_duplicate_positions_as_reads() {
         let memory_cache =
             MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
