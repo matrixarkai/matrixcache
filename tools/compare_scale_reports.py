@@ -28,6 +28,19 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def logfmt_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    text = str(value)
+    if text and all(ch.isalnum() or ch in "._:-/" for ch in text):
+        return text
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
@@ -243,6 +256,16 @@ def main() -> int:
         type=Path,
         help="Optional path for a human-readable comparison report.",
     )
+    parser.add_argument(
+        "--emit-operator-log",
+        action="store_true",
+        help="Print a compact logfmt summary for build logs and Grafana annotations.",
+    )
+    parser.add_argument(
+        "--operator-log-prefix",
+        default="matrixcache_scale_comparison",
+        help="Prefix for --emit-operator-log output.",
+    )
     args = parser.parse_args()
 
     baseline_manifest = load_manifest(args.baseline)
@@ -289,12 +312,24 @@ def main() -> int:
         ],
         "passed": True,
     }
+    summary["operator_log"] = {
+        "passed": True,
+        "reports": summary["reports"],
+        "latency_fields": summary["latency_fields"],
+        "throughput_fields": summary["throughput_fields"],
+        "worst_latency_ratio": worst_latency,
+        "weakest_throughput_ratio": worst_throughput,
+        "max_latency_regression": args.max_latency_regression,
+        "min_throughput_ratio": args.min_throughput_ratio,
+    }
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(json.dumps(summary, indent=2) + "\n")
     if args.markdown_output:
         args.markdown_output.parent.mkdir(parents=True, exist_ok=True)
         args.markdown_output.write_text(render_markdown(summary))
+    if args.emit_operator_log:
+        print(operator_logfmt_line(args.operator_log_prefix, summary["operator_log"]))
     print(
         "OK matrixcache scale report comparison: "
         f"reports={len(baseline_reports)} "
@@ -304,6 +339,13 @@ def main() -> int:
         f"worst_throughput={worst_throughput:.3f}x"
     )
     return 0
+
+
+def operator_logfmt_line(prefix: str, operator_log: dict[str, Any]) -> str:
+    fields = " ".join(
+        f"{field}={logfmt_value(operator_log[field])}" for field in sorted(operator_log)
+    )
+    return f"{prefix} {fields}"
 
 
 def render_markdown(summary: dict[str, Any]) -> str:

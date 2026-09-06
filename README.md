@@ -182,7 +182,7 @@ and says what the number means:
 - `tools/compare_scale_reports.py` -- compares two scale report manifests and
   fails on configured latency or throughput regressions. Add
   `--json-output <path>` or `--markdown-output <path>` to archive the
-  comparison.
+  comparison. Add `--emit-operator-log` to print a compact logfmt line for build logs and Grafana annotations.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather
