@@ -125,14 +125,20 @@ fn coalesce_batch_positions(keys: &[CacheKey]) -> Vec<(CacheKey, Vec<usize>)> {
     positions_by_key
 }
 
-fn coalesce_release_counts(handles: Vec<CachePinnedHandle>) -> (usize, Vec<(CacheKey, usize)>) {
-    let released = handles.len();
-    if released == 0 {
+fn coalesce_release_counts<I>(handles: I) -> (usize, Vec<(CacheKey, usize)>)
+where
+    I: IntoIterator<Item = CachePinnedHandle>,
+{
+    let handles = handles.into_iter();
+    let (lower_bound, upper_bound) = handles.size_hint();
+    if upper_bound == Some(0) {
         return (0, Vec::new());
     }
-    if released <= SMALL_BATCH_DEDUP_LIMIT {
-        let mut counts = Vec::<(CacheKey, usize)>::new();
+    let mut released = 0usize;
+    if upper_bound.unwrap_or(usize::MAX) <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut counts = Vec::<(CacheKey, usize)>::with_capacity(lower_bound);
         for handle in handles {
+            released = released.saturating_add(1);
             if let Some((_, count)) = counts
                 .iter_mut()
                 .find(|(existing, _)| existing == &handle.key)
@@ -145,8 +151,9 @@ fn coalesce_release_counts(handles: Vec<CachePinnedHandle>) -> (usize, Vec<(Cach
         return (released, counts);
     }
 
-    let mut counts_by_key = HashMap::<CacheKey, usize>::new();
+    let mut counts_by_key = HashMap::<CacheKey, usize>::with_capacity(lower_bound);
     for handle in handles {
+        released = released.saturating_add(1);
         *counts_by_key.entry(handle.key).or_default() += 1;
     }
     (released, counts_by_key.into_iter().collect())
@@ -3686,6 +3693,13 @@ impl MultiLayerCache {
     }
 
     pub fn release_batch(&self, handles: Vec<CachePinnedHandle>) -> usize {
+        self.release_batch_iter(handles)
+    }
+
+    pub fn release_batch_iter<I>(&self, handles: I) -> usize
+    where
+        I: IntoIterator<Item = CachePinnedHandle>,
+    {
         let (released, counts) = coalesce_release_counts(handles);
         if released == 0 {
             return 0;
