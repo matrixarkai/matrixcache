@@ -1245,13 +1245,23 @@ impl CacheInner {
     /// exclusive path counted one. That is a reporting counter, nothing
     /// branches on it, and the alternative is the lock this exists to avoid.
     fn record_hit_shared(&self, key: &CacheKey) -> HitOutcome {
+        let epoch = CoarseClock::now_millis();
+        self.reconfigure_refresh_window(epoch);
+        self.record_hit_shared_occurrences_at(key, 1, epoch)
+    }
+
+    fn record_hit_shared_occurrences_at(
+        &self,
+        key: &CacheKey,
+        occurrences: usize,
+        epoch: u64,
+    ) -> HitOutcome {
         let Some(entry) = self.metadata.get(key) else {
             return HitOutcome::NeedsMetadata;
         };
-        let epoch = CoarseClock::now_millis();
-        self.reconfigure_refresh_window(epoch);
         let threshold = self.tiering_policy.memory_hotness_threshold;
-        let hits_before = entry.hits.fetch_add(1, Ordering::Relaxed);
+        let occurrences = occurrences.max(1) as u64;
+        let hits_before = entry.hits.fetch_add(occurrences, Ordering::Relaxed);
         // A sampled hit signal for the admission sketch, and only when the
         // filter that consumes it is on -- a bool already in this cache line,
         // against ~1.6ns of sketch work nothing would read.
@@ -1260,10 +1270,14 @@ impl CacheInner {
         // sixteen is about 1.6ns. The comparison it feeds is ordinal, so the
         // lost resolution costs nothing: a key hit a thousand times still
         // records far more than one hit twice.
-        if self.admission_filter_enabled && hits_before % HIT_SAMPLE_INTERVAL == 0 {
-            self.access_frequency.record(key);
+        if self.admission_filter_enabled {
+            let sample_hits = sampled_hit_count(hits_before, occurrences);
+            for _ in 0..sample_hits {
+                self.access_frequency.record(key);
+            }
         }
-        let before = entry.hotness.fetch_add(1, Ordering::Relaxed);
+        let hotness_delta = occurrences.min(u32::MAX as u64) as u32;
+        let before = entry.hotness.fetch_add(hotness_delta, Ordering::Relaxed);
         // Read, do not swap: this stamp records when the entry was last MOVED
         // in the access order, not when it was last read. Swapping here made
         // the window measure the gap between consecutive reads, so an entry
@@ -1271,7 +1285,7 @@ impl CacheInner {
         // -- the exact opposite of what the window is for. The stamp is
         // advanced below, only when the move actually happens.
         let seen_at = entry.last_access_epoch.load(Ordering::Relaxed);
-        if before < threshold && before.saturating_add(1) >= threshold {
+        if before < threshold && before.saturating_add(hotness_delta) >= threshold {
             self.read_counters
                 .hotness_promotions
                 .fetch_add(1, Ordering::Relaxed);
@@ -2633,6 +2647,15 @@ fn initial_hotness(block_kind: CacheBlockKind, block_bytes: usize) -> u32 {
         CacheBlockKind::Object => 1,
         CacheBlockKind::Other => 0,
     }
+}
+
+fn sampled_hit_count(hits_before: u64, occurrences: u64) -> u64 {
+    if occurrences == 0 {
+        return 0;
+    }
+    let last_hit = hits_before.saturating_add(occurrences.saturating_sub(1));
+    let before_window = hits_before.saturating_sub(1);
+    last_hit / HIT_SAMPLE_INTERVAL - before_window / HIT_SAMPLE_INTERVAL
 }
 
 fn extract_routing_slot(key: &CacheKey) -> Option<u32> {

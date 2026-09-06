@@ -2892,46 +2892,63 @@ impl MultiLayerCache {
         // Only what genuinely needs the cache exclusively is deferred: entries
         // past their time to live, entries whose access order needs moving,
         // entries with no metadata yet, and everything below the memory tier.
-        let mut deferred: Vec<(usize, &CacheKey, Instant)> = Vec::new();
-        let mut memory_hits: Vec<(usize, Arc<[u8]>)> = Vec::new();
-        let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
+        let mut deferred: Vec<(usize, CacheKey, Instant)> = Vec::new();
+        let mut memory_hits: Vec<(Vec<usize>, Arc<[u8]>)> = Vec::new();
+        let mut needs_exclusive: Vec<(CacheKey, HitOutcome, usize)> = Vec::new();
+        let positions_by_key = coalesce_batch_positions(keys);
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (index, key) in keys.iter().enumerate() {
+            let epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(epoch);
+            for (key, positions) in positions_by_key {
                 let started = Instant::now();
                 // Checked under the same shared lock as the lookup, so an
                 // entry cannot be judged live and then read after it expired.
-                if inner.entry_expired(key, now_millis) || inner.ssd_instance_only {
-                    deferred.push((index, key, started));
+                if inner.entry_expired(&key, now_millis) || inner.ssd_instance_only {
+                    deferred.extend(
+                        positions
+                            .into_iter()
+                            .map(|position| (position, key.clone(), started)),
+                    );
                     continue;
                 }
-                match inner.memory.get(key).cloned() {
+                match inner.memory.get(&key).cloned() {
                     Some(value) => {
-                        inner
-                            .read_counters
-                            .memory_hits
-                            .fetch_add(1, Ordering::Relaxed);
-                        let outcome = inner.record_hit_shared(key);
+                        inner.read_counters.memory_hits.fetch_add(
+                            positions.len() as u64,
+                            Ordering::Relaxed,
+                        );
+                        let outcome =
+                            inner.record_hit_shared_occurrences_at(&key, positions.len(), epoch);
                         if !matches!(outcome, HitOutcome::Accounted) {
-                            needs_exclusive.push((key, outcome, value.len()));
+                            needs_exclusive.push((key.clone(), outcome, value.len()));
                         }
                         let micros = elapsed_micros(started);
-                        inner.record_get_latency_micros(micros);
-                        inner.record_read_through_latency_micros(micros);
-                        memory_hits.push((index, value));
+                        for _ in 0..positions.len() {
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                        }
+                        memory_hits.push((positions, value));
                     }
-                    None => deferred.push((index, key, started)),
+                    None => deferred.extend(
+                        positions
+                            .into_iter()
+                            .map(|position| (position, key.clone(), started)),
+                    ),
                 }
             }
         }
 
         // The copy that turns the shared buffer into the returned `Vec` is the
         // expensive part of a hit, and it is done here with no lock held.
-        for (index, value) in memory_hits {
-            results[index] = Some(value.to_vec());
+        for (positions, value) in memory_hits {
+            let decoded = value.to_vec();
+            for position in positions {
+                results[position] = Some(decoded.clone());
+            }
         }
 
         // One exclusive acquisition for the whole batch's leftovers, rather
@@ -2941,10 +2958,10 @@ impl MultiLayerCache {
             for (key, outcome, len) in needs_exclusive {
                 match outcome {
                     HitOutcome::Accounted => {}
-                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
                     HitOutcome::NeedsMetadata => {
-                        if inner.memory.contains_key(key) {
-                            inner.record_hit(key, len);
+                        if inner.memory.contains_key(&key) {
+                            inner.record_hit(&key, len);
                         }
                     }
                 }
@@ -2964,25 +2981,25 @@ impl MultiLayerCache {
                 // Expiry is noticed on the read that would have been served.
                 // Re-checked here: another reader may have dropped it since
                 // the probe, or it may have been rewritten with a fresh life.
-                if inner.entry_expired(key, now_millis) {
-                    inner.remove_expired_entry(key);
+                if inner.entry_expired(&key, now_millis) {
+                    inner.remove_expired_entry(&key);
                     inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
                     inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                     inner.record_get_latency(started);
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.memory.get(&key).cloned() {
                         inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
-                        inner.record_hit_metadata(key, value.len());
+                        inner.record_hit_metadata(&key, value.len());
                         inner.record_get_latency(started);
                         inner.record_read_through_latency(started);
                         results[index] = Some(value.to_vec());
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem.get(&key).cloned() {
                         inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                        inner.record_hit_metadata(key, value.len());
+                        inner.record_hit_metadata(&key, value.len());
                         let decoded = value.to_vec();
                         if !inner.put_memory(key.clone(), decoded.clone()) {
                             inner.stats.refill_failures =
