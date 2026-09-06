@@ -545,31 +545,31 @@ pub struct CacheBuffer {
 
 const STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS: usize = 64;
 
-fn coalesce_storage_batch_keys(keys: &[String]) -> (Vec<String>, Vec<usize>) {
+fn coalesce_storage_batch_key_refs<'a>(keys: &[&'a str]) -> (Vec<&'a str>, Vec<usize>) {
     if keys.len() <= STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS {
-        let mut unique_keys = Vec::<String>::with_capacity(keys.len());
+        let mut unique_keys = Vec::<&'a str>::with_capacity(keys.len());
         let mut output_positions = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(position) = unique_keys.iter().position(|existing| existing == key) {
                 output_positions.push(position);
             } else {
                 output_positions.push(unique_keys.len());
-                unique_keys.push(key.clone());
+                unique_keys.push(*key);
             }
         }
         return (unique_keys, output_positions);
     }
 
-    let mut unique_keys = Vec::<String>::with_capacity(keys.len());
-    let mut unique_positions = HashMap::<String, usize>::with_capacity(keys.len());
+    let mut unique_keys = Vec::<&'a str>::with_capacity(keys.len());
+    let mut unique_positions = HashMap::<&'a str, usize>::with_capacity(keys.len());
     let mut output_positions = Vec::with_capacity(keys.len());
     for key in keys {
         let position = if let Some(position) = unique_positions.get(key).copied() {
             position
         } else {
             let position = unique_keys.len();
-            unique_positions.insert(key.clone(), position);
-            unique_keys.push(key.clone());
+            unique_positions.insert(*key, position);
+            unique_keys.push(*key);
             position
         };
         output_positions.push(position);
@@ -2401,13 +2401,18 @@ impl StorageEngineRocksDb {
         Ok(view)
     }
     pub fn get_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        self.get_batch_refs(&key_refs)
+    }
+
+    fn get_batch_refs(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.initialized {
             return Err(CacheError::Stopped);
         }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let (unique_keys, output_positions) = coalesce_storage_batch_keys(keys);
+        let (unique_keys, output_positions) = coalesce_storage_batch_key_refs(keys);
         #[cfg(feature = "rocksdb-ssd")]
         let unique_values = {
             self.rocksdb()?
@@ -2417,12 +2422,10 @@ impl StorageEngineRocksDb {
                 .collect::<Result<Vec<_>, _>>()?
         };
         #[cfg(not(feature = "rocksdb-ssd"))]
-        let unique_values = {
-            unique_keys
-                .iter()
-                .map(|key| self.records.get(key).cloned())
-                .collect::<Vec<_>>()
-        };
+        let unique_values = unique_keys
+            .iter()
+            .map(|key| self.records.get(*key).cloned())
+            .collect::<Vec<_>>();
         Ok(output_positions
             .into_iter()
             .map(|position| unique_values[position].clone())
@@ -3041,12 +3044,13 @@ impl StorageEngineMultiSsd {
             return Ok(Vec::new());
         }
 
-        let (unique_keys, output_positions) = coalesce_storage_batch_keys(keys);
+        let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let (unique_keys, output_positions) = coalesce_storage_batch_key_refs(&key_refs);
 
-        let mut routed = vec![Vec::<(usize, String)>::new(); self.storages.len()];
+        let mut routed = vec![Vec::<(usize, &str)>::new(); self.storages.len()];
         for (unique_index, key) in unique_keys.iter().enumerate() {
-            let storage_index = Self::hash(&key) as usize % self.storages.len();
-            routed[storage_index].push((unique_index, key.clone()));
+            let storage_index = Self::hash(key) as usize % self.storages.len();
+            routed[storage_index].push((unique_index, *key));
         }
 
         let mut unique_values = vec![None; unique_keys.len()];
@@ -3054,11 +3058,8 @@ impl StorageEngineMultiSsd {
             if entries.is_empty() {
                 continue;
             }
-            let storage_keys = entries
-                .iter()
-                .map(|(_, key)| key.clone())
-                .collect::<Vec<_>>();
-            let storage_values = self.storages[storage_index].get_batch(&storage_keys)?;
+            let storage_keys = entries.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            let storage_values = self.storages[storage_index].get_batch_refs(&storage_keys)?;
             for ((unique_index, _), value) in entries.into_iter().zip(storage_values) {
                 unique_values[unique_index] = value;
             }
