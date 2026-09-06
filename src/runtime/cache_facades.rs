@@ -1582,6 +1582,13 @@ impl ZeroCopyCacheApi for MultiLayerCache {
         self.release_batch(handles)
     }
 
+    fn release_batch_iter_cache<I>(&self, handles: I) -> usize
+    where
+        I: IntoIterator<Item = CachePinnedHandle>,
+    {
+        self.release_batch_iter(handles)
+    }
+
     fn insert_pinned_cache(
         &self,
         key: CacheKey,

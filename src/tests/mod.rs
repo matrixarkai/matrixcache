@@ -11535,6 +11535,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_copy_trait_release_batch_iter_uses_concrete_fast_path() {
+        fn release_from_generic<C: ZeroCopyCacheApi>(cache: &C, handles: Vec<Option<CachePinnedHandle>>) -> usize {
+            cache.release_batch_iter_cache(handles.into_iter().flatten())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let k = |s: &str| CacheKey::string(0, s);
+        cache.put(k("a"), b"alpha".to_vec()).unwrap();
+        cache.put(k("b"), b"bravo".to_vec()).unwrap();
+
+        let handles = cache.acquire_batch_cache(&[k("a"), k("b")]).unwrap();
+        assert_eq!(cache.stats().pinned_entries, 2);
+
+        assert_eq!(release_from_generic(&cache, handles), 2);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
     fn sharded_release_batch_iter_drains_pins_across_shards() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ShardedMultiLayerCache::new(
