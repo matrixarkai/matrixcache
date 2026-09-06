@@ -669,6 +669,30 @@ impl AtomicLatencyHistogram {
         }
     }
 
+    fn observe_many_with_total(&self, micros: u64, samples: usize) {
+        let samples = samples as u64;
+        if samples == 0 {
+            return;
+        }
+        let bucket = if micros <= 10 {
+            &self.le_10us
+        } else if micros <= 100 {
+            &self.le_100us
+        } else if micros <= 1_000 {
+            &self.le_1ms
+        } else if micros <= 10_000 {
+            &self.le_10ms
+        } else {
+            &self.gt_10ms
+        };
+        bucket.fetch_add(samples, Ordering::Relaxed);
+        self.total_micros
+            .fetch_add(micros.saturating_mul(samples), Ordering::Relaxed);
+        if micros > self.max_micros.load(Ordering::Relaxed) {
+            self.max_micros.fetch_max(micros, Ordering::Relaxed);
+        }
+    }
+
     fn samples(&self) -> u64 {
         self.le_10us.load(Ordering::Relaxed)
             + self.le_100us.load(Ordering::Relaxed)
@@ -2992,10 +3016,8 @@ impl MultiLayerCache {
                             needs_exclusive.push((key.clone(), outcome, value.len()));
                         }
                         let micros = elapsed_micros(started);
-                        for _ in 0..positions.len() {
-                            inner.record_get_latency_micros(micros);
-                            inner.record_read_through_latency_micros(micros);
-                        }
+                        inner.record_get_latency_micros_many(micros, positions.len());
+                        inner.record_read_through_latency_micros_many(micros, positions.len());
                         memory_hits.push((positions, value));
                     }
                     None => deferred.extend(
@@ -3582,8 +3604,9 @@ impl MultiLayerCache {
                     .read_counters
                     .memory_hits
                     .fetch_add(occurrences as u64, Ordering::Relaxed);
+                let epoch = CoarseClock::now_millis();
                 let outcome = if inner.memory.contains_key(&key) {
-                    inner.record_hit_shared_occurrences_at(&key, occurrences, CoarseClock::now_millis())
+                    inner.record_hit_shared_occurrences_at(&key, occurrences, epoch)
                 } else {
                     HitOutcome::Accounted
                 };
@@ -3591,10 +3614,8 @@ impl MultiLayerCache {
                     exclusive_work.push((key.clone(), outcome, value.len()));
                 }
                 let micros = elapsed_micros(started);
-                for _ in 0..occurrences {
-                    inner.record_get_latency_micros(micros);
-                    inner.record_read_through_latency_micros(micros);
-                }
+                inner.record_get_latency_micros_many(micros, occurrences);
+                inner.record_read_through_latency_micros_many(micros, occurrences);
                 pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                 for position in positions {
                     results[position] = Some(CachePinnedHandle {
@@ -3641,10 +3662,8 @@ impl MultiLayerCache {
                         .misses
                         .fetch_add(occurrences as u64, Ordering::Relaxed);
                     let micros = elapsed_micros(started);
-                    for _ in 0..occurrences {
-                        inner.record_get_latency_micros(micros);
-                        inner.record_read_through_latency_micros(micros);
-                    }
+                    inner.record_get_latency_micros_many(micros, occurrences);
+                    inner.record_read_through_latency_micros_many(micros, occurrences);
                     continue;
                 }
                 if !inner.ssd_instance_only {
@@ -3656,9 +3675,7 @@ impl MultiLayerCache {
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit(&key, value.len());
                         let micros = elapsed_micros(started);
-                        for _ in 0..occurrences {
-                            inner.record_get_latency_micros(micros);
-                        }
+                        inner.record_get_latency_micros_many(micros, occurrences);
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -3682,10 +3699,8 @@ impl MultiLayerCache {
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit(&key, value.len());
                         let micros = elapsed_micros(started);
-                        for _ in 0..occurrences {
-                            inner.record_get_latency_micros(micros);
-                            inner.record_read_through_latency_micros(micros);
-                        }
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
@@ -3750,10 +3765,8 @@ impl MultiLayerCache {
                         }
                         inner.record_hit(&key, value.len());
                         let micros = elapsed_micros(started);
-                        for _ in 0..occurrences {
-                            inner.record_get_latency_micros(micros);
-                            inner.record_read_through_latency_micros(micros);
-                        }
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
                         pin_counts.push((key.clone(), value.len(), positions.len(), 1));
                         for position in positions {
@@ -3776,10 +3789,8 @@ impl MultiLayerCache {
                             .misses
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         let micros = elapsed_micros(started);
-                        for _ in 0..occurrences {
-                            inner.record_get_latency_micros(micros);
-                            inner.record_read_through_latency_micros(micros);
-                        }
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
                     }
                 }
             }

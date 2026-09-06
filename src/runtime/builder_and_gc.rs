@@ -2445,6 +2445,12 @@ impl CacheInner {
         self.read_counters.get_latency.observe_with_total(micros);
     }
 
+    fn record_get_latency_micros_many(&self, micros: u64, samples: usize) {
+        self.read_counters
+            .get_latency
+            .observe_many_with_total(micros, samples);
+    }
+
     fn record_put_latency(&mut self, started: Instant) {
         let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.stats.put_latency_samples = self.stats.put_latency_samples.saturating_add(1);
@@ -2472,6 +2478,12 @@ impl CacheInner {
         self.read_counters
             .read_through_latency
             .observe_with_total(micros);
+    }
+
+    fn record_read_through_latency_micros_many(&self, micros: u64, samples: usize) {
+        self.read_counters
+            .read_through_latency
+            .observe_many_with_total(micros, samples);
     }
 
     fn record_refill_latency(&self, started: Instant) {
