@@ -2409,23 +2409,27 @@ impl CacheInner {
         if counts.is_empty() {
             return;
         }
-        let mut by_stripe = (0..self.pins.len())
-            .map(|_| Vec::<usize>::new())
-            .collect::<Vec<_>>();
+        let mut updates = Vec::<(usize, usize)>::with_capacity(counts.len());
         for (index, (key, count)) in counts.iter().enumerate() {
             if *count == 0 {
                 continue;
             }
-            by_stripe[self.pin_stripe_index(key)].push(index);
+            updates.push((self.pin_stripe_index(key), index));
         }
-        for (stripe, indexes) in by_stripe.into_iter().enumerate() {
-            if indexes.is_empty() {
-                continue;
-            }
+
+        if updates.is_empty() {
+            return;
+        }
+        updates.sort_unstable_by_key(|(stripe, _)| *stripe);
+        let mut cursor = 0;
+        while cursor < updates.len() {
+            let stripe = updates[cursor].0;
             let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
-            for index in indexes {
+            while cursor < updates.len() && updates[cursor].0 == stripe {
+                let index = updates[cursor].1;
                 let (key, count) = &counts[index];
                 let Some(entry) = pins.entries.get_mut(key) else {
+                    cursor += 1;
                     continue;
                 };
                 let count = *count as u64;
@@ -2435,6 +2439,7 @@ impl CacheInner {
                     pins.entries.remove(key);
                 }
                 pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+                cursor += 1;
             }
         }
     }
