@@ -86,6 +86,17 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>
     (unique_keys, requested_positions)
 }
 
+fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
+    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        return keys
+            .iter()
+            .enumerate()
+            .any(|(position, key)| keys[..position].iter().any(|existing| existing == key));
+    }
+    let mut seen = HashSet::with_capacity(keys.len());
+    keys.iter().any(|key| !seen.insert(key))
+}
+
 fn coalesce_batch_positions(keys: &[CacheKey]) -> Vec<(CacheKey, Vec<usize>)> {
     let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
     if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
@@ -2418,6 +2429,16 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
+        let now_millis = CoarseClock::now_millis();
+        if !has_duplicate_batch_keys(keys) {
+            for key in keys {
+                self.emit_access_record(CacheAccessRecordKind::Get, key);
+            }
+            if let Some(results) = self.try_get_shared_memory_batch(keys, now_millis)? {
+                return Ok(results);
+            }
+        }
+
         let (unique_keys, requested_positions) = coalesce_batch_keys(keys);
 
         for key in &unique_keys {
@@ -2429,7 +2450,6 @@ impl MultiLayerCache {
         let mut pmem_refills = Vec::<(usize, CacheKey, Arc<[u8]>, Instant)>::new();
         let mut ssd_candidates = Vec::<(usize, CacheKey, Instant)>::new();
         let mut expired_keys = Vec::<(CacheKey, Instant)>::new();
-        let now_millis = CoarseClock::now_millis();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -2776,6 +2796,68 @@ impl MultiLayerCache {
         let mut results = Vec::with_capacity(keys.len());
         for (_, value, _) in memory_hits {
             results.push(Some(value.to_vec()));
+        }
+        Ok(Some(results))
+    }
+
+    fn try_get_shared_memory_batch(
+        &self,
+        keys: &[CacheKey],
+        now_millis: u64,
+    ) -> Result<Option<Vec<Option<Arc<[u8]>>>>, CacheError> {
+        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>, Instant)>::with_capacity(keys.len());
+        let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if inner.ssd_instance_only {
+                return Ok(None);
+            }
+            for key in keys {
+                let started = Instant::now();
+                if inner.entry_expired(key, now_millis) {
+                    return Ok(None);
+                }
+                let Some(value) = inner.memory.get(key).cloned() else {
+                    return Ok(None);
+                };
+                memory_hits.push((key, value, started));
+            }
+
+            let epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(epoch);
+            for (key, value, started) in &memory_hits {
+                inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                let outcome = inner.record_hit_shared_at(key, epoch);
+                if !matches!(outcome, HitOutcome::Accounted) {
+                    needs_exclusive.push(((*key).clone(), outcome, value.len()));
+                }
+                let micros = elapsed_micros(*started);
+                inner.record_get_latency_micros(micros);
+                inner.record_read_through_latency_micros(micros);
+            }
+        }
+
+        if !needs_exclusive.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (key, outcome, len) in needs_exclusive {
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
+                    HitOutcome::NeedsMetadata => {
+                        if inner.memory.contains_key(&key) {
+                            inner.record_hit(&key, len);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(keys.len());
+        for (_, value, _) in memory_hits {
+            results.push(Some(value));
         }
         Ok(Some(results))
     }

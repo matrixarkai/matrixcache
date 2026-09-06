@@ -5,12 +5,14 @@
 //!
 //! `get_batch` serves from the memory tier when it can, so a batch of resident
 //! keys should cost about what the same number of single gets costs and no
-//! more. `get_batch_no_promotion` is the scan path: it answers without moving
-//! entries between tiers or updating replacement metadata. The pinned
-//! no-promotion column measures the same scan shape when the caller wants
-//! zero-copy handles and releases them in one batch. Anything the regular path
-//! does *besides* answering -- bookkeeping whose result is not returned -- shows
-//! up here as a per-key cost that has nothing to do with the value.
+//! more. `get_shared_batch` keeps the normal replacement bookkeeping while
+//! returning shared buffers instead of copying values. `get_batch_no_promotion`
+//! is the scan path: it answers without moving entries between tiers or
+//! updating replacement metadata. The pinned no-promotion column measures the
+//! same scan shape when the caller wants zero-copy handles and releases them in
+//! one batch. Anything the regular path does *besides* answering -- bookkeeping
+//! whose result is not returned -- shows up here as a per-key cost that has
+//! nothing to do with the value.
 //!
 //! The cache is given an SSD path so that entries are present in the disk
 //! index as well as in memory. That combination is the one worth measuring:
@@ -111,11 +113,12 @@ fn main() {
          median of {PASSES} passes\n"
     );
     println!(
-        "{:<16}{:>14}{:>18}{:>22}{:>22}{:>24}{:>28}{:>28}",
+        "{:<16}{:>14}{:>18}{:>22}{:>18}{:>22}{:>24}{:>28}{:>28}",
         "batch size",
         "get_batch",
         "sharded_get",
         "sharded_colocated",
+        "shared_batch",
         "get_batch_no_prom",
         "acquire_no_prom",
         "sharded_acq_colocated",
@@ -130,6 +133,20 @@ fn main() {
                     let mut served = 0_usize;
                     for chunk in keys.chunks(batch) {
                         let values = cache.get_batch(chunk).expect("get_batch");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(served, RESIDENT, "every key should have hit memory");
+                    started.elapsed().as_nanos() as f64 / RESIDENT as f64
+                })
+                .collect(),
+        );
+        let shared_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    for chunk in keys.chunks(batch) {
+                        let values = cache.get_shared_batch(chunk).expect("get_shared_batch");
                         served += values.iter().filter(|value| value.is_some()).count();
                     }
                     assert_eq!(served, RESIDENT, "every key should have hit memory");
@@ -241,7 +258,7 @@ fn main() {
                 .collect(),
         );
         println!(
-            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
+            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{shared_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
     }
 
