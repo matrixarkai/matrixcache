@@ -577,6 +577,27 @@ fn coalesce_storage_batch_keys(keys: &[String]) -> (Vec<String>, Vec<usize>) {
     (unique_keys, output_positions)
 }
 
+fn coalesce_storage_delete_keys(keys: &[String]) -> Vec<String> {
+    if keys.len() <= STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS {
+        let mut unique_keys = Vec::<String>::with_capacity(keys.len());
+        for key in keys {
+            if !unique_keys.iter().any(|existing| existing == key) {
+                unique_keys.push(key.clone());
+            }
+        }
+        return unique_keys;
+    }
+
+    let mut unique_keys = Vec::<String>::with_capacity(keys.len());
+    let mut seen = HashSet::<String>::with_capacity(keys.len());
+    for key in keys {
+        if seen.insert(key.clone()) {
+            unique_keys.push(key.clone());
+        }
+    }
+    unique_keys
+}
+
 impl CacheBuffer {
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -2454,13 +2475,7 @@ impl StorageEngineRocksDb {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut unique_keys = Vec::<String>::new();
-        let mut seen = HashSet::<String>::new();
-        for key in keys {
-            if seen.insert(key.clone()) {
-                unique_keys.push(key.clone());
-            }
-        }
+        let unique_keys = coalesce_storage_delete_keys(keys);
 
         let mut deleted = 0usize;
         #[cfg(feature = "rocksdb-ssd")]
@@ -3030,7 +3045,7 @@ impl StorageEngineMultiSsd {
 
         let mut routed = vec![Vec::<(usize, String)>::new(); self.storages.len()];
         for (unique_index, key) in unique_keys.iter().enumerate() {
-            let storage_index = Self::hash(key) as usize % self.storages.len();
+            let storage_index = Self::hash(&key) as usize % self.storages.len();
             routed[storage_index].push((unique_index, key.clone()));
         }
 
@@ -3088,14 +3103,11 @@ impl StorageEngineMultiSsd {
             return Ok(0);
         }
 
+        let unique_keys = coalesce_storage_delete_keys(keys);
         let mut routed = vec![Vec::<String>::new(); self.storages.len()];
-        let mut seen = HashSet::<String>::new();
-        for key in keys {
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let storage_index = Self::hash(key) as usize % self.storages.len();
-            routed[storage_index].push(key.clone());
+        for key in unique_keys {
+            let storage_index = Self::hash(&key) as usize % self.storages.len();
+            routed[storage_index].push(key);
         }
 
         let mut deleted = 0usize;
