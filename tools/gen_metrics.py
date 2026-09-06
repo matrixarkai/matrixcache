@@ -108,6 +108,8 @@ HELP = {
     "disk_bytes": "Bytes resident on SSD",
     "pinned_entries": "Entries currently pinned against eviction",
     "pinned_bytes": "Bytes held by pinned entries",
+    "shared_buffer_hits": "Read positions served through shared-buffer reads without value copies",
+    "shared_buffer_misses": "Shared-buffer read positions that missed all tiers",
     "hotness_promotions": "Entries that crossed the hotness threshold",
     "refill_failures": "Promotions into a faster tier that did not fit",
     "async_writeback_queue_depth": "Write-back jobs waiting",
