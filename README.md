@@ -178,6 +178,8 @@ and says what the number means:
 - `tools/run_scale_reports.py` -- runs the read/retrieval scale benchmarks
   above, validates each JSON report, and writes a manifest that points to the
   archived reports.
+- `tools/compare_scale_reports.py` -- compares two scale report manifests and
+  fails on configured latency or throughput regressions.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather
