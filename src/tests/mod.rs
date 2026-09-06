@@ -9411,6 +9411,35 @@ mod tests {
     }
 
     #[test]
+    fn get_shared_batch_memory_duplicates_share_buffer_and_account_once() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let repeated = CacheKey::string(7, "shared-batch-memory-repeated");
+        let other = CacheKey::string(7, "shared-batch-memory-other");
+        cache.put(repeated.clone(), b"repeated".to_vec()).unwrap();
+        cache.put(other.clone(), b"other".to_vec()).unwrap();
+
+        let before = cache.stats();
+        let values = cache
+            .get_shared_batch(&[repeated.clone(), other.clone(), repeated.clone()])
+            .unwrap();
+        let after = cache.stats();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].as_deref(), Some(&b"repeated"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"other"[..]));
+        assert_eq!(values[2].as_deref(), Some(&b"repeated"[..]));
+        assert!(
+            std::sync::Arc::ptr_eq(
+                values[0].as_ref().expect("first repeated"),
+                values[2].as_ref().expect("second repeated"),
+            ),
+            "duplicate positions should reuse the same memory buffer"
+        );
+        assert_eq!(after.memory_hits.saturating_sub(before.memory_hits), 2);
+        assert_eq!(after.disk_hits.saturating_sub(before.disk_hits), 0);
+    }
+
+    #[test]
     fn sharded_get_shared_batch_preserves_order() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
         let first = CacheKey::string(1, "shared-sharded-a");
