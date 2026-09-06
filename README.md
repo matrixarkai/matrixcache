@@ -46,8 +46,9 @@ cargo run --release --example rocksdb_backend_bench -- 5000
 
 The `rocksdb_backend_bench` example drives the multi-tier cache against the
 RocksDB SSD backend and prints a JSON report (backend, tier evictions, resident
-hot key count, cold SSD refills, PMEM soak activity, pressure and replacement-soak status) that is
-useful as local performance/behavior evidence.
+hot key count, cold SSD refills, PMEM soak activity, pressure and
+replacement-soak status, p99 latency, average latency, and QPS) that is useful
+as local performance/behavior evidence.
 
 ## Durability
 
