@@ -15,6 +15,8 @@ invalidation, and asynchronous writeback with backpressure accounting.
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
 - Admission policy, cross-tier eviction, and read-through refill.
 - Pinned (no-promotion) handles and pinned-acquire APIs.
+- Shared-buffer reads for retrieval and scan paths that can consume cached
+  bytes without copying them.
 - Asynchronous writeback with backpressure counters and cache-pressure helpers.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
