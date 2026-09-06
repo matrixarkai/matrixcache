@@ -2474,10 +2474,7 @@ impl MultiLayerCache {
             for key in keys {
                 self.emit_access_record(CacheAccessRecordKind::Get, key);
             }
-            if let Some(memory_results) = self.try_get_shared_memory_batch(keys, now_millis)? {
-                for (position, value) in memory_results.into_iter().enumerate() {
-                    results[position] = value;
-                }
+            if self.try_get_shared_memory_batch(keys, now_millis, results)? {
                 return Ok(());
             }
         }
@@ -2870,7 +2867,8 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
         now_millis: u64,
-    ) -> Result<Option<Vec<Option<Arc<[u8]>>>>, CacheError> {
+        results: &mut [Option<Arc<[u8]>>],
+    ) -> Result<bool, CacheError> {
         let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>, Instant)>::with_capacity(keys.len());
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
         {
@@ -2879,15 +2877,15 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             if inner.ssd_instance_only {
-                return Ok(None);
+                return Ok(false);
             }
             for key in keys {
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let Some(value) = inner.memory.get(key).cloned() else {
-                    return Ok(None);
+                    return Ok(false);
                 };
                 memory_hits.push((key, value, started));
             }
@@ -2921,11 +2919,10 @@ impl MultiLayerCache {
             }
         }
 
-        let mut results = Vec::with_capacity(keys.len());
-        for (_, value, _) in memory_hits {
-            results.push(Some(value));
+        for (position, (_, value, _)) in memory_hits.into_iter().enumerate() {
+            results[position] = Some(value);
         }
-        Ok(Some(results))
+        Ok(true)
     }
 
     pub fn get_with_tier(&self, key: &CacheKey) -> Result<Option<CacheReadResult>, CacheError> {
