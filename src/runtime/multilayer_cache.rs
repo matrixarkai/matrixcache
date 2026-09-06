@@ -5541,7 +5541,7 @@ impl ShardedMultiLayerCache {
 
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
         let result = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
+            let mut workers = Vec::with_capacity(fanout);
             for (index, group) in groups.into_iter().enumerate() {
                 if !group.is_empty() {
                     let shard = &self.shards[index];
@@ -7019,7 +7019,7 @@ impl ShardedMultiLayerCache {
             started,
             fanout,
             std::thread::scope(|scope| {
-            let mut workers = Vec::new();
+            let mut workers = Vec::with_capacity(fanout);
             for (index, group) in groups.into_iter().enumerate() {
                 if !group.is_empty() {
                     let shard = &self.shards[index];
@@ -7109,7 +7109,7 @@ impl ShardedMultiLayerCache {
         }
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
         let result = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
+            let mut workers = Vec::with_capacity(fanout);
             for (index, group) in groups.into_iter().enumerate() {
                 if !group.is_empty() {
                     let shard = &self.shards[index];
