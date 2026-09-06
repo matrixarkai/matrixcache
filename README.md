@@ -49,6 +49,9 @@ RocksDB SSD backend and prints a JSON report (backend, tier evictions, resident
 hot key count, cold SSD refills, PMEM soak activity, pressure and
 replacement-soak status, p99 latency, average latency, and QPS) that is useful
 as local performance/behavior evidence.
+Each archive also includes an `operator_log` object with the compact fields most
+useful in build logs and scale dashboards: pass/fail, QPS, average and p99
+latency, tier evictions, refills, and write-back backpressure.
 
 ## Durability
 

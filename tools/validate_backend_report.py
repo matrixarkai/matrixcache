@@ -35,6 +35,7 @@ REQUIRED_TOP_LEVEL = {
     "replacement_soak_passed": bool,
     "async_writeback_backpressure": int,
     "restart_disk_refill_ready": bool,
+    "operator_log": dict,
     "matrixcache_contract": dict,
     "matrixcache_contract_evidence": dict,
 }
@@ -79,6 +80,25 @@ REQUIRED_WORKLOAD = {
     "ssd_capacity_bytes",
     "placement_threshold_bytes",
     "replacement_soak_iterations",
+}
+
+REQUIRED_OPERATOR_LOG = {
+    "passed",
+    "put_qps",
+    "resident_hot_get_qps",
+    "hot_get_qps",
+    "cold_refill_qps",
+    "put_avg_us",
+    "hot_get_avg_us",
+    "cold_refill_avg_us",
+    "hot_get_p99_us",
+    "cold_refill_p99_us",
+    "memory_evictions",
+    "pmem_evictions",
+    "ssd_evictions",
+    "disk_fills",
+    "cold_ssd_refills",
+    "async_writeback_backpressure",
 }
 QPS_RELATIVE_TOLERANCE = 0.01
 
@@ -216,6 +236,49 @@ def validate_min_qps(data: dict[str, Any], field: str, minimum: float | None) ->
     qps = require_numeric_field(timing, "qps")
     if qps < minimum:
         fail(f"{field}.qps={qps:.2f} below {minimum:.2f}")
+
+
+def validate_operator_log(data: dict[str, Any]) -> None:
+    operator_log = data.get("operator_log")
+    if not isinstance(operator_log, dict):
+        fail("operator_log must be an object")
+    missing = REQUIRED_OPERATOR_LOG.difference(operator_log)
+    if missing:
+        fail(f"operator_log missing fields: {', '.join(sorted(missing))}")
+    expected = {
+        "passed": data["matrixcache_contract"]["passed"],
+        "put_qps": data["put"]["qps"],
+        "resident_hot_get_qps": data["resident_hot_get"]["qps"],
+        "hot_get_qps": data["hot_get"]["qps"],
+        "cold_refill_qps": data["cold_ssd_refill_get"]["qps"],
+        "put_avg_us": data["put"]["avg_us"],
+        "hot_get_avg_us": data["hot_get"]["avg_us"],
+        "cold_refill_avg_us": data["cold_ssd_refill_get"]["avg_us"],
+        "hot_get_p99_us": data["hot_get"]["p99_us"],
+        "cold_refill_p99_us": data["cold_ssd_refill_get"]["p99_us"],
+        "memory_evictions": data["memory_evictions"],
+        "pmem_evictions": data["pmem_evictions"],
+        "ssd_evictions": data["ssd_evictions"],
+        "disk_fills": data["disk_fills"],
+        "cold_ssd_refills": data["cold_ssd_refills"],
+        "async_writeback_backpressure": data["async_writeback_backpressure"],
+    }
+    for field, expected_value in expected.items():
+        value = operator_log.get(field)
+        if isinstance(expected_value, float):
+            if not isinstance(value, (int, float)):
+                fail(f"operator_log.{field} must be numeric")
+            delta = abs(float(value) - expected_value)
+            if delta > max(0.01, abs(expected_value) * QPS_RELATIVE_TOLERANCE):
+                fail(
+                    f"operator_log.{field}={float(value):.2f} disagrees "
+                    f"with detailed report value {expected_value:.2f}"
+                )
+        elif value != expected_value:
+            fail(
+                f"operator_log.{field}={value!r} disagrees "
+                f"with detailed report value {expected_value!r}"
+            )
 
 
 def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
@@ -406,6 +469,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     validate_min_qps(data, "cold_ssd_refill_get", args.min_cold_refill_qps)
 
     validate_contract(data, args.allow_failed)
+    validate_operator_log(data)
     return data
 
 

@@ -465,6 +465,18 @@ fn main() {
         soak.restart_disk_refill_ready
     )
     .expect("format report");
+    append_operator_log(
+        &mut report,
+        contract_passed,
+        put_timing,
+        resident_hot_timing,
+        hot_timing,
+        cold_timing,
+        cold_ssd_refills,
+        &stats,
+        soak.observed_async_writeback_backpressure,
+        true,
+    );
     writeln!(&mut report, "  \"matrixcache_contract\": {{").expect("format report");
     writeln!(
         &mut report,
@@ -727,6 +739,68 @@ fn append_timing(report: &mut String, name: &str, timing: Timing, trailing_comma
     writeln!(report, "    \"p50_ns\": {},", timing.p50_ns).expect("format report");
     writeln!(report, "    \"p95_ns\": {},", timing.p95_ns).expect("format report");
     writeln!(report, "    \"p99_ns\": {}", timing.p99_ns).expect("format report");
+    writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
+}
+
+fn append_operator_log(
+    report: &mut String,
+    passed: bool,
+    put_timing: Timing,
+    resident_hot_timing: Timing,
+    hot_timing: Timing,
+    cold_refill_timing: Timing,
+    cold_ssd_refills: usize,
+    stats: &matrixcache::CacheStats,
+    async_writeback_backpressure: u64,
+    trailing_comma: bool,
+) {
+    writeln!(report, "  \"operator_log\": {{").expect("format report");
+    writeln!(report, "    \"passed\": {},", passed).expect("format report");
+    writeln!(report, "    \"put_qps\": {:.2},", put_timing.qps).expect("format report");
+    writeln!(
+        report,
+        "    \"resident_hot_get_qps\": {:.2},",
+        resident_hot_timing.qps
+    )
+    .expect("format report");
+    writeln!(report, "    \"hot_get_qps\": {:.2},", hot_timing.qps).expect("format report");
+    writeln!(
+        report,
+        "    \"cold_refill_qps\": {:.2},",
+        cold_refill_timing.qps
+    )
+    .expect("format report");
+    writeln!(report, "    \"put_avg_us\": {},", put_timing.avg_us).expect("format report");
+    writeln!(report, "    \"hot_get_avg_us\": {},", hot_timing.avg_us).expect("format report");
+    writeln!(
+        report,
+        "    \"cold_refill_avg_us\": {},",
+        cold_refill_timing.avg_us
+    )
+    .expect("format report");
+    writeln!(report, "    \"hot_get_p99_us\": {},", hot_timing.p99_us).expect("format report");
+    writeln!(
+        report,
+        "    \"cold_refill_p99_us\": {},",
+        cold_refill_timing.p99_us
+    )
+    .expect("format report");
+    writeln!(
+        report,
+        "    \"memory_evictions\": {},",
+        stats.memory_evictions
+    )
+    .expect("format report");
+    writeln!(report, "    \"pmem_evictions\": {},", stats.pmem_evictions).expect("format report");
+    writeln!(report, "    \"ssd_evictions\": {},", stats.ssd_evictions).expect("format report");
+    writeln!(report, "    \"disk_fills\": {},", stats.disk_fills).expect("format report");
+    writeln!(report, "    \"cold_ssd_refills\": {},", cold_ssd_refills).expect("format report");
+    writeln!(
+        report,
+        "    \"async_writeback_backpressure\": {}",
+        async_writeback_backpressure
+    )
+    .expect("format report");
     writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
 }
 
