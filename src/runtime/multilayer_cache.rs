@@ -1268,14 +1268,6 @@ fn unique_cache_keys(keys: &[CacheKey]) -> Vec<CacheKey> {
     unique
 }
 
-fn has_duplicate_cache_key(keys: &[CacheKey]) -> bool {
-    for (index, key) in keys.iter().enumerate() {
-        if keys[..index].iter().any(|existing| existing == key) {
-            return true;
-        }
-    }
-    false
-}
 
 impl CacheManifestOp {
     #[cfg(not(feature = "rocksdb-ssd"))]
@@ -2731,9 +2723,6 @@ impl MultiLayerCache {
         keys: &[CacheKey],
         now_millis: u64,
     ) -> Result<Option<Vec<Option<Vec<u8>>>>, CacheError> {
-        if keys.len() > SMALL_BATCH_DEDUP_LIMIT || has_duplicate_cache_key(keys) {
-            return Ok(None);
-        }
         let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>, Instant)>::with_capacity(keys.len());
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
         {
