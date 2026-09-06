@@ -6006,6 +6006,19 @@ impl ShardedMultiLayerCache {
             aggregate.observed_disk_refills = aggregate
                 .observed_disk_refills
                 .saturating_add(report.observed_disk_refills);
+            aggregate.pmem_tier_configured |= report.pmem_tier_configured;
+            aggregate.observed_pmem_hits = aggregate
+                .observed_pmem_hits
+                .saturating_add(report.observed_pmem_hits);
+            aggregate.observed_pmem_fills = aggregate
+                .observed_pmem_fills
+                .saturating_add(report.observed_pmem_fills);
+            aggregate.observed_pmem_evictions = aggregate
+                .observed_pmem_evictions
+                .saturating_add(report.observed_pmem_evictions);
+            aggregate.observed_pmem_admissions = aggregate
+                .observed_pmem_admissions
+                .saturating_add(report.observed_pmem_admissions);
             aggregate.observed_async_writeback_backpressure = aggregate
                 .observed_async_writeback_backpressure
                 .saturating_add(report.observed_async_writeback_backpressure);
@@ -9302,6 +9315,10 @@ impl MultiLayerCache {
     }
 
     pub fn replacement_policy_soak(&self, iterations: usize) -> CacheReplacementPolicySoakReport {
+        let pmem_tier_configured = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.pmem_capacity_bytes > 0 && !inner.pmem_paths.is_empty()
+        };
         let hot_keys = (0..4)
             .map(|idx| CacheKey::page_with_slot(7, 1, idx * 8, 8, Some(3)))
             .collect::<Vec<_>>();
@@ -9321,7 +9338,11 @@ impl MultiLayerCache {
             cold_keys.push(cold);
         }
 
-        let restart_probe_key = cold_keys[0].clone();
+        let restart_probe_key = cold_keys
+            .iter()
+            .find(|key| self.peek_tier(key) == Some(CacheReadTier::Ssd))
+            .cloned()
+            .unwrap_or_else(|| cold_keys[0].clone());
         let restart_probe_value = self.get(&restart_probe_key).ok().flatten();
         let (memory_capacity_bytes, disk_dir) = {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -9349,6 +9370,18 @@ impl MultiLayerCache {
             .iter()
             .filter(|key| recent_cold.contains(*key) && self.get_memory(key).is_some())
             .count();
+        let pmem_probe = if pmem_tier_configured {
+            cold_keys
+                .iter()
+                .rev()
+                .find(|key| self.peek_tier(key) == Some(CacheReadTier::Pmem))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(key) = pmem_probe.as_ref() {
+            let _ = self.get(key);
+        }
         self.set_async_writeback_queue_limit_for_test(1);
         let _ = self.enqueue_async_writeback(
             CacheKey::page_with_slot(7, 999, 0, 8, Some(9)),
@@ -9400,6 +9433,7 @@ impl MultiLayerCache {
             iterations,
             hot_key_count: hot_keys.len(),
             cold_key_count: cold_keys.len(),
+            pmem_tier_configured,
             hot_memory_survivors,
             cold_memory_survivors,
             pinned_memory_survived: self.get_memory(&pinned_key).is_some(),
@@ -9407,6 +9441,10 @@ impl MultiLayerCache {
             observed_evictions: stats.memory_evictions,
             observed_pinned_skips: stats.eviction_pinned_skips,
             observed_disk_refills: stats.disk_hits,
+            observed_pmem_hits: stats.pmem_hits,
+            observed_pmem_fills: stats.pmem_fills,
+            observed_pmem_evictions: stats.pmem_evictions,
+            observed_pmem_admissions: stats.pmem_admission_accepted,
             observed_async_writeback_backpressure: stats.async_writeback_backpressure_rejections,
             async_writeback_max_queue_depth: stats.async_writeback_max_queue_depth,
             async_writeback_max_queue_bytes: stats.async_writeback_max_queue_bytes,
@@ -9456,6 +9494,16 @@ impl MultiLayerCache {
             report
                 .reasons
                 .push("missing_disk_refill_observation".to_string());
+        }
+        if report.pmem_tier_configured
+            && (report.observed_pmem_hits == 0
+                || report.observed_pmem_fills == 0
+                || report.observed_pmem_evictions == 0
+                || report.observed_pmem_admissions == 0)
+        {
+            report
+                .reasons
+                .push("missing_pmem_tier_activity".to_string());
         }
         if !report.restart_disk_refill_ready {
             report

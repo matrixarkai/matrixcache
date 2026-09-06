@@ -8521,6 +8521,45 @@ mod tests {
 
     // shared-corpus: storage_cache_replacement_policy_soak
     #[test]
+    fn replacement_policy_soak_reports_three_tier_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 48,
+            pmem_capacity_bytes: 32,
+            ssd_capacity_bytes: 4096,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 1024 * 1024,
+            memory_hotness_threshold: 99,
+            pmem_admit_hotness_threshold: 99,
+            ssd_admit_hotness_threshold: 99,
+            max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 64,
+            max_ssd_block_bytes: 4096,
+            ssd_write_through: false,
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            },
+        );
+        cache.set_pmem_paths(vec![dir.path().join("pmem")]);
+
+        let report = cache.replacement_policy_soak(128);
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.pmem_tier_configured);
+        assert!(report.observed_pmem_admissions > 0, "{report:?}");
+        assert!(report.observed_pmem_fills > 0, "{report:?}");
+        assert!(report.observed_pmem_evictions > 0, "{report:?}");
+        assert!(report.observed_pmem_hits > 0, "{report:?}");
+        assert!(report.observed_disk_refills > 0, "{report:?}");
+    }
+
+    // shared-corpus: storage_cache_replacement_policy_soak
+    #[test]
     fn sharded_replacement_policy_soak_aggregates_all_shards() {
         let cache = MatrixCacheBuilder::build_sharded_cache(
             CacheOptions::new(96, 0, 8192)

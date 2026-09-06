@@ -23,6 +23,8 @@ pub struct CacheReplacementPolicySoakReport {
     pub iterations: usize,
     pub hot_key_count: usize,
     pub cold_key_count: usize,
+    #[serde(default)]
+    pub pmem_tier_configured: bool,
     pub hot_memory_survivors: usize,
     pub cold_memory_survivors: usize,
     pub pinned_memory_survived: bool,
@@ -30,6 +32,14 @@ pub struct CacheReplacementPolicySoakReport {
     pub observed_evictions: u64,
     pub observed_pinned_skips: u64,
     pub observed_disk_refills: u64,
+    #[serde(default)]
+    pub observed_pmem_hits: u64,
+    #[serde(default)]
+    pub observed_pmem_fills: u64,
+    #[serde(default)]
+    pub observed_pmem_evictions: u64,
+    #[serde(default)]
+    pub observed_pmem_admissions: u64,
     #[serde(default)]
     pub observed_async_writeback_backpressure: u64,
     #[serde(default)]
