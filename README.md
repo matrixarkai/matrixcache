@@ -169,6 +169,9 @@ and says what the number means:
   shared-buffer reads, no-promotion scans, pinned acquire reads, and sharded
   colocated reads. Add `--json-output <path>` to archive a machine-readable
   report, then validate it with `tools/validate_batch_read_report.py`.
+- `batch_concurrency_bench` -- concurrent batch-read throughput benchmark.
+  Add `--json-output <path>` to archive scale evidence and validate it with
+  `tools/validate_batch_concurrency_report.py`.
 
 Benchmarks that report a ratio measure both sides inside one pass and print the
 spread across passes. A run whose spread is wide measured the machine rather
