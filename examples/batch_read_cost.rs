@@ -230,7 +230,7 @@ fn main() {
                             .acquire_batch_no_promotion(chunk)
                             .expect("acquire_batch_no_promotion");
                         served += handles.iter().filter(|handle| handle.is_some()).count();
-                        cache.release_batch(handles.into_iter().flatten().collect());
+                        cache.release_batch_iter(handles.into_iter().flatten());
                     }
                     assert_eq!(served, RESIDENT, "every key should have hit memory");
                     started.elapsed().as_nanos() as f64 / RESIDENT as f64
@@ -280,7 +280,7 @@ fn main() {
                             .acquire_batch_no_promotion(chunk)
                             .expect("sharded acquire_batch_no_promotion");
                         served += handles.iter().filter(|handle| handle.is_some()).count();
-                        sharded.release_batch(handles.into_iter().flatten().collect());
+                        sharded.release_batch_iter(handles.into_iter().flatten());
                     }
                     assert_eq!(served, RESIDENT, "every key should have hit sharded memory");
                     started.elapsed().as_nanos() as f64 / RESIDENT as f64
@@ -297,7 +297,7 @@ fn main() {
                             .acquire_batch_no_promotion(chunk)
                             .expect("sharded colocated acquire_batch_no_promotion");
                         served += handles.iter().filter(|handle| handle.is_some()).count();
-                        sharded_colocated.release_batch(handles.into_iter().flatten().collect());
+                        sharded_colocated.release_batch_iter(handles.into_iter().flatten());
                     }
                     assert_eq!(
                         served, COLOCATED_RESIDENT,
