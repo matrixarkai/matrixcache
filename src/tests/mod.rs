@@ -3425,6 +3425,381 @@ mod tests {
         assert_eq!(response.GetResponse(), b"v");
     }
 
+    fn cluster_test_key(index: u32) -> CacheKey {
+        CacheKey::string(u64::from(index % 16), &format!("record-{index}"))
+    }
+
+    fn cluster_of(size: usize) -> CacheClusterTopology {
+        let names: Vec<String> = (0..size).map(|i| format!("cache-{i:04}")).collect();
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes(names.iter().map(|name| (name.as_str(), 1)))
+            .expect("distinct names and real weights");
+        cluster
+    }
+
+    #[test]
+    fn cluster_routing_does_not_depend_on_how_the_cluster_was_assembled() {
+        // Two nodes that assembled their view of the membership in different
+        // orders have to agree about every key, or each serves what the other
+        // is storing.
+        let mut forwards = CacheClusterTopology::new();
+        let mut backwards = CacheClusterTopology::new();
+        let names = ["cache-a", "cache-b", "cache-c", "cache-d"];
+        for name in names {
+            forwards.add_node(name, 1).expect("a distinct name");
+        }
+        for name in names.iter().rev() {
+            backwards.add_node(name, 1).expect("a distinct name");
+        }
+        // And a third that arrived at the same membership through a failure.
+        let mut via_failure = CacheClusterTopology::new();
+        for name in ["cache-c", "cache-z", "cache-a", "cache-d", "cache-b"] {
+            via_failure.add_node(name, 1).expect("a distinct name");
+        }
+        assert!(via_failure.remove_node("cache-z"));
+
+        for index in 0..5_000 {
+            let key = cluster_test_key(index);
+            let owner = forwards.owner(&key).expect("a live cluster owns every key");
+            assert_eq!(backwards.owner(&key), Some(owner));
+            assert_eq!(via_failure.owner(&key), Some(owner));
+        }
+    }
+
+    #[test]
+    fn cluster_adding_a_node_moves_only_the_share_that_becomes_its_own() {
+        // The whole reason a cache cluster is not addressed with `% node_count`.
+        let keys: Vec<CacheKey> = (0..100_000).map(cluster_test_key).collect();
+
+        let before = cluster_of(8);
+        let owners_before: Vec<String> = keys
+            .iter()
+            .map(|key| before.owner(key).expect("owned").to_string())
+            .collect();
+
+        let mut after = cluster_of(8);
+        after.add_node("cache-new", 1).expect("a distinct name");
+
+        let mut moved = 0_usize;
+        for (key, was) in keys.iter().zip(&owners_before) {
+            let now = after.owner(key).expect("owned");
+            if now != was {
+                moved += 1;
+                assert_eq!(
+                    now, "cache-new",
+                    "a key moved between two nodes that were both already there, \
+                     which is work no one asked for and a window where neither \
+                     node is the owner"
+                );
+            }
+        }
+
+        // One ninth of the keys belong to the ninth node.
+        let share = moved as f64 / keys.len() as f64;
+        let ideal = 1.0 / 9.0;
+        assert!(
+            share > ideal * 0.6 && share < ideal * 1.6,
+            "moved {share:.4} of the keys, wanted about {ideal:.4}"
+        );
+
+        // What the arithmetic this replaces would have done with the same keys.
+        let modulo_moved = keys
+            .iter()
+            .filter(|key| {
+                let hash = cache_key_route_hash(key);
+                hash % 8 != hash % 9
+            })
+            .count();
+        let modulo_share = modulo_moved as f64 / keys.len() as f64;
+        assert!(
+            modulo_share > 0.8,
+            "the modulo comparison is the point of the test and it moved only \
+             {modulo_share:.4}"
+        );
+        println!(
+            "one node joins 8: ring moves {:.2}% of keys, modulo moves {:.2}%",
+            share * 100.0,
+            modulo_share * 100.0
+        );
+    }
+
+    #[test]
+    fn cluster_losing_a_node_moves_only_what_that_node_held() {
+        let keys: Vec<CacheKey> = (0..50_000).map(cluster_test_key).collect();
+        let mut cluster = cluster_of(10);
+        let owners_before: Vec<String> = keys
+            .iter()
+            .map(|key| cluster.owner(key).expect("owned").to_string())
+            .collect();
+
+        assert!(cluster.set_node_state("cache-0003", CacheNodeState::Down));
+        assert_eq!(cluster.live_node_count(), 9);
+        assert_eq!(
+            cluster.member_count(),
+            10,
+            "a node that is down is still a member; that is how it comes back"
+        );
+
+        for (key, was) in keys.iter().zip(&owners_before) {
+            let now = cluster.owner(key).expect("nine nodes are still live");
+            if was == "cache-0003" {
+                assert_ne!(now, "cache-0003", "a node that is down owns nothing");
+            } else {
+                assert_eq!(
+                    now, was,
+                    "losing one node disturbed a key that was not on it"
+                );
+            }
+        }
+
+        // And it comes back to exactly what it had.
+        assert!(cluster.set_node_state("cache-0003", CacheNodeState::Live));
+        for (key, was) in keys.iter().zip(&owners_before) {
+            assert_eq!(cluster.owner(key), Some(was.as_str()));
+        }
+    }
+
+    #[test]
+    fn cluster_spreads_a_large_key_space_across_a_large_cluster() {
+        // A thousand nodes built in one pass, which is why `add_nodes` exists:
+        // adding them one at a time rebuilds a thousand rings to reach the same
+        // shape.
+        let nodes = 1_000;
+        let cluster = cluster_of(nodes);
+        assert_eq!(cluster.live_node_count(), nodes);
+        assert_eq!(
+            cluster.ring_point_count(),
+            nodes * CACHE_RING_POINTS_PER_WEIGHT as usize
+        );
+
+        let keys = 200_000_u32;
+        let mut load: HashMap<&str, u32> = HashMap::new();
+        for index in 0..keys {
+            let key = cluster_test_key(index);
+            *load.entry(cluster.owner(&key).expect("owned")).or_insert(0) += 1;
+        }
+
+        assert_eq!(
+            load.len(),
+            nodes,
+            "every node in a cluster this size should have been given something"
+        );
+        let mean = f64::from(keys) / nodes as f64;
+        let peak = f64::from(*load.values().max().expect("a thousand entries"));
+        let trough = f64::from(*load.values().min().expect("a thousand entries"));
+        println!(
+            "1000 nodes, {keys} keys: mean {mean:.1}, peak {peak:.0} ({:.2}x), \
+             trough {trough:.0} ({:.2}x)",
+            peak / mean,
+            trough / mean
+        );
+        // Sampling noise alone puts the peak of a thousand Poisson draws of
+        // mean 200 around 1.25x, so the bound is on the ring, not on the draw.
+        assert!(
+            peak / mean < 1.5,
+            "the busiest node holds {:.2}x its share",
+            peak / mean
+        );
+        assert!(
+            trough / mean > 0.55,
+            "the quietest node holds {:.2}x its share",
+            trough / mean
+        );
+    }
+
+    #[test]
+    fn cluster_copies_land_on_distinct_nodes() {
+        let cluster = cluster_of(6);
+        for index in 0..2_000 {
+            let key = cluster_test_key(index);
+            let owners = cluster.owners(&key, 3);
+            assert_eq!(owners.len(), 3);
+            assert_eq!(
+                owners[0],
+                cluster.owner(&key).expect("owned"),
+                "the first copy is the owner"
+            );
+            let distinct: HashSet<&str> = owners.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                3,
+                "a second copy on the same node is not a copy"
+            );
+        }
+
+        // Asking for more copies than there are nodes gets every node once.
+        let small = cluster_of(2);
+        let owners = small.owners(&cluster_test_key(7), 5);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(
+            owners.iter().collect::<HashSet<_>>().len(),
+            2,
+            "still no duplicates"
+        );
+
+        let empty = CacheClusterTopology::new();
+        assert_eq!(empty.owner(&cluster_test_key(1)), None);
+        assert!(empty.owners(&cluster_test_key(1), 3).is_empty());
+    }
+
+    #[test]
+    fn cluster_weight_buys_a_proportional_share() {
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes([("small-a", 1), ("small-b", 1), ("large", 4)])
+            .expect("distinct names");
+        assert_eq!(
+            cluster.ring_point_count(),
+            6 * CACHE_RING_POINTS_PER_WEIGHT as usize,
+            "a node of weight four takes four nodes' worth of ring"
+        );
+
+        let keys = 60_000_u32;
+        let mut load: HashMap<&str, u32> = HashMap::new();
+        for index in 0..keys {
+            let key = cluster_test_key(index);
+            *load.entry(cluster.owner(&key).expect("owned")).or_insert(0) += 1;
+        }
+        let large = f64::from(load["large"]);
+        let small = f64::from(load["small-a"] + load["small-b"]);
+        // Four units against two: the large node should hold twice the pair.
+        assert!(
+            large / small > 1.6 && large / small < 2.5,
+            "the weighted node holds {:.2}x the two others, wanted about 2",
+            large / small
+        );
+    }
+
+    #[test]
+    fn cluster_refuses_a_name_that_is_taken_or_a_node_of_no_weight() {
+        let mut cluster = CacheClusterTopology::new();
+        cluster.add_node("cache-a", 1).expect("the first of its name");
+
+        let repeated = cluster.add_node("cache-a", 2).expect_err("a repeated name");
+        assert!(matches!(repeated, CacheError::InvalidConfig(_)));
+        let weightless = cluster.add_node("cache-b", 0).expect_err("no weight");
+        assert!(matches!(weightless, CacheError::InvalidConfig(_)));
+        let nameless = cluster.add_node("", 1).expect_err("no name");
+        assert!(matches!(nameless, CacheError::InvalidConfig(_)));
+        assert_eq!(cluster.member_count(), 1, "nothing was half-added");
+
+        // A batch that fails leaves the cluster exactly as it was.
+        let batch = cluster
+            .add_nodes([("cache-c", 1), ("cache-d", 0)])
+            .expect_err("a weightless node in the batch");
+        assert!(matches!(batch, CacheError::InvalidConfig(_)));
+        assert_eq!(cluster.member_count(), 1, "the good half did not join either");
+        assert!(cluster.node("cache-c").is_none());
+
+        let repeated_in_batch = cluster
+            .add_nodes([("cache-e", 1), ("cache-e", 1)])
+            .expect_err("the same name twice in one batch");
+        assert!(matches!(repeated_in_batch, CacheError::InvalidConfig(_)));
+        assert_eq!(cluster.member_count(), 1);
+
+        assert!(!cluster.remove_node("cache-z"));
+        assert!(!cluster.set_node_state("cache-z", CacheNodeState::Down));
+
+        // A ring asked for no points per node would own nothing and answer
+        // every lookup with None, however many nodes had joined.
+        let mut thin = CacheClusterTopology::with_points_per_weight(0);
+        thin.add_node("only", 1).expect("the first of its name");
+        assert_eq!(thin.owner(&cluster_test_key(1)), Some("only"));
+    }
+
+    #[test]
+    fn cluster_routing_bytes_keep_the_fields_apart() {
+        // Plain concatenation would give these two the same bytes, so they
+        // would route to one node and each would answer for the other.
+        let split_early = CacheKey {
+            shard_id: 0,
+            record_key: "ab".to_string(),
+            namespace: std::borrow::Cow::Borrowed("string"),
+            selector: "c".to_string(),
+        };
+        let split_late = CacheKey {
+            shard_id: 0,
+            record_key: "a".to_string(),
+            namespace: std::borrow::Cow::Borrowed("string"),
+            selector: "bc".to_string(),
+        };
+        assert_ne!(split_early, split_late);
+        assert_ne!(
+            cache_key_routing_bytes(&split_early),
+            cache_key_routing_bytes(&split_late),
+            "a character moved across the record key / selector boundary"
+        );
+
+        // And a zero byte separator would not have been enough, because a
+        // `String` can hold one.
+        let zero_in_record = CacheKey {
+            shard_id: 0,
+            record_key: "a\u{0}b".to_string(),
+            namespace: std::borrow::Cow::Borrowed("string"),
+            selector: "c".to_string(),
+        };
+        let zero_in_selector = CacheKey {
+            shard_id: 0,
+            record_key: "a".to_string(),
+            namespace: std::borrow::Cow::Borrowed("string"),
+            selector: "b\u{0}c".to_string(),
+        };
+        assert_ne!(zero_in_record, zero_in_selector);
+        assert_ne!(
+            cache_key_routing_bytes(&zero_in_record),
+            cache_key_routing_bytes(&zero_in_selector),
+            "the separating byte appeared inside a field"
+        );
+
+        // The namespace is variable length too.
+        let long_namespace = CacheKey {
+            shard_id: 0,
+            record_key: "b".to_string(),
+            namespace: std::borrow::Cow::Borrowed("ab"),
+            selector: "value".to_string(),
+        };
+        let short_namespace = CacheKey {
+            shard_id: 0,
+            record_key: "b".to_string(),
+            namespace: std::borrow::Cow::Borrowed("a"),
+            selector: "value".to_string(),
+        };
+        assert_ne!(
+            cache_key_routing_bytes(&long_namespace),
+            cache_key_routing_bytes(&short_namespace)
+        );
+
+        // The shard is part of the key, so it is part of the route.
+        let shard_zero = CacheKey::string(0, "record");
+        let shard_one = CacheKey::string(1, "record");
+        assert_ne!(
+            cache_key_route_hash(&shard_zero),
+            cache_key_route_hash(&shard_one)
+        );
+
+        // The same key is the same route, every time it is asked.
+        assert_eq!(
+            cache_key_route_hash(&CacheKey::string(3, "record")),
+            cache_key_route_hash(&CacheKey::string(3, "record"))
+        );
+    }
+
+    #[test]
+    fn cluster_route_hash_is_a_fixed_value_not_a_run_of_the_day() {
+        // Where data lives depends on these numbers. If a change to the hash
+        // moves them, every cluster using it has to be told, so they are
+        // written down rather than recomputed.
+        assert_eq!(cache_route_hash(b""), 4_119_650_384_134_384_807);
+        assert_eq!(cache_route_hash(b"cache-0000#0"), 4_738_340_529_805_345_056);
+        // A length that is not a multiple of eight, so the tail is covered too.
+        assert_eq!(
+            mur_mur_hash2_64a(b"the quick brown fox", 0),
+            9_881_903_597_422_184_562
+        );
+        assert_eq!(mur_mur_hash2_64a(b"hello", 0), 0x1e68_d17c_457b_f117);
+    }
+
     #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();

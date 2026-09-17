@@ -26,7 +26,7 @@
 //! `--no-default-features` for a lightweight file-backed compatibility store.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(not(feature = "rocksdb-ssd"))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -61,5 +61,6 @@ include!("core/metrics.rs");
 include!("core/write_budget.rs");
 include!("core/health.rs");
 include!("core/config_check.rs");
+include!("core/cluster.rs");
 include!("core/legacy_names.rs");
 include!("tests/mod.rs");

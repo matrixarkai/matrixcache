@@ -123,6 +123,51 @@ tier that was never flushed, or a shard count that makes a tier refuse values
 it has room for. `MultiLayerCache::try_with_options` refuses the findings that
 mean the cache cannot do its job and starts anyway on the rest.
 
+## Placing keys on a cluster
+
+One cache picks the shard for a key with `hash(key) % shard_count`, which holds
+up because a shard count is fixed for the life of the cache. Across machines
+neither half survives. The node count changes while data is live, and `% n`
+reassigns nearly every key when it does; and the hash behind it,
+`DefaultHasher`, is documented as changing between releases, so two nodes on
+different builds would not agree about where anything lives.
+
+`CacheClusterTopology` answers the same question with a hash ring:
+
+```rust
+use matrixcache::{CacheClusterTopology, CacheKey, CacheNodeState};
+
+let mut cluster = CacheClusterTopology::new();
+cluster.add_nodes([("cache-a", 1), ("cache-b", 1), ("cache-big", 4)])?;
+
+let key = CacheKey::string(0, "greeting");
+let owner = cluster.owner(&key);              // where it lives
+let copies = cluster.owners(&key, 3);         // and its two backups, elsewhere
+
+cluster.set_node_state("cache-b", CacheNodeState::Down);   // its keys move on
+cluster.set_node_state("cache-b", CacheNodeState::Live);   // and come back
+```
+
+What it costs when membership changes, over 100,000 keys and a ninth node
+joining eight:
+
+| | keys reassigned |
+| --- | --- |
+| `hash % node_count` | 88.9% |
+| this ring | 12.1% |
+
+An ideal reassignment is 1/9, or 11.1%. Every key that moves, moves *to* the
+new node: none is shuffled between two nodes that were both already there.
+
+Weight is relative capacity -- `cache-big` above takes four ordinary nodes'
+worth of the key space. A node marked `Down` keeps its membership and owns
+nothing, so its keys pass to the next node on the ring and every other key
+stays put; marking it `Live` again restores exactly what it had.
+
+At 1,000 nodes and 200,000 keys the busiest node holds 1.40x its share and the
+quietest 0.70x, most of which is the sampling noise of 200 keys per node rather
+than the ring.
+
 ## Measuring
 
 The examples are measurements rather than demonstrations. Each prints a table
