@@ -94,6 +94,8 @@ fn option_f64_json(value: Option<f64>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+// Reporting helper: the arguments are the measurements being written out.
+#[allow(clippy::too_many_arguments)]
 fn write_json_report(
     path: Option<&PathBuf>,
     entries: usize,

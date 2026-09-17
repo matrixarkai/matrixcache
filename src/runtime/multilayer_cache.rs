@@ -9,6 +9,8 @@ fn average_latency_us(total_us: u64, count: u64) -> u64 {
     }
 }
 
+// Same shape as percentile_seconds: the arguments are one histogram's buckets.
+#[allow(clippy::too_many_arguments)]
 fn latency_percentile_us(
     count: u64,
     le_10us: u64,
@@ -5983,6 +5985,9 @@ impl ShardedMultiLayerCache {
             .sum()
     }
 
+    // Thirty-one fields are read out of separate atomics and assigned in
+    // turn; struct-init syntax would not read better here.
+    #[allow(clippy::field_reassign_with_default)]
     pub fn stats(&self) -> CacheStats {
         let mut total = CacheStats::default();
 
