@@ -9,6 +9,7 @@ fn average_latency_us(total_us: u64, count: u64) -> u64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn latency_percentile_us(
     count: u64,
     le_10us: u64,
@@ -5984,56 +5985,30 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn stats(&self) -> CacheStats {
-        let mut total = CacheStats::default();
-
-        total.sharded_batch_fanout_operations = self
-            .sharded_stats
-            .fanout_operations
-            .load(Ordering::Relaxed);
-        total.sharded_batch_local_operations = self
-            .sharded_stats
-            .local_operations
-            .load(Ordering::Relaxed);
-        total.sharded_batch_fanout_shards = self
-            .sharded_stats
-            .fanout_shards
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_samples = self.sharded_stats.latency.samples();
-        total.sharded_batch_latency_total_micros = self
-            .sharded_stats
-            .latency
-            .total_micros
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_max_micros = self
-            .sharded_stats
-            .latency
-            .max_micros
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_le_10us = self
-            .sharded_stats
-            .latency
-            .le_10us
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_le_100us = self
-            .sharded_stats
-            .latency
-            .le_100us
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_le_1ms = self
-            .sharded_stats
-            .latency
-            .le_1ms
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_le_10ms = self
-            .sharded_stats
-            .latency
-            .le_10ms
-            .load(Ordering::Relaxed);
-        total.sharded_batch_latency_gt_10ms = self
-            .sharded_stats
-            .latency
-            .gt_10ms
-            .load(Ordering::Relaxed);
+        // The sharded counters live on the cache rather than on any shard, so
+        // they are read here and the per-shard fold below adds to them. Every
+        // other field starts at its default and is filled by that fold.
+        let latency = &self.sharded_stats.latency;
+        let mut total = CacheStats {
+            sharded_batch_fanout_operations: self
+                .sharded_stats
+                .fanout_operations
+                .load(Ordering::Relaxed),
+            sharded_batch_local_operations: self
+                .sharded_stats
+                .local_operations
+                .load(Ordering::Relaxed),
+            sharded_batch_fanout_shards: self.sharded_stats.fanout_shards.load(Ordering::Relaxed),
+            sharded_batch_latency_samples: latency.samples(),
+            sharded_batch_latency_total_micros: latency.total_micros.load(Ordering::Relaxed),
+            sharded_batch_latency_max_micros: latency.max_micros.load(Ordering::Relaxed),
+            sharded_batch_latency_le_10us: latency.le_10us.load(Ordering::Relaxed),
+            sharded_batch_latency_le_100us: latency.le_100us.load(Ordering::Relaxed),
+            sharded_batch_latency_le_1ms: latency.le_1ms.load(Ordering::Relaxed),
+            sharded_batch_latency_le_10ms: latency.le_10ms.load(Ordering::Relaxed),
+            sharded_batch_latency_gt_10ms: latency.gt_10ms.load(Ordering::Relaxed),
+            ..Default::default()
+        };
 
         for shard in self.shards.iter() {
             let stats = shard.stats();

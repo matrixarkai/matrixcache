@@ -771,6 +771,7 @@ fn append_timing(report: &mut String, name: &str, timing: Timing, trailing_comma
     writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_operator_log(
     report: &mut String,
     passed: bool,
@@ -842,6 +843,7 @@ fn append_operator_log(
     writeln!(report, "  }}{}", if trailing_comma { "," } else { "" }).expect("format report");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn operator_logfmt_line(
     prefix: &str,
     passed: bool,
