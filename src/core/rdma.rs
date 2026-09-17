@@ -614,6 +614,18 @@ pub fn EntryCRC(entry: &RdmaIndexEntry) -> u8 {
 pub struct RdmaBucketHeader {
     fingerprints: [u8; RDMA_BUCKET_CAP],
     bitmap: u16,
+    /// Where the next eviction starts looking.
+    ///
+    /// Without it a full bucket picks its lowest occupied slot every time, and
+    /// since the incoming entry takes the slot it just freed, that is the same
+    /// slot forever: the bucket keeps fifteen entries but only one of them can
+    /// ever change.
+    ///
+    /// Defaulted on the way in, so a header serialised before this field
+    /// existed still reads back -- it starts its hand at slot 0, which is where
+    /// it would have been anyway.
+    #[serde(default)]
+    next_victim: u8,
 }
 
 impl Default for RdmaBucketHeader {
@@ -621,6 +633,7 @@ impl Default for RdmaBucketHeader {
         Self {
             fingerprints: [0; RDMA_BUCKET_CAP],
             bitmap: 0,
+            next_victim: 0,
         }
     }
 }
@@ -637,6 +650,11 @@ impl RdmaBucketHeader {
 
     pub fn fingerprint(&self, pos: usize) -> Option<u8> {
         self.fingerprints.get(pos).copied()
+    }
+
+    /// The slot the next eviction from this bucket starts at.
+    pub fn next_victim(&self) -> usize {
+        self.next_victim as usize % RDMA_BUCKET_CAP
     }
 }
 
@@ -753,12 +771,33 @@ where
     ///
     /// Clearing an entry is the only record of where its block is, so a caller
     /// that has to free that block needs to read the entry first.
+    ///
+    /// The search starts at the bucket's own hand and wraps, so consecutive
+    /// evictions work their way round the bucket rather than returning to its
+    /// lowest slot. Unoccupied slots are skipped: an eviction is asked for
+    /// because room is needed, and clearing an already-empty slot would not
+    /// make any.
     pub fn eviction_candidate(&self) -> usize {
-        self.keys
-            .iter()
-            .position(Option::is_some)
-            .unwrap_or(0)
-            .min(RDMA_BUCKET_CAP - 1)
+        let start = self.metadata.next_victim();
+        for step in 0..RDMA_BUCKET_CAP {
+            let pos = (start + step) % RDMA_BUCKET_CAP;
+            if self.keys[pos].is_some() {
+                return pos;
+            }
+        }
+        start
+    }
+
+    /// Evicts the candidate and hands back what it held, moving the hand on.
+    ///
+    /// The returned entry is the caller's last chance to learn where the
+    /// evicted block lives; once it is cleared, nothing points at that block.
+    pub fn take_eviction_candidate(&mut self) -> (usize, RdmaIndexEntry) {
+        let pos = self.eviction_candidate();
+        let evicted = self.entries[pos].clone();
+        self.clear_entry(pos);
+        self.metadata.next_victim = ((pos + 1) % RDMA_BUCKET_CAP) as u8;
+        (pos, evicted)
     }
 
     #[allow(non_snake_case)]
@@ -767,9 +806,7 @@ where
     }
 
     pub fn evict_entry(&mut self) -> usize {
-        let pos = self.eviction_candidate();
-        self.clear_entry(pos);
-        pos
+        self.take_eviction_candidate().0
     }
 
     #[allow(non_snake_case)]
@@ -935,12 +972,10 @@ where
                 // reports the value it replaced -- otherwise the block stays in
                 // the storage engine, counted against capacity, with nothing
                 // left that could ever free it.
-                let victim = bucket.eviction_candidate();
-                let evicted = &bucket.entries[victim];
+                let (victim, evicted) = bucket.take_eviction_candidate();
                 old_addr = Some(evicted.ptr());
                 old_len = evicted.length().max(0) as usize;
                 old_type = evicted.storage_engine_type();
-                bucket.clear_entry(victim);
                 victim
             };
             bucket.occupy_entry(pos);
