@@ -749,13 +749,25 @@ where
         self.clear_entry(pos);
     }
 
-    pub fn evict_entry(&mut self) -> usize {
-        let pos = self
-            .keys
+    /// Which entry a full bucket would evict, without evicting it.
+    ///
+    /// Clearing an entry is the only record of where its block is, so a caller
+    /// that has to free that block needs to read the entry first.
+    pub fn eviction_candidate(&self) -> usize {
+        self.keys
             .iter()
             .position(Option::is_some)
             .unwrap_or(0)
-            .min(RDMA_BUCKET_CAP - 1);
+            .min(RDMA_BUCKET_CAP - 1)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn GetEvictionCandidate(&self) -> usize {
+        self.eviction_candidate()
+    }
+
+    pub fn evict_entry(&mut self) -> usize {
+        let pos = self.eviction_candidate();
         self.clear_entry(pos);
         pos
     }
@@ -809,6 +821,12 @@ pub struct RdmaHashTableGet {
     pub storage_type: RdmaStorageEngineKind,
 }
 
+/// What a put displaced, and therefore what its caller now has to free.
+///
+/// `old_addr` names a block the index no longer points at: either the previous
+/// value of this key, or the entry a full bucket evicted to make room. Both
+/// leave a block behind in a storage engine, and clearing the entry is the last
+/// moment anything knows where that block is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaHashTablePut {
     pub status: i32,
@@ -911,7 +929,19 @@ where
             let pos = if empty >= 0 {
                 empty as usize
             } else {
-                bucket.evict_entry()
+                // A full bucket makes room by evicting, and the evicted entry
+                // is the only thing that knows where its block is. Read it
+                // before clearing it, and report it the same way an overwrite
+                // reports the value it replaced -- otherwise the block stays in
+                // the storage engine, counted against capacity, with nothing
+                // left that could ever free it.
+                let victim = bucket.eviction_candidate();
+                let evicted = &bucket.entries[victim];
+                old_addr = Some(evicted.ptr());
+                old_len = evicted.length().max(0) as usize;
+                old_type = evicted.storage_engine_type();
+                bucket.clear_entry(victim);
+                victim
             };
             bucket.occupy_entry(pos);
             bucket.keys[pos] = Some(key.clone());

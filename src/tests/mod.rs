@@ -3426,6 +3426,76 @@ mod tests {
     }
 
     #[test]
+    fn rdma_bucket_eviction_reports_the_block_it_displaced() {
+        // One bucket, so the sixteenth key has to evict one of the fifteen.
+        let mut table = RdmaHashTable::<Vec<u8>>::new(1);
+        let mut addrs = Vec::new();
+        for i in 0..RDMA_BUCKET_CAP {
+            let addr = 0x1000 + i as AllocatorAddress;
+            addrs.push(addr);
+            let put = table.put(
+                vec![i as u8],
+                addr,
+                16,
+                RdmaStorageEngineKind::Dram,
+            );
+            assert_eq!(put.status, RDMA_OP_SUCCESS);
+            assert_eq!(put.old_addr, None, "nothing was displaced yet");
+        }
+        assert_eq!(table.num_entries(), RDMA_BUCKET_CAP as u64);
+
+        let evicting = table.put(
+            vec![RDMA_BUCKET_CAP as u8],
+            0x2000,
+            16,
+            RdmaStorageEngineKind::Dram,
+        );
+        assert_eq!(evicting.status, RDMA_OP_SUCCESS);
+        assert!(
+            addrs.contains(&evicting.old_addr.expect(
+                "an eviction has to name the block it displaced; clearing the                  entry is the last moment anything knows where that block is"
+            )),
+            "the displaced address has to be one of the entries that was there"
+        );
+        assert!(evicting.old_len > 0, "a displaced block has a length to free");
+        assert_eq!(evicting.old_type, RdmaStorageEngineKind::Dram);
+        assert_eq!(table.num_entries(), RDMA_BUCKET_CAP as u64);
+    }
+
+    #[test]
+    fn rdma_cache_holds_no_block_its_index_has_forgotten() {
+        // The index is 1024 buckets of 15, so this many keys makes buckets
+        // overflow and evict. Every eviction that does not free its block
+        // leaves bytes counted against capacity that nothing can ever reclaim,
+        // and the cache stops accepting writes while holding far less than it
+        // was given.
+        let mut cache = RdmaCache::with_dram_capacity(8 << 20);
+        let inserted = 20_000_u32;
+        for i in 0..inserted {
+            let key = i.to_le_bytes();
+            assert_eq!(
+                cache.insert(&key, b"v"),
+                RDMA_OP_SUCCESS,
+                "insert {i} was refused, which means capacity ran out"
+            );
+        }
+
+        let indexed = cache.num_index_entries();
+        assert!(
+            indexed < u64::from(inserted),
+            "the point of this test is that buckets overflowed; they did not"
+        );
+
+        let (_, _, blocks) = cache
+            .storage_stats(RdmaStorageEngineKind::Dram)
+            .expect("the dram engine exists");
+        assert_eq!(
+            blocks as u64, indexed,
+            "the storage engine is holding blocks the index no longer points              at, so their bytes are counted against capacity forever"
+        );
+    }
+
+    #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
