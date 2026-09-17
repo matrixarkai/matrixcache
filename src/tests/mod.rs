@@ -3354,6 +3354,78 @@ mod tests {
     }
 
     #[test]
+    fn rdma_index_entry_flags_a_block_its_length_field_cannot_measure() {
+        // An entry records a block's length in an `i32`. A 3 GiB block is one
+        // it can point at but not measure, and until the overflow flag says so
+        // the clamped length it stores is indistinguishable from a real one.
+        let oversized = 3usize << 30;
+        assert!(!rdma_length_fits_index_entry(oversized));
+        assert!(
+            oversized < RDMA_MAX_BLOCK_SIZE,
+            "the interesting sizes are the ones the addressing scheme accepts"
+        );
+
+        let mut entry = RdmaIndexEntry::default();
+        entry.set_data_length(i32::MAX);
+        entry.set_packed_addr(0x4444, RdmaStorageEngineKind::Dram, oversized);
+        assert_eq!(
+            entry.overflow_flag(),
+            1,
+            "a block the length field cannot hold has to be flagged, or a reader              measures the block against a length that is not its own"
+        );
+
+        // The largest block the field does describe is not flagged. The flag
+        // costs a reader the chance to notice a truncated block, so it is set
+        // only where the length genuinely cannot be trusted.
+        let largest_measurable = i32::MAX as usize;
+        assert!(rdma_length_fits_index_entry(largest_measurable));
+        let mut exact = RdmaIndexEntry::default();
+        exact.set_data_length(i32::MAX);
+        exact.set_packed_addr(0x5555, RdmaStorageEngineKind::Dram, largest_measurable);
+        assert_eq!(exact.overflow_flag(), 0);
+    }
+
+    #[test]
+    fn rdma_lookup_of_an_oversized_block_is_not_reported_corrupt() {
+        // A block between `i32::MAX` and RDMA_MAX_BLOCK_SIZE was stored with a
+        // clamped length and no overflow flag, so a lookup handed the storage
+        // engine a length the block never had.
+        let key = b"oversized".to_vec();
+        let mut table = RdmaHashTable::<Vec<u8>>::new(8);
+        let kv_size = 3usize << 30;
+        assert_eq!(
+            table
+                .put(key.clone(), 0x9000, kv_size, RdmaStorageEngineKind::Dram)
+                .status,
+            RDMA_OP_SUCCESS
+        );
+
+        let got = table.get(&key);
+        assert_eq!(got.addr, Some(0x9000));
+        assert_eq!(
+            got.len, 0,
+            "a length the entry could not hold has to reach the reader as              'take it from the block', not as a clamped number"
+        );
+
+        // Why a clamped length is not survivable: the engine measures a block
+        // against the length it is given, and a length that is not the block's
+        // own is answered as corruption rather than as a miss. The zero above
+        // is exactly the value that makes the engine measure the block itself.
+        let mut engine = RdmaStorageEngine::new(RdmaStorageEngineKind::Dram, 4096);
+        let addr = engine.put(b"k", b"v").expect("block address");
+        let mut response = RdmaResponse::new();
+        assert_eq!(
+            engine.get(b"k", i32::MAX as usize, &mut response, addr),
+            RDMA_CRC_MISMATCH
+        );
+        assert_eq!(
+            engine.get(b"k", got.len, &mut response, addr),
+            RDMA_OP_SUCCESS
+        );
+        assert_eq!(response.GetResponse(), b"v");
+    }
+
+    #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(

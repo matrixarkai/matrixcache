@@ -51,6 +51,11 @@ const CACHE_MANIFEST_NAME: &str = "cache_manifest.jsonl";
 pub const MT_HASH_SEED: u64 = 0x2017_0730;
 pub const MT_MURMUR_HASH2_DEFAULT_SEED: u32 = 97;
 pub const RDMA_DEFAULT_DRAM: u8 = 0;
+/// The largest block the remote addressing scheme can reach.
+///
+/// This is not the largest block an index entry can *measure*: that limit
+/// belongs to the entry's `length` field and is checked by
+/// [`rdma_length_fits_index_entry`], which stops well below this one.
 pub const RDMA_MAX_BLOCK_SIZE: usize = 1usize << 32;
 pub const RDMA_BUCKET_SIZE: usize = 512;
 pub const RDMA_ENTRY_SIZE: usize = 32;
@@ -406,6 +411,22 @@ pub fn Signature_128<T: Hash>(key: &T, bucket_pos: u64) -> [u8; 16] {
     signature_128(key, bucket_pos)
 }
 
+/// Whether an index entry's `length` field can describe a block of this size.
+///
+/// The field is an `i32`, so the answer stops being yes far below
+/// [`RDMA_MAX_BLOCK_SIZE`]: a block between `i32::MAX` and that cap is one an
+/// entry has room to point at but not to measure. Where it cannot, the entry's
+/// overflow flag is set instead and readers take the length from the block.
+///
+/// Both sites that care -- the length an entry records, and the flag that tells
+/// readers to ignore that length -- ask this one function. They have to agree:
+/// a block whose length was clamped but whose flag was not set is handed to the
+/// storage engine with a length that is not its own, and an intact block then
+/// reads back as [`RDMA_CRC_MISMATCH`].
+pub fn rdma_length_fits_index_entry(block_size: usize) -> bool {
+    block_size <= i32::MAX as usize
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RdmaIndexEntry {
     signature: [u8; 16],
@@ -563,14 +584,9 @@ impl RdmaIndexEntry {
         storage_type: RdmaStorageEngineKind,
         block_size: usize,
     ) {
-        let overflow = if block_size > RDMA_MAX_BLOCK_SIZE {
-            1
-        } else {
-            0
-        };
-        let mut addr = ((ptr as u64) << 16)
-            | ((storage_type.as_code() as u64) << 6)
-            | ((overflow as u64) << 5);
+        let overflow = u64::from(!rdma_length_fits_index_entry(block_size));
+        let mut addr =
+            ((ptr as u64) << 16) | ((storage_type.as_code() as u64) << 6) | (overflow << 5);
         addr |= (self.entry_crc() as u64) << 8;
         self.addr = addr;
     }
@@ -909,7 +925,15 @@ where
         } else {
             entry.set_signature_96(sig96);
         }
-        entry.set_data_length(block_size.min(i32::MAX as usize) as i32);
+        // A block too big to measure records the largest length that fits. The
+        // overflow flag set below is what tells readers that this number is a
+        // ceiling and not the block's size.
+        let recorded_length = if rdma_length_fits_index_entry(block_size) {
+            block_size as i32
+        } else {
+            i32::MAX
+        };
+        entry.set_data_length(recorded_length);
         entry.set_version();
         entry.set_packed_addr(addr, storage_type, block_size);
         bucket.unlock_bucket();
