@@ -168,6 +168,31 @@ At 1,000 nodes and 200,000 keys the busiest node holds 1.40x its share and the
 quietest 0.70x, most of which is the sampling noise of 200 keys per node rather
 than the ring.
 
+**Failure domains.** Three copies on three nodes in one rack are one power
+supply away from being no copies. Give a node the thing it fails together with
+-- a rack, a power domain, an availability zone -- and `owners` places a key's
+copies in different ones:
+
+```rust
+let mut cluster = CacheClusterTopology::new();
+cluster.add_nodes_in_zones([
+    ("cache-a", 1, "rack-1"),
+    ("cache-b", 1, "rack-2"),
+    ("cache-c", 1, "rack-3"),
+])?;
+
+let copies = cluster.owners(&key, 3);        // one per rack
+cluster.failure_domain_count();              // 3: the most copies that can be kept apart
+```
+
+A node added without a zone is a domain of its own, so saying nothing spreads
+copies as widely as the cluster allows and a wrong zone is the only way to
+claim a separation that is not there. When more copies are asked for than there
+are domains, the ones that cannot be separated are still placed, on distinct
+nodes -- a third copy in a rack already used is worth less than a third copy
+elsewhere and more than no third copy, and `failure_domain_count` is how a
+caller knows which it is getting.
+
 ## Measuring
 
 The examples are measurements rather than demonstrations. Each prints a table
