@@ -3496,6 +3496,39 @@ mod tests {
     }
 
     #[test]
+    fn rdma_a_full_bucket_evicts_round_its_slots_not_one_of_them() {
+        // Every key lands in the one bucket, so everything after the first
+        // fifteen has to displace something.
+        let mut table = RdmaHashTable::<Vec<u8>>::new(1);
+        let inserts = 30_u8;
+        for i in 0..inserts {
+            let put = table.put(
+                vec![i],
+                0x1000 + AllocatorAddress::from(i),
+                16,
+                RdmaStorageEngineKind::Dram,
+            );
+            assert_eq!(put.status, RDMA_OP_SUCCESS);
+        }
+
+        let survivors: Vec<u8> = (0..inserts)
+            .filter(|i| table.get(&vec![*i]).addr.is_some())
+            .collect();
+        assert_eq!(survivors.len(), RDMA_BUCKET_CAP, "the bucket stays full");
+
+        // The fifteen that survive have to be the fifteen most recent. When
+        // the bucket always took its lowest slot, the incoming entry landed in
+        // the slot it had just freed, so the same slot was evicted every time:
+        // the first fourteen keys were frozen in place and the other sixteen
+        // took turns in one slot, each lasting exactly one insert.
+        let expected: Vec<u8> = (inserts - RDMA_BUCKET_CAP as u8..inserts).collect();
+        assert_eq!(
+            survivors, expected,
+            "a full bucket has to spread its evictions across its slots"
+        );
+    }
+
+    #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(
