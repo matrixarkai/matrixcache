@@ -2617,6 +2617,57 @@ mod tests {
 
     /// Under a throttled share, admission must not depend on how big the write
     /// is, or a tight budget would fill the drive with small entries alone.
+
+    #[test]
+    fn a_window_that_saw_nothing_recovers_by_a_step_not_all_at_once() {
+        // The recovery branch used to be followed by an unreachable one saying
+        // that a window with no bytes in it reopened the share completely. It
+        // could not run: a window of zero bytes is a window inside its target,
+        // so the branch above always took it first. The two also disagreed --
+        // one said recovery is bounded, the other said silence undoes it
+        // entirely -- and the code did the first.
+        //
+        // This pins the behaviour that actually ships, so the question does not
+        // come back as another branch nobody can reach.
+        let start = Instant::now();
+        let mut budget = SsdWriteBudget::with_target(1_000);
+
+        // Write far over the target, and close the window on it.
+        budget.record_written(100_000, start);
+        let _ = budget.admits(0, start + Duration::from_secs(2));
+        let throttled = budget.admitted_share();
+        assert!(
+            throttled < WRITE_BUDGET_SCALE,
+            "the budget did not throttle, so there is no recovery to measure"
+        );
+
+        // One entirely silent window: nothing recorded at all.
+        let _ = budget.admits(0, start + Duration::from_secs(4));
+        let after_one = budget.admitted_share();
+        assert_eq!(
+            after_one,
+            (throttled * 2).min(WRITE_BUDGET_SCALE),
+            "a silent window moves the share by one bounded step"
+        );
+        assert!(
+            after_one < WRITE_BUDGET_SCALE,
+            "a single silent window handed the whole share back, which is the \
+             behaviour the unreachable branch claimed"
+        );
+
+        // And it does get all the way back, given enough silence.
+        let mut second = 6;
+        while budget.admitted_share() < WRITE_BUDGET_SCALE && second < 120 {
+            let _ = budget.admits(0, start + Duration::from_secs(second));
+            second += 2;
+        }
+        assert_eq!(
+            budget.admitted_share(),
+            WRITE_BUDGET_SCALE,
+            "the share never recovered, so the bounded step is a one-way door"
+        );
+    }
+
     #[test]
     fn write_budget_does_not_favour_small_writes() {
         let mut budget = SsdWriteBudget::with_target(1 << 20);
