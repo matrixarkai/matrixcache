@@ -352,9 +352,18 @@ impl CacheClusterTopology {
         self.owners_of_hash(cache_route_hash(key), copies)
     }
 
-    fn owner_of_hash(&self, hash: u64) -> Option<&str> {
+    /// The node holding a given point of the hash space.
+    ///
+    /// What [`owner`](Self::owner) resolves a key to. A caller working through
+    /// a [`CacheHandoff`] has hashes rather than keys -- that is what the
+    /// ranges are in -- and this is how it confirms where one belongs.
+    pub fn owner_of_route_hash(&self, hash: u64) -> Option<&str> {
         let point = self.first_point_at_or_after(hash)?;
         Some(self.live[self.ring[point].node as usize].as_str())
+    }
+
+    fn owner_of_hash(&self, hash: u64) -> Option<&str> {
+        self.owner_of_route_hash(hash)
     }
 
     fn owners_of_hash(&self, hash: u64, copies: usize) -> Vec<&str> {
@@ -469,6 +478,168 @@ impl CacheClusterTopology {
             left.hash.cmp(&right.hash).then(left.node.cmp(&right.node))
         });
         self.ring = ring;
+    }
+}
+
+/// A stretch of the hash space, both ends included.
+///
+/// `start` above `end` means the stretch wraps past the top of the space and
+/// continues from zero, which the last one on a ring always does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheHashRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl CacheHashRange {
+    /// Whether a key's route hash falls in this stretch.
+    pub fn contains(&self, hash: u64) -> bool {
+        if self.start <= self.end {
+            hash >= self.start && hash <= self.end
+        } else {
+            hash >= self.start || hash <= self.end
+        }
+    }
+
+    /// How many hashes this stretch covers.
+    ///
+    /// A `u128` because a range covering the whole space holds `u64::MAX + 1`
+    /// of them, which is the one value a `u64` cannot hold.
+    pub fn count(&self) -> u128 {
+        if self.start <= self.end {
+            u128::from(self.end - self.start) + 1
+        } else {
+            u128::from(u64::MAX - self.start) + 1 + u128::from(self.end) + 1
+        }
+    }
+}
+
+/// Data one node has to send another for a membership change to take effect.
+///
+/// The ring says where a key belongs; this says what that costs. Without it a
+/// node that gains keys gains misses instead, and serves nothing until the
+/// misses have refilled it from underneath.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheHandoff {
+    /// The node holding the keys now.
+    pub from: String,
+    /// The node that will hold them.
+    pub to: String,
+    /// The stretches of hash space that move. A key moves exactly when its
+    /// [`cache_key_route_hash`] falls in one of them.
+    pub ranges: Vec<CacheHashRange>,
+}
+
+impl CacheHandoff {
+    /// How many hashes this handoff moves, across all its stretches.
+    pub fn count(&self) -> u128 {
+        self.ranges.iter().map(CacheHashRange::count).sum()
+    }
+}
+
+impl CacheClusterTopology {
+    /// What has to move to get from this membership to `next`.
+    ///
+    /// Ownership only changes at a ring point, so the two rings' points laid
+    /// together cut the hash space into stretches on which both memberships
+    /// agree with themselves. Every stretch whose owner differs between the two
+    /// is work for somebody; the rest is not, and the ring is built so that
+    /// most of it is the rest.
+    ///
+    /// Stretches that move between the same pair of nodes are gathered into one
+    /// handoff, and neighbouring stretches of that pair are joined, so a caller
+    /// gets a list to work through rather than one entry per ring point.
+    ///
+    /// Empty when nothing moves, and when either membership has no live node --
+    /// there is no sending keys to nowhere, and nothing to send if the keys had
+    /// no owner to begin with.
+    pub fn handoffs_to(&self, next: &Self) -> Vec<CacheHandoff> {
+        if self.ring.is_empty() || next.ring.is_empty() {
+            return Vec::new();
+        }
+
+        let mut bounds: Vec<u64> = self
+            .ring
+            .iter()
+            .chain(next.ring.iter())
+            .map(|point| point.hash)
+            .collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+
+        // One stretch per boundary: the hashes from just past the previous
+        // boundary up to and including this one. The first boundary's stretch
+        // is the one that wraps, which is why it starts at the last boundary.
+        let mut moved: Vec<(CacheHashRange, &str, &str)> = Vec::new();
+        for (index, &end) in bounds.iter().enumerate() {
+            let previous = if index == 0 {
+                bounds[bounds.len() - 1]
+            } else {
+                bounds[index - 1]
+            };
+            // A single boundary covers the whole space by wrapping onto itself.
+            let start = previous.wrapping_add(1);
+            let (Some(before), Some(after)) = (self.owner_of_hash(end), next.owner_of_hash(end))
+            else {
+                continue;
+            };
+            if before == after {
+                continue;
+            }
+            moved.push((CacheHashRange { start, end }, before, after));
+        }
+
+        // Join stretches that touch and move between the same two nodes. Walked
+        // in boundary order, so "touches" is the previous one ending exactly
+        // where this one starts.
+        let mut joined: Vec<(CacheHashRange, &str, &str)> = Vec::new();
+        for (range, from, to) in moved {
+            match joined.last_mut() {
+                Some((last, last_from, last_to))
+                    if *last_from == from
+                        && *last_to == to
+                        && last.end.wrapping_add(1) == range.start =>
+                {
+                    last.end = range.end;
+                }
+                _ => joined.push((range, from, to)),
+            }
+        }
+        // The first and last stretches are neighbours too, round the wrap.
+        if joined.len() > 1 {
+            let (last_range, last_from, last_to) = *joined.last().expect("checked above");
+            let (first_range, first_from, first_to) = joined[0];
+            if last_from == first_from
+                && last_to == first_to
+                && last_range.end.wrapping_add(1) == first_range.start
+            {
+                joined[0] = (
+                    CacheHashRange {
+                        start: last_range.start,
+                        end: first_range.end,
+                    },
+                    first_from,
+                    first_to,
+                );
+                joined.pop();
+            }
+        }
+
+        let mut handoffs: Vec<CacheHandoff> = Vec::new();
+        for (range, from, to) in joined {
+            match handoffs
+                .iter_mut()
+                .find(|handoff| handoff.from == from && handoff.to == to)
+            {
+                Some(handoff) => handoff.ranges.push(range),
+                None => handoffs.push(CacheHandoff {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    ranges: vec![range],
+                }),
+            }
+        }
+        handoffs
     }
 }
 

@@ -168,6 +168,25 @@ At 1,000 nodes and 200,000 keys the busiest node holds 1.40x its share and the
 quietest 0.70x, most of which is the sampling noise of 200 keys per node rather
 than the ring.
 
+**What a change costs.** The ring says where a key belongs. `handoffs_to` says
+what has to move for that to be true:
+
+```rust
+let plan = before.handoffs_to(&after);
+for handoff in &plan {
+    // handoff.from streams every key it holds whose route hash falls in one
+    // of handoff.ranges to handoff.to.
+}
+```
+
+Ownership only changes at a ring point, so the two memberships' points laid
+together cut the hash space into stretches each membership agrees with itself
+on; the stretches whose owner differs are the work. Without this a node that
+gains keys gains misses instead, and serves nothing until reads have refilled
+it from underneath.
+
+Nothing here moves data. It says what would have to.
+
 **Failure domains.** Three copies on three nodes in one rack are one power
 supply away from being no copies. Give a node the thing it fails together with
 -- a rack, a power domain, an availability zone -- and `owners` places a key's
