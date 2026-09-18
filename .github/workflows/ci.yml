@@ -194,6 +194,15 @@ jobs:
       - name: Doc
         run: cargo doc --no-deps --locked
 
+  prohibited-vocabulary:
+    name: prohibited vocabulary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tracked files for prohibited vocabulary
+        shell: bash
+        run: ./scripts/check_prohibited_vocabulary.sh
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
