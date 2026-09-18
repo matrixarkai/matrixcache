@@ -17257,6 +17257,129 @@ mod tests {
     }
 
     #[test]
+    fn the_admission_filter_does_not_weigh_a_candidate_against_a_pinned_entry() {
+        // The filter asks whether a newcomer is wanted more than the entry it
+        // would displace. A pinned entry is not an entry anything displaces --
+        // eviction skips it -- so weighing against one approves a trade that
+        // cannot happen, and the trade that happens instead is with whatever
+        // eviction picks in its place.
+        //
+        // A pin is exactly where this bites, and in the worst direction: a
+        // handle held without being read through is what a pin is for, so a
+        // pinned entry both drifts to the least-recently-accessed end -- where
+        // admission was looking -- and stays cold, so everything beats it.
+        const ENTRIES: usize = 64;
+        const VALUE: usize = 64;
+        const STRANGERS: usize = 32;
+
+        let cache =
+            MultiLayerCache::try_with_options(CacheOptions::new(ENTRIES * VALUE, 0, 0)).unwrap();
+        cache.set_admission_filter_enabled(true);
+
+        // One entry written, pinned, and never read again.
+        let held = CacheKey::string(0, "held-000");
+        cache.put(held.clone(), vec![b'h'; VALUE]).unwrap();
+        cache.pin(held.clone());
+
+        // The rest written and read until they are unmistakably wanted.
+        for i in 1..ENTRIES {
+            cache
+                .put(CacheKey::string(0, &format!("res-{i:03}")), vec![b'r'; VALUE])
+                .unwrap();
+        }
+        for _ in 0..80 {
+            for i in 1..ENTRIES {
+                cache
+                    .get(&CacheKey::string(0, &format!("res-{i:03}")))
+                    .unwrap();
+            }
+        }
+
+        let mut admitted = 0_usize;
+        for i in 0..STRANGERS {
+            let stranger = CacheKey::string(0, &format!("stranger-{i:03}"));
+            let rejected_before = cache.stats().memory_admission_rejected;
+            cache.put(stranger, vec![b's'; VALUE]).unwrap();
+            if cache.stats().memory_admission_rejected == rejected_before {
+                admitted += 1;
+            }
+        }
+        cache.unpin(&held);
+
+        assert_eq!(
+            admitted, 0,
+            "{admitted} of {STRANGERS} first sightings were admitted over a \
+             resident set read eighty times, because each was weighed against a \
+             pinned entry that could never have been the one displaced"
+        );
+    }
+
+    #[test]
+    fn the_admission_filter_looks_past_a_window_that_is_entirely_pinned() {
+        // Eviction searches a bounded window and falls back to the whole order
+        // when the window turns up nothing evictable, so that a run of pinned
+        // entries at the cold end cannot stall it. Admission has to do the
+        // same, or a long enough run of pins puts it back where it started --
+        // finding nothing to weigh against and letting everything in.
+        //
+        // The window is 128, so 150 pinned entries at the cold end fill it.
+        const PINNED: usize = 150;
+        const HOT: usize = 50;
+        const VALUE: usize = 64;
+
+        let cache = MultiLayerCache::try_with_options(CacheOptions::new(
+            (PINNED + HOT) * VALUE,
+            0,
+            0,
+        ))
+        .unwrap();
+        cache.set_admission_filter_enabled(true);
+
+        // Written, pinned, never read: cold, and at the front of the order.
+        let held: Vec<CacheKey> = (0..PINNED)
+            .map(|i| CacheKey::string(0, &format!("held-{i:03}")))
+            .collect();
+        for key in &held {
+            cache.put(key.clone(), vec![b'h'; VALUE]).unwrap();
+            cache.pin(key.clone());
+        }
+
+        // Written after, and read until they are unmistakably wanted.
+        for i in 0..HOT {
+            cache
+                .put(CacheKey::string(0, &format!("res-{i:03}")), vec![b'r'; VALUE])
+                .unwrap();
+        }
+        for _ in 0..80 {
+            for i in 0..HOT {
+                cache
+                    .get(&CacheKey::string(0, &format!("res-{i:03}")))
+                    .unwrap();
+            }
+        }
+
+        let mut admitted = 0_usize;
+        for i in 0..16 {
+            let stranger = CacheKey::string(0, &format!("stranger-{i:03}"));
+            let before = cache.stats().memory_admission_rejected;
+            cache.put(stranger, vec![b's'; VALUE]).unwrap();
+            if cache.stats().memory_admission_rejected == before {
+                admitted += 1;
+            }
+        }
+        for key in &held {
+            cache.unpin(key);
+        }
+
+        assert_eq!(
+            admitted, 0,
+            "{admitted} of 16 first sightings got in past a window of {PINNED} \
+             pinned entries; the search has to reach the entries beyond it, as \
+             eviction's does"
+        );
+    }
+
+    #[test]
     fn the_admission_filter_is_off_by_default() {
         let cache =
             MultiLayerCache::try_with_options(CacheOptions::new(64 * 64, 0, 0)).unwrap();

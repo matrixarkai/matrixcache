@@ -1435,7 +1435,32 @@ impl CacheInner {
         if self.memory_bytes + value_len <= self.memory_capacity_bytes {
             return true;
         }
-        let Some(victim) = self.memory_order.iter_access().next() else {
+        // The entry weighed against has to be one that could actually be
+        // displaced. Eviction skips pinned entries, so a pinned entry is not a
+        // trade on offer -- and weighing against one is not a conservative
+        // mistake but the worst available one. A pin is a handle held without
+        // being read through, so a pinned entry drifts to the least recently
+        // accessed end *and* stays cold, which is both the place this was
+        // looking and a score everything beats. One of them at the head turned
+        // the filter off outright: 32 of 32 first sightings admitted over a
+        // resident set read eighty times.
+        //
+        // Searched over the window eviction uses, with the same fallback to the
+        // whole order when the window turns up nothing, so the two cannot
+        // disagree about what is on offer.
+        let mut on_offer = self
+            .memory_order
+            .iter_access()
+            .take(EVICTION_CANDIDATE_WINDOW)
+            .find(|candidate| !self.is_pinned(candidate));
+        if on_offer.is_none() && self.memory_order.len() > EVICTION_CANDIDATE_WINDOW {
+            on_offer = self
+                .memory_order
+                .iter_access()
+                .find(|candidate| !self.is_pinned(candidate));
+        }
+        // Nothing here can be displaced at all, so there is no trade to judge.
+        let Some(victim) = on_offer else {
             return true;
         };
         // Both sides from the same estimator, so they share a scale and a
