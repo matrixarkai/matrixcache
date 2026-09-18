@@ -27,10 +27,14 @@ const WRITE_BUDGET_SCALE: u64 = 10_000;
 /// a few large blocks does not slam the share shut.
 const WRITE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
 
-/// The most the share may move in one step, as a multiplier numerator over
-/// `WRITE_BUDGET_SCALE`. Halving or doubling per window converges in a few
-/// seconds without oscillating, which a proportional correction does when the
-/// workload is bursty.
+/// What the admitted share is multiplied by after a window that stayed inside
+/// the target.
+///
+/// Doubling converges in a few seconds without oscillating, which a
+/// proportional correction does when the workload is bursty. Only the way *up*
+/// is bounded like this: going down is proportional to how far over the target
+/// the window went, because a drive being written past its budget should stop
+/// being written past its budget now rather than in fourteen windows' time.
 const WRITE_BUDGET_MAX_STEP_UP: u64 = 2;
 
 /// Admission control for SSD writes, targeting a sustainable byte rate.
@@ -166,12 +170,14 @@ impl SsdWriteBudget {
         self.admitted_share = if self.bytes_this_window <= allowed {
             // Under target: open up, but by a bounded step, so a quiet window
             // does not immediately undo a share that took several windows to
-            // find.
+            // find. A window that saw nothing at all takes this branch too, and
+            // gets the same bounded step rather than the whole share back: a
+            // second of silence is not evidence that the pressure has gone, and
+            // at a doubling per window the share is fully recovered after
+            // fourteen of them.
             self.admitted_share
                 .saturating_mul(WRITE_BUDGET_MAX_STEP_UP)
                 .clamp(1, WRITE_BUDGET_SCALE)
-        } else if self.bytes_this_window == 0 {
-            WRITE_BUDGET_SCALE
         } else {
             // Over target: scale the share by how far over we went. Never to
             // zero -- a budget that admits nothing can never learn that the
