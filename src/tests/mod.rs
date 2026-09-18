@@ -12874,9 +12874,9 @@ mod tests {
         seen.sort_by_key(|entry| entry.1);
 
         // Each freed region reports the size reclaiming it would return, and no
-        // live references. Previously every field was zero, so a caller
-        // filtering on `num_freed_bytes` -- which is how the reference decides
-        // what is worth collecting -- selected nothing, ever.
+        // live holders. Previously every field was zero, so a caller filtering
+        // on `num_freed_bytes` -- the field that says what collecting a chunk
+        // would give back -- selected nothing, ever.
         assert_eq!(
             seen,
             vec![(small as ChunkId, 8, 8, 0), (large as ChunkId, 64, 64, 0)]

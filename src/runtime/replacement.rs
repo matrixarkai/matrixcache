@@ -1193,9 +1193,9 @@ impl ReplacementArc {
     /// lists directly; do not "harmonize" it away.
     /// Clear every tracked key and mark the policy uninitialized.
     ///
-    /// Clearing the flag matches the reference, whose `Reset` clears it for this
-    /// policy and *not* for [`ReplacementSlru`] or [`ReplacementFifo`]. The
-    /// asymmetry is deliberate; do not harmonize it away.
+    /// This policy's reset clears the flag; [`ReplacementSlru`]'s and
+    /// [`ReplacementFifo`]'s do not. The asymmetry is deliberate; do not
+    /// harmonize it away.
     ///
     /// Note what it does **not** mean here. Unlike those two, this policy's
     /// [`put`](Self::put), [`get`](Self::get) and [`delete`](Self::delete) never
