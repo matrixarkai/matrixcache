@@ -3800,6 +3800,228 @@ mod tests {
         assert_eq!(mur_mur_hash2_64a(b"hello", 0), 0x1e68_d17c_457b_f117);
     }
 
+    /// A cluster of `per_zone` nodes in each of `zones`, named `z0-n0` and so on.
+    fn zoned_cluster(zones: usize, per_zone: usize) -> CacheClusterTopology {
+        let members: Vec<(String, String)> = (0..zones)
+            .flat_map(|zone| {
+                (0..per_zone).map(move |node| (format!("z{zone}-n{node:03}"), format!("zone-{zone}")))
+            })
+            .collect();
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes_in_zones(
+                members
+                    .iter()
+                    .map(|(name, zone)| (name.as_str(), 1, zone.as_str())),
+            )
+            .expect("distinct names and real zones");
+        cluster
+    }
+
+    fn zone_of<'a>(cluster: &'a CacheClusterTopology, node: &str) -> &'a str {
+        cluster
+            .node(node)
+            .expect("an owner is a member")
+            .zone
+            .as_deref()
+            .expect("this cluster gave every node a zone")
+    }
+
+    #[test]
+    fn cluster_copies_of_a_key_go_to_different_zones() {
+        let cluster = zoned_cluster(3, 6);
+        assert_eq!(cluster.live_node_count(), 18);
+        assert_eq!(
+            cluster.failure_domain_count(),
+            3,
+            "eighteen nodes in three racks can keep three copies apart, not eighteen"
+        );
+
+        for index in 0..5_000 {
+            let key = cluster_test_key(index);
+            let owners = cluster.owners(&key, 3);
+            assert_eq!(owners.len(), 3);
+            let zones: HashSet<&str> = owners.iter().map(|o| zone_of(&cluster, o)).collect();
+            assert_eq!(
+                zones.len(),
+                3,
+                "two copies of a key landed in one failure domain: {owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_a_whole_zone_failing_leaves_every_key_with_a_copy() {
+        // The reason the copies are placed apart at all.
+        let mut cluster = zoned_cluster(3, 6);
+        let keys: Vec<CacheKey> = (0..5_000).map(cluster_test_key).collect();
+        let holders: Vec<Vec<String>> = keys
+            .iter()
+            .map(|key| {
+                cluster
+                    .owners(key, 3)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
+
+        for node in 0..6 {
+            assert!(cluster.set_node_state(&format!("z0-n{node:03}"), CacheNodeState::Down));
+        }
+        assert_eq!(cluster.live_node_count(), 12);
+        assert_eq!(cluster.failure_domain_count(), 2);
+
+        for (key, held) in keys.iter().zip(&holders) {
+            let survived = held
+                .iter()
+                .filter(|name| zone_of_before(name) != "zone-0")
+                .count();
+            assert!(
+                survived >= 2,
+                "a zone failure took {} of the three copies of {key:?}",
+                3 - survived
+            );
+            // And the cluster that is left still names three holders for it,
+            // from the two zones it has.
+            let now = cluster.owners(key, 3);
+            assert_eq!(now.len(), 3);
+            assert!(now.iter().all(|name| !name.starts_with("z0-")));
+        }
+    }
+
+    /// The zone a node was in, read from its name, so the check does not depend
+    /// on the topology it is checking.
+    fn zone_of_before(node: &str) -> String {
+        let zone = node.split('-').next().expect("a name has a first segment");
+        format!("zone-{}", zone.trim_start_matches('z'))
+    }
+
+    #[test]
+    fn cluster_places_the_copies_it_cannot_separate_rather_than_dropping_them() {
+        // Three copies asked of a cluster with two racks. Two can be kept
+        // apart; the third cannot, and is placed anyway.
+        let cluster = zoned_cluster(2, 4);
+        assert_eq!(cluster.failure_domain_count(), 2);
+
+        for index in 0..2_000 {
+            let key = cluster_test_key(index);
+            let owners = cluster.owners(&key, 3);
+            assert_eq!(owners.len(), 3, "the third copy is placed, not dropped");
+            assert_eq!(
+                owners.iter().collect::<HashSet<_>>().len(),
+                3,
+                "still on three distinct nodes"
+            );
+            let first_two: HashSet<&str> =
+                owners[..2].iter().map(|o| zone_of(&cluster, o)).collect();
+            assert_eq!(
+                first_two.len(),
+                2,
+                "the copies that could be separated were: {owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_a_node_without_a_zone_is_a_zone_of_its_own() {
+        // Saying nothing has to spread copies as widely as the cluster allows,
+        // or a cluster that has not been told about its racks would pile every
+        // copy onto one node's neighbours.
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes([("plain-a", 1), ("plain-b", 1), ("plain-c", 1)])
+            .expect("distinct names");
+        assert_eq!(
+            cluster.failure_domain_count(),
+            3,
+            "three nodes that said nothing are three domains, not one"
+        );
+        for index in 0..1_000 {
+            let owners = cluster.owners(&cluster_test_key(index), 3);
+            assert_eq!(owners.iter().collect::<HashSet<_>>().len(), 3);
+        }
+
+        // Mixed: two nodes sharing a rack, one that said nothing.
+        let mut mixed = CacheClusterTopology::new();
+        mixed.add_node_in_zone("racked-a", 1, "rack-1").expect("new");
+        mixed.add_node_in_zone("racked-b", 1, "rack-1").expect("new");
+        mixed.add_node("loner", 1).expect("new");
+        assert_eq!(mixed.failure_domain_count(), 2);
+        for index in 0..1_000 {
+            let owners = mixed.owners(&cluster_test_key(index), 2);
+            assert_eq!(owners.len(), 2);
+            let racked = owners.iter().filter(|o| o.starts_with("racked-")).count();
+            assert!(
+                racked <= 1,
+                "both copies went into rack-1 while a separate node was free: {owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_spreads_copies_across_zones_at_size() {
+        // A thousand nodes in twenty racks, which is the shape the zone walk
+        // has to stay cheap in: the ring holds 160,000 points and a lookup must
+        // not walk them.
+        let zones = 20;
+        let per_zone = 50;
+        let cluster = zoned_cluster(zones, per_zone);
+        assert_eq!(cluster.live_node_count(), zones * per_zone);
+        assert_eq!(cluster.failure_domain_count(), zones);
+
+        let mut load: HashMap<&str, u32> = HashMap::new();
+        let keys = 20_000_u32;
+        for index in 0..keys {
+            let key = cluster_test_key(index);
+            let owners = cluster.owners(&key, 3);
+            assert_eq!(owners.len(), 3);
+            let owner_zones: HashSet<&str> =
+                owners.iter().map(|o| zone_of(&cluster, o)).collect();
+            assert_eq!(owner_zones.len(), 3, "copies shared a zone: {owners:?}");
+            *load.entry(owners[0]).or_insert(0) += 1;
+        }
+
+        // Placing copies by zone must not have wrecked the placement of the
+        // owners themselves.
+        let mean = f64::from(keys) / (zones * per_zone) as f64;
+        let peak = f64::from(*load.values().max().expect("a thousand nodes"));
+        println!(
+            "1000 nodes in 20 zones, {keys} keys: owner mean {mean:.1}, peak {peak:.0} ({:.2}x)",
+            peak / mean
+        );
+        assert!(peak / mean < 2.5, "the busiest owner holds {:.2}x", peak / mean);
+    }
+
+    #[test]
+    fn cluster_refuses_a_zone_name_that_says_nothing() {
+        let mut cluster = CacheClusterTopology::new();
+        let empty = cluster
+            .add_node_in_zone("cache-a", 1, "")
+            .expect_err("an empty zone name");
+        assert!(matches!(empty, CacheError::InvalidConfig(_)));
+        assert_eq!(
+            cluster.member_count(),
+            0,
+            "a node whose zone was unusable did not join"
+        );
+
+        let batch = cluster
+            .add_nodes_in_zones([("cache-a", 1, "rack-1"), ("cache-b", 1, "")])
+            .expect_err("an empty zone name in the batch");
+        assert!(matches!(batch, CacheError::InvalidConfig(_)));
+        assert_eq!(cluster.member_count(), 0, "the good half did not join either");
+
+        cluster
+            .add_node_in_zone("cache-a", 1, "rack-1")
+            .expect("a real zone");
+        assert_eq!(
+            cluster.node("cache-a").expect("a member").zone.as_deref(),
+            Some("rack-1")
+        );
+        assert_eq!(cluster.node("cache-a").expect("a member").weight, 1);
+    }
+
     #[test]
     fn rdma_bucket_eviction_reports_the_block_it_displaced() {
         // One bucket, so the sixteenth key has to evict one of the fifteen.
