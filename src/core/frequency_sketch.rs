@@ -97,20 +97,35 @@ impl FrequencySketch {
 
     /// The four positions this key hashes to.
     ///
-    /// One pass over the key, not four. Hashing dominated the cost of recording
-    /// -- 86ns per record against roughly 226ns for an entire cache read -- and
-    /// four passes over the same bytes was nearly all of it.
+    /// Every field of the key, because the cache tells these keys apart and an
+    /// estimator that cannot is answering a different question from the one it
+    /// is asked. Reading `record_key` alone gave one estimate to every page of
+    /// a segment, every field of a hash, and the same record in every shard --
+    /// so a sequential scan over one segment raised the estimate as it went and
+    /// the pages it had not reached yet arrived looking like the hottest keys
+    /// in the cache. Measured: 196 of 200 scanned pages admitted over a
+    /// resident set read eighty times.
     ///
-    /// `h1 + i * h2` from a single pair of hashes behaves like `i` independent
-    /// hash functions for this purpose (Kirsch and Mitzenmacher), which is how
+    /// Chained rather than concatenated. `xxh32` mixes each input's length into
+    /// its result, so seeding each field's hash with the last one's output
+    /// tells apart the same bytes divided differently, and it costs no buffer
+    /// on a path where building one would be the expensive part. A collision
+    /// here only inflates an estimate, which is the direction this structure is
+    /// already allowed to be wrong in.
+    ///
+    /// `h1 + i * h2` from the resulting pair behaves like `i` independent hash
+    /// functions for this purpose (Kirsch and Mitzenmacher), which is how
     /// production Bloom filters and sketches are built.
     fn positions(&self, key: &CacheKey) -> [usize; SKETCH_HASHES] {
-        let bytes = key.record_key.as_bytes();
-        let first = xxh32_with_seed(bytes, 0) as usize;
+        let mut identity = xxh32_with_seed(key.namespace.as_bytes(), 0);
+        identity = xxh32_with_seed(&key.shard_id.to_le_bytes(), identity);
+        identity = xxh32_with_seed(key.record_key.as_bytes(), identity);
+        let first = xxh32_with_seed(key.selector.as_bytes(), identity) as usize;
         // Forced odd: with a power-of-two width an even step could be congruent
         // to zero, collapsing all four positions onto one counter and turning
         // the minimum of four into a minimum of one.
-        let step = (xxh32_with_seed(bytes, 0x9E37_79B9) as usize) | 1;
+        let step =
+            (xxh32_with_seed(key.selector.as_bytes(), identity ^ 0x9E37_79B9) as usize) | 1;
         let mut out = [0_usize; SKETCH_HASHES];
         for (row, slot) in out.iter_mut().enumerate() {
             *slot = first.wrapping_add(row.wrapping_mul(step)) & self.mask;

@@ -17066,6 +17066,134 @@ mod tests {
     }
 
     #[test]
+    fn the_sketch_tells_apart_keys_the_cache_tells_apart() {
+        // Four fields make a cache key, and two keys differing in any of them
+        // are different entries with different values. An estimator that reads
+        // only one field answers for all of them at once.
+        let sketch = FrequencySketch::with_capacity(4_096);
+
+        let read_often = CacheKey::page(0, 7, 0, 4_096);
+        for _ in 0..200 {
+            sketch.record(&read_often);
+        }
+        assert!(sketch.estimate(&read_often) >= 200);
+
+        // A different page of the same segment. Same record key, different
+        // selector -- and nobody has ever asked for it.
+        let never_read = CacheKey::page(0, 7, 512 * 4_096, 4_096);
+        assert_eq!(
+            sketch.estimate(&never_read),
+            0,
+            "a page nobody has read inherited the count of another page of the \
+             same segment, so a sequential scan makes every page of it look hot"
+        );
+
+        // Same record key, different namespace: a string value and a hash field.
+        let as_string = CacheKey::string(3, "record");
+        let as_field = CacheKey::hash(3, "record", "field");
+        for _ in 0..200 {
+            sketch.record(&as_string);
+        }
+        assert_eq!(
+            sketch.estimate(&as_field),
+            0,
+            "a hash field inherited the count of the string under the same name"
+        );
+
+        // Same record key, different shard. The cache treats these as
+        // different keys; `CacheKey`'s own documentation says so.
+        let other_shard = CacheKey::string(4, "record");
+        assert_eq!(
+            sketch.estimate(&other_shard),
+            0,
+            "the same record key in another shard inherited its count"
+        );
+
+        // And the selector alone is enough to separate two hash fields.
+        let one_field = CacheKey::hash(0, "profile", "name");
+        let other_field = CacheKey::hash(0, "profile", "avatar");
+        for _ in 0..200 {
+            sketch.record(&one_field);
+        }
+        assert_eq!(sketch.estimate(&other_field), 0);
+    }
+
+    /// How many of a scan's pages the admission filter let in, over a resident
+    /// set that has been read eighty times.
+    ///
+    /// `one_segment` chooses whether the scan walks the pages of a single
+    /// segment -- which is what a sequential read is -- or touches a different
+    /// segment each time. Those two are the same workload by every measure the
+    /// filter should care about: the same number of keys, each seen once,
+    /// none of them ever read again.
+    fn scan_pages_admitted(one_segment: bool) -> usize {
+        const ENTRIES: usize = 64;
+        const VALUE: usize = 64;
+        const SCAN: usize = 200;
+
+        let cache =
+            MultiLayerCache::try_with_options(CacheOptions::new(ENTRIES * VALUE, 0, 0)).unwrap();
+        cache.set_admission_filter_enabled(true);
+        for i in 0..ENTRIES {
+            cache
+                .put(CacheKey::string(0, &format!("res-{i:03}")), vec![b'r'; VALUE])
+                .unwrap();
+        }
+        for _ in 0..80 {
+            for i in 0..ENTRIES {
+                cache
+                    .get(&CacheKey::string(0, &format!("res-{i:03}")))
+                    .unwrap();
+            }
+        }
+
+        let mut admitted = 0_usize;
+        for page in 0..SCAN as u64 {
+            let key = if one_segment {
+                CacheKey::page(0, 42, page * 4_096, 4_096)
+            } else {
+                CacheKey::page(0, 1_000 + page, 0, 4_096)
+            };
+            let before = cache.stats().memory_admission_rejected;
+            cache.put(key, vec![b'p'; VALUE]).unwrap();
+            if cache.stats().memory_admission_rejected == before {
+                admitted += 1;
+            }
+        }
+        admitted
+    }
+
+    #[test]
+    fn the_admission_filter_is_not_fooled_by_a_scan_over_one_records_pages() {
+        // A scan is a burst of keys read once and never again, and declining to
+        // admit them is what the filter is for. When every page of a segment
+        // shared one estimate, a scan raised that estimate as it went and the
+        // pages it had not reached yet arrived looking like the hottest keys in
+        // the cache: 196 of 200 got in, against 1 for the same scan spread over
+        // separate segments.
+        //
+        // Asserted as a comparison rather than against zero. A count-min sketch
+        // never under-counts but may over-count, so a page whose four counters
+        // all collide with hot ones is admitted, and that is the structure
+        // behaving as documented rather than a fault. What must not differ is
+        // whether the scan walks one segment or two hundred -- the same keys,
+        // the same number of sightings, the same nothing-read-twice.
+        let spread = scan_pages_admitted(false);
+        let one_segment = scan_pages_admitted(true);
+        assert!(
+            spread * 20 < 200,
+            "the control admitted {spread} of 200, which is too many for it to \
+             be a control"
+        );
+        assert!(
+            one_segment <= spread + 2,
+            "scanning one segment got {one_segment} of 200 pages in where \
+             scanning separate segments got {spread}; the pages of a record are \
+             talking each other in"
+        );
+    }
+
+    #[test]
     fn the_admission_filter_declines_a_colder_newcomer_then_relents() {
         // Asserted through `memory_admission_rejected`, not through whether the
         // key ends up resident.
