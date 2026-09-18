@@ -421,6 +421,10 @@ impl<'a> SlotEvictionGroup<'a> {
     /// in cloned the whole window on every eviction, and all but one of those
     /// clones was thrown away. The winner is cloned once, by the caller.
     fn observe(&mut self, key: &'a CacheKey, score: EvictionScore) {
+        // The coldest segment any member is in, because that member is the one
+        // this group would give up. Taking the max would let one protected
+        // entry shelter a whole group of probationary ones.
+        self.group_score.segment = self.group_score.segment.min(score.segment);
         self.group_score.hotness = self.group_score.hotness.max(score.hotness);
         self.group_score.hits = self.group_score.hits.saturating_add(score.hits);
         self.group_score.last_access_epoch = self

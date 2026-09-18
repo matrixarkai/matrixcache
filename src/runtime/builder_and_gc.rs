@@ -1863,8 +1863,13 @@ impl CacheInner {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.memory_order)
             }
-            CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.memory_order);
+            CacheReplacementPolicy::Slru => {
+                let picked = self.select_windowed_eviction_victim(&self.memory_order, true);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
+            }
+            CacheReplacementPolicy::WeightedHotnessLru => {
+                let picked = self.select_windowed_eviction_victim(&self.memory_order, false);
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
@@ -1876,8 +1881,13 @@ impl CacheInner {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.pmem_order)
             }
-            CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.pmem_order);
+            CacheReplacementPolicy::Slru => {
+                let picked = self.select_windowed_eviction_victim(&self.pmem_order, true);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
+            }
+            CacheReplacementPolicy::WeightedHotnessLru => {
+                let picked = self.select_windowed_eviction_victim(&self.pmem_order, false);
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
@@ -1889,8 +1899,13 @@ impl CacheInner {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.disk_order)
             }
-            CacheReplacementPolicy::Slru | CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.disk_order);
+            CacheReplacementPolicy::Slru => {
+                let picked = self.select_windowed_eviction_victim(&self.disk_order, true);
+                self.record_sampled_groups(picked.groups_weighed);
+                picked.victim
+            }
+            CacheReplacementPolicy::WeightedHotnessLru => {
+                let picked = self.select_windowed_eviction_victim(&self.disk_order, false);
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
@@ -1919,7 +1934,11 @@ impl CacheInner {
     /// stall eviction while unpinned entries sit further back. A tier holding
     /// no more than the window weighs everything either way, so its victim is
     /// exactly the one it would have picked before the window existed.
-    fn select_windowed_eviction_victim(&self, order: &CacheKeyOrder) -> PickedEvictionVictim {
+    fn select_windowed_eviction_victim(
+        &self,
+        order: &CacheKeyOrder,
+        segmented: bool,
+    ) -> PickedEvictionVictim {
         // An entry past its time to live could not have been served again, so
         // dropping it costs no future hit. Take one the moment the window turns
         // one up, in preference to weighing live entries against each other and
@@ -1939,12 +1958,12 @@ impl CacheInner {
                 };
             }
         }
-        let windowed =
-            self.select_eviction_victim(order.iter_access().take(EVICTION_CANDIDATE_WINDOW));
+        let windowed = self
+            .select_eviction_victim(order.iter_access().take(EVICTION_CANDIDATE_WINDOW), segmented);
         if windowed.victim.is_some() || order.len() <= EVICTION_CANDIDATE_WINDOW {
             return windowed;
         }
-        let full = self.select_eviction_victim(order.iter_access());
+        let full = self.select_eviction_victim(order.iter_access(), segmented);
         PickedEvictionVictim {
             victim: full.victim,
             groups_weighed: windowed
@@ -1965,7 +1984,7 @@ impl CacheInner {
     /// Borrows the keys rather than taking them by value: the caller passes the
     /// tier's own map keys straight in, so a selection no longer starts by
     /// cloning every key in the tier.
-    fn select_eviction_victim<'a, I>(&self, keys: I) -> PickedEvictionVictim
+    fn select_eviction_victim<'a, I>(&self, keys: I, segmented: bool) -> PickedEvictionVictim
     where
         I: IntoIterator<Item = &'a CacheKey>,
     {
@@ -1981,7 +2000,7 @@ impl CacheInner {
             // Strings -- doing it twice per candidate, up to 128 candidates
             // per eviction, is the bulk of choosing a victim.
             let meta = self.metadata.get(key);
-            let score = eviction_score_of(meta);
+            let score = eviction_score_of(meta, segmented);
             let group_key = eviction_group_key_of(meta, key);
             groups
                 .entry(group_key)
@@ -2011,8 +2030,16 @@ impl CacheInner {
         }
     }
 
+    /// An entry's score, unsegmented.
+    ///
+    /// Its one caller weighs an *incoming* SSD block against the blocks already
+    /// there, which is an admission question rather than a victim-selection
+    /// one: an arriving block has no history, so ranking it below everything
+    /// protected would answer that question by construction rather than by
+    /// weighing it. Segments decide which resident entry gives way, and that is
+    /// [`select_eviction_victim`](Self::select_eviction_victim).
     fn eviction_score(&self, key: &CacheKey) -> EvictionScore {
-        eviction_score_of(self.metadata.get(key))
+        eviction_score_of(self.metadata.get(key), false)
     }
 
     fn incoming_ssd_block_is_colder_than_existing_groups(
@@ -2022,6 +2049,7 @@ impl CacheInner {
         block_bytes: usize,
     ) -> bool {
         let incoming_score = EvictionScore {
+            segment: 0,
             hotness: initial_hotness(request.block_kind, block_bytes).max(request.hotness),
             hits: 0,
             last_access_epoch: CoarseClock::now_millis(),
@@ -2625,14 +2653,19 @@ impl CacheInner {
 /// An entry with no metadata scores as never read, which is what the previous
 /// fallback amounted to: it built a whole `CacheEntryMeta`, inferring a block
 /// kind and extracting a routing slot, and then read three zero fields off it.
-fn eviction_score_of(meta: Option<&CacheEntryMeta>) -> EvictionScore {
+fn eviction_score_of(meta: Option<&CacheEntryMeta>, segmented: bool) -> EvictionScore {
     match meta {
-        Some(meta) => EvictionScore {
-            hotness: meta.hotness.load(Ordering::Relaxed),
-            hits: meta.hits.load(Ordering::Relaxed),
-            last_access_epoch: meta.last_access_epoch.load(Ordering::Relaxed),
-        },
+        Some(meta) => {
+            let hits = meta.hits.load(Ordering::Relaxed);
+            EvictionScore {
+                segment: u8::from(segmented && hits >= SLRU_PROTECTED_HITS),
+                hotness: meta.hotness.load(Ordering::Relaxed),
+                hits,
+                last_access_epoch: meta.last_access_epoch.load(Ordering::Relaxed),
+            }
+        }
         None => EvictionScore {
+            segment: 0,
             hotness: 0,
             hits: 0,
             last_access_epoch: 0,

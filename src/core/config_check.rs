@@ -192,38 +192,6 @@ impl CacheOptions {
         // A name that is recognised and then answered with a different
         // policy is worse than one that is not recognised at all: the second
         // can be reported as a typo, and the first reads as confirmation.
-        for (field, name) in [
-            (
-                "cache_dram_replacement_policy",
-                &self.cache_dram_replacement_policy,
-            ),
-            (
-                "cache_pmem_replacement_policy",
-                &self.cache_pmem_replacement_policy,
-            ),
-            (
-                "cache_ssd_replacement_policy",
-                &self.cache_ssd_replacement_policy,
-            ),
-        ] {
-            if CacheReplacementPolicy::try_from_config_name(name)
-                != Some(CacheReplacementPolicy::Slru)
-            {
-                continue;
-            }
-            findings.push(config_finding(
-                "replacement_policy_resolves_to_another",
-                CacheHealthSeverity::Warning,
-                field,
-                "SLRU selects the same eviction as WeightedHotnessLru on a cache tier: \
-                 the two share a branch in victim selection, and a scan-resistance run \
-                 gives them identical hit rates and identical eviction counts. The \
-                 segmented policy exists as a component, and nothing connects it to \
-                 tier eviction yet"
-                    .to_string(),
-            ));
-        }
-
         let placement = &self.cache_dram_pmem_data_placement_type;
         if !placement.is_empty() && CacheDataPlacement::try_from_config_name(placement).is_err() {
             findings.push(config_finding(

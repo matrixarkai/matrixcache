@@ -339,17 +339,23 @@ pub struct CacheLatencyMetricsReport {
 /// Defaults to `WeightedHotnessLru`.
 /// Which entry a tier gives up when it needs room.
 ///
-/// `Slru` selects the same eviction as `WeightedHotnessLru` on a
-/// [`MultiLayerCache`] tier: the two share a branch in every tier's victim
-/// selection, and a scan-resistance run gives them identical hit rates and
-/// identical eviction counts at every insertion point. The segmented policy
-/// itself exists, as [`ReplacementSlru`], but nothing connects it to tier
-/// eviction yet.
+/// `WeightedHotnessLru` reduces an entry to one number -- a hotness that
+/// combines what the caller said at write time with what reading has since
+/// added -- and gives up the lowest. It follows a working set well and it can
+/// be talked into keeping something nobody has read, because a large enough
+/// hint outranks the evidence of a read.
 ///
-/// It is kept as a distinct value rather than removed, because a
-/// configuration naming it should keep working; [`CacheOptions::validate`]
-/// reports that it resolves to the weighted policy, so asking for it is not
-/// silently answered with something else.
+/// `Slru` puts every entry in one of two segments first: probationary until it
+/// has been read [`SLRU_PROTECTED_HITS`] times, protected after. A protected
+/// entry is not weighed against a probationary one at all, so a burst of
+/// entries seen once cannot displace the set that has been asked for again,
+/// however hot the burst is claimed to be. Within a segment the ordering is the
+/// weighted one.
+///
+/// `Fifo` gives up the oldest and reads nothing else.
+///
+/// [`ReplacementSlru`] is a separate thing: a standalone segmented store with
+/// its own capacity and hot/warm/cold lists, not the policy a tier selects by.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheReplacementPolicy {
     Fifo,
