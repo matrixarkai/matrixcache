@@ -351,8 +351,9 @@ pub struct ConcurrentHashMapInsertResult<K, V> {
 /// [`map_trylock`](Self::map_trylock), which despite its name cannot give you
 /// one.
 ///
-/// This is a `std::HashMap` behind a lock rather than a port of the reference's
-/// vendored striped map, which is deliberately not carried over.
+/// This is a `std::HashMap` behind one lock, and deliberately not a striped
+/// map: striping would buy concurrency this type does not need, because nothing
+/// on a read path goes through it.
 #[derive(Debug, Clone)]
 pub struct ConcurrentHashMap<K, V> {
     inner: Arc<RwLock<HashMap<K, V>>>,
@@ -617,9 +618,9 @@ where
     /// Always returns `true`, and takes no lock.
     ///
     /// **This is not a lock and must not be used as one.** It exists to keep the
-    /// shape of the reference's per-key locking API, which this crate does not
-    /// port — the map serialises each operation internally instead, so there is
-    /// no per-key lock to acquire.
+    /// shape of a per-key locking API this crate does not implement — the map
+    /// serialises each operation internally instead, so there is no per-key lock
+    /// to acquire.
     ///
     /// The danger is that it looks like it works. Guarding a read-modify-write
     /// with it:

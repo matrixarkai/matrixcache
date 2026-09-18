@@ -153,8 +153,8 @@ should fail if current throughput per resident MiB falls behind the baseline.
 
 The minimum read/write/eviction sample options are intentionally separate from
 latency budgets. Use low floors for CI smoke and production-sized floors for
-release soak archives so an empty or mostly idle run cannot become cache parity
-evidence.
+release soak archives so an empty or mostly idle run cannot become evidence
+that two caches perform the same.
 
 For the batch control path TemporalStore uses to warm, pin, release, and rewrite
 groups of block entries, archive `batch_write_cost` too. The report captures

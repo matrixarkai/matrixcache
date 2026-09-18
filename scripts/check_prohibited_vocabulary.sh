@@ -59,10 +59,28 @@ report "internal datastore name" '(^|[^A-Za-z])abase([^A-Za-z]|$)'
 # The C-FFI spelling is CIpsFoo, which a token-start-only pattern misses.
 report "retired data-model name" '(^|[^A-Za-z0-9])(C?Ips[A-Z]|ips_|IPS([^a-zA-Z]|$))'
 
+# Prose that narrates this project as following another one. "the reference",
+# meaning some other system, had reached eight tracked files before anything
+# looked for it -- this check is the reason it cannot come back.
+#
+# Deliberately narrow. "reference" has ordinary uses this must not flag: a Rust
+# shared reference, a reference counted bump, references to internal systems in
+# the contributing rules. Only the noun phrase that names another system is
+# matched, which is "the reference" and "reference design/model/engine/
+# implementation".
+report "provenance framing" \
+  '\bthe reference\b|\breference (design|model|implementation|engine)\b'
+
+# "parity" says the same thing in one word. Its ordinary senses -- a parity bit,
+# RAID parity -- have never appeared here; if one ever needs to, narrow this
+# rather than deleting it.
+report "comparison framing" '(^|[^A-Za-z])parity([^A-Za-z]|$)'
+
 if [ "$status" -ne 0 ]; then
   echo
-  echo "These names must not appear in this repository. Use the project's own"
-  echo "vocabulary instead; see CONTRIBUTING.md."
+  echo "These must not appear in this repository. Use the project's own"
+  echo "vocabulary, and describe what the code does rather than what it"
+  echo "follows; see CONTRIBUTING.md."
   exit 1
 fi
 echo "OK: no prohibited vocabulary in tracked files"

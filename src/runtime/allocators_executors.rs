@@ -115,8 +115,8 @@ pub struct PoolChunkMeta {
 /// How eagerly an allocator should flush to persistent memory.
 ///
 /// Declared vocabulary: nothing in this crate reads it. Present so the
-/// persistent-memory options can express the choice that the reference design
-/// makes, but no code path here honours it.
+/// persistent-memory options can express the choice, but no code path here
+/// honours it.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FlushPolicy {
@@ -1058,9 +1058,9 @@ impl LogBasedMemoryAllocatorApi for SimpleLogBasedMemoryAllocator {
     fn gc(&mut self, chunk_ids: &[ChunkId]) -> Result<(), CacheError> {
         self.gc_runs = self.gc_runs.saturating_add(1);
         if chunk_ids.is_empty() {
-            // Collecting nothing was asked for; the run still counts, matching
-            // the reference, which takes an explicit list and does not treat an
-            // empty one as "everything".
+            // Collecting nothing was asked for; the run still counts. The list
+            // is explicit, so an empty one means nothing rather than
+            // everything -- a caller that means everything has to say so.
             return Ok(());
         }
         for id in chunk_ids {

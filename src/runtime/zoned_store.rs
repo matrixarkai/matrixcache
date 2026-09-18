@@ -41,7 +41,8 @@ pub const ZONE_HEADER_MAGIC: u64 = 20220209;
 
 /// How a device's zones are grouped.
 ///
-/// The discriminants match the values the reference model uses on disk.
+/// The discriminants are the values written to disk, so they are part of the
+/// on-disk format and cannot be renumbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ZoneMode {
     /// One group spans several zones.

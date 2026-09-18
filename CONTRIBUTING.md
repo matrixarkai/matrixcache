@@ -38,6 +38,13 @@ warnings-as-errors build, tests for both the default (RocksDB) and
    green.
 3. Update [`CHANGELOG.md`](CHANGELOG.md) under **Unreleased**.
 4. Keep the public source free of references to internal or proprietary systems.
+5. Describe what the code does, not what it follows. A comment explaining a
+   choice by saying it agrees with some other system tells a reader nothing
+   they can check, and casts this project as trailing something they cannot
+   see. Say what the code does and why that is right here.
+   `scripts/check_prohibited_vocabulary.sh` fails on the usual phrasings. It is
+   deliberately narrow: ordinary senses, such as a Rust shared reference or a
+   reuse distance, are not matched.
 
 ## Reporting issues
 

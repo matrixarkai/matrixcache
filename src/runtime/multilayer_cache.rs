@@ -3111,12 +3111,12 @@ impl MultiLayerCache {
         }
 
         // The memory hits are served under a *shared* lock, the way a single
-        // `get` serves them, and the way the model this follows never takes a
-        // container exclusively merely to look something up.
+        // `get` serves them. Nothing should take a container exclusively merely
+        // to look something up.
         //
         // This path used to hold the cache exclusively for the whole batch,
         // which serialised every reader against every other for as long as a
-        // batch took. It cost what that predicts: parity with a plain loop of
+        // batch took. It cost what that predicts: level with a plain loop of
         // `get` at one thread, and about a third of it at two and above -- a
         // batch API slower than the loop it exists to replace.
         //

@@ -1641,9 +1641,9 @@ impl PmemAllocatorRecoverListenerImpl {
 /// differ only in what a signature calls them. Nothing in this crate constructs
 /// any of the three; the tiers of a [`MultiLayerCache`] are owned directly.
 ///
-/// It implements more than the reference engine of the same name, which returns
-/// "not implemented" from `Get` and from recovery. In particular
-/// [`StorageEngineApi::recover_data`] here succeeds by replaying the records it
+/// `Get` and recovery both work here rather than answering "not implemented",
+/// which an engine over volatile memory could defensibly do. In particular
+/// [`StorageEngineApi::recover_data`] succeeds by replaying the records it
 /// currently holds, rather than reporting that a volatile tier has nothing to
 /// recover. On a fresh instance that is a successful recovery of zero records,
 /// which is not the same answer as "this tier cannot be recovered".
