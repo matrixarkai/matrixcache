@@ -608,18 +608,15 @@ mod tests {
         );
     }
 
-    /// Asking a tier for SLRU gets the weighted policy, and the check says so.
+    /// Asking a tier for SLRU gets SLRU, and the check no longer objects.
     ///
-    /// Both names take the same branch in every tier's victim selection, so a
-    /// configuration naming SLRU is answered with something else -- and a name
-    /// that is recognised and then substituted is worse than one that is
-    /// rejected, because it reads as confirmation.
-    ///
-    /// The first half pins the behaviour rather than trusting the branch. If
-    /// SLRU is ever connected to tier eviction this fails, which is the point:
-    /// the finding below has to go at the same time.
+    /// The previous version of this test pinned the opposite: the two names
+    /// took the same branch in victim selection, so a configuration naming SLRU
+    /// was answered with the weighted policy, and `validate` reported that. It
+    /// said in its own failure message that connecting SLRU would break it and
+    /// that the finding had to go at the same time. This is that.
     #[test]
-    fn slru_selects_the_same_victims_as_the_weighted_policy_and_is_reported() {
+    fn slru_selects_different_victims_from_the_weighted_policy_and_is_not_reported() {
         fn evictions_under(policy: CacheReplacementPolicy) -> (u64, Vec<String>) {
             let dir = tempfile::tempdir().unwrap();
             let cache = MultiLayerCache::with_options(CacheOptions {
@@ -641,15 +638,30 @@ mod tests {
                     .push(format!("{:?}", record.key));
             });
 
-            // A hot half read repeatedly against a cold half, so the policies
-            // have something to disagree about if they can.
+            // Written hot and never read, against written plain and read twice:
+            // the one case where a hint and the evidence disagree.
             for round in 0..8 {
                 for index in 0..128 {
-                    cache
-                        .put(CacheKey::string(0, &format!("k{index:03}")), vec![b'v'; 64])
-                        .unwrap();
+                    let key = CacheKey::string(0, &format!("k{index:03}"));
                     if index % 2 == 0 {
-                        let _ = cache.get(&CacheKey::string(0, &format!("k{index:03}")));
+                        cache.put(key.clone(), vec![b'v'; 64]).unwrap();
+                        let _ = cache.get(&key);
+                        let _ = cache.get(&key);
+                    } else {
+                        cache
+                            .put_with_admission(
+                                key,
+                                vec![b'v'; 64],
+                                CacheAdmissionRequest {
+                                    block_kind: CacheBlockKind::Object,
+                                    shard_id: 0,
+                                    routing_slot: None,
+                                    block_bytes: 64,
+                                    hotness: 50,
+                                    pinned: false,
+                                },
+                            )
+                            .unwrap();
                     }
                 }
                 let _ = round;
@@ -662,44 +674,31 @@ mod tests {
         let (weighted_count, weighted_order) =
             evictions_under(CacheReplacementPolicy::WeightedHotnessLru);
         assert!(slru_count > 0, "nothing was evicted, so nothing was compared");
-        assert_eq!(
+        assert_ne!(
             (slru_count, slru_order.clone()),
             (weighted_count, weighted_order),
-            "SLRU now evicts differently from the weighted policy -- it has been \
-             connected to tier eviction, so the finding that says it has not must go"
+            "SLRU evicted exactly what the weighted policy did, so it is still \
+             not connected to tier eviction"
         );
 
-        // The harness can tell policies apart, or "identical" above would mean
-        // nothing: FIFO ignores the reads and evicts a different set.
+        // The harness can tell policies apart generally, not just these two.
         let (fifo_count, fifo_order) = evictions_under(CacheReplacementPolicy::Fifo);
         assert!(
-            (fifo_count, fifo_order) != (slru_count, slru_order.clone()),
-            "every policy evicted the same entries, so this test cannot tell them apart"
+            (fifo_count, fifo_order) != (slru_count, slru_order),
+            "every policy evicted the same entries, so this test cannot tell \
+             them apart"
         );
 
-        // And a configuration naming it is told.
-        let options = CacheOptions {
-            dram_capacity: 1 << 16,
-            cache_ssd_replacement_policy: "SLRU".to_string(),
-            ..CacheOptions::default()
-        };
-        let findings = options.validate();
-        let finding = findings
-            .iter()
-            .find(|f| f.id == "replacement_policy_resolves_to_another")
-            .expect("a policy answered with another was not reported");
-        assert_eq!(finding.field, "cache_ssd_replacement_policy");
-        assert!(finding.message.contains("WeightedHotnessLru"), "{}", finding.message);
-
-        // The policies that are what they say they are report nothing.
-        for name in ["FIFO", "WeightedHotnessLru"] {
-            let honest = CacheOptions {
+        // And a configuration naming it is no longer told it gets something
+        // else, because it does not.
+        for name in ["FIFO", "SLRU", "WeightedHotnessLru"] {
+            let options = CacheOptions {
                 dram_capacity: 1 << 16,
                 cache_dram_replacement_policy: name.to_string(),
                 ..CacheOptions::default()
             };
             assert!(
-                !honest
+                !options
                     .validate()
                     .iter()
                     .any(|f| f.id == "replacement_policy_resolves_to_another"),
@@ -17376,6 +17375,103 @@ mod tests {
             "{admitted} of 16 first sightings got in past a window of {PINNED} \
              pinned entries; the search has to reach the entries beyond it, as \
              eviction's does"
+        );
+    }
+
+    /// Which keys a tier gives up when a hinted-hot set competes with a set
+    /// that was actually read.
+    ///
+    /// `asked-for` entries are written plainly and read twice. `hinted` entries
+    /// are written with a hotness hint far above anything reading could earn
+    /// and never read at all. The two disagree about which is worth keeping,
+    /// which is the whole of the difference between a weighted policy and a
+    /// segmented one.
+    fn evicted_under(policy: CacheReplacementPolicy) -> Vec<String> {
+        const VALUE: usize = 64;
+        const RESIDENT: usize = 8;
+        const HINT: u32 = 50;
+
+        let cache = MultiLayerCache::try_with_options(CacheOptions::new(
+            RESIDENT * VALUE,
+            0,
+            0,
+        ))
+        .unwrap();
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, policy);
+
+        let departed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&departed);
+        cache.register_eviction_callback(move |record| {
+            recorder
+                .lock()
+                .expect("recorder poisoned")
+                .push(record.key.record_key.clone());
+        });
+
+        let hinted = || CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Object,
+            shard_id: 0,
+            routing_slot: None,
+            block_bytes: VALUE,
+            hotness: HINT,
+            pinned: false,
+        };
+
+        // Two entries somebody came back for.
+        for i in 0..2 {
+            let key = CacheKey::string(0, &format!("asked-for-{i:02}"));
+            cache.put(key.clone(), vec![b'a'; VALUE]).unwrap();
+            cache.get(&key).unwrap();
+            cache.get(&key).unwrap();
+        }
+        // Six that were only ever claimed to be hot.
+        for i in 0..6 {
+            cache
+                .put_with_admission(
+                    CacheKey::string(0, &format!("hinted-{i:02}")),
+                    vec![b'h'; VALUE],
+                    hinted(),
+                )
+                .unwrap();
+        }
+        // And four more of the same, which is what forces the choice.
+        for i in 6..10 {
+            cache
+                .put_with_admission(
+                    CacheKey::string(0, &format!("hinted-{i:02}")),
+                    vec![b'h'; VALUE],
+                    hinted(),
+                )
+                .unwrap();
+        }
+
+        let out = departed.lock().expect("recorder poisoned").clone();
+        out
+    }
+
+    #[test]
+    fn slru_keeps_what_was_read_over_what_was_claimed_to_be_hot() {
+        // A hotness hint is a caller's opinion about an entry it has just
+        // written. Two reads are the cache's own evidence that somebody wanted
+        // the entry again. A segmented policy ranks the evidence above the
+        // opinion; a weighted one adds them into a single number and lets a
+        // large enough hint win.
+        let segmented = evicted_under(CacheReplacementPolicy::Slru);
+        let weighted = evicted_under(CacheReplacementPolicy::WeightedHotnessLru);
+
+        assert!(
+            !segmented.is_empty() && !weighted.is_empty(),
+            "nothing was evicted, so nothing was decided"
+        );
+        assert!(
+            !segmented.iter().any(|key| key.starts_with("asked-for")),
+            "SLRU gave up an entry that had been read twice while entries \
+             nobody had ever read were available: {segmented:?}"
+        );
+        assert!(
+            weighted.iter().any(|key| key.starts_with("asked-for")),
+            "the weighted policy kept the read entries too, so this workload \
+             cannot tell the two apart and proves nothing: {weighted:?}"
         );
     }
 

@@ -264,12 +264,35 @@ enum EvictionReason {
     Expired,
 }
 
+/// What an entry is weighed by when a tier needs room. Lower is evicted first.
+///
+/// Ordered by the derive, so field order is the tie-breaking order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct EvictionScore {
+    /// Which segment the entry sits in under a segmented policy: 0 for
+    /// probationary, 1 for protected.
+    ///
+    /// First, so it decides before anything else does. That is what makes a
+    /// segmented policy segmented -- a protected entry is not weighed against a
+    /// probationary one on hotness, it simply outranks it, and a burst of
+    /// entries seen once cannot displace the set that has been seen twice
+    /// however hot the burst looks.
+    ///
+    /// Always 0 under the unsegmented policies, which leaves their ordering
+    /// exactly as it was.
+    segment: u8,
     hotness: u32,
     hits: u64,
     last_access_epoch: u64,
 }
+
+/// Reads before an entry is protected from a probationary one.
+///
+/// An entry arrives on a write, which is not evidence anybody wants it; one
+/// read is the miss that filled it being followed up once. Two is the first
+/// point at which the entry has been asked for again, which is the distinction
+/// a segmented policy exists to draw.
+pub const SLRU_PROTECTED_HITS: u64 = 2;
 
 /// Borrowed bytes from a cache, held resident until the handle is released.
 ///
