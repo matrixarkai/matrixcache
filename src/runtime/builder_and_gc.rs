@@ -611,6 +611,13 @@ impl CacheInner {
         for key in keys {
             let _ = fs::remove_file(self.disk_path(key));
         }
+        // A store with no capacity holds nothing and accepts nothing: its own
+        // `delete_batch` returns `Ok(())` without looking at the keys. Encoding
+        // a store key per entry to hand it that answer is a manifest line built
+        // per key for a tier that is switched off.
+        if !self.ssd_store.holds_blocks() {
+            return Ok(());
+        }
         let store_keys = keys.iter().map(Self::ssd_store_key).collect::<Vec<_>>();
         self.ssd_store.delete_batch(&store_keys).map(|_| ())
     }
@@ -645,34 +652,56 @@ impl CacheInner {
         }
     }
 
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn append_disk_manifest_op(&self, op: CacheManifestOp) -> Result<(), CacheError> {
-        #[cfg(feature = "rocksdb-ssd")]
-        {
-            let _ = op;
-            Ok(())
-        }
-        #[cfg(not(feature = "rocksdb-ssd"))]
-        {
-            let line = op.encode_line();
-            creating_the_directory_if_missing(&self.disk_dir, || {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(self.manifest_path())
-                    .map_err(CacheError::Io)?;
-                writeln!(file, "{line}").map_err(CacheError::Io)
-            })
-        }
+        let line = op.encode_line();
+        creating_the_directory_if_missing(&self.disk_dir, || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.manifest_path())
+                .map_err(CacheError::Io)?;
+            writeln!(file, "{line}").map_err(CacheError::Io)
+        })
     }
 
+    /// Record a block's arrival in the disk manifest.
+    ///
+    /// With RocksDB there is no manifest: the store keeps its own index and
+    /// nothing replays these lines. The operation is therefore not built either.
+    /// It used to be -- constructed, passed in, and dropped unread -- which is a
+    /// clone of the key and its record per call.
+    #[cfg(feature = "rocksdb-ssd")]
+    fn append_disk_manifest_put(&self, _key: &CacheKey, _block_len: u64) -> Result<(), CacheError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn append_disk_manifest_put(&self, key: &CacheKey, block_len: u64) -> Result<(), CacheError> {
         self.append_disk_manifest_op(CacheManifestOp::Put(CacheManifestRecord::from_entry(
             key, block_len,
         )))
     }
 
+    /// Record a block's removal in the disk manifest. See
+    /// [`Self::append_disk_manifest_put`] for why this builds nothing with
+    /// RocksDB.
+    #[cfg(feature = "rocksdb-ssd")]
+    fn append_disk_manifest_delete(&self, _key: &CacheKey) -> Result<(), CacheError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn append_disk_manifest_delete(&self, key: &CacheKey) -> Result<(), CacheError> {
         self.append_disk_manifest_op(CacheManifestOp::Delete(key.clone()))
+    }
+
+    /// Whether this cache has a persistent-memory tier at all.
+    ///
+    /// Cheap on purpose: it answers without cloning a path, so the persistence
+    /// paths below can ask it before they encode anything.
+    fn has_pmem_tier(&self) -> bool {
+        !self.pmem_paths.is_empty()
     }
 
     fn pmem_root_dir(&self) -> Option<PathBuf> {
@@ -692,11 +721,19 @@ impl CacheInner {
         CacheManifestRecord::from_entry(key, block_len).encode_line()
     }
 
+    /// Where a key's block would live in the persistent-memory tier, if there is
+    /// one.
+    ///
+    /// The directory is looked up **first**. Naming the block means encoding the
+    /// key as a manifest line and hashing it, and a cache with no persistent
+    /// tier used to pay for that on every call before discovering there was
+    /// nowhere to put the answer. Same result either way -- `None` when the tier
+    /// is absent, the same path when it is there.
     fn pmem_block_path_for_key(&self, key: &CacheKey) -> Option<PathBuf> {
+        let dir = self.pmem_block_dir()?;
         let mut hasher = DefaultHasher::new();
         Self::pmem_manifest_key(key, 0).hash(&mut hasher);
-        self.pmem_block_dir()
-            .map(|dir| dir.join(format!("{:016x}.bin", hasher.finish())))
+        Some(dir.join(format!("{:016x}.bin", hasher.finish())))
     }
 
     fn encode_pmem_delete_line(key: &CacheKey) -> String {
@@ -771,7 +808,18 @@ impl CacheInner {
         self.append_pmem_manifest_line(CacheManifestRecord::from_entry(key, value.len() as u64).encode_line())
     }
 
+    /// Drop a key from the persistent-memory tier's files.
+    ///
+    /// Returns before encoding anything when there is no such tier. Both halves
+    /// below are already no-ops in that case -- there is no block path to remove
+    /// and no manifest to append to -- but they were reached through a manifest
+    /// line and a delete line built for a tier that does not exist. An
+    /// invalidation on a cache with no persistent-memory tier is the common
+    /// case, not a corner of it.
     fn persist_pmem_delete(&self, key: &CacheKey) -> Result<(), CacheError> {
+        if !self.has_pmem_tier() {
+            return Ok(());
+        }
         if let Some(path) = self.pmem_block_path_for_key(key) {
             match fs::remove_file(path) {
                 Ok(()) => {}
