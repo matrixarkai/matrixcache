@@ -11079,7 +11079,7 @@ mod tests {
             CacheReadTier::Ssd,
         ] {
             assert!(
-                before.iter().any(|seen| *seen == Some(tier)),
+                before.contains(&Some(tier)),
                 "no entry reached {tier:?}, so the listing cannot show that tier surviving"
             );
         }
@@ -11113,12 +11113,12 @@ mod tests {
             resident_before - 1,
             "an invalidation of one key changed how many keys are resident by more than one"
         );
-        for index in 0..keys.len() {
+        for (index, key) in keys.iter().enumerate() {
             if index == removed {
                 continue;
             }
             assert_eq!(
-                cache.get(&keys[index]).unwrap(),
+                cache.get(key).unwrap(),
                 Some(vec![b'a' + (index % 26) as u8; 96]),
                 "entry {index} reads back differently after an invalidation of a different key"
             );
