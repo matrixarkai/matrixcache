@@ -11083,9 +11083,12 @@ mod tests {
                 "no entry reached {tier:?}, so the listing cannot show that tier surviving"
             );
         }
-        let values_before: Vec<Option<Vec<u8>>> =
-            keys.iter().map(|key| cache.get(key).unwrap()).collect();
-
+        // Nothing may touch the cache between the two listings except the
+        // invalidation. A read is not neutral here -- a hit can promote an
+        // entry, and promoting one demotes another -- so the values are checked
+        // at the end, against what was stored rather than against a read taken
+        // in between.
+        //
         // Take one the SSD tier is answering for, so the persistence side of the
         // invalidation is the part under test rather than a memory removal.
         let removed = before
@@ -11110,16 +11113,21 @@ mod tests {
             resident_before - 1,
             "an invalidation of one key changed how many keys are resident by more than one"
         );
-        for (index, expected) in values_before.iter().enumerate() {
+        for index in 0..keys.len() {
             if index == removed {
                 continue;
             }
             assert_eq!(
-                &cache.get(&keys[index]).unwrap(),
-                expected,
+                cache.get(&keys[index]).unwrap(),
+                Some(vec![b'a' + (index % 26) as u8; 96]),
                 "entry {index} reads back differently after an invalidation of a different key"
             );
         }
+        assert_eq!(
+            cache.get(&keys[removed]).unwrap(),
+            None,
+            "the invalidated key is still being served"
+        );
     }
 
     /// The direction that matters: an invalidated key must not come back.
