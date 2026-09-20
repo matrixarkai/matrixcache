@@ -11011,6 +11011,237 @@ mod tests {
         assert_eq!(cache.stats().pinned_bytes, 0);
     }
 
+    /// A cache holding entries in every tier, for the invalidation guards below.
+    ///
+    /// Small memory against large persistent tiers, so the entries spread rather
+    /// than all sitting in DRAM -- a listing that is `Memory` all the way down
+    /// would pass the comparison below without ever exercising a persistent
+    /// tier, so the guards check the spread before they check the survivors.
+    fn cache_with_entries_in_every_tier(
+        dir: &std::path::Path,
+        count: usize,
+    ) -> (MultiLayerCache, Vec<CacheKey>) {
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            // Both resident tiers are deliberately far too small for the corpus,
+            // so entries overflow past them and some keys are served from the
+            // SSD tier alone. A generous PMEM capacity would keep everything
+            // above the SSD tier and the guards would never reach it.
+            dram_capacity: 512,
+            pmem_capacity: 2048,
+            pmem_paths: vec![dir.join("pmem")],
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.to_path_buf()],
+            // Recovery has to be able to see what the tiers hold, or the
+            // resurrection guard would pass because nothing was written rather
+            // than because the delete landed.
+            pmem_block_durability: true,
+            ssd_block_durability: true,
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+        let keys: Vec<CacheKey> = (0..count)
+            .map(|index| CacheKey::string((index % 4) as u64, &format!("survivor-{index:04}")))
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            cache
+                .put(key.clone(), vec![b'a' + (index % 26) as u8; 96])
+                .unwrap();
+        }
+        (cache, keys)
+    }
+
+    fn tier_listing(cache: &MultiLayerCache, keys: &[CacheKey]) -> Vec<Option<CacheReadTier>> {
+        keys.iter().map(|key| cache.peek_tier(key)).collect()
+    }
+
+    /// Invalidating one key must take that key and nothing else.
+    ///
+    /// The comparison is element by element over the whole listing, and the
+    /// survivor count is asserted **equal** to what it was, not merely non-zero:
+    /// an invalidation that quietly took a second key with it would satisfy
+    /// "some entries survived" and fail this.
+    #[test]
+    fn invalidating_one_key_leaves_every_other_entry_in_the_tier_it_was_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, keys) = cache_with_entries_in_every_tier(dir.path(), 48);
+
+        let before = tier_listing(&cache, &keys);
+        let resident_before = before.iter().filter(|tier| tier.is_some()).count();
+        assert_eq!(
+            resident_before,
+            keys.len(),
+            "the fixture lost entries before the invalidation, so nothing below is measuring \
+             an invalidation"
+        );
+        for tier in [
+            CacheReadTier::Memory,
+            CacheReadTier::Pmem,
+            CacheReadTier::Ssd,
+        ] {
+            assert!(
+                before.iter().any(|seen| *seen == Some(tier)),
+                "no entry reached {tier:?}, so the listing cannot show that tier surviving"
+            );
+        }
+        let values_before: Vec<Option<Vec<u8>>> =
+            keys.iter().map(|key| cache.get(key).unwrap()).collect();
+
+        // Take one the SSD tier is answering for, so the persistence side of the
+        // invalidation is the part under test rather than a memory removal.
+        let removed = before
+            .iter()
+            .position(|tier| *tier == Some(CacheReadTier::Ssd))
+            .expect("no key is served from the SSD tier");
+        cache.invalidate(&keys[removed]).unwrap();
+
+        let after = tier_listing(&cache, &keys);
+        assert_eq!(after[removed], None, "the invalidated key is still resident");
+        for (index, (was, is)) in before.iter().zip(after.iter()).enumerate() {
+            if index == removed {
+                continue;
+            }
+            assert_eq!(
+                is, was,
+                "entry {index} moved tier across an invalidation of a different key"
+            );
+        }
+        assert_eq!(
+            after.iter().filter(|tier| tier.is_some()).count(),
+            resident_before - 1,
+            "an invalidation of one key changed how many keys are resident by more than one"
+        );
+        for (index, expected) in values_before.iter().enumerate() {
+            if index == removed {
+                continue;
+            }
+            assert_eq!(
+                &cache.get(&keys[index]).unwrap(),
+                expected,
+                "entry {index} reads back differently after an invalidation of a different key"
+            );
+        }
+    }
+
+    /// The direction that matters: an invalidated key must not come back.
+    ///
+    /// Skipping persistence work for a key that IS in a persistent tier leaves
+    /// the block and its index entry behind, and the next recovery re-indexes
+    /// it -- a deleted value served afterwards as truth. Recovering the tiers is
+    /// what makes that visible, so the guard recovers and then asks for the key
+    /// again. Every other key must still be there, and the count is asserted
+    /// **equal**.
+    #[test]
+    fn an_invalidated_key_does_not_come_back_when_the_persistent_tiers_are_recovered() {
+        // Once for a key the persistent-memory tier is answering for and once
+        // for one the SSD tier is answering for: each tier's delete is a
+        // separate line of code, and a guard that only ever removes a
+        // memory-resident key proves neither of them landed.
+        for tier in [CacheReadTier::Pmem, CacheReadTier::Ssd] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cache, keys) = cache_with_entries_in_every_tier(dir.path(), 48);
+            let before = tier_listing(&cache, &keys);
+            let resident_before = before.iter().filter(|seen| seen.is_some()).count();
+            assert_eq!(resident_before, keys.len(), "the fixture lost entries early");
+            let removed = before
+                .iter()
+                .position(|seen| *seen == Some(tier))
+                .unwrap_or_else(|| panic!("no key is served from {tier:?}"));
+
+            cache.invalidate(&keys[removed]).unwrap();
+            cache.recover_persistent_tiers().unwrap();
+
+            assert_eq!(
+                cache.peek_tier(&keys[removed]),
+                None,
+                "{tier:?}: recovery brought back a key that had been invalidated, so that tier \
+                 was never told"
+            );
+            assert_eq!(
+                cache.get(&keys[removed]).unwrap(),
+                None,
+                "{tier:?}: an invalidated key is being served again after recovery"
+            );
+            let after = tier_listing(&cache, &keys);
+            assert_eq!(
+                after.iter().filter(|seen| seen.is_some()).count(),
+                resident_before - 1,
+                "{tier:?}: recovery after an invalidation changed how many keys are resident by \
+                 more than one"
+            );
+            for (index, key) in keys.iter().enumerate() {
+                if index == removed {
+                    continue;
+                }
+                assert!(
+                    cache.get(key).unwrap().is_some(),
+                    "{tier:?}: entry {index} was lost by an invalidation of a different key, or \
+                     by recovery"
+                );
+            }
+        }
+    }
+
+    /// A cache with no persistent-memory tier writes no persistent-memory files.
+    ///
+    /// This is the invariant the invalidation path now leans on: with no
+    /// `pmem_paths` there is nowhere to put a block and no manifest to append
+    /// to, so building the block path and the delete line was work whose result
+    /// had nowhere to go. The guard states the invariant rather than assuming
+    /// it.
+    #[test]
+    fn a_cache_with_no_persistent_memory_tier_leaves_no_persistent_memory_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 512,
+            pmem_capacity: 0,
+            pmem_paths: Vec::new(),
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+        let keys: Vec<CacheKey> = (0..64)
+            .map(|index| CacheKey::string(0, &format!("no-pmem-{index:04}")))
+            .collect();
+        for key in &keys {
+            cache.put(key.clone(), vec![b'z'; 96]).unwrap();
+        }
+        for key in &keys {
+            cache.invalidate(key).unwrap();
+        }
+        assert_eq!(
+            cache.stats().pmem_fills,
+            0,
+            "a cache with no persistent-memory paths filled that tier"
+        );
+
+        let mut pmem_artefacts = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    stack.push(entry_path.clone());
+                }
+                if entry_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("pmem-cache-"))
+                {
+                    pmem_artefacts.push(entry_path);
+                }
+            }
+        }
+        assert_eq!(
+            pmem_artefacts,
+            Vec::<std::path::PathBuf>::new(),
+            "a cache with no persistent-memory tier produced persistent-memory files"
+        );
+    }
+
     #[test]
     fn invalidate_page_segment_clears_all_cache_tiers() {
         let dir = tempfile::tempdir().unwrap();

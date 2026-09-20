@@ -1099,6 +1099,15 @@ impl SsdTierStore {
         }
     }
 
+    /// Whether this store can be holding a block.
+    ///
+    /// `Disabled` cannot: `put` is a no-op, `get` is `NotFound`, and both delete
+    /// paths return without looking at their keys. A caller that would have to
+    /// build something to ask the store a question can check this first.
+    fn holds_blocks(&self) -> bool {
+        !matches!(self, Self::Disabled { .. })
+    }
+
     fn get(&self, key: &str) -> Result<CacheBuffer, CacheError> {
         match self {
             Self::Disabled { .. } => Err(CacheError::NotFound),
@@ -1259,10 +1268,11 @@ impl CacheManifestRecord {
     }
 }
 
-// The payloads are consumed only by the file-backed compatibility store's manifest
-// replay (`#[cfg(not(feature = "rocksdb-ssd"))]`), so they read as dead under the
-// default RocksDB feature.
-#[allow(dead_code)]
+// A line in the file-backed compatibility store's manifest. That store exists only
+// under `#[cfg(not(feature = "rocksdb-ssd"))]`; with RocksDB there is no manifest to
+// append to, replay or read back, so the type is not compiled at all rather than
+// compiled and allowed to look dead.
+#[cfg(not(feature = "rocksdb-ssd"))]
 enum CacheManifestOp {
     Put(CacheManifestRecord),
     Delete(CacheKey),
@@ -1280,8 +1290,8 @@ fn unique_cache_keys(keys: &[CacheKey]) -> Vec<CacheKey> {
 }
 
 
+#[cfg(not(feature = "rocksdb-ssd"))]
 impl CacheManifestOp {
-    #[cfg(not(feature = "rocksdb-ssd"))]
     fn encode_line(&self) -> String {
         match self {
             Self::Put(record) => record.encode_line(),
@@ -1295,7 +1305,6 @@ impl CacheManifestOp {
         }
     }
 
-    #[cfg(not(feature = "rocksdb-ssd"))]
     fn decode_line(line: &str) -> Option<Self> {
         if let Some(record) = CacheManifestRecord::decode_line(line) {
             return Some(Self::Put(record));
