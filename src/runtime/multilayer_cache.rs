@@ -1212,6 +1212,12 @@ struct CacheManifestRecord {
 }
 
 impl CacheManifestRecord {
+    // Only the file-backed manifest builds a record in order to write it out.
+    // With RocksDB the lines are built straight from the key by
+    // `manifest_line_for_key`, and a record is only ever produced by
+    // `decode_line` reading one back, so these two are not compiled there
+    // rather than compiled and allowed to look dead.
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn from_entry(key: &CacheKey, block_len: u64) -> Self {
         Self {
             shard_id: key.shard_id,
@@ -1234,14 +1240,15 @@ impl CacheManifestRecord {
         }
     }
 
+    #[cfg(not(feature = "rocksdb-ssd"))]
     fn encode_line(&self) -> String {
-        format!(
-            "v1\t{}\t{}\t{}\t{}\t{}",
+        manifest_line(
+            "v1",
             self.shard_id,
-            encode_manifest_field(&self.record_key),
-            encode_manifest_field(&self.namespace),
-            encode_manifest_field(&self.selector),
-            self.block_len
+            &self.record_key,
+            &self.namespace,
+            &self.selector,
+            Some(self.block_len),
         )
     }
 
@@ -1295,12 +1302,13 @@ impl CacheManifestOp {
     fn encode_line(&self) -> String {
         match self {
             Self::Put(record) => record.encode_line(),
-            Self::Delete(key) => format!(
-                "d1\t{}\t{}\t{}\t{}",
+            Self::Delete(key) => manifest_line(
+                "d1",
                 key.shard_id,
-                encode_manifest_field(&key.record_key),
-                encode_manifest_field(&key.namespace),
-                encode_manifest_field(&key.selector)
+                &key.record_key,
+                &key.namespace,
+                &key.selector,
+                None,
             ),
         }
     }

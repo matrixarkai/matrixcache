@@ -458,8 +458,15 @@ impl CacheInner {
             .join(key.disk_name())
     }
 
+    /// The SSD tier's key for an entry: the entry's `v1` manifest line.
+    ///
+    /// This runs on every invalidation **and on every SSD read**, including the
+    /// tier lookup for a key the cache does not hold, so it is built directly
+    /// rather than through a record that exists only to be encoded and dropped.
+    /// The bytes are unchanged -- see [`manifest_line`] for why that matters
+    /// more here than the allocations do.
     fn ssd_store_key(key: &CacheKey) -> String {
-        CacheManifestRecord::from_entry(key, 0).encode_line()
+        manifest_line_for_key(key, 0)
     }
 
     fn ssd_block_exists(&self, key: &CacheKey) -> bool {
@@ -642,8 +649,7 @@ impl CacheInner {
             {
                 let mut file = File::create(&temp_path)?;
                 for (key, block_len) in &self.disk_index {
-                    let record = CacheManifestRecord::from_entry(key, *block_len);
-                    writeln!(file, "{}", record.encode_line())?;
+                    writeln!(file, "{}", manifest_line_for_key(key, *block_len))?;
                 }
                 file.sync_all()?;
             }
@@ -718,7 +724,7 @@ impl CacheInner {
     }
 
     fn pmem_manifest_key(key: &CacheKey, block_len: u64) -> String {
-        CacheManifestRecord::from_entry(key, block_len).encode_line()
+        manifest_line_for_key(key, block_len)
     }
 
     /// Where a key's block would live in the persistent-memory tier, if there is
@@ -737,12 +743,13 @@ impl CacheInner {
     }
 
     fn encode_pmem_delete_line(key: &CacheKey) -> String {
-        format!(
-            "pmd1	{}	{}	{}	{}",
+        manifest_line(
+            "pmd1",
             key.shard_id,
-            encode_manifest_field(&key.record_key),
-            encode_manifest_field(&key.namespace),
-            encode_manifest_field(&key.selector)
+            &key.record_key,
+            &key.namespace,
+            &key.selector,
+            None,
         )
     }
 
@@ -805,7 +812,7 @@ impl CacheInner {
         if durable {
             sync_parent_dir(&path).map_err(CacheError::Io)?;
         }
-        self.append_pmem_manifest_line(CacheManifestRecord::from_entry(key, value.len() as u64).encode_line())
+        self.append_pmem_manifest_line(manifest_line_for_key(key, value.len() as u64))
     }
 
     /// Drop a key from the persistent-memory tier's files.
@@ -2819,14 +2826,117 @@ fn extract_routing_slot(key: &CacheKey) -> Option<u32> {
     slot.parse::<u32>().ok()
 }
 
-fn encode_manifest_field(value: &str) -> String {
+/// Hex-encode a manifest field into a line that is already being built.
+///
+/// The bytes are exactly what the field encoding has always produced. What
+/// changes is where they land: into the caller's line rather than into a
+/// `String` of their own that is then copied into it and dropped.
+fn push_manifest_field(line: &mut String, value: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        line.push(HEX[(byte >> 4) as usize] as char);
+        line.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    encoded
+}
+
+/// Decimal digits, pushed rather than formatted.
+///
+/// `write!` would do the same thing, but it reaches for `std::fmt::Write`,
+/// and this file's `Write` import is gated to one backend while every manifest
+/// line is built under both.
+fn push_decimal(line: &mut String, value: u64) {
+    // u64::MAX is 20 digits.
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut rest = value;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    for &digit in &digits[index..] {
+        line.push(digit as char);
+    }
+}
+
+/// How many characters `value` occupies in decimal.
+fn decimal_width(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
+/// A manifest line, in one allocation.
+///
+/// Every manifest line in this crate is a tag, a shard id and three hex-encoded
+/// key fields, with a block length on the two shapes that carry one. Building
+/// one with `format!` over a per-field encoder allocated three field `String`s
+/// that were copied into the line and dropped, and then let `format!` size the
+/// line by its literal pieces alone -- which under-counts the hex fields by an
+/// order of magnitude, so the line was allocated and then grown twice more.
+/// Nine allocations for a string this can size up front, measured flat from
+/// four record-key characters to a hundred and sixty.
+///
+/// **The bytes are unchanged.** These lines are RocksDB keys and manifest
+/// records already written to disk; a changed byte would not fail a test, it
+/// would make an entry that is present unfindable. The capacity below is the
+/// exact length of the result, so the line is allocated once and never grown.
+fn manifest_line(
+    tag: &str,
+    shard_id: ShardId,
+    record_key: &str,
+    namespace: &str,
+    selector: &str,
+    block_len: Option<u64>,
+) -> String {
+    let mut line = String::with_capacity(
+        tag.len()
+            + 1
+            + decimal_width(shard_id)
+            + 1
+            + record_key.len() * 2
+            + 1
+            + namespace.len() * 2
+            + 1
+            + selector.len() * 2
+            + block_len.map_or(0, |len| 1 + decimal_width(len)),
+    );
+    line.push_str(tag);
+    line.push('\t');
+    push_decimal(&mut line, shard_id);
+    line.push('\t');
+    push_manifest_field(&mut line, record_key);
+    line.push('\t');
+    push_manifest_field(&mut line, namespace);
+    line.push('\t');
+    push_manifest_field(&mut line, selector);
+    if let Some(len) = block_len {
+        line.push('\t');
+        push_decimal(&mut line, len);
+    }
+    line
+}
+
+/// A `v1` manifest line for a key, without building the record first.
+///
+/// [`CacheManifestRecord::from_entry`] owns its three key fields, so asking a
+/// record for its line clones the record key, the namespace and the selector
+/// only to hex-encode each one and drop it. The line reads them where they
+/// already are.
+fn manifest_line_for_key(key: &CacheKey, block_len: u64) -> String {
+    manifest_line(
+        "v1",
+        key.shard_id,
+        &key.record_key,
+        &key.namespace,
+        &key.selector,
+        Some(block_len),
+    )
 }
 
 fn decode_manifest_field(value: &str) -> Option<String> {
