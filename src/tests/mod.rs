@@ -4540,7 +4540,7 @@ mod tests {
         let mut routed = Vec::new();
         for index in 0..512 {
             let key = CacheKey::page_with_slot(9, index, index * 64, 64, Some(index as u32 % 8));
-            let store_key = CacheManifestRecord::from_entry(&key, 0).encode_line();
+            let store_key = CacheInner::ssd_store_key(&key);
             let Some(device) = routing_probe.device_for_key(&store_key).map(str::to_string) else {
                 continue;
             };
@@ -8844,7 +8844,7 @@ mod tests {
         for index in 0..512 {
             let record_key = format!("multi-ssd-flex-key-{index}");
             let key = CacheKey::string(0, &record_key);
-            let store_key = CacheManifestRecord::from_entry(&key, 0).encode_line();
+            let store_key = CacheInner::ssd_store_key(&key);
             let Some(device) = routing_probe.device_for_key(&store_key).map(str::to_string) else {
                 continue;
             };
@@ -8870,7 +8870,7 @@ mod tests {
         assert!(storage_probe.Start());
         for (index, (key, _device)) in routed.iter().enumerate() {
             let store_key =
-                CacheManifestRecord::from_entry(&CacheKey::string(0, key), 0).encode_line();
+                CacheInner::ssd_store_key(&CacheKey::string(0, key));
             assert_eq!(
                 decode_cache_block(storage_probe.Get(&store_key).unwrap().Data()).unwrap(),
                 format!("flex-multi-ssd-value-{index}").into_bytes()
@@ -18256,4 +18256,327 @@ fn dashboard_metric_names(input: &str) -> Vec<String> {
         }
     }
     names
+}
+
+
+// ---------------------------------------------------------------------------
+// The manifest line is a RocksDB key and an on-disk manifest record. Making it
+// cheaper to build is only safe while it is byte for byte the same line: a key
+// that encodes differently for the same logical entry means a write and a later
+// read disagree and the read silently misses, and the tier lookup is
+// `disk_index.contains_key(key) || ssd_block_exists(key)`, so a block the store
+// holds and the index does not is still served. Encoding more expensively is
+// merely slow. These guards assert the strong direction.
+// ---------------------------------------------------------------------------
+
+/// The field encoding exactly as it stood before the one-allocation line
+/// builder, written out here rather than called, so that this is an independent
+/// statement of the format and not the code under test agreeing with itself.
+#[cfg(test)]
+fn manifest_field_as_it_was(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// The `v1` line exactly as `format!` produced it before this change.
+#[cfg(test)]
+fn v1_line_as_it_was(key: &CacheKey, block_len: u64) -> String {
+    format!(
+        "v1\t{}\t{}\t{}\t{}\t{}",
+        key.shard_id,
+        manifest_field_as_it_was(&key.record_key),
+        manifest_field_as_it_was(&key.namespace),
+        manifest_field_as_it_was(&key.selector),
+        block_len
+    )
+}
+
+/// Every key shape the public constructors can produce, plus the awkward ones:
+/// empty fields, a tab and a newline inside a field, a non-ASCII field, shard
+/// zero and shard `u64::MAX`.
+#[cfg(test)]
+fn every_manifest_key_shape() -> Vec<CacheKey> {
+    let mut shapes = vec![
+        CacheKey::string(0, "plain"),
+        CacheKey::string(u64::MAX, "the-largest-shard-id"),
+        CacheKey::string(9, ""),
+        CacheKey::hash(1, "record", "field"),
+        CacheKey::set_members(2, "members"),
+        CacheKey::page(3, 7, 4096, 512),
+        CacheKey::page_with_slot(4, 70_000, 0, 16, Some(17)),
+        CacheKey::page_with_slot(5, 70_000, 0, 16, None),
+        CacheKey::page_with_slot_generation(6, 11, 64, 32, Some(3), Some(99)),
+        CacheKey::feature_query(7, "model", 1_700_000_000_000, 1_700_000_060_000, Some(16)),
+        CacheKey::feature_query(7, "model", 0, 0, None),
+    ];
+    for awkward in ["", "with\ttab", "with\nnewline", "non-ascii-\u{00e9}\u{4e2d}", "v1"] {
+        shapes.push(CacheKey {
+            shard_id: 8,
+            record_key: awkward.to_string(),
+            namespace: std::borrow::Cow::Owned(awkward.to_string()),
+            selector: awkward.to_string(),
+        });
+    }
+    for length in [1usize, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 255] {
+        shapes.push(CacheKey::string(10, &"k".repeat(length)));
+    }
+    shapes
+}
+
+/// A key that is encoded one way on write and another way on read is data that
+/// is present and unfindable. Nothing in this crate would fail; the entry would
+/// simply stop being found. So the bytes are asserted against an independent
+/// copy of the old format, for every shape, at several block lengths.
+#[test]
+fn the_ssd_store_key_is_byte_for_byte_the_line_the_old_encoding_produced() {
+    let shapes = every_manifest_key_shape();
+    assert!(
+        shapes.len() >= 25,
+        "the shape set has shrunk to {} and would pass vacuously",
+        shapes.len()
+    );
+    for key in &shapes {
+        assert_eq!(
+            CacheInner::ssd_store_key(key),
+            v1_line_as_it_was(key, 0),
+            "the SSD tier's key for {key:?} changed"
+        );
+        for block_len in [0u64, 1, 9, 10, 4096, u64::MAX] {
+            assert_eq!(
+                CacheInner::pmem_manifest_key(key, block_len),
+                v1_line_as_it_was(key, block_len),
+                "the persistent tier's key for {key:?} at block_len {block_len} changed"
+            );
+            #[cfg(not(feature = "rocksdb-ssd"))]
+            assert_eq!(
+                CacheManifestRecord::from_entry(key, block_len).encode_line(),
+                v1_line_as_it_was(key, block_len),
+                "the manifest line for {key:?} at block_len {block_len} changed"
+            );
+        }
+    }
+}
+
+/// The delete lines are the same format with a different tag and no block
+/// length. They are read back by their own decoders on recovery.
+#[test]
+fn the_delete_lines_are_byte_for_byte_what_they_were() {
+    let shapes = every_manifest_key_shape();
+    assert!(shapes.len() >= 25, "the shape set has shrunk");
+    for key in &shapes {
+        let expected = format!(
+            "pmd1\t{}\t{}\t{}\t{}",
+            key.shard_id,
+            manifest_field_as_it_was(&key.record_key),
+            manifest_field_as_it_was(&key.namespace),
+            manifest_field_as_it_was(&key.selector)
+        );
+        assert_eq!(
+            CacheInner::encode_pmem_delete_line(key),
+            expected,
+            "the persistent-memory delete line for {key:?} changed"
+        );
+        assert_eq!(
+            CacheInner::decode_pmem_delete_line(&CacheInner::encode_pmem_delete_line(key)).as_ref(),
+            Some(key),
+            "the persistent-memory delete line for {key:?} no longer decodes to its key"
+        );
+    }
+}
+
+#[cfg(not(feature = "rocksdb-ssd"))]
+#[test]
+fn the_disk_manifest_delete_line_is_byte_for_byte_what_it_was() {
+    let shapes = every_manifest_key_shape();
+    assert!(shapes.len() >= 25, "the shape set has shrunk");
+    for key in &shapes {
+        let expected = format!(
+            "d1\t{}\t{}\t{}\t{}",
+            key.shard_id,
+            manifest_field_as_it_was(&key.record_key),
+            manifest_field_as_it_was(&key.namespace),
+            manifest_field_as_it_was(&key.selector)
+        );
+        assert_eq!(
+            CacheManifestOp::Delete(key.clone()).encode_line(),
+            expected,
+            "the disk manifest delete line for {key:?} changed"
+        );
+    }
+}
+
+/// Every line shape still decodes to the entry it was built from.
+#[test]
+fn every_manifest_line_shape_still_decodes_to_its_entry() {
+    let shapes = every_manifest_key_shape();
+    assert!(shapes.len() >= 25, "the shape set has shrunk");
+    for key in &shapes {
+        for block_len in [0u64, 1, 4096, u64::MAX] {
+            // Built by the encoder production actually uses under both feature
+            // settings, and read by the decoder recovery actually uses: this is
+            // the write and the later read, and they must agree.
+            let line = CacheInner::pmem_manifest_key(key, block_len);
+            let decoded = CacheManifestRecord::decode_line(&line)
+                .unwrap_or_else(|| panic!("{line} no longer decodes"));
+            assert_eq!(&decoded.key(), key, "{line} decoded to the wrong key");
+            assert_eq!(decoded.block_len, block_len, "{line} lost its block length");
+        }
+    }
+}
+
+/// One allocation, asserted the only way a test inside a crate that forbids
+/// `unsafe` can assert it: the line is never grown, so the capacity it was
+/// given is exactly the length it ended up with. A builder that reserved too
+/// little would have grown (capacity above length, and an allocation spent
+/// doing it); one that reserved too much would leave capacity above length too.
+///
+/// This is a band, not a bound: equality fails on both sides.
+#[test]
+fn a_manifest_line_is_sized_exactly_and_never_grown() {
+    let shapes = every_manifest_key_shape();
+    assert!(shapes.len() >= 25, "the shape set has shrunk");
+    let mut checked = 0usize;
+    for key in &shapes {
+        for block_len in [0u64, 1, 9, 10, 99, 100, 4096, u64::MAX] {
+            for line in [
+                CacheInner::ssd_store_key(key),
+                CacheInner::pmem_manifest_key(key, block_len),
+                CacheInner::encode_pmem_delete_line(key),
+            ] {
+                assert_eq!(
+                    line.capacity(),
+                    line.len(),
+                    "a manifest line was sized {} for {} bytes, so it was not built in one \
+                     allocation: {line}",
+                    line.capacity(),
+                    line.len()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 600,
+        "only {checked} lines were checked, which is too few to mean anything"
+    );
+}
+
+/// `decimal_width` is what makes the sizing exact, so it is asserted against
+/// the formatting it stands in for rather than against itself.
+#[test]
+fn the_decimal_width_is_the_width_the_formatter_would_use() {
+    let mut cases = vec![0u64, 1, 9, 10, 11, 99, 100, 101, u64::MAX, u64::MAX - 1];
+    for power in 0..20u32 {
+        cases.push(10u64.pow(power));
+        cases.push(10u64.pow(power).saturating_sub(1));
+        cases.push(10u64.pow(power).saturating_add(1));
+    }
+    assert!(cases.len() >= 60, "the case set has shrunk");
+    for value in cases {
+        assert_eq!(
+            decimal_width(value),
+            value.to_string().len(),
+            "decimal_width({value}) does not match its formatted width"
+        );
+        let mut pushed = String::new();
+        push_decimal(&mut pushed, value);
+        assert_eq!(pushed, value.to_string(), "push_decimal({value}) wrote the wrong digits");
+    }
+}
+
+/// The end the encoding exists for: a store written by the old encoding is read
+/// by the new one. The old bytes are written here by the independent copy of
+/// the old format above, straight into the tier, and then the cache -- which
+/// now builds its keys the new way -- is asked for them.
+///
+/// The whole tier listing is compared element by element, and the count of
+/// entries that should persist is asserted **equal** to what went in, not
+/// merely non-zero.
+#[test]
+fn a_tier_written_with_the_old_encoding_is_read_by_the_new_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = CacheOptions::new(1 << 20, 0, 1 << 24)
+        .with_ssd_paths([directory.path().to_path_buf()]);
+
+    let keys = every_manifest_key_shape();
+    let expected_count = keys.len();
+    assert!(expected_count >= 25, "the shape set has shrunk");
+
+    let before: Vec<CacheEntryInfo>;
+    {
+        let cache = MultiLayerCache::with_options(options.clone());
+        cache.start().unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            cache
+                .put(key.clone(), format!("block-{index}").into_bytes())
+                .unwrap();
+        }
+        // Every store key the cache just wrote under is the line the old
+        // encoding would have produced, so the bytes on disk are old bytes.
+        for key in &keys {
+            assert_eq!(CacheInner::ssd_store_key(key), v1_line_as_it_was(key, 0));
+        }
+        before = cache.all_entries();
+        assert_eq!(
+            before.len(),
+            expected_count,
+            "the tier did not hold every entry that was written to it"
+        );
+        assert!(cache.stop(), "the cache did not stop cleanly");
+    }
+
+    let reopened = MultiLayerCache::with_options(options);
+    reopened.start().unwrap();
+    reopened.recover_persistent_tiers().unwrap();
+
+    let mut found = 0usize;
+    for (index, key) in keys.iter().enumerate() {
+        let value = reopened
+            .get(key)
+            .unwrap_or_else(|error| panic!("reading {key:?} back failed: {error:?}"));
+        assert_eq!(
+            value,
+            Some(format!("block-{index}").into_bytes()),
+            "the entry for {key:?} was written before this change and is not found after it"
+        );
+        found += 1;
+        assert!(
+            reopened.peek(key),
+            "the tier lookup no longer finds {key:?}, so a block the store holds is unindexed"
+        );
+    }
+    assert_eq!(
+        found, expected_count,
+        "only {found} of {expected_count} entries survived the encoding change"
+    );
+
+    let after = reopened.all_entries();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the tier listing changed length across the encoding change"
+    );
+    for (left, right) in before.iter().zip(after.iter()) {
+        assert_eq!(
+            (
+                left.shard_id,
+                left.namespace.as_str(),
+                left.record_key.as_str(),
+                left.selector.as_str()
+            ),
+            (
+                right.shard_id,
+                right.namespace.as_str(),
+                right.record_key.as_str(),
+                right.selector.as_str()
+            ),
+            "the tier listing changed element by element across the encoding change"
+        );
+    }
+    assert!(reopened.stop(), "the cache did not stop cleanly");
 }
