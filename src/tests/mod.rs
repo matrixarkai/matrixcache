@@ -4175,6 +4175,172 @@ mod tests {
         );
     }
 
+    /// The memory tier's byte counter, against the memory tier.
+    ///
+    /// `size_for_tier` returns a counter that a dozen sites add to and subtract
+    /// from. `used_space_for_tier` walks the tier and adds it up. The two differ
+    /// by exactly the resident keys' own sizes, so together they say whether the
+    /// counter still describes the thing it is counting.
+    ///
+    /// Worth checking rather than assuming, because every subtraction is
+    /// saturating: a counter that has drifted below the truth is clamped to
+    /// zero on the way past, so drift shows up as a plausible number rather
+    /// than an absurd one.
+    fn assert_memory_accounting(cache: &MultiLayerCache, universe: &[CacheKey], stage: &str) {
+        let resident_key_bytes: usize = universe
+            .iter()
+            .filter(|key| cache.peek_tier(key) == Some(CacheReadTier::Memory))
+            .map(CacheKey::logical_size)
+            .sum();
+        let walked = cache.used_space_for_tier(CacheTier::Memory);
+        let counted = cache.size_for_tier(CacheTier::Memory);
+        assert_eq!(
+            walked,
+            counted + resident_key_bytes,
+            "after {stage}: the memory tier holds {walked} bytes of keys and \
+             values, the counter says {counted} bytes of values, and the \
+             resident keys are {resident_key_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn the_memory_byte_counter_keeps_describing_the_memory_tier() {
+        const VALUE: usize = 96;
+        const ENTRIES: usize = 48;
+        // Room to spare on purpose. Eviction runs until the *counter* is inside
+        // capacity and subtracts real lengths as it goes, so a counter that has
+        // drifted high evicts its way back down and, once the tier is empty,
+        // the saturating subtraction clamps the remainder away. Drift is
+        // laundered by the very pressure it causes. So the writes that could
+        // cause it happen where nothing is evicting, and pressure gets a phase
+        // of its own at the end.
+        const HEADROOM: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: ENTRIES * VALUE * HEADROOM,
+            pmem_capacity: 0,
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+
+        // Every key this test will ever mention, so residency can be counted.
+        let universe: Vec<CacheKey> = (0..ENTRIES)
+            .map(|i| CacheKey::string(0, &format!("acct-{i:04}")))
+            .collect();
+
+        assert_memory_accounting(&cache, &universe, "an empty cache");
+
+        for key in &universe {
+            cache.put(key.clone(), vec![b'v'; VALUE]).unwrap();
+        }
+        assert_eq!(
+            cache.stats().memory_evictions,
+            0,
+            "the point of the headroom is that nothing has been evicted yet"
+        );
+        assert_memory_accounting(&cache, &universe, "the first writes");
+
+        // Overwriting one resident value with another is where a counter goes
+        // wrong: the old length has to come off before the new one goes on.
+        //
+        // Reached through `put_memory_only`, because `put` will not do it. A
+        // key written repeatedly grows hot enough for the tiering decision to
+        // route its rewrite *past* this tier -- deliberately, and the code says
+        // so -- which takes the old value out rather than replacing it. After
+        // three rounds of rewriting every key with `put`, none of the
+        // forty-eight is still here. That is a different piece of accounting,
+        // checked below, and not this one.
+        for round in 0..3_u8 {
+            for key in &universe {
+                cache.put_memory_only(key.clone(), vec![b'o' + round; VALUE]);
+            }
+        }
+        assert_eq!(
+            universe
+                .iter()
+                .filter(|key| cache.peek_tier(key) == Some(CacheReadTier::Memory))
+                .count(),
+            ENTRIES,
+            "the rewrites were supposed to land here, and this check is worth              nothing if they did not"
+        );
+        assert_eq!(cache.stats().memory_evictions, 0, "still no eviction");
+        assert_memory_accounting(&cache, &universe, "overwriting in place");
+
+        // And the sizes that move an entry off this tier, which is a different
+        // piece of accounting.
+        for key in universe.iter().take(ENTRIES / 2) {
+            cache.put(key.clone(), vec![b'w'; VALUE * 3]).unwrap();
+        }
+        assert_eq!(cache.stats().memory_evictions, 0, "still no eviction");
+        assert_memory_accounting(&cache, &universe, "overwriting larger");
+
+        for key in universe.iter().take(ENTRIES / 2) {
+            cache.put(key.clone(), vec![b'x'; VALUE / 4]).unwrap();
+        }
+        assert_eq!(cache.stats().memory_evictions, 0, "still no eviction");
+        assert_memory_accounting(&cache, &universe, "overwriting smaller");
+
+        for key in universe.iter().skip(4).step_by(5) {
+            cache.invalidate(key).unwrap();
+        }
+        assert_memory_accounting(&cache, &universe, "invalidating a scattering");
+
+        for key in universe.iter().skip(2).step_by(7) {
+            cache.remove(key).unwrap();
+        }
+        assert_memory_accounting(&cache, &universe, "removing a scattering");
+
+        // An entry that expires is dropped by a reader or by the sweep, and
+        // both have to account for it.
+        let short_lived: Vec<CacheKey> = (0..8)
+            .map(|i| CacheKey::string(0, &format!("brief-{i:02}")))
+            .collect();
+        for key in &short_lived {
+            cache
+                .put_with_ttl(key.clone(), vec![b't'; VALUE], Duration::from_millis(1))
+                .unwrap();
+        }
+        let mut all: Vec<CacheKey> = universe.clone();
+        all.extend(short_lived.iter().cloned());
+        std::thread::sleep(Duration::from_millis(40));
+        for key in &short_lived {
+            let _ = cache.get(key).unwrap();
+        }
+        assert_memory_accounting(&cache, &all, "entries expiring");
+
+        // Reads promote between tiers, which moves bytes between counters.
+        for key in &all {
+            let _ = cache.get(key).unwrap();
+        }
+        assert_memory_accounting(&cache, &all, "reading everything back");
+
+        // Now the pressure, in its own phase and with its own keys, so what it
+        // checks is eviction's accounting rather than everything before it.
+        let flood: Vec<CacheKey> = (0..ENTRIES * HEADROOM * 2)
+            .map(|i| CacheKey::string(0, &format!("flood-{i:05}")))
+            .collect();
+        for key in &flood {
+            cache.put(key.clone(), vec![b'f'; VALUE]).unwrap();
+        }
+        assert!(
+            cache.stats().memory_evictions > 0,
+            "the flood was supposed to force eviction and did not"
+        );
+        all.extend(flood.iter().cloned());
+        assert_memory_accounting(&cache, &all, "writing past capacity");
+
+        cache.remove_all().unwrap();
+        assert_memory_accounting(&cache, &all, "removing everything");
+        assert_eq!(
+            cache.size_for_tier(CacheTier::Memory),
+            0,
+            "the tier is empty and the counter should say so"
+        );
+    }
+
     #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
