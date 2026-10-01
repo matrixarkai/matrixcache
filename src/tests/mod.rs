@@ -4442,6 +4442,103 @@ mod tests {
     }
 
     #[test]
+    fn cluster_joining_one_at_a_time_lands_where_joining_together_does() {
+        // Adding one node puts its points on the ring and leaves everyone
+        // else's alone, rather than rebuilding. That is only sound if it
+        // produces the ring a rebuild would have: the same points, in the same
+        // order, numbered the same way.
+        //
+        // Checked by placing the same keys through both and insisting on the
+        // same answers -- not on the same internals, which would pass for a
+        // ring that happened to agree about these keys and nothing else, but on
+        // the point count as well.
+        let names: Vec<String> = (0..64).map(|i| format!("cache-{i:04}")).collect();
+
+        let mut together = CacheClusterTopology::new();
+        together
+            .add_nodes(names.iter().map(|name| (name.as_str(), 1)))
+            .expect("distinct names");
+
+        // Added one at a time, and deliberately not in the order the membership
+        // will hold them, so the renumbering is exercised rather than appended
+        // to.
+        let mut one_at_a_time = CacheClusterTopology::new();
+        for name in names.iter().rev() {
+            one_at_a_time.add_node(name, 1).expect("a distinct name");
+        }
+
+        assert_eq!(
+            one_at_a_time.ring_point_count(),
+            together.ring_point_count(),
+            "the two rings hold different numbers of points"
+        );
+        assert_eq!(
+            one_at_a_time.live_node_count(),
+            together.live_node_count()
+        );
+        for index in 0..20_000 {
+            let key = cluster_test_key(index);
+            assert_eq!(
+                one_at_a_time.owner(&key),
+                together.owner(&key),
+                "joining one at a time put {key:?} somewhere else"
+            );
+        }
+        // And the copies, which walk the ring rather than binary search it.
+        for index in 0..2_000 {
+            let key = cluster_test_key(index);
+            assert_eq!(one_at_a_time.owners(&key, 3), together.owners(&key, 3));
+        }
+    }
+
+    #[test]
+    fn cluster_a_node_leaving_lands_where_it_never_joined() {
+        // The same question for removal: taking one member's points off the
+        // ring has to leave the ring a cluster that never had it would have
+        // built.
+        let staying: Vec<String> = (0..48).map(|i| format!("cache-{i:04}")).collect();
+
+        let mut without = CacheClusterTopology::new();
+        without
+            .add_nodes(staying.iter().map(|name| (name.as_str(), 1)))
+            .expect("distinct names");
+
+        let mut with_then_without = CacheClusterTopology::new();
+        with_then_without
+            .add_nodes(staying.iter().map(|name| (name.as_str(), 1)))
+            .expect("distinct names");
+        // A name that sorts into the middle, so removing it renumbers members
+        // on both sides of it.
+        with_then_without
+            .add_node("cache-0023-extra", 2)
+            .expect("a distinct name");
+        assert!(with_then_without.ring_point_count() > without.ring_point_count());
+        assert!(with_then_without.remove_node("cache-0023-extra"));
+
+        assert_eq!(
+            with_then_without.ring_point_count(),
+            without.ring_point_count(),
+            "removal left points behind or took too many"
+        );
+        assert_eq!(with_then_without.member_count(), without.member_count());
+        for index in 0..20_000 {
+            let key = cluster_test_key(index);
+            assert_eq!(
+                with_then_without.owner(&key),
+                without.owner(&key),
+                "removing a node left {key:?} somewhere else"
+            );
+        }
+
+        // Removing something that was never there changes nothing.
+        assert!(!with_then_without.remove_node("cache-9999"));
+        assert_eq!(
+            with_then_without.ring_point_count(),
+            without.ring_point_count()
+        );
+    }
+
+    #[test]
     fn cluster_an_unchanged_membership_moves_nothing() {
         let cluster = cluster_of(6);
         let same = cluster_of(6);
