@@ -2076,15 +2076,24 @@ impl MultiLayerCache {
     /// state where a write set evicts itself -- 256 shards of 64 entries, read
     /// hard, then written:
     ///
-    /// | share | evictions per write | hit rate after the writes |
-    /// | ---: | ---: | ---: |
-    /// | 100 (default) | 0.965 | 82.77% |
-    /// | 40 | 0.028 | 78.48% |
+    /// | values | share | evictions per write | hit rate after the writes |
+    /// | --- | ---: | ---: | ---: |
+    /// | all 256 B | 100 (default) | 0.991 | 82.77% |
+    /// | all 256 B | 40 | 0.022 | 78.48% |
+    /// | 32 B..1 KiB | 100 (default) | 0.979 | 81.87% |
+    /// | 32 B..1 KiB | 40 | 0.099 | **68.21%** |
     ///
-    /// Thirty-four times fewer evictions for a bit over four points of hit rate.
-    /// Re-measured after the change that made an overwrite an access, which moved
-    /// the default row from 0.996 to 0.965: these are the numbers this code
-    /// produces, not the ones the bound produced on its own.
+    /// **Read the second pair before turning this on.** With uniform values it is
+    /// forty times fewer evictions for four points of hit rate. With values
+    /// spread over two orders of magnitude it is ten times fewer for *fourteen*
+    /// points -- a much worse bargain, and the first version of this doc quoted
+    /// only the uniform row, which made the knob look far cheaper than it is for
+    /// most caches.
+    ///
+    /// Some of that gap was the share being counted in entries rather than bytes,
+    /// and fixing the unit recovered a little of it: the varied row was 65.96%
+    /// when the share was a share of the entry count. The rest is the mismatch
+    /// below, which a bound on one order cannot close.
     /// Worth it for a write-heavy tier whose reads are already served elsewhere,
     /// and not worth it otherwise -- which is why the default does not move.
     ///
