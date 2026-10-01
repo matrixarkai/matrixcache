@@ -1057,6 +1057,17 @@ pub struct CacheStats {
     /// it to a slower tier would have spent a write on a value no read can be
     /// given.
     pub expired_demotions_skipped: u64,
+    /// Memory evictions whose entry was already on the tier below, so the
+    /// demotion succeeded and wrote nothing.
+    ///
+    /// A read served from the persistent-memory tier copies the entry up into
+    /// memory and leaves the lower copy where it is, so from then on the key is
+    /// on both tiers. Evicting the memory copy then has nothing to write down.
+    ///
+    /// Without this counter that outcome is invisible, and `pmem_fills` looks
+    /// like it has lost an eviction. It is the difference between
+    /// `memory_evictions` and `pmem_fills` that nothing else explains.
+    pub demotions_already_resident: u64,
     /// Reads that found an entry which had passed its time to live. Counted as
     /// misses too, because that is what the caller was served.
     pub expired_reads: u64,
