@@ -6035,21 +6035,27 @@ impl ShardedMultiLayerCache {
             ..Default::default()
         };
 
-        for shard in self.shards.iter() {
-            let stats = shard.stats();
-            fold_shard_stats(&mut total, stats);
-        }
         // Not a count, so adding it would report four shards each admitting
         // half of everything as a share of two. The tightest shard is the
         // useful one: it is the reason a caller is seeing writes refused.
-        // Taken after the loop because the running total starts at zero, which
-        // is a minimum nothing can beat.
-        total.ssd_write_budget_share = self
-            .shards
-            .iter()
-            .map(|shard| shard.stats().ssd_write_budget_share)
-            .min()
-            .unwrap_or(0);
+        //
+        // Carried in an `Option` so it can be taken during the fold rather than
+        // by a second pass over the shards. The second pass asked every shard
+        // for all 146 of its counters again to re-read one it had already been
+        // given, which doubled what a snapshot of a sharded cache costs -- 1.2ms
+        // at a thousand shards, and every shard's stats built twice at any
+        // count. The `Option` is what the second pass was avoiding: a running
+        // total starts at zero, and zero is a minimum nothing can beat.
+        let mut tightest_write_budget_share: Option<u64> = None;
+        for shard in self.shards.iter() {
+            let stats = shard.stats();
+            tightest_write_budget_share = Some(match tightest_write_budget_share {
+                Some(tightest) => tightest.min(stats.ssd_write_budget_share),
+                None => stats.ssd_write_budget_share,
+            });
+            fold_shard_stats(&mut total, stats);
+        }
+        total.ssd_write_budget_share = tightest_write_budget_share.unwrap_or(0);
         total
     }
 
