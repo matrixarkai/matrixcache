@@ -2078,10 +2078,13 @@ impl MultiLayerCache {
     ///
     /// | share | evictions per write | hit rate after the writes |
     /// | ---: | ---: | ---: |
-    /// | 100 (default) | 0.996 | 82.77% |
-    /// | 40 | 0.031 | 78.33% |
+    /// | 100 (default) | 0.965 | 82.77% |
+    /// | 40 | 0.028 | 78.48% |
     ///
-    /// Thirty-two times fewer evictions for four and a half points of hit rate.
+    /// Thirty-four times fewer evictions for a bit over four points of hit rate.
+    /// Re-measured after the change that made an overwrite an access, which moved
+    /// the default row from 0.996 to 0.965: these are the numbers this code
+    /// produces, not the ones the bound produced on its own.
     /// Worth it for a write-heavy tier whose reads are already served elsewhere,
     /// and not worth it otherwise -- which is why the default does not move.
     ///
@@ -2095,7 +2098,7 @@ impl MultiLayerCache {
     /// The victim inside the share is still the lowest-scoring entry, not the
     /// least recently used one, and that is deliberate: picking the least
     /// recently used entry inside the share was driven and is worse, 0.000
-    /// evictions per write for a hit rate of 73.72% against this 78.33%. The
+    /// evictions per write for a hit rate of 73.72% against this 78.48%. The
     /// score preserves entries that have been read often, and recency on its own
     /// discards them. Two orderings disagreeing is also where the remaining cost
     /// comes from -- the share is held by recency while the victim is chosen by
