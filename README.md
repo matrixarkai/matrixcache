@@ -167,33 +167,44 @@ read-hot should stay well below that.
 So: sixteen for a mixed workload, fewer if you only read, and measure before going
 past sixty-four.
 
-### Sixteen is a compromise, and the compromise is removable
+### Sixteen is for this size of cache; the rule is entries per shard
 
-One number sets two unrelated things: how many locks writers can spread across,
-and how finely the byte budget is divided. They pull in opposite directions.
+One number sets two things: how many locks writers can spread across, and how
+finely the byte budget is divided. They pull in opposite directions.
 
 - **More shards, less queueing.** Four writers at one shard cost 3.1x to 3.9x what
   a single writer costs -- four threads taking turns on one lock. At sixteen
   shards four writers cost *less per write* than one writer does.
-- **More shards, a smaller budget each.** At 256 shards a shard holds 64 entries,
-  and once a read-heavy phase has filled the protected segment a freshly written
-  key is the best victim that shard has. The writes then evict each other: 0.93
-  evictions per write against none at sixteen, with the write cost rising more
-  than tenfold.
+- **More shards, a smaller budget each.** Once a read-heavy phase has filled the
+  protected segment, a freshly written key is the best victim a shard has, so if a
+  shard is small the writes evict each other.
 
-Sixteen is where those two meet for the sweep's workload. It is a compromise
-rather than an optimum, and the two halves are not equally sensitive: going from
-sixteen shards to 256 buys only about **1.2x** for four writers, because sixteen
-locks already make a collision rare at that thread count. What costs at 256 is the
-divided budget, not the locking. (Four writers is as far as the measurement goes
-here -- the lock half would matter more with far more writers, and this machine
-cannot resolve that.)
+The second effect is not about the shard count. It is about how many entries a
+shard still holds, which is the count divided into the capacity:
 
-A cache that sharded only its index for locking, over **one undivided byte budget
-per tier**, would not have to choose: many locks and no capacity pressure. That is
-a larger change than a constant -- capacity accounting, the write budget and
-eviction victim selection are per-shard today -- and it is the direction worth
-taking rather than a knob to turn.
+| entries per shard | evictions per write |
+| ---: | ---: |
+| 16,384 | 0.000 |
+| 1,024 | 0.000 |
+| 256 | 0.045 |
+| 64 | **0.927** |
+| 16 | 0.837 |
+
+So sixteen is not a constant to carry elsewhere -- it is 16,384 entries divided by
+a thousand. The sweep's cache holds 16,384 entries, so 256 shards leaves 64 each
+and the writes thrash; a cache ten times the size at the same count would leave 640
+each and behave like the 256-entry row. **Scale the count with the capacity**, and
+leave a shard enough entries that the write set and the entries a read-heavy phase
+has protected can both sit in it: about a thousand was comfortable here, sixty-four
+was not.
+
+Spend shards on that headroom rather than on locks you do not need. The locking
+half saturates early and is the cheaper half to satisfy -- sixteen to 256 shards
+buys about **1.2x** for four writers, because sixteen locks already make a
+collision rare at that thread count. (Four writers is as far as the measurement
+goes here; the lock half would matter more with far more writers, and this machine
+cannot resolve that.) Measure on your own size with
+`examples/shard_count_bench.rs`.
 
 ## Placing keys on a cluster
 
