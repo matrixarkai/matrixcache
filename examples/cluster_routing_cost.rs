@@ -26,6 +26,12 @@
 //! rebuilds once per node, each time over a larger ring. The third table is the
 //! size of that difference, which is the reason the bulk form exists.
 //!
+//! **Nodes that are down.** Their ring points stay where they are -- taking
+//! them out would mean rehashing the ring, which costs 86ms at four thousand
+//! nodes -- so a lookup steps over them instead. That makes a node failing
+//! almost free and puts a small cost on every lookup while it is down, and the
+//! fourth table is how small.
+//!
 //! **The knob.** Ring points per node is what the first table's cost is really
 //! made of, and the default of 160 is chosen for a cluster of tens rather than
 //! thousands. Balance depends on the ring's *total* points, so a large cluster
@@ -302,6 +308,51 @@ fn main() {
         crowded_ns.push((copies, ns));
     }
 
+    // What a lookup pays while part of the cluster is down. The points of a
+    // node that is down stay on the ring, so a lookup that lands on one steps
+    // forward to the next live node.
+    let down_nodes = rows.last().expect("a row").nodes;
+    println!("\n{down_nodes} nodes, some of them down:");
+    println!("{:>9}  {:>11}  {:>18}", "down", "owner ns", "owner spread");
+    let mut down_rows = Vec::new();
+    for percent in [0_usize, 1, 10, 50] {
+        let names: Vec<String> = (0..down_nodes).map(|i| format!("cache-{i:05}")).collect();
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes(names.iter().map(|name| (name.as_str(), 1)))
+            .expect("distinct names");
+        let taking_down = down_nodes * percent / 100;
+        for name in names.iter().take(taking_down) {
+            assert!(cluster.set_node_state(name, CacheNodeState::Down));
+        }
+        assert_eq!(cluster.live_node_count(), down_nodes - taking_down);
+        let (ns, low, high) = owner_ns(&cluster, &sample);
+        println!("{percent:>8}%  {ns:>11.1}  {low:>8.1}..{high:<8.1}");
+        down_rows.push((percent, ns, low, high));
+    }
+    // Stepping over a node that is down can only cost time, so this column has
+    // to rise. The test of whether it measured that is strict on purpose: the
+    // worst share's *best* pass has to clear the best share's *worst* pass. A
+    // looser rule -- medians rising within a spread -- reported success on
+    // figures that plainly fell, which is a check that cannot fail.
+    let first = *down_rows.first().expect("a row");
+    let last = *down_rows.last().expect("a row");
+    let down_cost_separated = last.2 > first.3;
+    if down_cost_separated {
+        println!(
+            "  cost rises with the share down: {:.0}ns at {}% clears {:.0}ns at {}%",
+            last.2, last.0, first.3, first.0
+        );
+    } else {
+        println!(
+            "  cost did NOT separate -- {:.0}..{:.0}ns at {}% against {:.0}..{:.0}ns \
+at {}%, so this column has measured the machine rather than the cluster. The \
+extra work is bounded by down/(1-down) steps, usually inside the slot the scan \
+already read.",
+            last.2, last.3, last.0, first.2, first.3, first.0
+        );
+    }
+
     // The knob. At the largest size measured above, what fewer points per node
     // buys and what it costs.
     let knob_nodes = rows.last().expect("a row").nodes;
@@ -432,6 +483,24 @@ an idle machine for the cost"
             );
         }
         let _ = writeln!(report, "  ],");
+        let _ = writeln!(report, "  \"nodes_down\": [");
+        for (position, (percent, ns, low, high)) in down_rows.iter().enumerate() {
+            let comma = if position + 1 == down_rows.len() {
+                ""
+            } else {
+                ","
+            };
+            let _ = writeln!(
+                report,
+                "    {{\"percent_down\": {percent}, \"owner_ns\": {ns:.1}, \
+                 \"owner_low_ns\": {low:.1}, \"owner_high_ns\": {high:.1}}}{comma}"
+            );
+        }
+        let _ = writeln!(report, "  ],");
+        let _ = writeln!(
+            report,
+            "  \"nodes_down_cost_separated\": {down_cost_separated},"
+        );
         let _ = writeln!(report, "  \"balance_keys_per_node\": {balance_mean:.0},");
         let _ = writeln!(
             report,
