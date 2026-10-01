@@ -836,19 +836,45 @@ impl CacheClusterTopology {
             return Vec::new();
         }
 
-        let mut bounds: Vec<u64> = self
-            .ring
-            .iter()
-            .chain(next.ring.iter())
-            .map(|point| point.hash)
-            .collect();
-        bounds.sort_unstable();
-        bounds.dedup();
+        // Both rings are already in hash order, so their boundaries come out of
+        // a merge. Collecting them and sorting cost a 1,310,720-element vector
+        // and an O(n log n) sort at four thousand nodes, to put in order two
+        // runs that were each in order already.
+        let mut bounds: Vec<u64> = Vec::with_capacity(self.ring.len() + next.ring.len());
+        {
+            let mut mine = self.ring.iter().map(|point| point.hash).peekable();
+            let mut theirs = next.ring.iter().map(|point| point.hash).peekable();
+            loop {
+                let take = match (mine.peek(), theirs.peek()) {
+                    (Some(left), Some(right)) => {
+                        if left <= right {
+                            mine.next()
+                        } else {
+                            theirs.next()
+                        }
+                    }
+                    (Some(_), None) => mine.next(),
+                    (None, Some(_)) => theirs.next(),
+                    (None, None) => break,
+                };
+                let Some(hash) = take else { break };
+                // Both runs can hold the same hash, and a run can hold it twice.
+                if bounds.last() != Some(&hash) {
+                    bounds.push(hash);
+                }
+            }
+        }
 
         // One stretch per boundary: the hashes from just past the previous
         // boundary up to and including this one. The first boundary's stretch
         // is the one that wraps, which is why it starts at the last boundary.
+        // Walking the bounds in order, the point each one lands on in either
+        // ring only ever moves forward -- so two indices stepping alongside
+        // replace two searches per boundary. At four thousand nodes that was
+        // 2.6 million searches to describe one node arriving.
         let mut moved: Vec<(CacheHashRange, &str, &str)> = Vec::new();
+        let mut mine = 0_usize;
+        let mut theirs = 0_usize;
         for (index, &end) in bounds.iter().enumerate() {
             let previous = if index == 0 {
                 bounds[bounds.len() - 1]
@@ -857,8 +883,20 @@ impl CacheClusterTopology {
             };
             // A single boundary covers the whole space by wrapping onto itself.
             let start = previous.wrapping_add(1);
-            let (Some(before), Some(after)) = (self.owner_of_hash(end), next.owner_of_hash(end))
-            else {
+            while mine < self.ring.len() && self.ring[mine].hash < end {
+                mine += 1;
+            }
+            while theirs < next.ring.len() && next.ring[theirs].hash < end {
+                theirs += 1;
+            }
+            // Past the last point, ownership wraps to the first -- the same
+            // answer `first_point_at_or_after` gives.
+            let my_point = if mine == self.ring.len() { 0 } else { mine };
+            let their_point = if theirs == next.ring.len() { 0 } else { theirs };
+            let (Some(before), Some(after)) = (
+                self.first_live_point_from(my_point).map(|p| self.point_member(p)),
+                next.first_live_point_from(their_point).map(|p| next.point_member(p)),
+            ) else {
                 continue;
             };
             if before == after {

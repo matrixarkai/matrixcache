@@ -32,6 +32,12 @@
 //! almost free and puts a small cost on every lookup while it is down, and the
 //! fourth table is how small.
 //!
+//! **Planning the move.** A membership change is only half the work: something
+//! has to say which stretches of the hash space change hands, or the node that
+//! gained keys serves misses until reads refill it. `handoffs_to` answers that,
+//! and it is on the same operational path as the change itself, so it belongs
+//! in the same table.
+//!
 //! **The knob.** Ring points per node is what the first table's cost is really
 //! made of, and the default of 160 is chosen for a cluster of tens rather than
 //! thousands. Balance depends on the ring's *total* points, so a large cluster
@@ -46,7 +52,7 @@
 //!     --json-output /tmp/matrixcache-routing.json --require-passed --max-owner-ns 2000
 //! ```
 
-use matrixcache::{CacheClusterTopology, CacheKey, CacheNodeState};
+use matrixcache::{CacheClusterTopology, CacheHandoff, CacheKey, CacheNodeState};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -209,6 +215,7 @@ fn main() {
     let mut max_owner_ns: Option<f64> = None;
     let mut max_mark_down_ms: Option<f64> = None;
     let mut max_copies_ns: Option<f64> = None;
+    let mut max_plan_ms: Option<f64> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -226,6 +233,15 @@ fn main() {
                         .expect("--max-mark-down-ms needs a number")
                         .parse()
                         .expect("--max-mark-down-ms takes a number"),
+                );
+            }
+            "--max-plan-ms" => {
+                index += 1;
+                max_plan_ms = Some(
+                    args.get(index)
+                        .expect("--max-plan-ms needs a number")
+                        .parse()
+                        .expect("--max-plan-ms takes a number"),
                 );
             }
             "--max-copies-ns" => {
@@ -461,6 +477,7 @@ an idle machine for the cost"
         .add_node("cache-arriving", 1)
         .expect("a distinct name");
     let join_ms = join_started.elapsed().as_secs_f64() * 1e3;
+    let joined_view = growing.clone();
     let leave_started = Instant::now();
     assert!(growing.remove_node("cache-arriving"));
     let leave_ms = leave_started.elapsed().as_secs_f64() * 1e3;
@@ -469,6 +486,19 @@ an idle machine for the cost"
         rows.last().expect("a row").nodes
     );
     println!("  that node leaves again      {leave_ms:>8.2} ms");
+
+    // What planning the move costs, against the same join. This runs right
+    // after a membership change, so its cost adds to the change's.
+    let plan_started = Instant::now();
+    let plan = growing.handoffs_to(&joined_view);
+    let plan_ms = plan_started.elapsed().as_secs_f64() * 1e3;
+    let moved: u128 = plan.iter().map(CacheHandoff::count).sum();
+    let whole = u128::from(u64::MAX) + 1;
+    println!(
+        "  planning that move          {plan_ms:>8.2} ms  ({} handoffs, {:.2}% of the space)",
+        plan.len(),
+        moved as f64 / whole as f64 * 100.0
+    );
 
     // Marking a node down rebuilds the ring too, which is what a failure costs
     // before any data moves.
@@ -490,7 +520,8 @@ an idle machine for the cost"
         .fold(0.0_f64, f64::max);
     let passed = max_owner_ns.is_none_or(|limit| worst_owner_ns <= limit)
         && max_mark_down_ms.is_none_or(|limit| down_ms <= limit)
-        && max_copies_ns.is_none_or(|limit| worst_copies_ns <= limit);
+        && max_copies_ns.is_none_or(|limit| worst_copies_ns <= limit)
+        && max_plan_ms.is_none_or(|limit| plan_ms <= limit);
 
     if let Some(path) = json_output {
         let mut report = String::new();
@@ -571,6 +602,8 @@ an idle machine for the cost"
         let _ = writeln!(report, "  \"mark_down_ms\": {down_ms:.3},");
         let _ = writeln!(report, "  \"join_one_ms\": {join_ms:.3},");
         let _ = writeln!(report, "  \"leave_one_ms\": {leave_ms:.3},");
+        let _ = writeln!(report, "  \"plan_one_ms\": {plan_ms:.3},");
+        let _ = writeln!(report, "  \"plan_handoffs\": {},", plan.len());
         let _ = writeln!(report, "  \"worst_owner_ns\": {worst_owner_ns:.1},");
         let _ = writeln!(report, "  \"worst_copies_ns\": {worst_copies_ns:.1},");
         if let Some(limit) = max_owner_ns {
@@ -606,6 +639,12 @@ an idle machine for the cost"
         println!(
             "marking one node down {down_ms:.2}ms against a ceiling of {limit:.2}ms: {}",
             if down_ms <= limit { "within" } else { "OVER" }
+        );
+    }
+    if let Some(limit) = max_plan_ms {
+        println!(
+            "planning a move {plan_ms:.2}ms against a ceiling of {limit:.2}ms: {}",
+            if plan_ms <= limit { "within" } else { "OVER" }
         );
     }
     if require_passed && !passed {
