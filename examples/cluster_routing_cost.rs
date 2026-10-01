@@ -207,6 +207,8 @@ fn main() {
     let mut json_output: Option<PathBuf> = None;
     let mut require_passed = false;
     let mut max_owner_ns: Option<f64> = None;
+    let mut max_mark_down_ms: Option<f64> = None;
+    let mut max_copies_ns: Option<f64> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -217,6 +219,24 @@ fn main() {
                 ));
             }
             "--require-passed" => require_passed = true,
+            "--max-mark-down-ms" => {
+                index += 1;
+                max_mark_down_ms = Some(
+                    args.get(index)
+                        .expect("--max-mark-down-ms needs a number")
+                        .parse()
+                        .expect("--max-mark-down-ms takes a number"),
+                );
+            }
+            "--max-copies-ns" => {
+                index += 1;
+                max_copies_ns = Some(
+                    args.get(index)
+                        .expect("--max-copies-ns needs a number")
+                        .parse()
+                        .expect("--max-copies-ns takes a number"),
+                );
+            }
             "--max-owner-ns" => {
                 index += 1;
                 max_owner_ns = Some(
@@ -441,7 +461,18 @@ an idle machine for the cost"
     println!("  one node marked down        {down_ms:>8.2} ms");
 
     let worst_owner_ns = rows.iter().map(|row| row.owner_ns).fold(0.0_f64, f64::max);
-    let passed = max_owner_ns.is_none_or(|limit| worst_owner_ns <= limit);
+    // The worst copy placement measured anywhere above, the crowded table
+    // included -- that is where every copy after the first had to be placed
+    // without being separated, and where a return to comparing node names by
+    // string would show up. It was 12.3us at sixty-four copies and is 1.4us.
+    let worst_copies_ns = rows
+        .iter()
+        .map(|row| row.copies_ns.max(row.zoned_copies_ns))
+        .chain(crowded_ns.iter().map(|(_, ns)| *ns))
+        .fold(0.0_f64, f64::max);
+    let passed = max_owner_ns.is_none_or(|limit| worst_owner_ns <= limit)
+        && max_mark_down_ms.is_none_or(|limit| down_ms <= limit)
+        && max_copies_ns.is_none_or(|limit| worst_copies_ns <= limit);
 
     if let Some(path) = json_output {
         let mut report = String::new();
@@ -521,6 +552,7 @@ an idle machine for the cost"
         let _ = writeln!(report, "  \"build_one_at_a_time_ms\": {one_ms:.3},");
         let _ = writeln!(report, "  \"mark_down_ms\": {down_ms:.3},");
         let _ = writeln!(report, "  \"worst_owner_ns\": {worst_owner_ns:.1},");
+        let _ = writeln!(report, "  \"worst_copies_ns\": {worst_copies_ns:.1},");
         if let Some(limit) = max_owner_ns {
             let _ = writeln!(report, "  \"max_owner_ns\": {limit:.1},");
         }
@@ -533,7 +565,27 @@ an idle machine for the cost"
     if let Some(limit) = max_owner_ns {
         println!(
             "\nworst owner cost {worst_owner_ns:.1}ns against a ceiling of {limit:.1}ns: {}",
-            if passed { "within" } else { "OVER" }
+            if worst_owner_ns <= limit {
+                "within"
+            } else {
+                "OVER"
+            }
+        );
+    }
+    if let Some(limit) = max_copies_ns {
+        println!(
+            "worst copy placement {worst_copies_ns:.1}ns against a ceiling of {limit:.1}ns: {}",
+            if worst_copies_ns <= limit {
+                "within"
+            } else {
+                "OVER"
+            }
+        );
+    }
+    if let Some(limit) = max_mark_down_ms {
+        println!(
+            "marking one node down {down_ms:.2}ms against a ceiling of {limit:.2}ms: {}",
+            if down_ms <= limit { "within" } else { "OVER" }
         );
     }
     if require_passed && !passed {

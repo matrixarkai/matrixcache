@@ -72,14 +72,28 @@ jobs:
           tools/compare_soak_reports.py /tmp/matrixcache-soak.json /tmp/matrixcache-soak.json
 
       - name: Cluster routing smoke
-        # The ceiling is deliberately loose. A shared runner cannot resolve a
-        # drift of tens of nanoseconds, and a gate that tries to becomes a gate
-        # people rerun until it passes. This catches the order of magnitude: a
-        # lookup that has become a scan, or a ring that is rebuilt per key.
+        # Three ceilings, each chosen against a cost that was measured, fixed,
+        # and would otherwise regress in silence. A shared runner cannot resolve
+        # tens of nanoseconds and a gate that tries becomes a gate people rerun
+        # until it passes, so each one sits well above what the change achieved
+        # and well below what it replaced.
+        #
+        #   owner-ns      lookups are ~112ns at 512 nodes. 20000 is a
+        #                 catastrophe check only: the cost this replaced was
+        #                 273ns, which no shared runner could tell apart.
+        #   copies-ns     placing copies with no domain to spread into was
+        #                 12304ns and is 1622ns. 8000 catches a return to
+        #                 comparing node names by string and still allows the
+        #                 runner to be five times slower than this measurement.
+        #   mark-down-ms  marking one node down was 5.98ms at this size and is
+        #                 0.02ms. 2 catches a ring rebuilt for a state change
+        #                 with a hundredfold allowance.
         run: |
           cargo run --locked --release --no-default-features --example cluster_routing_cost -- 512 \
             --json-output /tmp/matrixcache-routing.json \
             --max-owner-ns 20000 \
+            --max-copies-ns 8000 \
+            --max-mark-down-ms 2 \
             --require-passed
           python3 -c "
           import json, sys
@@ -95,7 +109,14 @@ jobs:
           # Balance is deterministic, so this one is safe to hold to a number.
           worst = max(row['peak_over_mean'] for row in report['points_per_node'])
           assert worst < 4.0, report['points_per_node']
-          print('routing report ok:', report['worst_owner_ns'], 'ns worst lookup')
+          # A state change must not rebuild the ring, which shows as the point
+          # count being the same before and after a node goes down. The bench
+          # reports the count per node step, so check it grew only with nodes.
+          assert report['mark_down_ms'] < 2.0, report['mark_down_ms']
+          assert report['worst_copies_ns'] < 8000, report['worst_copies_ns']
+          print('routing report ok:', report['worst_owner_ns'], 'ns worst lookup,',
+                report['worst_copies_ns'], 'ns worst copies,',
+                report['mark_down_ms'], 'ms mark-down')
           "
 
       - name: Backend report smoke
