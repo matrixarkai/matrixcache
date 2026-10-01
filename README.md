@@ -155,14 +155,14 @@ proportion as the capacity: 75.00% at one shard and at 256, and 74.98% at 1,024,
 where sixteen entries a shard is small enough for the unevenness of the draw to
 show.
 
-**Past about 64 shards, writes can start evicting each other.** An entry becomes
-protected once it has been read twice, and the eviction score weighs that before
-anything else, so no protected entry is evicted while an unprotected one remains.
-A read-heavy phase moves residents into protected and shrinks the room the
-unprotected share. A freshly written key is unprotected, so once that room is
-smaller than the set of keys being written the write set competes only with
-itself -- admitting one evicts the oldest of them, and nearly every write
-evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
+**Past about 64 shards, writes can start evicting each other.** Under the default
+replacement policy an entry's hotness decides this: a write starts at a small
+hotness set by its block kind, every read adds to it, and eviction gives up the
+lowest. Reading a resident therefore makes it expensive to evict, and a freshly
+written key sits near the bottom of the order. In a large shard that is harmless
+-- there is always something colder. In a small one the low-hotness population is
+mostly the write set itself, so admitting one member evicts another and nearly
+every write evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
 256, with the write cost rising by more than ten times. A write-heavy cache that is also
 read-hot should stay well below that.
 
@@ -177,10 +177,15 @@ finely the byte budget is divided. They pull in opposite directions.
 - **More shards, less queueing.** Four writers at one shard cost 3.1x to 3.9x what
   a single writer costs -- four threads taking turns on one lock. At sixteen
   shards four writers cost *less per write* than one writer does.
-- **More shards, a smaller budget each.** A read-heavy phase moves residents into
-  the protected segment, which no unprotected entry can displace, so the room left
-  for a write set shrinks. If a shard is small enough, the write set competes only
-  with itself and the writes evict each other.
+- **More shards, a smaller budget each.** Reading a resident raises its hotness and
+  eviction gives up the lowest, so a read-heavy phase leaves a freshly written key
+  near the bottom of the order. If a shard is small enough, what is near the bottom
+  is mostly the write set, and the writes evict each other.
+
+None of that is the probationary-and-protected scheme the `slru` policy applies.
+That policy does hold a read-twice entry above every entry below it, but it is not
+the default and is not what any number here was measured under; `ReplacementSlru`
+is a third thing again, a standalone store with its own hot, warm and cold lists.
 
 The second effect is not about the shard count. It is about how many entries a
 shard still holds, which is the count divided into the capacity:
