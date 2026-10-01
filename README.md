@@ -155,45 +155,102 @@ proportion as the capacity: 75.00% at one shard and at 256, and 74.98% at 1,024,
 where sixteen entries a shard is small enough for the unevenness of the draw to
 show.
 
-**Past about 64 shards, writes can start evicting each other.** An entry becomes
-protected once it has been read twice, and the eviction score considers that before
-anything else, so a freshly written key is the best victim a shard has. Once a
-read-heavy phase has filled the protected segment and a shard's leftover
-probationary room is smaller than the set of keys being written, nearly every write
-evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
+**Past about 64 shards, writes can start evicting each other.** Under the default
+replacement policy an entry's hotness decides this: a write starts at a small
+hotness set by its block kind, every read adds to it, and eviction gives up the
+lowest. Reading a resident therefore makes it expensive to evict, and a freshly
+written key sits near the bottom of the order. In a large shard that is harmless
+-- there is always something colder. In a small one the low-hotness population is
+mostly the write set itself, so admitting one member evicts another and nearly
+every write evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
 256, with the write cost rising by more than ten times. A write-heavy cache that is also
 read-hot should stay well below that.
 
 So: sixteen for a mixed workload, fewer if you only read, and measure before going
 past sixty-four.
 
-### Sixteen is a compromise, and the compromise is removable
+### Sixteen is for this size of cache; the rule is entries per shard
 
-One number sets two unrelated things: how many locks writers can spread across,
-and how finely the byte budget is divided. They pull in opposite directions.
+One number sets two things: how many locks writers can spread across, and how
+finely the byte budget is divided. They pull in opposite directions.
 
 - **More shards, less queueing.** Four writers at one shard cost 3.1x to 3.9x what
   a single writer costs -- four threads taking turns on one lock. At sixteen
   shards four writers cost *less per write* than one writer does.
-- **More shards, a smaller budget each.** At 256 shards a shard holds 64 entries,
-  and once a read-heavy phase has filled the protected segment a freshly written
-  key is the best victim that shard has. The writes then evict each other: 0.93
-  evictions per write against none at sixteen, with the write cost rising more
-  than tenfold.
+- **More shards, a smaller budget each.** Reading a resident raises its hotness and
+  eviction gives up the lowest, so a read-heavy phase leaves a freshly written key
+  near the bottom of the order. If a shard is small enough, what is near the bottom
+  is mostly the write set, and the writes evict each other.
 
-Sixteen is where those two meet for the sweep's workload. It is a compromise
-rather than an optimum, and the two halves are not equally sensitive: going from
-sixteen shards to 256 buys only about **1.2x** for four writers, because sixteen
-locks already make a collision rare at that thread count. What costs at 256 is the
-divided budget, not the locking. (Four writers is as far as the measurement goes
-here -- the lock half would matter more with far more writers, and this machine
-cannot resolve that.)
+**Neither tier policy helps, but the structure does.** Driven on the sweep's own
+write arms at 256 shards, varying only the DRAM policy, then driving
+`ReplacementSlru` directly on the same shape -- same capacity, same 256 segments,
+same 64 entries each, same key space and read volume:
 
-A cache that sharded only its index for locking, over **one undivided byte budget
-per tier**, would not have to choose: many locks and no capacity pressure. That is
-a larger change than a constant -- capacity accounting, the write budget and
-eviction victim selection are per-shard today -- and it is the direction worth
-taking rather than a knob to turn.
+| | hit rate | evictions per write |
+| --- | ---: | ---: |
+| `weightedhotnesslru` (tier) | 82.77% | 0.996 |
+| `slru` (tier) | 82.77% | 0.996 |
+| `ReplacementSlru` (store) | 82.59% | **0.144** |
+
+Both tier policies score entries over one access order, so neither reserves
+anything for an arrival: when a shard is oversubscribed, every admission evicts.
+`ReplacementSlru` holds its hot list to a share of each segment's budget, so a
+recently written set sits in room that reading cannot take, and rewriting it
+mostly updates in place instead of displacing something. Seven times fewer
+evictions, with the hit rate unchanged.
+
+Which half of that structure does the work is worth knowing, because the two cost
+very different amounts to reproduce. Turning the store's maintainer off leaves the
+placement rule -- a rewrite re-attaching at the hot end -- and nothing else:
+
+| | hit rate | evictions per write |
+| --- | ---: | ---: |
+| hot and warm held to their shares | 82.59% | 0.144 |
+| placement only, no shares | 82.59% | 1.000 |
+
+Placement alone buys nothing: 1.000, which is what both tier policies already do.
+The whole of it is the shares. That is also why `set_insertion_point_spec`, which
+is the tier's own placement rule, leaves the rate at 1.000 at every setting -- it
+is the half that does not matter.
+
+That store is not what a tier selects, so this is not a knob available to a cache
+today -- but it does mean the structure of the policy is a lever here and the
+choice between the two tier policies is not. Scale the shard count for the cache
+you have, and read the entries-per-shard table below rather than reaching for
+`slru`.
+
+None of that is the probationary-and-protected scheme the `slru` policy applies.
+That policy does hold a read-twice entry above every entry below it, but it is not
+the default and is not what any number here was measured under; `ReplacementSlru`
+is a third thing again, a standalone store with its own hot, warm and cold lists.
+
+The second effect is not about the shard count. It is about how many entries a
+shard still holds, which is the count divided into the capacity:
+
+| entries per shard | evictions per write |
+| ---: | ---: |
+| 16,384 | 0.000 |
+| 1,024 | 0.000 |
+| 256 | 0.045 |
+| 64 | **0.927** |
+| 16 | 0.837 |
+
+So sixteen is not a constant to carry elsewhere -- it is 16,384 entries divided by
+a thousand. The sweep's cache holds 16,384 entries, so 256 shards leaves 64 each
+and the writes thrash; a cache ten times the size at the same count would leave 640
+each and behave like the 256-entry row. **Scale the count with the capacity**, and
+leave a shard enough entries that the write set and the entries a read-heavy phase
+has protected can both sit in it: about a thousand was comfortable here, sixty-four
+was not.
+
+Spend shards on that headroom rather than on locks you do not need. The locking
+half saturates early and is the cheaper half to satisfy -- sixteen to 256 shards
+buys about **1.2x** for four writers, because sixteen locks already make a
+collision rare at that thread count. (Four writers is as far as the measurement
+goes here; the lock half would matter more with far more writers, and this machine
+cannot resolve that.) Measure on your own size with
+`examples/shard_count_bench.rs`.
 
 ## Placing keys on a cluster
 
