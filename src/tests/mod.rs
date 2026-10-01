@@ -1592,6 +1592,73 @@ mod tests {
         );
     }
 
+    /// The tightest shard, where the shards actually differ.
+    ///
+    /// Its sibling above checks an uncapped cache, where every shard reports a
+    /// full share -- which is the case that catches aggregating by addition, and
+    /// the only case there was. With all four shards reading 10,000, the minimum
+    /// of them, the maximum of them and the first of them are the same number,
+    /// so nothing distinguished the rule from several wrong ones.
+    ///
+    /// Here one shard is driven against a one-byte-a-second budget until it
+    /// closes and the other three are never written to at all, so the minimum is
+    /// near zero and the maximum is still full.
+    #[test]
+    fn the_sharded_write_budget_share_is_the_tightest_shard_when_they_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions {
+                dram_capacity: 1 << 16,
+                ssd_capacity: 1 << 20,
+                ssd_paths: vec![dir.path().to_path_buf()],
+                // One byte a second, against a workload writing kilobytes.
+                ssd_write_bytes_per_sec: 1,
+                ..CacheOptions::default()
+            },
+            4,
+        );
+        cache.start().unwrap();
+        assert_eq!(
+            cache.stats().ssd_write_budget_share,
+            10_000,
+            "before any writing every shard admits everything"
+        );
+
+        // One key, so one shard carries all of it and three are untouched.
+        for pass in 0..400 {
+            let _ = cache.put(
+                CacheKey::string(0, "only-one-key"),
+                vec![b'v' + (pass % 7) as u8; 4096],
+            );
+        }
+        // Long enough for a measurement window to close and the share to move.
+        std::thread::sleep(Duration::from_millis(1100));
+        for pass in 0..400 {
+            let _ = cache.put(
+                CacheKey::string(0, "only-one-key"),
+                vec![b'v' + (pass % 7) as u8; 4096],
+            );
+        }
+
+        let stats = cache.stats();
+        assert!(
+            stats.ssd_write_budget_rejections > 0,
+            "nothing was refused, so no shard closed and there is nothing to \
+             aggregate: {stats:?}"
+        );
+        let share = stats.ssd_write_budget_share;
+        assert!(
+            share < 1_000,
+            "a shard closed to near nothing and the cache reported {share}, which \
+             is not the tightest of them"
+        );
+        assert_ne!(
+            share, 10_000,
+            "the cache reported a full share while one of its shards had closed, \
+             which is what reporting the loosest shard looks like"
+        );
+    }
+
     /// Expired entries have to give their memory back even when the cache is
     /// nowhere near full, and without anyone calling the sweep.
     ///
