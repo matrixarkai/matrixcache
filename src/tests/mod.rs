@@ -1659,6 +1659,42 @@ mod tests {
         );
     }
 
+    /// A sharded cache can reach the insertion point at all.
+    ///
+    /// This test could not be written before: `set_insertion_point_spec` was on
+    /// `MultiLayerCache` and never forwarded, so the arrangement a concurrent
+    /// deployment runs was the one that could not tune where an arrival lands.
+    /// The round trip is the whole point -- a setter that silently applied to
+    /// nothing would read back as zero.
+    #[test]
+    fn a_sharded_cache_can_set_and_read_back_the_insertion_point() {
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions {
+                dram_capacity: 1 << 16,
+                ..CacheOptions::default()
+            },
+            8,
+        );
+        // Zero is the behaviour a cache has without this, and it is what an
+        // untouched cache must report -- otherwise the default has moved and
+        // every measurement taken against it is describing something else.
+        assert_eq!(
+            cache.insertion_point_spec(),
+            0,
+            "an untouched sharded cache should place arrivals at the hottest end"
+        );
+        cache.set_insertion_point_spec(2);
+        assert_eq!(
+            cache.insertion_point_spec(),
+            2,
+            "the spec did not survive being set, so the setter reached nothing"
+        );
+        // And it can be put back, because a knob that only turns one way is not
+        // one a caller can experiment with.
+        cache.set_insertion_point_spec(0);
+        assert_eq!(cache.insertion_point_spec(), 0);
+    }
+
     /// Expired entries have to give their memory back even when the cache is
     /// nowhere near full, and without anyone calling the sweep.
     ///

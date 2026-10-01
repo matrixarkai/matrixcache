@@ -7788,6 +7788,36 @@ impl ShardedMultiLayerCache {
         });
     }
 
+    /// Place new entries part-way down each shard's access order.
+    ///
+    /// `MultiLayerCache` has carried this and a sharded cache could not reach
+    /// it: the setter was never forwarded, so the arrangement a concurrent
+    /// deployment actually runs was the one arrangement that could not tune
+    /// where an arrival lands. A spec of zero puts a new entry at the hottest
+    /// end, which is the behaviour a cache has without this.
+    ///
+    /// Every shard keeps its own access order, so the spec is per shard and the
+    /// same value is given to all of them. A shard's order holds `1 /
+    /// shard_count` of the entries, and the spec is relative to the order it is
+    /// applied to -- so one spec reserves the same *fraction* of a shard however
+    /// many shards there are, not the same number of entries.
+    pub fn set_insertion_point_spec(&self, spec: u8) {
+        for shard in self.shards.iter() {
+            shard.set_insertion_point_spec(spec);
+        }
+    }
+
+    /// The spec every shard was given by [`Self::set_insertion_point_spec`].
+    ///
+    /// Reads shard zero. The setter writes all of them and nothing else can set
+    /// one shard's spec alone, so one shard answers for the cache.
+    pub fn insertion_point_spec(&self) -> u8 {
+        self.shards
+            .first()
+            .map(MultiLayerCache::insertion_point_spec)
+            .unwrap_or(0)
+    }
+
     pub fn try_set_replacement_policy_for_tier(
         &self,
         tier: CacheTier,
