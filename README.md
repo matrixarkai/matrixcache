@@ -182,6 +182,20 @@ finely the byte budget is divided. They pull in opposite directions.
   near the bottom of the order. If a shard is small enough, what is near the bottom
   is mostly the write set, and the writes evict each other.
 
+**A different replacement policy does not help, and that is measured.** Driven on
+the sweep's own write arms at 256 shards, varying only the DRAM policy:
+
+| dram policy | hit rate | ns per write | evictions per write |
+| --- | ---: | ---: | ---: |
+| `weightedhotnesslru` | 82.77% | 17,509 | 0.996 |
+| `slru` | 82.77% | 18,682 | 0.996 |
+
+Identical eviction rate, identical hit rate, and the segmented policy slightly
+dearer per write. The reason is arithmetic rather than policy: once the distinct
+keys a shard is asked for exceed what the shard holds, every admission has to
+evict something, and a replacement policy only chooses which entry goes -- never
+whether one must. Reach for the shard count, not the policy.
+
 None of that is the probationary-and-protected scheme the `slru` policy applies.
 That policy does hold a read-twice entry above every entry below it, but it is not
 the default and is not what any number here was measured under; `ReplacementSlru`
