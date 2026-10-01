@@ -182,19 +182,29 @@ finely the byte budget is divided. They pull in opposite directions.
   near the bottom of the order. If a shard is small enough, what is near the bottom
   is mostly the write set, and the writes evict each other.
 
-**A different replacement policy does not help, and that is measured.** Driven on
-the sweep's own write arms at 256 shards, varying only the DRAM policy:
+**Neither tier policy helps, but the structure does.** Driven on the sweep's own
+write arms at 256 shards, varying only the DRAM policy, then driving
+`ReplacementSlru` directly on the same shape -- same capacity, same 256 segments,
+same 64 entries each, same key space and read volume:
 
-| dram policy | hit rate | ns per write | evictions per write |
-| --- | ---: | ---: | ---: |
-| `weightedhotnesslru` | 82.77% | 17,509 | 0.996 |
-| `slru` | 82.77% | 18,682 | 0.996 |
+| | hit rate | evictions per write |
+| --- | ---: | ---: |
+| `weightedhotnesslru` (tier) | 82.77% | 0.996 |
+| `slru` (tier) | 82.77% | 0.996 |
+| `ReplacementSlru` (store) | 82.59% | **0.144** |
 
-Identical eviction rate, identical hit rate, and the segmented policy slightly
-dearer per write. The reason is arithmetic rather than policy: once the distinct
-keys a shard is asked for exceed what the shard holds, every admission has to
-evict something, and a replacement policy only chooses which entry goes -- never
-whether one must. Reach for the shard count, not the policy.
+Both tier policies score entries over one access order, so neither reserves
+anything for an arrival: when a shard is oversubscribed, every admission evicts.
+`ReplacementSlru` holds its hot list to a share of each segment's budget, so a
+recently written set sits in room that reading cannot take, and rewriting it
+mostly updates in place instead of displacing something. Seven times fewer
+evictions, with the hit rate unchanged.
+
+That store is not what a tier selects, so this is not a knob available to a cache
+today -- but it does mean the structure of the policy is a lever here and the
+choice between the two tier policies is not. Scale the shard count for the cache
+you have, and read the entries-per-shard table below rather than reaching for
+`slru`.
 
 None of that is the probationary-and-protected scheme the `slru` policy applies.
 That policy does hold a read-twice entry above every entry below it, but it is not
