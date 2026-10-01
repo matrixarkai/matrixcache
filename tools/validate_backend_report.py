@@ -30,6 +30,7 @@ REQUIRED_TOP_LEVEL = {
     "refill_failures": int,
     "disk_fills": int,
     "pmem_fills": int,
+    "demotions_already_resident": int,
     "main_pressure_passed": bool,
     "replacement_soak_iterations": int,
     "replacement_soak_passed": bool,
@@ -445,9 +446,21 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         fail(
             f"disk_fills={data['disk_fills']} below cold_ssd_refills={data['cold_ssd_refills']}"
         )
-    if data["pmem_fills"] < data["memory_evictions"]:
+    # A memory eviction either writes a copy down or finds one already there.
+    # The second happens whenever a read was served by the tier below: that read
+    # copies the entry up into memory and leaves the lower copy alone, so the
+    # eviction that follows has nothing to write.
+    #
+    # This was `pmem_fills < memory_evictions`, which is not an invariant and
+    # failed CI by exactly the run's `pmem_hits`. Left as an inequality rather
+    # than an identity because a demotion can also be declined for an entry that
+    # has expired, which this workload does not produce.
+    demoted = data["pmem_fills"] + data["demotions_already_resident"]
+    if demoted < data["memory_evictions"]:
         fail(
-            f"pmem_fills={data['pmem_fills']} below memory_evictions={data['memory_evictions']}"
+            f"pmem_fills={data['pmem_fills']} plus "
+            f"demotions_already_resident={data['demotions_already_resident']} "
+            f"is below memory_evictions={data['memory_evictions']}"
         )
     if data["main_pressure_passed"] != (
         data["memory_evictions"] > 0

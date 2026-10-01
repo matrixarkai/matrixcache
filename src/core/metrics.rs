@@ -132,6 +132,7 @@ pub fn prometheus_text_into_with_label_scratch(
     metric(out, "matrixcache_ssd_write_budget_target_bytes_per_sec", "Bytes per second the SSD write budget is aiming at, zero when uncapped", "gauge", tags, stats.ssd_write_budget_target_bytes_per_sec);
     metric(out, "matrixcache_stale_tier_copies_dropped", "Stale tier copies dropped", "counter", tags, stats.stale_tier_copies_dropped);
     metric(out, "matrixcache_expired_demotions_skipped", "Demotions declined because the entry had already expired", "counter", tags, stats.expired_demotions_skipped);
+    metric(out, "matrixcache_demotions_already_resident", "Demotions that wrote nothing because the entry was already on the tier below", "counter", tags, stats.demotions_already_resident);
     metric(out, "matrixcache_expired_reads", "Expired reads", "counter", tags, stats.expired_reads);
     metric(out, "matrixcache_expired_removals", "Expired removals", "counter", tags, stats.expired_removals);
     metric(out, "matrixcache_eviction_expired", "Eviction expired", "counter", tags, stats.eviction_expired);

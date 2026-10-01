@@ -1721,6 +1721,11 @@ impl CacheInner {
             && !self.pmem_paths.is_empty()
         {
             if self.pmem.contains_key(key) {
+                // Already down there, so the demotion is done and there is
+                // nothing to write. Counted because the alternative is a
+                // `pmem_fills` that silently trails `memory_evictions`.
+                self.stats.demotions_already_resident =
+                    self.stats.demotions_already_resident.saturating_add(1);
                 return true;
             }
             return self.put_pmem(key.clone(), value.to_vec());

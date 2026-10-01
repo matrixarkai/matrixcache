@@ -4176,6 +4176,107 @@ mod tests {
     }
 
     #[test]
+    fn a_demotion_onto_an_existing_copy_is_counted_rather_than_lost() {
+        // A read served from the persistent-memory tier copies the entry up into
+        // memory and leaves the lower copy alone, so from then on the key is on
+        // both tiers. Evicting the memory copy has nothing to write down, and
+        // the demotion succeeds without a fill.
+        //
+        // That is correct, and it means `pmem_fills` does not count every
+        // `memory_evictions`. The difference used to be invisible, which is what
+        // broke a CI gate asserting `pmem_fills >= memory_evictions`: it was
+        // short by exactly the number of persistent-memory hits the run had
+        // taken.
+        const VALUE: usize = 128;
+        const RESIDENT: usize = 32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pmem_dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            // Memory for four entries, so everything else is pushed below.
+            dram_capacity: 4 * VALUE,
+            pmem_capacity: 256 * VALUE,
+            pmem_paths: vec![pmem_dir.path().to_path_buf()],
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+
+        let resident = |index: usize| CacheKey::string(0, &format!("entry-{index:03}"));
+
+        for index in 0..RESIDENT {
+            cache.put(resident(index), vec![b'v'; VALUE]).unwrap();
+        }
+
+        // Read them all back. Most are on the tier below by now, and each of
+        // those reads copies the entry up into memory while leaving the lower
+        // copy where it is -- so each one becomes a key on two tiers.
+        let mut from_below = 0_usize;
+        for index in 0..RESIDENT {
+            let key = resident(index);
+            if cache.peek_tier(&key) == Some(CacheReadTier::Pmem) {
+                from_below += 1;
+            }
+            assert!(cache.get(&key).unwrap().is_some(), "every key should hit");
+        }
+        let before = cache.stats();
+        assert!(
+            from_below > 0 && before.pmem_hits > 0,
+            "the reads were supposed to be served by the tier below: \
+             {from_below} were there, {} hits",
+            before.pmem_hits
+        );
+
+        // Now write enough fresh keys to push those promoted copies out of
+        // memory again. Their lower copies are still there, so those demotions
+        // have nothing to write.
+        for index in RESIDENT..RESIDENT * 2 {
+            cache.put(resident(index), vec![b'v'; VALUE]).unwrap();
+        }
+
+        // Counted over the whole run rather than across the last phase. The
+        // demotions this is about happen during the *reads*: each promotion into
+        // a four-entry tier pushes something out, and what it pushes out already
+        // has a copy below. A window that starts after the reads sees none of
+        // them, which is what the first version of this test did -- it reported
+        // zero already-resident demotions while twenty-eight had happened, and
+        // the check that the test was exercising its own subject is what caught
+        // it.
+        let after = cache.stats();
+        let _ = before;
+        assert!(
+            after.memory_evictions > 0,
+            "nothing was evicted, so nothing was demoted"
+        );
+        assert!(
+            after.demotions_already_resident > 0,
+            "no demotion found its entry already on the tier below, so this test \
+             is not exercising the case it is named for: {} evicted, {} filled",
+            after.memory_evictions,
+            after.pmem_fills
+        );
+        assert_eq!(
+            after.memory_evictions,
+            after.pmem_fills + after.demotions_already_resident,
+            "every eviction should either write a copy down or find one already \
+             there: {} evicted, {} filled, {} already there",
+            after.memory_evictions,
+            after.pmem_fills,
+            after.demotions_already_resident
+        );
+        // Those are the only two outcomes a demotion has here. A workload whose
+        // entries expired would also put `expired_demotions_skipped` on the
+        // right-hand side, which is why the gate this fixes is written as an
+        // inequality rather than as this identity.
+        assert_eq!(after.expired_demotions_skipped, 0);
+        // Not asserted: `pmem_admission_rejected`. It counts writes the
+        // *placement* decision sent somewhere other than the tier below -- 64 of
+        // them here -- and has nothing to do with demotion, which was worth
+        // finding out before leaning on it.
+    }
+
+    #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_tiering_policy(

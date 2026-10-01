@@ -5181,6 +5181,7 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
         ssd_write_budget_target_bytes_per_sec,
         stale_tier_copies_dropped,
         expired_demotions_skipped,
+        demotions_already_resident,
         expired_reads,
         expired_removals,
         eviction_expired,
@@ -5331,6 +5332,9 @@ fn fold_shard_stats(total: &mut CacheStats, shard: CacheStats) {
     total.expired_demotions_skipped = total
         .expired_demotions_skipped
         .saturating_add(expired_demotions_skipped);
+    total.demotions_already_resident = total
+        .demotions_already_resident
+        .saturating_add(demotions_already_resident);
     total.expired_reads = total.expired_reads.saturating_add(expired_reads);
     total.expired_removals = total.expired_removals.saturating_add(expired_removals);
     total.eviction_expired = total.eviction_expired.saturating_add(eviction_expired);

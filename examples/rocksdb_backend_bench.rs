@@ -410,6 +410,12 @@ fn main() {
     writeln!(&mut report, "  \"pmem_fills\": {},", stats.pmem_fills).expect("format report");
     writeln!(
         &mut report,
+        "  \"demotions_already_resident\": {},",
+        stats.demotions_already_resident
+    )
+    .expect("format report");
+    writeln!(
+        &mut report,
         "  \"main_pressure_passed\": {},",
         stats.memory_evictions > 0
             && stats.pmem_evictions > 0
@@ -543,6 +549,10 @@ fn main() {
         &[
             ("memory_evictions", stats.memory_evictions),
             ("pmem_fills", stats.pmem_fills),
+            (
+                "demotions_already_resident",
+                stats.demotions_already_resident,
+            ),
         ],
         true,
     );
