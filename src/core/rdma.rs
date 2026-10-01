@@ -1826,6 +1826,12 @@ static FAST_RAND16_SEED: AtomicU32 = AtomicU32::new(1988);
 static FAST_RAND64_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 pub fn fast_rand16() -> i32 {
+    // Deprecated on newer toolchains, renamed to `try_update`, which this
+    // crate's MSRV of 1.88 does not have -- and raising an MSRV is a decision
+    // for a release, not for a lint. CI denies warnings on `stable`, so without
+    // this the build goes red the day the rename reaches stable, which is how
+    // this was found.
+    #[allow(deprecated)]
     let next = FAST_RAND16_SEED
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seed| {
             Some(seed.wrapping_mul(214013).wrapping_add(2531011))
@@ -1836,6 +1842,9 @@ pub fn fast_rand16() -> i32 {
 }
 
 pub fn fast_rand64() -> u64 {
+    // Deprecated on newer toolchains, renamed to `try_update`, which this
+    // crate's MSRV of 1.88 does not have. See `fast_rand16` above.
+    #[allow(deprecated)]
     FAST_RAND64_SEED
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seed| {
             Some(

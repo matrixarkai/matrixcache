@@ -140,6 +140,9 @@ impl FrequencySketch {
             // returns without a store when the closure declines. The keys that
             // would contend are the hot ones, and the hot ones are the ones
             // that saturate, so the contention removes itself.
+            // Deprecated on newer toolchains, renamed to `try_update`, which
+            // this crate's MSRV of 1.88 does not have.
+            #[allow(deprecated)]
             let _ = self.counters[position].fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
