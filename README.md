@@ -200,6 +200,20 @@ recently written set sits in room that reading cannot take, and rewriting it
 mostly updates in place instead of displacing something. Seven times fewer
 evictions, with the hit rate unchanged.
 
+Which half of that structure does the work is worth knowing, because the two cost
+very different amounts to reproduce. Turning the store's maintainer off leaves the
+placement rule -- a rewrite re-attaching at the hot end -- and nothing else:
+
+| | hit rate | evictions per write |
+| --- | ---: | ---: |
+| hot and warm held to their shares | 82.59% | 0.144 |
+| placement only, no shares | 82.59% | 1.000 |
+
+Placement alone buys nothing: 1.000, which is what both tier policies already do.
+The whole of it is the shares. That is also why `set_insertion_point_spec`, which
+is the tier's own placement rule, leaves the rate at 1.000 at every setting -- it
+is the half that does not matter.
+
 That store is not what a tier selects, so this is not a knob available to a cache
 today -- but it does mean the structure of the policy is a lever here and the
 choice between the two tier policies is not. Scale the shard count for the cache
