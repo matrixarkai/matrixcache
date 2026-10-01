@@ -123,6 +123,50 @@ tier that was never flushed, or a shard count that makes a tier refuse values
 it has room for. `MultiLayerCache::try_with_options` refuses the findings that
 mean the cache cannot do its job and starts anyway on the rest.
 
+## Choosing a shard count
+
+`ShardedMultiLayerCache::with_options(options, shards)` takes a count and nothing
+here used to say what to pass. **Sixteen**, unless you have measured otherwise on
+your own workload -- and the reason is not the one most people reach for.
+
+Ratios rather than absolute times below, because the times move by about 30%
+between a busy machine and an idle one while the ratios do not. All of it comes
+from `examples/shard_count_bench.rs`, which prints the table and refuses to pass
+if the findings stop holding.
+
+**Sharding does not buy you concurrent reads.** A memory hit is served under a
+shared lock, so readers already proceed together at one shard: four readers cost
+*less* per operation at one shard than a single reader does. Adding shards then
+makes reads slower, not faster -- 1,897ns at one shard against 3,189ns at a
+thousand -- because each shard's own tables are smaller but the work per lookup is
+not.
+
+**Sharding buys you concurrent writes.** A write takes the exclusive lock, so at
+one shard four writers queue: they cost about 3x what a single writer costs, where
+four perfectly serialised would be 4x. Sixteen shards is between 4x and 10x
+cheaper per write than one for four writers -- 4.4x on a shared CI runner, 9.7x on
+an idle development box. If your workload only reads, a shard count buys you
+nothing; if it writes concurrently, this is the whole reason the type exists.
+
+**It costs you nothing in hit rate.** A sharded cache divides its byte budget by
+its shard count, so the shard holding the hot keys might be expected to run out
+while the others sit idle. It does not happen, because the keys divide in the same
+proportion as the capacity: 75.00% at one shard and at 256, and 74.98% at 1,024,
+where sixteen entries a shard is small enough for the unevenness of the draw to
+show.
+
+**Past about 64 shards, writes can start evicting each other.** An entry becomes
+protected once it has been read twice, and the eviction score considers that before
+anything else, so a freshly written key is the best victim a shard has. Once a
+read-heavy phase has filled the protected segment and a shard's leftover
+probationary room is smaller than the set of keys being written, nearly every write
+evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
+256, with the write cost rising by more than ten times. A write-heavy cache that is also
+read-hot should stay well below that.
+
+So: sixteen for a mixed workload, fewer if you only read, and measure before going
+past sixty-four.
+
 ## Placing keys on a cluster
 
 One cache picks the shard for a key with `hash(key) % shard_count`, which holds
