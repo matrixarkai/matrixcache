@@ -9,12 +9,44 @@
 //! against: routing that costs a fraction of that is bookkeeping, and routing
 //! that approaches it is a second cache lookup nobody asked for.
 //!
+//! That comparison has an answer now, and it is the reason the sweep reaches
+//! 32,768 nodes when asked. The lookup table over the ring is capped at sixteen
+//! bits, so past four thousand nodes every further node makes its slots fuller
+//! rather than adding slots -- which the `index KiB` column shows by stopping:
+//!
+//! ```text
+//!   nodes   ring points   index KiB     owner ns        owner spread
+//!     512         81920       128.0         70.0      69.6..122.7
+//!    4096        655360       256.0        137.9     127.3..234.7
+//!   16384       2621440       256.0        278.8     271.0..385.0
+//!   32768       5242880       256.0        425.7     418.5..495.1
+//! ```
+//!
+//! Ten points to a slot at four thousand nodes, forty at sixteen thousand,
+//! eighty at thirty-two thousand. Occupancy grows eight-fold over that range and
+//! the lookup grows three-fold, because the points in a slot are contiguous:
+//! eighty of them is twenty cache lines read in order, which is not the same
+//! animal as twenty dependent misses. The cap is not what gives out.
+//!
+//! What gives out is the comparison at the top of this file. Against roughly
+//! 226ns for a memory-tier hit, routing is a fraction of a lookup at four
+//! thousand nodes and larger than one at sixteen thousand -- so somewhere in
+//! between, deciding where a key lives stops being bookkeeping and becomes the
+//! more expensive half of the operation. Size a cluster against that.
+//!
+//! Read those numbers with their spreads. The 4,096 row came out at 137.9ns in
+//! one run and 206.5ns in another on the same binary, because this machine is
+//! shared; the ordering across rows is stable and the absolute values are not.
+//!
 //! Three things are worth watching, and they grow differently.
 //!
-//! **Placing one key.** A hash and a binary search over the ring. The search is
-//! logarithmic in ring points, which is the easy part; the ring is 16 bytes per
-//! point, so at four thousand nodes it is ten megabytes and every probe is a
-//! cache miss. That is the part that does not look logarithmic.
+//! **Placing one key.** A hash, one read of the lookup table over the ring, and
+//! a short scan inside the slot that read names. It was a binary search when
+//! this file was written, and the description above it has outlived that: a
+//! search logarithmic in ring points sounds cheap until the ring is 16 bytes a
+//! point -- ten megabytes at four thousand nodes -- which made each of those
+//! twenty probes a dependent cache miss. The table trades twenty scattered
+//! misses for one, and the points it then scans share cache lines.
 //!
 //! **Placing a key and its copies.** `owners` walks the ring from the key's own
 //! point, taking each node whose failure domain it has not used. It stops as
@@ -59,7 +91,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// Node counts the tables step through, filtered by the requested ceiling.
-const NODE_STEPS: [usize; 5] = [1, 8, 64, 512, 4_096];
+const NODE_STEPS: [usize; 7] = [1, 8, 64, 512, 4_096, 16_384, 32_768];
+/// Largest step this measures unless a ceiling is asked for.
+///
+/// The two steps above it are opt-in because they are slow to build -- 32,768
+/// nodes is 5.2 million ring points -- and because four thousand is where the
+/// interesting change in the lookup already happens. Pass a number to reach
+/// them: `cluster_routing_cost 32768`.
+const DEFAULT_MAX_NODES: usize = 4_096;
 /// Keys placed per measurement. Enough that the timer is not the subject.
 const KEYS: usize = 20_000;
 /// Medians are taken over this many passes.
@@ -209,7 +248,7 @@ struct Placement {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut max_nodes = *NODE_STEPS.last().expect("a last step");
+    let mut max_nodes = DEFAULT_MAX_NODES;
     let mut json_output: Option<PathBuf> = None;
     let mut require_passed = false;
     let mut max_owner_ns: Option<f64> = None;
