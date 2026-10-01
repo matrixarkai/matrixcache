@@ -4175,6 +4175,214 @@ mod tests {
         );
     }
 
+    /// Which handoff, if any, claims this hash.
+    fn handoff_for(handoffs: &[CacheHandoff], hash: u64) -> Option<&CacheHandoff> {
+        handoffs
+            .iter()
+            .find(|handoff| handoff.ranges.iter().any(|range| range.contains(hash)))
+    }
+
+    #[test]
+    fn cluster_a_handoff_plan_accounts_for_every_key_that_moves() {
+        // The plan has to agree with `owner` key by key, or a node streams the
+        // wrong data and the keys nobody planned for are served from a node
+        // that no longer owns them.
+        let before = cluster_of(8);
+        let mut after = cluster_of(8);
+        after.add_node("cache-new", 1).expect("a distinct name");
+
+        let handoffs = before.handoffs_to(&after);
+        assert!(!handoffs.is_empty(), "a node joined and nothing moved");
+
+        let mut moved = 0_usize;
+        for index in 0..50_000 {
+            let key = cluster_test_key(index);
+            let hash = cache_key_route_hash(&key);
+            let was = before.owner(&key).expect("owned");
+            let now = after.owner(&key).expect("owned");
+            match handoff_for(&handoffs, hash) {
+                Some(handoff) => {
+                    assert_ne!(
+                        was, now,
+                        "the plan moves a key whose owner did not change: {key:?}"
+                    );
+                    assert_eq!(handoff.from, was, "the plan sends from the wrong node");
+                    assert_eq!(handoff.to, now, "the plan sends to the wrong node");
+                    moved += 1;
+                }
+                None => assert_eq!(
+                    was, now,
+                    "a key changed owner and no handoff carries it: {key:?}"
+                ),
+            }
+        }
+        assert!(moved > 0, "nothing moved, so nothing was checked");
+    }
+
+    #[test]
+    fn cluster_a_joining_node_only_receives_and_a_leaving_node_only_sends() {
+        let eight = cluster_of(8);
+
+        let mut joined = cluster_of(8);
+        joined.add_node("cache-new", 1).expect("a distinct name");
+        for handoff in eight.handoffs_to(&joined) {
+            assert_eq!(
+                handoff.to, "cache-new",
+                "a node that was already there was sent keys by a join"
+            );
+            assert_ne!(handoff.from, "cache-new", "the new node sent keys away");
+        }
+
+        // And the reverse: taking that node out again sends only from it.
+        for handoff in joined.handoffs_to(&eight) {
+            assert_eq!(
+                handoff.from, "cache-new",
+                "a node that is staying was made to give keys up"
+            );
+        }
+
+        // Marking a node down is the same shape as removing it.
+        let mut downed = cluster_of(8);
+        assert!(downed.set_node_state("cache-0003", CacheNodeState::Down));
+        for handoff in eight.handoffs_to(&downed) {
+            assert_eq!(handoff.from, "cache-0003");
+        }
+    }
+
+    #[test]
+    fn cluster_a_handoff_plan_covers_each_hash_once_and_only_what_moves() {
+        let before = cluster_of(8);
+        let mut after = cluster_of(8);
+        after.add_node("cache-new", 1).expect("a distinct name");
+        let handoffs = before.handoffs_to(&after);
+
+        // No hash is claimed twice: two nodes both sending the same keys is two
+        // writes racing for one entry.
+        let mut ranges: Vec<CacheHashRange> = handoffs
+            .iter()
+            .flat_map(|handoff| handoff.ranges.iter().copied())
+            .collect();
+        assert!(!ranges.is_empty());
+        ranges.sort_by_key(|range| range.start);
+        for window in ranges.windows(2) {
+            let (left, right) = (window[0], window[1]);
+            assert!(
+                left.end < right.start || left.start > left.end,
+                "two handoff ranges overlap: {left:?} and {right:?}"
+            );
+        }
+
+        // And the plan moves about a ninth of the space, which is the share
+        // that belongs to the ninth node.
+        let moved: u128 = handoffs.iter().map(CacheHandoff::count).sum();
+        let whole = u128::from(u64::MAX) + 1;
+        let share = moved as f64 / whole as f64;
+        println!("handoff covers {:.2}% of the hash space", share * 100.0);
+        assert!(
+            share > 0.06 && share < 0.18,
+            "the plan moves {share:.4} of the space, wanted about one ninth"
+        );
+    }
+
+    #[test]
+    fn cluster_a_handoff_plan_covers_the_stretch_that_wraps() {
+        // The stretch from the last ring point round to the first is the one
+        // that is easy to leave out, and hard to notice leaving out: it is two
+        // ring points wide out of thirteen hundred, so a sample of keys is very
+        // unlikely to land in it, and it only matters when its owner changes.
+        //
+        // Dropping it from the plan passed every other test in this file. So
+        // this one goes looking for a membership change that moves it, and
+        // checks the plan carries it.
+        let before = cluster_of(8);
+        let mut found = None;
+        for attempt in 0..64 {
+            let name = format!("cache-join-{attempt:02}");
+            let mut after = cluster_of(8);
+            after.add_node(&name, 1).expect("a distinct name");
+            if before.owner_of_route_hash(0) != after.owner_of_route_hash(0) {
+                found = Some((name, after));
+                break;
+            }
+        }
+        let (joined, after) = found.expect(
+            "no joining node in 64 tries took over the top of the hash space, \
+             which is itself worth looking at",
+        );
+
+        let handoffs = before.handoffs_to(&after);
+        let was = before.owner_of_route_hash(0).expect("owned");
+        let now = after.owner_of_route_hash(0).expect("owned");
+        assert_eq!(now, joined);
+
+        let carrier = handoffs
+            .iter()
+            .find(|handoff| handoff.ranges.iter().any(|range| range.contains(0)))
+            .expect("the wrapping stretch changed hands and no handoff carries it");
+        assert_eq!(carrier.from, was);
+        assert_eq!(carrier.to, now);
+
+        // The top of the space is the other half of that same stretch.
+        assert_eq!(
+            before.owner_of_route_hash(u64::MAX),
+            Some(was),
+            "the two ends of the wrapping stretch had different owners"
+        );
+        assert!(
+            carrier
+                .ranges
+                .iter()
+                .any(|range| range.contains(u64::MAX)),
+            "the plan carries the bottom of the wrapping stretch but not the top"
+        );
+    }
+
+    #[test]
+    fn cluster_an_unchanged_membership_moves_nothing() {
+        let cluster = cluster_of(6);
+        let same = cluster_of(6);
+        assert!(
+            cluster.handoffs_to(&same).is_empty(),
+            "two identical memberships disagreed about where keys live"
+        );
+        assert!(cluster.handoffs_to(&cluster).is_empty());
+
+        // A node going down and coming back leaves nothing to do either.
+        let mut cycled = cluster_of(6);
+        assert!(cycled.set_node_state("cache-0002", CacheNodeState::Down));
+        assert!(cycled.set_node_state("cache-0002", CacheNodeState::Live));
+        assert!(cluster.handoffs_to(&cycled).is_empty());
+
+        // Nothing to send to nowhere, and nothing to send from nowhere.
+        let empty = CacheClusterTopology::new();
+        assert!(cluster.handoffs_to(&empty).is_empty());
+        assert!(empty.handoffs_to(&cluster).is_empty());
+    }
+
+    #[test]
+    fn cluster_a_hash_range_knows_what_it_holds_including_round_the_wrap() {
+        let plain = CacheHashRange { start: 10, end: 20 };
+        assert!(plain.contains(10) && plain.contains(20) && plain.contains(15));
+        assert!(!plain.contains(9) && !plain.contains(21));
+        assert_eq!(plain.count(), 11);
+
+        // Past the top of the space and on from zero.
+        let wrapped = CacheHashRange {
+            start: u64::MAX - 1,
+            end: 2,
+        };
+        assert!(wrapped.contains(u64::MAX - 1));
+        assert!(wrapped.contains(u64::MAX));
+        assert!(wrapped.contains(0) && wrapped.contains(2));
+        assert!(!wrapped.contains(3) && !wrapped.contains(u64::MAX - 2));
+        assert_eq!(wrapped.count(), 5);
+
+        // The whole space is one range that starts just past where it ends.
+        let everything = CacheHashRange { start: 0, end: u64::MAX };
+        assert_eq!(everything.count(), u128::from(u64::MAX) + 1);
+        assert!(everything.contains(0) && everything.contains(u64::MAX));
+    }
+
     #[test]
     fn lifecycle_capacity_and_size_match_unified_cache_controls() {
         let dir = tempfile::tempdir().unwrap();
