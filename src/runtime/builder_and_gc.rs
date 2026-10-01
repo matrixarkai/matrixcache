@@ -1946,6 +1946,7 @@ impl CacheInner {
                 let picked =
                     self.select_windowed_eviction_victim(&self.memory_order, true, candidates);
                 self.record_sampled_groups(picked.groups_weighed);
+                self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
             }
             CacheReplacementPolicy::WeightedHotnessLru => {
@@ -1953,6 +1954,7 @@ impl CacheInner {
                 let picked =
                     self.select_windowed_eviction_victim(&self.memory_order, false, candidates);
                 self.record_sampled_groups(picked.groups_weighed);
+                self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
             }
         }
@@ -2054,6 +2056,54 @@ impl CacheInner {
                 return PickedEvictionVictim {
                     victim: Some((candidate.clone(), EvictionReason::Expired, 0)),
                     groups_weighed: 0,
+                    promote: Vec::new(),
+                };
+            }
+        }
+        // The rule a three-list policy applies at the tail of its cold list: an
+        // entry that has been read twice is moved back rather than given up, and
+        // only an entry that has not is deleted. The classes here are derived
+        // rather than stored -- cold is the byte share this scan already walks,
+        // and read-twice is the counter the score already keeps -- so there is no
+        // per-class bookkeeping to drift.
+        //
+        // Bounded by the scan, and gives up the coldest anyway when every
+        // candidate has earned a second chance: a full cache must be able to
+        // release something, and a rule that can refuse to is a stall.
+        if self.cold_eviction_share_pct < 100 {
+            let mut promote = Vec::new();
+            let mut first_unpinned = None;
+            for key in order.iter_access().take(candidates) {
+                if self.is_pinned(key) {
+                    continue;
+                }
+                if first_unpinned.is_none() {
+                    first_unpinned = Some(key.clone());
+                }
+                let twice_read = self
+                    .metadata
+                    .get(key)
+                    .is_some_and(|meta| meta.hits.load(Ordering::Relaxed) >= SLRU_PROTECTED_HITS);
+                if twice_read {
+                    promote.push(key.clone());
+                    continue;
+                }
+                return PickedEvictionVictim {
+                    victim: Some((key.clone(), EvictionReason::Stale, 0)),
+                    groups_weighed: 0,
+                    promote,
+                };
+            }
+            if let Some(victim) = first_unpinned {
+                // Everything in the share had been read twice. Keep the moves --
+                // they are still the right answer for the rest -- but take the
+                // coldest, which is what the list would have done once its warm
+                // share filled.
+                promote.retain(|key| key != &victim);
+                return PickedEvictionVictim {
+                    victim: Some((victim, EvictionReason::Stale, 0)),
+                    groups_weighed: 0,
+                    promote,
                 };
             }
         }
@@ -2067,6 +2117,7 @@ impl CacheInner {
             groups_weighed: windowed
                 .groups_weighed
                 .saturating_add(full.groups_weighed),
+            promote: Vec::new(),
         }
     }
 
@@ -2125,6 +2176,7 @@ impl CacheInner {
         PickedEvictionVictim {
             victim,
             groups_weighed: group_count,
+            promote: Vec::new(),
         }
     }
 
@@ -2878,6 +2930,20 @@ impl CacheInner {
     /// Walks no further than the window it replaces, so a large tier does not
     /// scan more than it used to, and returns at least one candidate because a
     /// cache with a resident entry has to be able to give one up.
+    /// Move entries the scan passed over back to the hot end.
+    ///
+    /// The scan runs while the cache is held shared and cannot move anything, so
+    /// it reports what it passed over and this applies it. An entry read twice is
+    /// moved rather than given up, which is what a three-list policy does at the
+    /// tail of its cold list; moving it is what stops the next eviction weighing
+    /// it again and makes the second chance a chance rather than a reprieve of
+    /// one scan.
+    fn apply_cold_tail_promotions(&mut self, keys: &[CacheKey]) {
+        for key in keys {
+            self.memory_order.touch_access(key);
+        }
+    }
+
     fn memory_cold_candidate_count(&self) -> usize {
         let share = self.cold_eviction_share_pct;
         if share >= 100 {
