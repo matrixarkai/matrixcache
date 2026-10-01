@@ -1583,6 +1583,24 @@ impl CacheInner {
         self.stats.memory_fills += 1;
         if let Some(old) = self.memory.insert(key.clone(), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
+            // An overwrite is an access. The access order alone does not settle
+            // it -- the eviction score weighs hotness before recency, so a
+            // rewritten key with the lowest hotness is given up whatever
+            // position it holds -- so raise both.
+            self.memory_order.touch_access(&key);
+            if let Some(meta) = self.metadata.get(&key) {
+                let threshold = self.tiering_policy.memory_hotness_threshold;
+                let before = meta.hotness.fetch_add(1, Ordering::Relaxed);
+                // Counted the same way a read counts it. Raising hotness
+                // without this would let an entry cross the threshold by being
+                // written and never appear in , which is a
+                // counter quietly ceasing to mean what it says.
+                if before < threshold && before.saturating_add(1) >= threshold {
+                    self.read_counters
+                        .hotness_promotions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         } else {
             self.memory_order.push_back_if_absent(key);
         }
