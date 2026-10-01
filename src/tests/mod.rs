@@ -4407,18 +4407,38 @@ mod tests {
         }
         assert_eq!(seen.len(), live.len(), "some live node was never named");
 
-        // And the runs survive the membership changing under them.
+        // A node going down leaves the ring exactly as it was -- that is what
+        // makes it cheap, and it is worth asserting rather than assuming, since
+        // the alternative is rehashing every point in it.
+        let points_before = cluster.ring_point_count();
         assert!(cluster.set_node_state("two", CacheNodeState::Down));
         assert_eq!(
             cluster.ring_point_count(),
-            2 * CACHE_RING_POINTS_PER_WEIGHT as usize
+            points_before,
+            "a state change rebuilt the ring"
         );
-        for index in 0..256 {
+        assert_eq!(cluster.live_node_count(), 2, "two was weighted 2 of 4 units");
+
+        // Its points are still there and must never be answered with.
+        for index in 0..512 {
             let key = CacheKey::string(0, &format!("step-{index:05}"));
             let owner = cluster.owner(&key).expect("owned");
             assert_ne!(owner, "two", "a node that is down was named");
             assert!(live.contains(owner));
         }
+
+        // Back up, and it owns again -- without the ring having moved either.
+        assert!(cluster.set_node_state("two", CacheNodeState::Live));
+        assert_eq!(cluster.ring_point_count(), points_before);
+        let mut named_two = false;
+        for index in 0..512 {
+            let key = CacheKey::string(0, &format!("step-{index:05}"));
+            if cluster.owner(&key) == Some("two") {
+                named_two = true;
+                break;
+            }
+        }
+        assert!(named_two, "a node brought back up owns nothing");
     }
 
     #[test]

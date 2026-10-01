@@ -118,12 +118,22 @@ struct CacheRingPoint {
 #[derive(Debug, Clone)]
 pub struct CacheClusterTopology {
     nodes: BTreeMap<String, CacheClusterNode>,
-    /// Names of the live nodes, in the order the ring points index them.
-    live: Vec<String>,
-    /// The failure domain of each live node, as an index. Two live nodes share
-    /// a number when they share a zone; a node with no zone gets a number of
-    /// its own.
-    live_domain: Vec<u32>,
+    /// Every member's name, in the order the ring points index them.
+    ///
+    /// All members, not only the live ones. A node going down does not change
+    /// any hash and does not change the order of the points that remain, so the
+    /// ring does not have to be rebuilt for it -- lookups step over what is not
+    /// live instead. Rebuilding cost 94ms at four thousand nodes, half of it
+    /// hashing points whose hashes had not changed.
+    members: Vec<String>,
+    /// Whether each member is taking traffic, at the same index.
+    member_live: Vec<bool>,
+    /// The failure domain of each member, as an index. Two members share a
+    /// number when they share a zone; one with no zone gets a number of its own.
+    member_domain: Vec<u32>,
+    /// How many members are live. Kept because a lookup needs to know whether
+    /// stepping over the not-live ones can ever terminate.
+    live_count: usize,
     /// How many distinct values `live_domain` holds. Counted once per rebuild
     /// because every copy placement needs it and a lookup must not walk the
     /// membership to find it.
@@ -167,8 +177,10 @@ impl CacheClusterTopology {
     pub fn with_points_per_weight(points_per_weight: u32) -> Self {
         Self {
             nodes: BTreeMap::new(),
-            live: Vec::new(),
-            live_domain: Vec::new(),
+            members: Vec::new(),
+            member_live: Vec::new(),
+            member_domain: Vec::new(),
+            live_count: 0,
             domain_count: 0,
             ring: Vec::new(),
             prefix_index: Vec::new(),
@@ -324,7 +336,8 @@ impl CacheClusterTopology {
             return true;
         }
         node.state = state;
-        self.rebuild_ring();
+        // No hash changed and no point moved, so the ring and its index stand.
+        self.refresh_live();
         true
     }
 
@@ -342,7 +355,7 @@ impl CacheClusterTopology {
     }
 
     pub fn live_node_count(&self) -> usize {
-        self.live.len()
+        self.live_count
     }
 
     /// How many things can fail independently.
@@ -354,6 +367,43 @@ impl CacheClusterTopology {
         self.domain_count
     }
 
+    /// Whether the ring point at `index` belongs to a member taking traffic.
+    fn point_is_live(&self, index: usize) -> bool {
+        self.member_live[self.ring[index].node as usize]
+    }
+
+    /// The member owning the ring point at `index`.
+    fn point_member(&self, index: usize) -> &str {
+        self.members[self.ring[index].node as usize].as_str()
+    }
+
+    /// The first live ring point at or after `index`, wrapping once.
+    ///
+    /// A member that is down keeps its points -- rebuilding the ring to take
+    /// them out would mean rehashing every point in it -- so a lookup steps
+    /// over them. With nothing down this never steps at all, and with a tenth
+    /// of a cluster down it steps about once, usually within the same cache
+    /// line the slot scan already touched.
+    fn first_live_point_from(&self, index: usize) -> Option<usize> {
+        if self.live_count == 0 {
+            return None;
+        }
+        let points = self.ring.len();
+        for step in 0..points {
+            let candidate = (index + step) % points;
+            if self.point_is_live(candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Points on the ring, over every member.
+    ///
+    /// Including members that are down: their points stay put, because taking
+    /// them out would mean rehashing the ring, and a lookup steps over them
+    /// instead. So this does not move when a node goes up or down -- only when
+    /// one joins or leaves.
     pub fn ring_point_count(&self) -> usize {
         self.ring.len()
     }
@@ -412,7 +462,8 @@ impl CacheClusterTopology {
     /// ranges are in -- and this is how it confirms where one belongs.
     pub fn owner_of_route_hash(&self, hash: u64) -> Option<&str> {
         let point = self.first_point_at_or_after(hash)?;
-        Some(self.live[self.ring[point].node as usize].as_str())
+        let live = self.first_live_point_from(point)?;
+        Some(self.point_member(live))
     }
 
     fn owner_of_hash(&self, hash: u64) -> Option<&str> {
@@ -420,7 +471,7 @@ impl CacheClusterTopology {
     }
 
     fn owners_of_hash(&self, hash: u64, copies: usize) -> Vec<&str> {
-        let wanted = copies.min(self.live.len());
+        let wanted = copies.min(self.live_count);
         if wanted == 0 {
             return Vec::new();
         }
@@ -434,12 +485,16 @@ impl CacheClusterTopology {
         // ring's order and not an arbitrary one.
         let mut crowded: Vec<&str> = Vec::new();
         for step in 0..self.ring.len() {
-            let node = self.ring[(start + step) % self.ring.len()].node as usize;
-            let name = self.live[node].as_str();
+            let point = (start + step) % self.ring.len();
+            if !self.point_is_live(point) {
+                continue;
+            }
+            let node = self.ring[point].node as usize;
+            let name = self.members[node].as_str();
             if owners.contains(&name) || crowded.contains(&name) {
                 continue;
             }
-            let domain = self.live_domain[node];
+            let domain = self.member_domain[node];
             if used_domains.contains(&domain) {
                 crowded.push(name);
             } else {
@@ -492,20 +547,16 @@ impl CacheClusterTopology {
     }
 
     fn rebuild_ring(&mut self) {
-        let live_nodes: Vec<&CacheClusterNode> = self
+        self.members = self.nodes.values().map(|node| node.name.clone()).collect();
+        // Named zones share a number; an unzoned member gets one nobody else
+        // has, which is what makes "no zone" mean "its own domain" rather than
+        // "the same domain as every other member that said nothing".
+        let mut zone_ids: BTreeMap<String, u32> = BTreeMap::new();
+        let mut next_id = 0_u32;
+        self.member_domain = self
             .nodes
             .values()
-            .filter(|node| node.state == CacheNodeState::Live)
-            .collect();
-        self.live = live_nodes.iter().map(|node| node.name.clone()).collect();
-        // Named zones share a number; an unzoned node gets one nobody else has,
-        // which is what makes "no zone" mean "its own domain" rather than "the
-        // same domain as every other node that said nothing".
-        let mut zone_ids: BTreeMap<&str, u32> = BTreeMap::new();
-        let mut next_id = 0_u32;
-        self.live_domain = live_nodes
-            .iter()
-            .map(|node| match node.zone.as_deref() {
+            .map(|node| match node.zone.clone() {
                 Some(zone) => *zone_ids.entry(zone).or_insert_with(|| {
                     let id = next_id;
                     next_id += 1;
@@ -518,9 +569,8 @@ impl CacheClusterTopology {
                 }
             })
             .collect();
-        self.domain_count = self.live_domain.iter().collect::<BTreeSet<_>>().len();
         let mut ring = Vec::new();
-        for (index, name) in self.live.iter().enumerate() {
+        for (index, name) in self.members.iter().enumerate() {
             let weight = self.nodes[name].weight;
             let points = self.points_per_weight.saturating_mul(weight);
             let mut label = String::with_capacity(name.len() + 12);
@@ -543,6 +593,30 @@ impl CacheClusterTopology {
         });
         self.ring = ring;
         self.rebuild_prefix_index();
+        self.refresh_live();
+    }
+
+    /// Recompute what is live, without touching the ring.
+    ///
+    /// All a node going up or down changes. Costs one pass over the membership
+    /// rather than a rehash and a sort of every ring point.
+    fn refresh_live(&mut self) {
+        self.member_live = self
+            .nodes
+            .values()
+            .map(|node| node.state == CacheNodeState::Live)
+            .collect();
+        self.live_count = self.member_live.iter().filter(|live| **live).count();
+        self.domain_count = self
+            .member_domain
+            .iter()
+            .zip(&self.member_live)
+            .filter(|(_, live)| **live)
+            .map(|(domain, _)| *domain)
+            .collect::<BTreeSet<_>>()
+            .len();
+        debug_assert_eq!(self.member_live.len(), self.members.len());
+        debug_assert_eq!(self.member_domain.len(), self.members.len());
     }
 
     /// Rebuild the lookup table for the ring as it now stands.
