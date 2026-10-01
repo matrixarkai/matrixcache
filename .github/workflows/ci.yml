@@ -71,6 +71,33 @@ jobs:
             --min-eviction-samples 1
           tools/compare_soak_reports.py /tmp/matrixcache-soak.json /tmp/matrixcache-soak.json
 
+      - name: Cluster routing smoke
+        # The ceiling is deliberately loose. A shared runner cannot resolve a
+        # drift of tens of nanoseconds, and a gate that tries to becomes a gate
+        # people rerun until it passes. This catches the order of magnitude: a
+        # lookup that has become a scan, or a ring that is rebuilt per key.
+        run: |
+          cargo run --locked --release --no-default-features --example cluster_routing_cost -- 512 \
+            --json-output /tmp/matrixcache-routing.json \
+            --max-owner-ns 20000 \
+            --require-passed
+          python3 -c "
+          import json, sys
+          report = json.load(open('/tmp/matrixcache-routing.json'))
+          assert report['passed'], report
+          rows = report['placement']
+          assert len(rows) == 4, rows
+          # A ring is built for every node, so the point count has to grow with
+          # the cluster; a ring that stopped growing would place everything on
+          # one node and still answer quickly.
+          points = [row['ring_points'] for row in rows]
+          assert points == sorted(points) and points[0] < points[-1], points
+          # Balance is deterministic, so this one is safe to hold to a number.
+          worst = max(row['peak_over_mean'] for row in report['points_per_node'])
+          assert worst < 4.0, report['points_per_node']
+          print('routing report ok:', report['worst_owner_ns'], 'ns worst lookup')
+          "
+
       - name: Backend report smoke
         run: |
           cargo run --locked --no-default-features --example rocksdb_backend_bench -- \
