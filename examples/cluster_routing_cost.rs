@@ -186,6 +186,7 @@ fn peak_over_mean(cluster: &CacheClusterTopology) -> (f64, f64) {
 struct Placement {
     nodes: usize,
     ring_points: usize,
+    index_slots: usize,
     owner_ns: f64,
     owner_low_ns: f64,
     owner_high_ns: f64,
@@ -246,6 +247,7 @@ fn main() {
         rows.push(Placement {
             nodes,
             ring_points: plain.ring_point_count(),
+            index_slots: plain.ring_index_slots(),
             owner_ns: owner_median,
             owner_low_ns: owner_low,
             owner_high_ns: owner_high,
@@ -256,14 +258,21 @@ fn main() {
     }
 
     println!(
-        "{:>7}  {:>12}  {:>11}  {:>18}  {:>13}  {:>12}",
-        "nodes", "ring points", "owner ns", "owner spread", "3 copies ns", "zoned 3 ns"
+        "{:>7}  {:>12}  {:>10}  {:>11}  {:>18}  {:>13}  {:>12}",
+        "nodes",
+        "ring points",
+        "index KiB",
+        "owner ns",
+        "owner spread",
+        "3 copies ns",
+        "zoned 3 ns"
     );
     for row in &rows {
         println!(
-            "{:>7}  {:>12}  {:>11.1}  {:>8.1}..{:<8.1}  {:>13.1}  {:>12.1}",
+            "{:>7}  {:>12}  {:>10.1}  {:>11.1}  {:>8.1}..{:<8.1}  {:>13.1}  {:>12.1}",
             row.nodes,
             row.ring_points,
+            (row.index_slots + 1) as f64 * 4.0 / 1024.0,
             row.owner_ns,
             row.owner_low_ns,
             row.owner_high_ns,
@@ -395,11 +404,13 @@ an idle machine for the cost"
             let _ = writeln!(
                 report,
                 "    {{\"nodes\": {}, \"ring_points\": {}, \"domains\": {}, \
+                 \"index_slots\": {}, \
                  \"owner_ns\": {:.1}, \"owner_low_ns\": {:.1}, \"owner_high_ns\": {:.1}, \
                  \"copies_ns\": {:.1}, \"zoned_copies_ns\": {:.1}}}{comma}",
                 row.nodes,
                 row.ring_points,
                 row.domains,
+                row.index_slots,
                 row.owner_ns,
                 row.owner_low_ns,
                 row.owner_high_ns,
