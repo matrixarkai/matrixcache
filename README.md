@@ -156,10 +156,12 @@ where sixteen entries a shard is small enough for the unevenness of the draw to
 show.
 
 **Past about 64 shards, writes can start evicting each other.** An entry becomes
-protected once it has been read twice, and the eviction score considers that before
-anything else, so a freshly written key is the best victim a shard has. Once a
-read-heavy phase has filled the protected segment and a shard's leftover
-probationary room is smaller than the set of keys being written, nearly every write
+protected once it has been read twice, and the eviction score weighs that before
+anything else, so no protected entry is evicted while an unprotected one remains.
+A read-heavy phase moves residents into protected and shrinks the room the
+unprotected share. A freshly written key is unprotected, so once that room is
+smaller than the set of keys being written the write set competes only with
+itself -- admitting one evicts the oldest of them, and nearly every write
 evicts: measured at 0.04 evictions per write or fewer up to 64 shards, and 0.93 at
 256, with the write cost rising by more than ten times. A write-heavy cache that is also
 read-hot should stay well below that.
@@ -175,9 +177,10 @@ finely the byte budget is divided. They pull in opposite directions.
 - **More shards, less queueing.** Four writers at one shard cost 3.1x to 3.9x what
   a single writer costs -- four threads taking turns on one lock. At sixteen
   shards four writers cost *less per write* than one writer does.
-- **More shards, a smaller budget each.** Once a read-heavy phase has filled the
-  protected segment, a freshly written key is the best victim a shard has, so if a
-  shard is small the writes evict each other.
+- **More shards, a smaller budget each.** A read-heavy phase moves residents into
+  the protected segment, which no unprotected entry can displace, so the room left
+  for a write set shrinks. If a shard is small enough, the write set competes only
+  with itself and the writes evict each other.
 
 The second effect is not about the shard count. It is about how many entries a
 shard still holds, which is the count divided into the capacity:
