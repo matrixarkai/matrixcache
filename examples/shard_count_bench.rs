@@ -53,6 +53,16 @@ const KEY_SPACE: usize = 65_536;
 const READS: usize = 200_000;
 /// Passes a timing is the median of.
 const PASSES: usize = 3;
+/// Writes per measurement, per arm.
+const WRITES: usize = 50_000;
+/// Distinct keys each writer owns.
+///
+/// Four writers times this is 8,192 keys, half the resident set, so the cache is
+/// not evicting while the write arms are timed -- what they measure is the lock
+/// and not the replacement policy. It still fits at every shard count in
+/// [`SHARD_STEPS`]: at 1,024 shards the cache holds sixteen entries a shard and
+/// this puts eight there.
+const WRITE_KEYS_PER_THREAD: usize = 2_048;
 /// Threads the concurrent read arm uses.
 ///
 /// Sharding exists so readers of different shards do not queue behind one
@@ -96,6 +106,19 @@ fn even_key(step: usize) -> CacheKey {
     CacheKey::string((index % 16) as u64, &format!("key-{index:06}"))
 }
 
+/// A key for the write arms: no two writers ever name the same one.
+///
+/// `step * THREADS + thread_index` is a bijection, so the arm measures four
+/// writers contending for a lock rather than four writers contending for an
+/// entry. [`skewed_key`] would not do: it pushes three quarters of its traffic
+/// into an eighth of the space, so the writers would collide on the hot keys and
+/// land on one shard however many shards there were -- which would answer "do
+/// shards help writes" with "no" for a reason that is about the skew.
+fn write_key(thread_index: usize, step: usize) -> CacheKey {
+    let index = (step % WRITE_KEYS_PER_THREAD) * THREADS + thread_index;
+    CacheKey::string((index % 16) as u64, &format!("w-{index:08}"))
+}
+
 fn median(mut values: Vec<f64>) -> (f64, f64, f64) {
     values.sort_by(f64::total_cmp);
     (
@@ -114,6 +137,12 @@ struct Row {
     read_low_ns: f64,
     read_high_ns: f64,
     concurrent_ns: f64,
+    single_write_ns: f64,
+    single_write_low_ns: f64,
+    single_write_high_ns: f64,
+    concurrent_write_ns: f64,
+    concurrent_write_low_ns: f64,
+    concurrent_write_high_ns: f64,
     stats_us: f64,
 }
 
@@ -145,6 +174,83 @@ fn concurrent_read_ns(cache: &Arc<ShardedMultiLayerCache>, reads: usize) -> f64 
         .sum();
     let elapsed = started.elapsed();
     assert!(found > 0, "every pass should have found something");
+    elapsed.as_secs_f64() * 1e9 / (per_thread * THREADS) as f64
+}
+
+/// Put every key the write arms use, so none of them is a first admission.
+fn warm_the_write_keys(cache: &Arc<ShardedMultiLayerCache>) {
+    let value = vec![b'w'; VALUE_BYTES];
+    for thread_index in 0..THREADS {
+        for step in 0..WRITE_KEYS_PER_THREAD {
+            let _ = cache.put(write_key(thread_index, step), value.clone());
+        }
+    }
+}
+
+/// Nanoseconds per write with one writer, as the control for the arm below.
+///
+/// Without it a slow four-writer number cannot be read: writes may simply cost
+/// more at a thousand shards the way reads do, and only the ratio of the two
+/// arms separates "sharding is expensive" from "writers are queueing".
+fn single_write_ns(cache: &Arc<ShardedMultiLayerCache>, writes: usize) -> f64 {
+    let per_thread = writes / THREADS;
+    let value = vec![b'w'; VALUE_BYTES];
+    let started = Instant::now();
+    let mut stored = 0_usize;
+    // Every key the four-writer arm covers, in one thread. The first version of
+    // this control wrote only writer 0's keys -- a quarter of the distinct keys
+    // for the same number of writes -- so the two arms differed in how much the
+    // cache had to evict as well as in how many threads were running, and a
+    // ratio between them was not about threads. It read 38,834ns against
+    // 2,566ns at neighbouring shard counts, which is what sent me looking.
+    for thread_index in 0..THREADS {
+        for step in 0..per_thread {
+            if cache
+                .put(write_key(thread_index, step), value.clone())
+                .is_ok()
+            {
+                stored += 1;
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(stored > 0, "nothing was stored, so this timed nothing");
+    elapsed.as_secs_f64() * 1e9 / (per_thread * THREADS) as f64
+}
+
+/// Nanoseconds per write with [`THREADS`] writers going at once.
+///
+/// The read arm found that readers do not need shards: a memory hit is served
+/// under a shared lock, so four readers already go at once at one shard. A write
+/// takes the exclusive lock, so this is the arm where sharding has something to
+/// do -- and the pair is what says whether "concurrency does not need shards" is
+/// a fact about concurrency or a fact about reading.
+fn concurrent_write_ns(cache: &Arc<ShardedMultiLayerCache>, writes: usize) -> f64 {
+    let per_thread = writes / THREADS;
+    let started = Instant::now();
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_index in 0..THREADS {
+        let cache = Arc::clone(cache);
+        handles.push(thread::spawn(move || {
+            let value = vec![b'w'; VALUE_BYTES];
+            let mut stored = 0_usize;
+            for step in 0..per_thread {
+                if cache
+                    .put(write_key(thread_index, step), value.clone())
+                    .is_ok()
+                {
+                    stored += 1;
+                }
+            }
+            stored
+        }));
+    }
+    let stored: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer thread"))
+        .sum();
+    let elapsed = started.elapsed();
+    assert!(stored > 0, "nothing was stored, so this timed nothing");
     elapsed.as_secs_f64() * 1e9 / (per_thread * THREADS) as f64
 }
 
@@ -248,6 +354,25 @@ median of {PASSES}\n"
         }
         let (concurrent_ns, _, _) = median(concurrent_samples);
 
+        // Last, because these arms put new keys in the cache: run them earlier
+        // and the read arm above would be reading a different cache.
+        // Admit the write set once, untimed. Without this the first timed pass is
+        // the one that puts all 8,192 keys in for the first time and the other
+        // two overwrite, which showed up as a one-writer spread of
+        // 1,926..9,879ns at sixteen shards -- one cold pass and two warm ones,
+        // and a median that reported neither.
+        warm_the_write_keys(&shared);
+
+        let mut single_write_samples = Vec::with_capacity(PASSES);
+        let mut concurrent_write_samples = Vec::with_capacity(PASSES);
+        for _ in 0..PASSES {
+            single_write_samples.push(single_write_ns(&shared, WRITES));
+            concurrent_write_samples.push(concurrent_write_ns(&shared, WRITES));
+        }
+        let (single_write, single_write_low, single_write_high) = median(single_write_samples);
+        let (concurrent_write, concurrent_write_low, concurrent_write_high) =
+            median(concurrent_write_samples);
+
         rows.push(Row {
             shards,
             per_shard_entries: RESIDENT / shards.max(1),
@@ -257,6 +382,12 @@ median of {PASSES}\n"
             read_low_ns: read_low,
             read_high_ns: read_high,
             concurrent_ns,
+            single_write_ns: single_write,
+            single_write_low_ns: single_write_low,
+            single_write_high_ns: single_write_high,
+            concurrent_write_ns: concurrent_write,
+            concurrent_write_low_ns: concurrent_write_low,
+            concurrent_write_high_ns: concurrent_write_high,
             stats_us,
         });
     }
@@ -286,6 +417,33 @@ median of {PASSES}\n"
             row.stats_us
         );
     }
+
+    // A table of its own rather than two more columns, because the question it
+    // answers is its own question: a write takes the exclusive lock, so this is
+    // where dividing the cache into shards has something to do.
+    println!();
+    println!(
+        "{:>7}  {:>10}  {:>16}  {:>11}  {:>16}  {:>7}",
+        "shards", "1 writer", "spread", "4 writers", "spread", "gain"
+    );
+    for row in &rows {
+        println!(
+            "{:>7}  {:>10.1}  {:>7.0}..{:<7.0}  {:>11.1}  {:>7.0}..{:<7.0}  {:>6.2}x",
+            row.shards,
+            row.single_write_ns,
+            row.single_write_low_ns,
+            row.single_write_high_ns,
+            row.concurrent_write_ns,
+            row.concurrent_write_low_ns,
+            row.concurrent_write_high_ns,
+            row.single_write_ns / row.concurrent_write_ns
+        );
+    }
+    println!(
+        "ns per write; gain is one writer's cost over four writers' -- 1.00x means \
+the writers never queued, 0.25x means they took turns. Spreads because the \
+one-writer column is not stable and a bare median would hide that."
+    );
 
     let first = rows.first().expect("a row");
     let last = rows.last().expect("a row");
@@ -317,6 +475,55 @@ whatever sharding costs a skewed workload should be absent here",
         last.shards,
         first.concurrent_ns / last.concurrent_ns
     );
+    let gain_of = |row: &Row| row.single_write_ns / row.concurrent_write_ns;
+    // The cheapest four-writer cost, which is what a caller choosing a shard
+    // count would pick. Choosing by the one-over-four ratio instead picked 256
+    // shards, where four writers cost MORE per operation than at one shard and
+    // the ratio was large only because that row's own one-writer control was
+    // slow -- a best row that is worse than the baseline it is compared to.
+    let best_write = rows
+        .iter()
+        .min_by(|left, right| {
+            left.concurrent_write_ns
+                .total_cmp(&right.concurrent_write_ns)
+        })
+        .expect("a row");
+    println!(
+        "{THREADS} writers: {:.0}ns per write at {} shard, {:.0}ns at {} -- {:.2}x, {}",
+        first.concurrent_write_ns,
+        first.shards,
+        best_write.concurrent_write_ns,
+        best_write.shards,
+        first.concurrent_write_ns / best_write.concurrent_write_ns,
+        if best_write.shards > first.shards {
+            "so writers DO need the shards, where readers did not"
+        } else {
+            "so writers do not need them either"
+        }
+    );
+    println!(
+        "   at {} shard four writers cost {:.2}x what one writer costs, so they are \
+taking turns on the one lock",
+        first.shards,
+        1.0 / gain_of(first)
+    );
+
+    let write_separated = best_write.concurrent_write_high_ns < first.concurrent_write_low_ns;
+    println!(
+        "   four writers cost {:.0}..{:.0}ns at {} shard against {:.0}..{:.0}ns at {} -- {}",
+        first.concurrent_write_low_ns,
+        first.concurrent_write_high_ns,
+        first.shards,
+        best_write.concurrent_write_low_ns,
+        best_write.concurrent_write_high_ns,
+        best_write.shards,
+        if write_separated {
+            "separated, so the queueing is the finding"
+        } else {
+            "did NOT separate, so this has measured the machine and not the lock"
+        }
+    );
+
     let read_separated =
         last.read_low_ns > first.read_high_ns || first.read_low_ns > last.read_high_ns;
     println!(
