@@ -289,6 +289,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut reads = READS;
     let mut json_output: Option<PathBuf> = None;
+    let mut shards_max = usize::MAX;
+    let mut require_passed = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -298,6 +300,15 @@ fn main() {
                     args.get(index).expect("--json-output needs a path"),
                 ));
             }
+            "--shards-max" => {
+                index += 1;
+                shards_max = args
+                    .get(index)
+                    .expect("--shards-max needs a number")
+                    .parse()
+                    .expect("--shards-max takes a number");
+            }
+            "--require-passed" => require_passed = true,
             other => reads = other.parse().expect("the read count takes a number"),
         }
         index += 1;
@@ -309,7 +320,7 @@ median of {PASSES}\n"
     );
 
     let mut rows = Vec::new();
-    for shards in SHARD_STEPS {
+    for shards in SHARD_STEPS.into_iter().filter(|count| *count <= shards_max) {
         let cache = ShardedMultiLayerCache::with_options(
             CacheOptions::new(RESIDENT * VALUE_BYTES, 0, 0),
             shards,
@@ -460,6 +471,13 @@ the writers never queued, 0.25x means they took turns. Spreads because the \
 one-writer column is not stable and a bare median would hide that."
     );
 
+    assert!(
+        rows.len() >= 2,
+        "a sweep of one shard count compares nothing; --shards-max {shards_max} left \
+{} of {} rows",
+        rows.len(),
+        SHARD_STEPS.len()
+    );
     let first = rows.first().expect("a row");
     let last = rows.last().expect("a row");
     println!();
@@ -584,6 +602,43 @@ to look at, while the rate rises"
 apart and is not evidence of either"
     );
 
+    // Two findings a gate can hold, and one it cannot.
+    //
+    // The eviction regime is the strong one: the rates come out the same to
+    // three decimals on an idle box and on a shared one, because they are a
+    // property of the cache and the workload and not of the machine. A count
+    // that evicts on almost nothing and a count that evicts on almost every
+    // write both have to exist, or the sweep has stopped covering the two
+    // regimes the write column is about.
+    //
+    // The write-lock finding is the second: four writers against one shard
+    // measured between 7.5x and 9.7x the cost at sixteen, on a loaded box and an
+    // idle one. A gate wants the bands not to overlap rather than a number.
+    //
+    // Read cost is the one a gate cannot have. It separated at 1.4x, and a
+    // shared runner's own spread is wider than that, so a gate on it would be a
+    // gate people rerun until it passes. It is reported and not required.
+    let eviction_regime_separated = rows.iter().any(|row| row.evictions_per_write < 0.05)
+        && rows.iter().any(|row| row.evictions_per_write > 0.5);
+    // The even-workload control is not a term here on purpose: a control that
+    // never hit is asserted against above, which aborts, so including it would
+    // be a term that cannot be false.
+    let passed = write_separated && eviction_regime_separated;
+    println!(
+        "\nreport {}: write bands {}, eviction regimes {}",
+        if passed { "PASSED" } else { "FAILED" },
+        if write_separated {
+            "separated"
+        } else {
+            "OVERLAP"
+        },
+        if eviction_regime_separated {
+            "both present"
+        } else {
+            "NOT both present -- the sweep no longer covers them"
+        }
+    );
+
     let read_separated =
         last.read_low_ns > first.read_high_ns || first.read_low_ns > last.read_high_ns;
     println!(
@@ -608,6 +663,17 @@ apart and is not evidence of either"
         let _ = writeln!(report, "  \"key_space\": {KEY_SPACE},");
         let _ = writeln!(report, "  \"reads\": {reads},");
         let _ = writeln!(report, "  \"read_cost_separated\": {read_separated},");
+        let _ = writeln!(report, "  \"write_bands_separated\": {write_separated},");
+        let _ = writeln!(
+            report,
+            "  \"eviction_regimes_present\": {eviction_regime_separated},"
+        );
+        let _ = writeln!(report, "  \"passed\": {passed},");
+        let _ = writeln!(
+            report,
+            "  \"cheapest_concurrent_write_shards\": {},",
+            best_write.shards
+        );
         let _ = writeln!(report, "  \"shards\": [");
         for (position, row) in rows.iter().enumerate() {
             let comma = if position + 1 == rows.len() { "" } else { "," };
@@ -616,6 +682,10 @@ apart and is not evidence of either"
                 "    {{\"shards\": {}, \"entries_each\": {}, \
                  \"hit_percent_skewed\": {:.2}, \"hit_percent_even\": {:.2}, \
                  \"read_ns\": {:.1}, \"concurrent_ns\": {:.1}, \
+                 \"single_write_ns\": {:.1}, \"concurrent_write_ns\": {:.1}, \
+                 \"concurrent_write_low_ns\": {:.1}, \
+                 \"concurrent_write_high_ns\": {:.1}, \
+                 \"evictions_per_write\": {:.3}, \
                  \"stats_us\": {:.1}}}{comma}",
                 row.shards,
                 row.per_shard_entries,
@@ -623,6 +693,11 @@ apart and is not evidence of either"
                 row.even_hit_percent,
                 row.read_ns,
                 row.concurrent_ns,
+                row.single_write_ns,
+                row.concurrent_write_ns,
+                row.concurrent_write_low_ns,
+                row.concurrent_write_high_ns,
+                row.evictions_per_write,
                 row.stats_us
             );
         }
@@ -630,5 +705,10 @@ apart and is not evidence of either"
         let _ = writeln!(report, "}}");
         std::fs::write(&path, report).expect("write the report");
         println!("\nwrote {}", path.display());
+    }
+
+    if require_passed && !passed {
+        eprintln!("shard sweep: a required finding did not hold; see the report above");
+        std::process::exit(1);
     }
 }
