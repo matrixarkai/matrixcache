@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A snapshot of a sharded cache folds in one pass.**
+  `ShardedMultiLayerCache::stats` built every shard's full `CacheStats` twice:
+  once in the fold, and again in a second pass whose only purpose was to re-read
+  one field it had already been handed — the write-budget share, which is a
+  proportion and so is aggregated by taking the tightest shard rather than by
+  addition. An `Option` carried through the existing loop does what the second
+  pass was avoiding, since a running total starts at zero and zero is a minimum
+  nothing can beat. A snapshot at a thousand shards went from 1,238µs to 603µs,
+  measured ABBA with the two binaries checksummed to prove the arms differed. A
+  scrape every few seconds would not have noticed either number; anything
+  calling it per operation would be destroyed by both.
+
+- **Guidance on how many shards to ask for**, in the README. The count is not
+  configured anywhere in this repository, so the cost of choosing one was
+  visible in no measurement until now. Sixteen, and the reason is not the
+  obvious one: a memory hit is served under a shared lock, so sharding buys
+  nothing for readers — four readers already cost less per operation at one
+  shard than one reader does — while a write takes the exclusive lock, so four
+  writers at one shard queue at about 3x a single writer's cost and sixteen
+  shards is 4x to 10x cheaper per write. It costs nothing in hit rate: 75.00% at
+  one shard and at 256. Past about 64 shards writes can start evicting each
+  other, because a read-heavy phase leaves every resident entry protected and a
+  freshly written key is then the best victim a shard has.
+  `examples/shard_count_bench.rs` reports all of it, and CI holds the two
+  findings a shared runner can resolve.
+
 - **The public API has been renamed extensively, and no caller has to change a
   line.** Every previous spelling still resolves — they are collected as
   re-exports in `src/core/legacy_names.rs`, so `ReplacementSLRU`,
@@ -155,6 +181,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entirely unsafe-free.
 
 ### Added
+
+- **`CacheClusterTopology`, placement across machines.** One cache picks a shard
+  with `hash(key) % shard_count`, which holds up because a shard count is fixed
+  for the life of the cache. Across machines neither half survives: the node
+  count changes while data is live and `% n` reassigns nearly every key when it
+  does, and `DefaultHasher` is documented as changing between releases, so two
+  nodes on different builds would not agree about where anything lives. The new
+  type answers the same question with a hash ring over a stable hash, and adds
+  the operations a live cluster needs rather than only the lookup.
+
+  - `owner` and `owners` place a key and its copies, spreading copies across
+    failure domains declared with `add_node_in_zone`. A node with no zone is its
+    own domain, so "unzoned" means "separate", not "together".
+  - `set_node_state` marks a node down without touching the ring. Its points
+    stay where they are and lookups step over them, which is what makes a
+    failure cheap: marking one node down went from 5.98ms to **0.02ms** at 512
+    nodes once it stopped rebuilding.
+  - `handoffs_to` says which stretches of the hash space change hands between
+    two memberships, because a membership change that nobody acts on leaves the
+    node that gained keys serving misses until reads refill it. Planning a move
+    is **1.8ms** at 512 nodes, against 5.4ms when it sorted both rings'
+    boundaries rather than merging them.
+  - Adding nodes in bulk with `add_nodes` rebuilds the ring once; adding them
+    one at a time renumbers and merges instead of rehashing, so a join does not
+    rehash the points that are not moving.
+
+  A lookup is one read of a prefix table over the ring and a short scan inside
+  the slot it names, rather than a binary search whose every probe was a
+  dependent cache miss. Measured by `examples/cluster_routing_cost.rs`:
+
+  |  nodes | ring points | index KiB | place one key |
+  | -----: | ----------: | --------: | ------------: |
+  |    512 |      81,920 |     128.0 |         70 ns |
+  |  4,096 |     655,360 |     256.0 |        138 ns |
+  | 16,384 |   2,621,440 |     256.0 |        279 ns |
+  | 32,768 |   5,242,880 |     256.0 |        426 ns |
+
+  The table is capped at sixteen bits, so past four thousand nodes further nodes
+  fill its slots rather than adding slots — eighty points to a slot at 32,768.
+  Occupancy grows eight-fold across that range and the lookup three-fold,
+  because a slot's points are contiguous. What does bind is the comparison worth
+  making: a memory-tier hit is about 226ns on that hardware, so routing is a
+  fraction of a lookup at four thousand nodes and larger than one at sixteen
+  thousand. Size a cluster against that.
 
 - **Paced collection checks.** `StorageGCController::poll` runs a collection
   round when one is due, at an interval set by `set_gc_check_interval_ms` (1
