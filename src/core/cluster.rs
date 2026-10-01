@@ -478,27 +478,32 @@ impl CacheClusterTopology {
         let Some(start) = self.first_point_at_or_after(hash) else {
             return Vec::new();
         };
-        let mut owners: Vec<&str> = Vec::with_capacity(wanted);
+        // Members are tracked by index rather than by name. Both of these are
+        // scanned once per candidate, so what they hold is compared `copies`
+        // times per copy placed -- and comparing a `u32` is an instruction where
+        // comparing a `&str` is a length check, a pointer chase and a memcmp.
+        // At sixty-four copies that was the whole cost: 12.8us per key, almost
+        // all of it in these two scans.
+        let mut owners: Vec<u32> = Vec::with_capacity(wanted);
         let mut used_domains: Vec<u32> = Vec::with_capacity(wanted);
         // Nodes the ring offered but whose domain was already spoken for. Kept
         // in the order they were met, so falling back to them is still the
         // ring's order and not an arbitrary one.
-        let mut crowded: Vec<&str> = Vec::new();
+        let mut crowded: Vec<u32> = Vec::new();
         for step in 0..self.ring.len() {
             let point = (start + step) % self.ring.len();
             if !self.point_is_live(point) {
                 continue;
             }
-            let node = self.ring[point].node as usize;
-            let name = self.members[node].as_str();
-            if owners.contains(&name) || crowded.contains(&name) {
+            let node = self.ring[point].node;
+            if owners.contains(&node) || crowded.contains(&node) {
                 continue;
             }
-            let domain = self.member_domain[node];
+            let domain = self.member_domain[node as usize];
             if used_domains.contains(&domain) {
-                crowded.push(name);
+                crowded.push(node);
             } else {
-                owners.push(name);
+                owners.push(node);
                 used_domains.push(domain);
                 if owners.len() == wanted {
                     break;
@@ -517,13 +522,16 @@ impl CacheClusterTopology {
                 break;
             }
         }
-        for name in crowded {
+        for node in crowded {
             if owners.len() == wanted {
                 break;
             }
-            owners.push(name);
+            owners.push(node);
         }
         owners
+            .into_iter()
+            .map(|node| self.members[node as usize].as_str())
+            .collect()
     }
 
     /// The first ring point at or after `hash`, wrapping round to the first.
