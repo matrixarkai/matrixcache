@@ -52,8 +52,11 @@ report() {
 # Toolchain and third-party system names.
 report "language and toolchain names" \
   'c\+\+|cplusplus|c_plus_plus|cxx|(^|[^A-Za-z])cpp([^A-Za-z]|$)|gtest' 'mcp'
+# This list is other people's product names. Our own object-store name was in
+# it, which is the wrong place for it: that is this project's own word for its
+# own thing and not a name anyone is avoiding.
 report "third-party product names" \
-  '(^|[^A-Za-z])(lark|feishu|wukong|bytedance|byteraft|bytestore|mtcache|openviking|vikingmem)([^A-Za-z]|$)|volcano engine|matrixobjectstore'
+  '(^|[^A-Za-z])(lark|feishu|wukong|bytedance|byteraft|bytestore|mtcache|openviking|vikingmem)([^A-Za-z]|$)|volcano engine'
 # "abase" is a substring of "database", so it only counts on a token boundary.
 report "internal datastore name" '(^|[^A-Za-z])abase([^A-Za-z]|$)'
 # The C-FFI spelling is CIpsFoo, which a token-start-only pattern misses.
