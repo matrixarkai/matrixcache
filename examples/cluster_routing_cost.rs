@@ -452,6 +452,24 @@ an idle machine for the cost"
         one_ms / bulk_ms
     );
 
+    // What one node arriving at the largest size measured costs. The build
+    // table above is a loop at 256 nodes; this is the single event an operator
+    // actually causes, at the size where it is dearest.
+    let mut growing = unzoned(rows.last().expect("a row").nodes.max(1));
+    let join_started = Instant::now();
+    growing
+        .add_node("cache-arriving", 1)
+        .expect("a distinct name");
+    let join_ms = join_started.elapsed().as_secs_f64() * 1e3;
+    let leave_started = Instant::now();
+    assert!(growing.remove_node("cache-arriving"));
+    let leave_ms = leave_started.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "  one node joins at {} nodes   {join_ms:>8.2} ms",
+        rows.last().expect("a row").nodes
+    );
+    println!("  that node leaves again      {leave_ms:>8.2} ms");
+
     // Marking a node down rebuilds the ring too, which is what a failure costs
     // before any data moves.
     let mut failing = unzoned(rows.last().expect("a row").nodes.max(1));
@@ -551,6 +569,8 @@ an idle machine for the cost"
         let _ = writeln!(report, "  \"build_bulk_ms\": {bulk_ms:.3},");
         let _ = writeln!(report, "  \"build_one_at_a_time_ms\": {one_ms:.3},");
         let _ = writeln!(report, "  \"mark_down_ms\": {down_ms:.3},");
+        let _ = writeln!(report, "  \"join_one_ms\": {join_ms:.3},");
+        let _ = writeln!(report, "  \"leave_one_ms\": {leave_ms:.3},");
         let _ = writeln!(report, "  \"worst_owner_ns\": {worst_owner_ns:.1},");
         let _ = writeln!(report, "  \"worst_copies_ns\": {worst_copies_ns:.1},");
         if let Some(limit) = max_owner_ns {
