@@ -130,6 +130,75 @@ jobs:
                 report['mark_down_ms'], 'ms mark-down')
           "
 
+      - name: Shard count smoke
+        # Two findings, and deliberately no timing ceiling.
+        #
+        # A shard count is not configured anywhere in this repository, so the
+        # cost of choosing one is only ever visible in this sweep. Both things
+        # held here are ratios or counts rather than absolute times, because the
+        # absolute times move by 30% between a loaded box and an idle one while
+        # these do not.
+        #
+        #   writers need the locks   four writers against one shard measured
+        #                            7.5x the cost at sixteen on a loaded box and
+        #                            9.7x on an idle one. The gate asks for 2x
+        #                            and for the bands not to overlap, which is
+        #                            about four times the headroom that spread
+        #                            needs. It catches the one regression that
+        #                            matters: a change that puts the shards back
+        #                            behind a single lock.
+        #
+        #   both eviction regimes    evictions per write came out identical to
+        #                            three decimals on both boxes, so this one is
+        #                            not a timing at all. A count that evicts on
+        #                            almost nothing and a count that evicts on
+        #                            almost every write must both still be in the
+        #                            sweep -- otherwise the write column has
+        #                            stopped covering the behaviour it describes,
+        #                            and the gate above would be passing on a
+        #                            workload that no longer provokes it. Driven:
+        #                            dropping the read count to 20,000 removes the
+        #                            evicting regime and this fails, as it should.
+        #
+        # Read cost is reported and not required: it separates at 1.4x, which is
+        # inside a shared runner's own spread, and a gate on it would be one
+        # people rerun until it passes.
+        #
+        # Capped at 256 shards. A thousand shards adds half the runtime and the
+        # two findings are already covered by 1 against 16 and by 16 against 256.
+        run: |
+          cargo run --locked --release --no-default-features --example shard_count_bench -- \
+            --shards-max 256 \
+            --json-output /tmp/matrixcache-shards.json \
+            --require-passed
+          python3 -c "
+          import json
+          report = json.load(open('/tmp/matrixcache-shards.json'))
+          assert report['passed'], report
+          rows = report['shards']
+          # A sweep of one row compares nothing.
+          assert len(rows) >= 3, rows
+          by_shards = {row['shards']: row for row in rows}
+          one = by_shards[1]
+          best = by_shards[report['cheapest_concurrent_write_shards']]
+          # Writers must be better off with shards than without. If this ever
+          # reads 1, the shards are back behind one lock.
+          assert best['shards'] > 1, report['cheapest_concurrent_write_shards']
+          ratio = one['concurrent_write_ns'] / best['concurrent_write_ns']
+          assert ratio >= 2.0, (ratio, one, best)
+          # Bands, not medians: a ratio of two overlapping spreads says nothing.
+          assert best['concurrent_write_high_ns'] < one['concurrent_write_low_ns'], (one, best)
+          # The workload still provokes both eviction regimes.
+          quiet = [r['shards'] for r in rows if r['evictions_per_write'] < 0.05]
+          busy = [r['shards'] for r in rows if r['evictions_per_write'] > 0.5]
+          assert quiet and busy, (quiet, busy, rows)
+          # The even-workload control has to be able to hit, or its flatness
+          # elsewhere in the table means nothing.
+          assert min(r['hit_percent_even'] for r in rows) > 1.0, rows
+          print('shard sweep ok:', ratio, 'x cheaper with', best['shards'],
+                'shards; evicting at', busy, 'and not at', quiet)
+          "
+
       - name: Backend report smoke
         run: |
           cargo run --locked --no-default-features --example rocksdb_backend_bench -- \
