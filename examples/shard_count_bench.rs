@@ -555,19 +555,29 @@ key is probationary and therefore the first victim, so once the probationary \
 room left over is smaller than the write set the writes evict each other",
         evicting, dearest.shards, dearest.single_write_ns
     );
-    let unexplained: Vec<usize> = rows
+    // The write cost is a product: how often a write evicts, times what one
+    // eviction costs. Taking the cheapest row as the cost of a write that does
+    // not evict, the rest divides out -- and the two factors move in opposite
+    // directions, which is why the cost peaks in the middle rather than at the
+    // end. Printed because 64 shards otherwise reads as an anomaly: it costs
+    // several times the cheapest write while evicting on only a few per cent of
+    // them, and that is a high price per eviction, not a different mechanism.
+    let floor_ns = rows
         .iter()
-        .filter(|row| {
-            row.evictions_per_write <= 0.25 && row.single_write_ns > first.single_write_ns * 2.0
-        })
-        .map(|row| row.shards)
-        .collect();
-    if !unexplained.is_empty() {
-        println!(
-            "   not explained by that: {unexplained:?} -- more than twice the \
-one-shard write cost while barely evicting at all"
+        .map(|row| row.single_write_ns)
+        .fold(f64::INFINITY, f64::min);
+    print!("   implied cost of one eviction:");
+    for row in rows.iter().filter(|row| row.evictions_per_write > 0.01) {
+        print!(
+            " {} shards {:.1}us;",
+            row.shards,
+            (row.single_write_ns - floor_ns) / row.evictions_per_write / 1000.0
         );
     }
+    println!(
+        " -- falling as the shards shrink, because an eviction has fewer entries \
+to look at, while the rate rises"
+    );
     assert!(
         rows.iter().any(|row| row.evictions_per_write < 0.05),
         "every shard count evicted, so this column cannot tell the two regimes \
