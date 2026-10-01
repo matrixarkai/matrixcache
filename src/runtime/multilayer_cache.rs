@@ -2092,6 +2092,16 @@ impl MultiLayerCache {
     /// reserves pays no such cost -- [`ReplacementSlru`] measures 0.144 on this
     /// shape at 82.59% -- and that, not this bound, is the structural answer.
     ///
+    /// The victim inside the share is still the lowest-scoring entry, not the
+    /// least recently used one, and that is deliberate: picking the least
+    /// recently used entry inside the share was driven and is worse, 0.000
+    /// evictions per write for a hit rate of 73.72% against this 78.33%. The
+    /// score preserves entries that have been read often, and recency on its own
+    /// discards them. Two orderings disagreeing is also where the remaining cost
+    /// comes from -- the share is held by recency while the victim is chosen by
+    /// score -- and closing that is a policy with its own lists rather than a
+    /// bound on this one.
+    ///
     /// Clamped to 1..=100: a share of zero would leave a full cache unable to
     /// give anything up.
     pub fn set_cold_eviction_share_pct(&self, share_pct: u32) {
