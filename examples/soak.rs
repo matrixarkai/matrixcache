@@ -61,6 +61,32 @@ fn skewed_index(state: &mut u64) -> usize {
     ((skewed * KEY_SPACE as f64) as usize).min(KEY_SPACE - 1)
 }
 
+/// Pearson correlation, or `None` if either series never varies.
+///
+/// Used to say whether the hit rate moved with the machine rather than with the
+/// clock. A series that never varies has no correlation with anything, and
+/// reporting 0 for that case would read as "unrelated" rather than "nothing to
+/// relate".
+fn correlation(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < 3 {
+        return None;
+    }
+    let count = xs.len() as f64;
+    let mean_x = xs.iter().sum::<f64>() / count;
+    let mean_y = ys.iter().sum::<f64>() / count;
+    let covariance: f64 = xs
+        .iter()
+        .zip(ys)
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum();
+    let spread_x = xs.iter().map(|x| (x - mean_x).powi(2)).sum::<f64>().sqrt();
+    let spread_y = ys.iter().map(|y| (y - mean_y).powi(2)).sum::<f64>().sqrt();
+    if spread_x == 0.0 || spread_y == 0.0 {
+        return None;
+    }
+    Some(covariance / (spread_x * spread_y))
+}
+
 fn main() {
     let mut positional = Vec::new();
     let mut emit_json = false;
@@ -354,6 +380,48 @@ fn main() {
             index + 1
         );
     }
+    // Hit rate by third -- and why a fall here is not the decay signal that a
+    // falling throughput ceiling is.
+    //
+    // The refresh debounce is on a wall clock: the workload sets
+    // `set_lru_refresh_time(500ms)`, so a hit only moves an entry's position if
+    // half a second has passed since it last did. At higher operations per second
+    // a larger share of hits skip that refresh, eviction chooses worse, and the
+    // hit rate FALLS as the machine gets faster. On a shared box, where
+    // throughput rises whenever the other load goes away, that looks exactly like
+    // a cache slowly decaying.
+    //
+    // Driven over one eight-hour run: the hit rate fell from 51.81% to 51.15%
+    // between the first quarter and the last, which reads as decay -- but its
+    // correlation with throughput was -0.96, against -0.80 with elapsed time, and
+    // inside each one-hour window, where age barely moves, it stayed between
+    // -0.83 and -0.98. The movement was the box.
+    //
+    // So the correlation is printed beside the bands. A strongly negative one
+    // means read `entries` and `MiB` for the invariants and compare hit rate only
+    // at matched throughput.
+    println!("\nhit rate by third, % (read with the correlation below):");
+    for (index, chunk) in hit_rates.chunks(window).take(3).enumerate() {
+        let best = chunk.iter().copied().fold(f64::MIN, f64::max);
+        let worst = chunk.iter().copied().fold(f64::MAX, f64::min);
+        println!("  window {}: {worst:6.2}..{best:<6.2}", index + 1);
+    }
+    match correlation(&rates, &hit_rates) {
+        Some(r) if r <= -0.5 => println!(
+            "  hit rate against throughput r = {r:+.2} -- the movement tracks the \
+machine, not the clock: the refresh debounce is wall-clock, so a faster box \
+refreshes fewer hits. Compare thirds at matched throughput."
+        ),
+        Some(r) => println!(
+            "  hit rate against throughput r = {r:+.2} -- weak, so a fall here is \
+the cache and not the box"
+        ),
+        None => println!(
+            "  hit rate against throughput: not computable -- too few intervals, or \
+one series never moved"
+        ),
+    }
+
     let latency = cache.latency_metrics_report();
     println!(
         "get latency p99 {}us max {}us over {} samples",
