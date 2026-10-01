@@ -607,6 +607,10 @@ struct CacheInner {
     eviction_metric_callback: Option<CacheEvictionMetricCallback>,
     pending_eviction_metric_tiers: VecDeque<CacheTier>,
     ssd_instance_only: bool,
+    /// Share of the access order, coldest first, an eviction may choose from.
+    ///
+    /// See [`MultiLayerCache::set_cold_eviction_share_pct`].
+    cold_eviction_share_pct: u32,
     memory_replacement_policy: CacheReplacementPolicy,
     pmem_replacement_policy: CacheReplacementPolicy,
     ssd_replacement_policy: CacheReplacementPolicy,
@@ -1481,6 +1485,7 @@ impl MultiLayerCache {
                 pins: (0..PIN_STRIPES)
                     .map(|_| Mutex::new(CachePinState::default()))
                     .collect(),
+                cold_eviction_share_pct: COLD_EVICTION_SHARE_PCT_DEFAULT,
                 memory_order: CacheKeyOrder::new(),
                 pmem_order: CacheKeyOrder::new(),
                 async_writeback_queue: VecDeque::new(),
@@ -2057,6 +2062,49 @@ impl MultiLayerCache {
     pub fn set_insertion_point_spec(&self, spec: u8) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.memory_order.set_insertion_spec(spec);
+    }
+
+    /// Narrow eviction to the coldest share of the access order.
+    ///
+    /// A hundred, the default, lets an eviction weigh every resident entry, and
+    /// is what this cache has always done. Less than that makes the hottest part
+    /// of the order ineligible, so a newly written entry is not weighed against
+    /// the entries that have been resident longest until it has aged into the
+    /// evictable share.
+    ///
+    /// **This is a trade, and a sharp one.** Driven on a cache pushed into the
+    /// state where a write set evicts itself -- 256 shards of 64 entries, read
+    /// hard, then written:
+    ///
+    /// | share | evictions per write | hit rate after the writes |
+    /// | ---: | ---: | ---: |
+    /// | 100 (default) | 0.996 | 82.77% |
+    /// | 40 | 0.031 | 78.33% |
+    ///
+    /// Thirty-two times fewer evictions for four and a half points of hit rate.
+    /// Worth it for a write-heavy tier whose reads are already served elsewhere,
+    /// and not worth it otherwise -- which is why the default does not move.
+    ///
+    /// The hit rate is what it costs because this bound protects by recency
+    /// alone: nothing demotes an entry that stops being read, so the shielded
+    /// part of the order can hold something cold while a genuinely hot entry
+    /// inside the evictable share is given up. A policy that demotes as well as
+    /// reserves pays no such cost -- [`ReplacementSlru`] measures 0.144 on this
+    /// shape at 82.59% -- and that, not this bound, is the structural answer.
+    ///
+    /// Clamped to 1..=100: a share of zero would leave a full cache unable to
+    /// give anything up.
+    pub fn set_cold_eviction_share_pct(&self, share_pct: u32) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.cold_eviction_share_pct = share_pct.clamp(1, 100);
+    }
+
+    /// The share set by [`Self::set_cold_eviction_share_pct`].
+    pub fn cold_eviction_share_pct(&self) -> u32 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .cold_eviction_share_pct
     }
 
     /// The spec set by [`Self::set_insertion_point_spec`].
@@ -7816,6 +7864,33 @@ impl ShardedMultiLayerCache {
             .first()
             .map(MultiLayerCache::insertion_point_spec)
             .unwrap_or(0)
+    }
+
+    /// Narrow eviction to the coldest share of each shard's access order.
+    ///
+    /// Per shard, because each keeps its own order. A share is a fraction of the
+    /// order it is applied to, so the same number means the same fraction of a
+    /// shard however many shards there are -- and a shard holds
+    /// `1 / shard_count` of the entries, so it is a smaller number of entries
+    /// as the count rises.
+    ///
+    /// See [`MultiLayerCache::set_cold_eviction_share_pct`] for what it buys and
+    /// what it costs; the default of a hundred changes nothing.
+    pub fn set_cold_eviction_share_pct(&self, share_pct: u32) {
+        for shard in self.shards.iter() {
+            shard.set_cold_eviction_share_pct(share_pct);
+        }
+    }
+
+    /// The share every shard was given by [`Self::set_cold_eviction_share_pct`].
+    ///
+    /// Reads shard zero; the setter writes all of them and nothing else can set
+    /// one shard's share alone.
+    pub fn cold_eviction_share_pct(&self) -> u32 {
+        self.shards
+            .first()
+            .map(MultiLayerCache::cold_eviction_share_pct)
+            .unwrap_or(COLD_EVICTION_SHARE_PCT_DEFAULT)
     }
 
     pub fn try_set_replacement_policy_for_tier(

@@ -1695,6 +1695,52 @@ mod tests {
         assert_eq!(cache.insertion_point_spec(), 0);
     }
 
+    /// The cold eviction share round-trips, and defaults to changing nothing.
+    ///
+    /// The default is the load-bearing part: a hundred lets an eviction weigh
+    /// every resident entry, which is what this cache has always done. If it
+    /// ever reads as anything else, every measurement taken against the default
+    /// is describing a different cache.
+    #[test]
+    fn the_cold_eviction_share_defaults_to_the_whole_order_and_round_trips() {
+        let plain = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 1 << 16,
+            ..CacheOptions::default()
+        });
+        assert_eq!(
+            plain.cold_eviction_share_pct(),
+            100,
+            "the default must weigh every resident entry"
+        );
+        plain.set_cold_eviction_share_pct(40);
+        assert_eq!(plain.cold_eviction_share_pct(), 40);
+        // Zero would leave a full cache unable to give anything up, so it is
+        // clamped rather than accepted.
+        plain.set_cold_eviction_share_pct(0);
+        assert_eq!(
+            plain.cold_eviction_share_pct(),
+            1,
+            "a share of zero must not be able to stall eviction"
+        );
+        plain.set_cold_eviction_share_pct(250);
+        assert_eq!(plain.cold_eviction_share_pct(), 100);
+
+        let sharded = ShardedMultiLayerCache::with_options(
+            CacheOptions {
+                dram_capacity: 1 << 16,
+                ..CacheOptions::default()
+            },
+            8,
+        );
+        assert_eq!(sharded.cold_eviction_share_pct(), 100);
+        sharded.set_cold_eviction_share_pct(40);
+        assert_eq!(
+            sharded.cold_eviction_share_pct(),
+            40,
+            "the share did not survive being set, so the setter reached nothing"
+        );
+    }
+
     /// Expired entries have to give their memory back even when the cache is
     /// nowhere near full, and without anyone calling the sweep.
     ///
