@@ -2025,7 +2025,8 @@ impl CacheInner {
         // Scanned over the same bounded window as the scoring below, so this
         // adds a comparison per candidate rather than a pass over the tier.
         let now_millis = CoarseClock::now_millis();
-        for candidate in order.iter_access().take(EVICTION_CANDIDATE_WINDOW) {
+        let candidates = cold_candidate_count(order.len(), self.cold_eviction_share_pct);
+        for candidate in order.iter_access().take(candidates) {
             if self.is_pinned(candidate) {
                 continue;
             }
@@ -2036,9 +2037,8 @@ impl CacheInner {
                 };
             }
         }
-        let windowed = self
-            .select_eviction_victim(order.iter_access().take(EVICTION_CANDIDATE_WINDOW), segmented);
-        if windowed.victim.is_some() || order.len() <= EVICTION_CANDIDATE_WINDOW {
+        let windowed = self.select_eviction_victim(order.iter_access().take(candidates), segmented);
+        if windowed.victim.is_some() || order.len() <= candidates {
             return windowed;
         }
         let full = self.select_eviction_victim(order.iter_access(), segmented);
@@ -2805,6 +2805,21 @@ fn infer_block_kind(key: &CacheKey) -> CacheBlockKind {
 /// exactly what they chose before.
 const EVICTION_CANDIDATE_WINDOW: usize = 128;
 
+/// Share of the access order, coldest first, an eviction may choose from when a
+/// caller has not asked for one.
+///
+/// A hundred is every resident entry, which is what this cache has always done,
+/// so the default changes nothing. See
+/// [`MultiLayerCache::set_cold_eviction_share_pct`] for what asking for less
+/// buys and what it costs.
+pub const COLD_EVICTION_SHARE_PCT_DEFAULT: u32 = 100;
+
+/// The share a segmented policy would leave evictable: what is left after a hot
+/// and a warm share, `100 - SLRU_DEFAULT_HOT_LRU_PCT - SLRU_DEFAULT_WARM_LRU_PCT`.
+/// Written as the remainder so the three cannot drift apart.
+pub const COLD_EVICTION_SHARE_PCT_SEGMENTED: u32 =
+    100 - SLRU_DEFAULT_HOT_LRU_PCT - SLRU_DEFAULT_WARM_LRU_PCT;
+
 /// How many of the coldest entries a write looks at for expiry.
 ///
 /// Small on purpose. The expired entries collect at the cold end, so a few per
@@ -2821,6 +2836,30 @@ fn eviction_reason_for(score: EvictionScore) -> EvictionReason {
     } else {
         EvictionReason::Stale
     }
+}
+
+/// How many of the coldest entries an eviction may choose between.
+///
+/// The window used to be a flat [`EVICTION_CANDIDATE_WINDOW`], which is larger
+/// than a small shard: at 64 entries a shard every resident entry was a
+/// candidate, so where an entry sat in the access order decided nothing and the
+/// victim was simply whichever had the lowest hotness -- always the thing most
+/// recently written. A write set then evicted itself, measured at 0.996
+/// evictions per write.
+///
+/// A segmented policy avoids that by keeping its hot and warm lists to a share
+/// of the budget and evicting only from cold. The same rule here is a bound on
+/// the candidate set: the coldest [`COLD_EVICTION_SHARE_PCT`] of the order are
+/// eligible and the rest are not, so an arrival is not weighed against the
+/// entries that have been resident longest until it has aged into that share.
+///
+/// Floored at one, because a cache with any resident entry must be able to give
+/// one up, and capped at the old window so a large order does not scan further
+/// than it used to.
+fn cold_candidate_count(len: usize, share_pct: u32) -> usize {
+    len.saturating_mul(share_pct as usize)
+        .saturating_div(100)
+        .clamp(1, EVICTION_CANDIDATE_WINDOW)
 }
 
 fn initial_hotness(block_kind: CacheBlockKind, block_bytes: usize) -> u32 {
