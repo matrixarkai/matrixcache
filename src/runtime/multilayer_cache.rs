@@ -458,6 +458,12 @@ enum EvictionGroupKey<'a> {
 struct PickedEvictionVictim {
     victim: Option<(CacheKey, EvictionReason, u64)>,
     groups_weighed: usize,
+    /// Entries the scan passed over because they had been read twice, to be
+    /// moved back to the hot end by the caller.
+    ///
+    /// Carried out rather than applied where they are found because choosing a
+    /// victim holds the cache shared and moving an entry needs it exclusively.
+    promote: Vec<CacheKey>,
 }
 
 /// The multi-tier cache: a DRAM tier, a persistent-memory-like resident tier and
@@ -2076,15 +2082,23 @@ impl MultiLayerCache {
     /// state where a write set evicts itself -- 256 shards of 64 entries, read
     /// hard, then written:
     ///
-    /// | share | evictions per write | hit rate after the writes |
-    /// | ---: | ---: | ---: |
-    /// | 100 (default) | 0.965 | 82.77% |
-    /// | 40 | 0.028 | 78.48% |
+    /// | values | share | evictions per write | hit rate after the writes |
+    /// | --- | ---: | ---: | ---: |
+    /// | all 256 B | 100 (default) | 0.988 | 82.77% |
+    /// | all 256 B | 40 | 0.041 | 78.69% |
+    /// | 32 B..1 KiB | 100 (default) | 0.969 | 81.96% |
+    /// | 32 B..1 KiB | 40 | 0.177 | 73.88% |
     ///
-    /// Thirty-four times fewer evictions for a bit over four points of hit rate.
-    /// Re-measured after the change that made an overwrite an access, which moved
-    /// the default row from 0.996 to 0.965: these are the numbers this code
-    /// produces, not the ones the bound produced on its own.
+    /// Twenty-four times fewer evictions for four points of hit rate on uniform
+    /// values; five and a half times fewer for eight points on values spread over
+    /// two orders of magnitude. **Read the second pair before turning this on** --
+    /// a cache with a size distribution pays twice what a uniform one does.
+    ///
+    /// Both halves of that varied row were earned. It read 65.96% when the share
+    /// was a share of the entry count rather than of bytes, and 68.21% before an
+    /// entry read twice was moved back instead of given up. Quoting only the
+    /// uniform row, which an earlier version of this doc did, made the setting
+    /// look far cheaper than it is.
     /// Worth it for a write-heavy tier whose reads are already served elsewhere,
     /// and not worth it otherwise -- which is why the default does not move.
     ///

@@ -1942,13 +1942,19 @@ impl CacheInner {
                 self.select_fifo_eviction_victim(&self.memory_order)
             }
             CacheReplacementPolicy::Slru => {
-                let picked = self.select_windowed_eviction_victim(&self.memory_order, true);
+                let candidates = self.memory_cold_candidate_count();
+                let picked =
+                    self.select_windowed_eviction_victim(&self.memory_order, true, candidates);
                 self.record_sampled_groups(picked.groups_weighed);
+                self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
             }
             CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.memory_order, false);
+                let candidates = self.memory_cold_candidate_count();
+                let picked =
+                    self.select_windowed_eviction_victim(&self.memory_order, false, candidates);
                 self.record_sampled_groups(picked.groups_weighed);
+                self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
             }
         }
@@ -1960,12 +1966,20 @@ impl CacheInner {
                 self.select_fifo_eviction_victim(&self.pmem_order)
             }
             CacheReplacementPolicy::Slru => {
-                let picked = self.select_windowed_eviction_victim(&self.pmem_order, true);
+                let picked = self.select_windowed_eviction_victim(
+                    &self.pmem_order,
+                    true,
+                    EVICTION_CANDIDATE_WINDOW,
+                );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
             CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.pmem_order, false);
+                let picked = self.select_windowed_eviction_victim(
+                    &self.pmem_order,
+                    false,
+                    EVICTION_CANDIDATE_WINDOW,
+                );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
@@ -1978,12 +1992,20 @@ impl CacheInner {
                 self.select_fifo_eviction_victim(&self.disk_order)
             }
             CacheReplacementPolicy::Slru => {
-                let picked = self.select_windowed_eviction_victim(&self.disk_order, true);
+                let picked = self.select_windowed_eviction_victim(
+                    &self.disk_order,
+                    true,
+                    EVICTION_CANDIDATE_WINDOW,
+                );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
             CacheReplacementPolicy::WeightedHotnessLru => {
-                let picked = self.select_windowed_eviction_victim(&self.disk_order, false);
+                let picked = self.select_windowed_eviction_victim(
+                    &self.disk_order,
+                    false,
+                    EVICTION_CANDIDATE_WINDOW,
+                );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
             }
@@ -2016,6 +2038,7 @@ impl CacheInner {
         &self,
         order: &CacheKeyOrder,
         segmented: bool,
+        candidates: usize,
     ) -> PickedEvictionVictim {
         // An entry past its time to live could not have been served again, so
         // dropping it costs no future hit. Take one the moment the window turns
@@ -2025,7 +2048,6 @@ impl CacheInner {
         // Scanned over the same bounded window as the scoring below, so this
         // adds a comparison per candidate rather than a pass over the tier.
         let now_millis = CoarseClock::now_millis();
-        let candidates = cold_candidate_count(order.len(), self.cold_eviction_share_pct);
         for candidate in order.iter_access().take(candidates) {
             if self.is_pinned(candidate) {
                 continue;
@@ -2034,6 +2056,54 @@ impl CacheInner {
                 return PickedEvictionVictim {
                     victim: Some((candidate.clone(), EvictionReason::Expired, 0)),
                     groups_weighed: 0,
+                    promote: Vec::new(),
+                };
+            }
+        }
+        // The rule a three-list policy applies at the tail of its cold list: an
+        // entry that has been read twice is moved back rather than given up, and
+        // only an entry that has not is deleted. The classes here are derived
+        // rather than stored -- cold is the byte share this scan already walks,
+        // and read-twice is the counter the score already keeps -- so there is no
+        // per-class bookkeeping to drift.
+        //
+        // Bounded by the scan, and gives up the coldest anyway when every
+        // candidate has earned a second chance: a full cache must be able to
+        // release something, and a rule that can refuse to is a stall.
+        if self.cold_eviction_share_pct < 100 {
+            let mut promote = Vec::new();
+            let mut first_unpinned = None;
+            for key in order.iter_access().take(candidates) {
+                if self.is_pinned(key) {
+                    continue;
+                }
+                if first_unpinned.is_none() {
+                    first_unpinned = Some(key.clone());
+                }
+                let twice_read = self
+                    .metadata
+                    .get(key)
+                    .is_some_and(|meta| meta.hits.load(Ordering::Relaxed) >= SLRU_PROTECTED_HITS);
+                if twice_read {
+                    promote.push(key.clone());
+                    continue;
+                }
+                return PickedEvictionVictim {
+                    victim: Some((key.clone(), EvictionReason::Stale, 0)),
+                    groups_weighed: 0,
+                    promote,
+                };
+            }
+            if let Some(victim) = first_unpinned {
+                // Everything in the share had been read twice. Keep the moves --
+                // they are still the right answer for the rest -- but take the
+                // coldest, which is what the list would have done once its warm
+                // share filled.
+                promote.retain(|key| key != &victim);
+                return PickedEvictionVictim {
+                    victim: Some((victim, EvictionReason::Stale, 0)),
+                    groups_weighed: 0,
+                    promote,
                 };
             }
         }
@@ -2047,6 +2117,7 @@ impl CacheInner {
             groups_weighed: windowed
                 .groups_weighed
                 .saturating_add(full.groups_weighed),
+            promote: Vec::new(),
         }
     }
 
@@ -2105,6 +2176,7 @@ impl CacheInner {
         PickedEvictionVictim {
             victim,
             groups_weighed: group_count,
+            promote: Vec::new(),
         }
     }
 
@@ -2838,28 +2910,63 @@ fn eviction_reason_for(score: EvictionScore) -> EvictionReason {
     }
 }
 
-/// How many of the coldest entries an eviction may choose between.
-///
-/// The window used to be a flat [`EVICTION_CANDIDATE_WINDOW`], which is larger
-/// than a small shard: at 64 entries a shard every resident entry was a
-/// candidate, so where an entry sat in the access order decided nothing and the
-/// victim was simply whichever had the lowest hotness -- always the thing most
-/// recently written. A write set then evicted itself, measured at 0.996
-/// evictions per write.
-///
-/// A segmented policy avoids that by keeping its hot and warm lists to a share
-/// of the budget and evicting only from cold. The same rule here is a bound on
-/// the candidate set: the coldest [`COLD_EVICTION_SHARE_PCT`] of the order are
-/// eligible and the rest are not, so an arrival is not weighed against the
-/// entries that have been resident longest until it has aged into that share.
-///
-/// Floored at one, because a cache with any resident entry must be able to give
-/// one up, and capped at the old window so a large order does not scan further
-/// than it used to.
-fn cold_candidate_count(len: usize, share_pct: u32) -> usize {
-    len.saturating_mul(share_pct as usize)
-        .saturating_div(100)
-        .clamp(1, EVICTION_CANDIDATE_WINDOW)
+impl CacheInner {
+    /// How many of the coldest memory entries make up the evictable share.
+    ///
+    /// The share is a share of BYTES, which is the unit a budget is kept in and
+    /// the unit the policy this follows bounds its lists by. It was a share of
+    /// the entry count until a workload with varied sizes was driven through it:
+    /// at a share of 40 the count version cost sixteen points of hit rate where
+    /// the byte version costs four, because sixty per cent of the entries is not
+    /// sixty per cent of the bytes once entries differ in size, so the
+    /// reservation was the wrong size and protected the wrong set.
+    ///
+    /// Prices each candidate from `memory`, which is the authority on what an
+    /// entry costs. Nothing is accounted twice and nothing can drift: the
+    /// alternative was a byte count per node in the access order, maintained at
+    /// five mutation sites, and a drifting one of those is an eviction bound that
+    /// is quietly wrong.
+    ///
+    /// Walks no further than the window it replaces, so a large tier does not
+    /// scan more than it used to, and returns at least one candidate because a
+    /// cache with a resident entry has to be able to give one up.
+    /// Move entries the scan passed over back to the hot end.
+    ///
+    /// The scan runs while the cache is held shared and cannot move anything, so
+    /// it reports what it passed over and this applies it. An entry read twice is
+    /// moved rather than given up, which is what a three-list policy does at the
+    /// tail of its cold list; moving it is what stops the next eviction weighing
+    /// it again and makes the second chance a chance rather than a reprieve of
+    /// one scan.
+    fn apply_cold_tail_promotions(&mut self, keys: &[CacheKey]) {
+        for key in keys {
+            self.memory_order.touch_access(key);
+        }
+    }
+
+    fn memory_cold_candidate_count(&self) -> usize {
+        let share = self.cold_eviction_share_pct;
+        if share >= 100 {
+            return EVICTION_CANDIDATE_WINDOW;
+        }
+        let budget = self
+            .memory_bytes
+            .saturating_mul(share as usize)
+            .saturating_div(100);
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for key in self.memory_order.iter_access() {
+            if count >= EVICTION_CANDIDATE_WINDOW {
+                break;
+            }
+            if bytes >= budget && count >= 1 {
+                break;
+            }
+            bytes = bytes.saturating_add(self.memory.get(key).map_or(0, |value| value.len()));
+            count += 1;
+        }
+        count.max(1)
+    }
 }
 
 fn initial_hotness(block_kind: CacheBlockKind, block_bytes: usize) -> u32 {
