@@ -167,6 +167,34 @@ read-hot should stay well below that.
 So: sixteen for a mixed workload, fewer if you only read, and measure before going
 past sixty-four.
 
+### Sixteen is a compromise, and the compromise is removable
+
+One number sets two unrelated things: how many locks writers can spread across,
+and how finely the byte budget is divided. They pull in opposite directions.
+
+- **More shards, less queueing.** Four writers at one shard cost 3.1x to 3.9x what
+  a single writer costs -- four threads taking turns on one lock. At sixteen
+  shards four writers cost *less per write* than one writer does.
+- **More shards, a smaller budget each.** At 256 shards a shard holds 64 entries,
+  and once a read-heavy phase has filled the protected segment a freshly written
+  key is the best victim that shard has. The writes then evict each other: 0.93
+  evictions per write against none at sixteen, with the write cost rising more
+  than tenfold.
+
+Sixteen is where those two meet for the sweep's workload. It is a compromise
+rather than an optimum, and the two halves are not equally sensitive: going from
+sixteen shards to 256 buys only about **1.2x** for four writers, because sixteen
+locks already make a collision rare at that thread count. What costs at 256 is the
+divided budget, not the locking. (Four writers is as far as the measurement goes
+here -- the lock half would matter more with far more writers, and this machine
+cannot resolve that.)
+
+A cache that sharded only its index for locking, over **one undivided byte budget
+per tier**, would not have to choose: many locks and no capacity pressure. That is
+a larger change than a constant -- capacity accounting, the write budget and
+eviction victim selection are per-shard today -- and it is the direction worth
+taking rather than a knob to turn.
+
 ## Placing keys on a cluster
 
 One cache picks the shard for a key with `hash(key) % shard_count`, which holds
