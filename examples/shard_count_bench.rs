@@ -143,6 +143,7 @@ struct Row {
     concurrent_write_ns: f64,
     concurrent_write_low_ns: f64,
     concurrent_write_high_ns: f64,
+    evictions_per_write: f64,
     stats_us: f64,
 }
 
@@ -363,12 +364,24 @@ median of {PASSES}\n"
         // and a median that reported neither.
         warm_the_write_keys(&shared);
 
+        let evictions_before = shared.stats().memory_evictions;
         let mut single_write_samples = Vec::with_capacity(PASSES);
         let mut concurrent_write_samples = Vec::with_capacity(PASSES);
         for _ in 0..PASSES {
             single_write_samples.push(single_write_ns(&shared, WRITES));
             concurrent_write_samples.push(concurrent_write_ns(&shared, WRITES));
         }
+        // Evictions per write over the timed arms, which is what the write
+        // column is made of. A cache that has been read a great many times holds
+        // entries hit twice or more, and those are protected: the eviction score
+        // puts the segment first, so a freshly written key -- zero hits,
+        // probationary -- is the preferred victim. Where the probationary room
+        // left over is smaller than the write set, the writes evict each other.
+        let evictions_per_write = shared
+            .stats()
+            .memory_evictions
+            .saturating_sub(evictions_before) as f64
+            / (PASSES * WRITES * 2) as f64;
         let (single_write, single_write_low, single_write_high) = median(single_write_samples);
         let (concurrent_write, concurrent_write_low, concurrent_write_high) =
             median(concurrent_write_samples);
@@ -388,6 +401,7 @@ median of {PASSES}\n"
             concurrent_write_ns: concurrent_write,
             concurrent_write_low_ns: concurrent_write_low,
             concurrent_write_high_ns: concurrent_write_high,
+            evictions_per_write,
             stats_us,
         });
     }
@@ -423,12 +437,12 @@ median of {PASSES}\n"
     // where dividing the cache into shards has something to do.
     println!();
     println!(
-        "{:>7}  {:>10}  {:>16}  {:>11}  {:>16}  {:>7}",
-        "shards", "1 writer", "spread", "4 writers", "spread", "gain"
+        "{:>7}  {:>10}  {:>16}  {:>11}  {:>16}  {:>7}  {:>9}",
+        "shards", "1 writer", "spread", "4 writers", "spread", "gain", "evict/wr"
     );
     for row in &rows {
         println!(
-            "{:>7}  {:>10.1}  {:>7.0}..{:<7.0}  {:>11.1}  {:>7.0}..{:<7.0}  {:>6.2}x",
+            "{:>7}  {:>10.1}  {:>7.0}..{:<7.0}  {:>11.1}  {:>7.0}..{:<7.0}  {:>6.2}x  {:>9.3}",
             row.shards,
             row.single_write_ns,
             row.single_write_low_ns,
@@ -436,7 +450,8 @@ median of {PASSES}\n"
             row.concurrent_write_ns,
             row.concurrent_write_low_ns,
             row.concurrent_write_high_ns,
-            row.single_write_ns / row.concurrent_write_ns
+            row.single_write_ns / row.concurrent_write_ns,
+            row.evictions_per_write
         );
     }
     println!(
@@ -522,6 +537,41 @@ taking turns on the one lock",
         } else {
             "did NOT separate, so this has measured the machine and not the lock"
         }
+    );
+
+    let evicting: Vec<usize> = rows
+        .iter()
+        .filter(|row| row.evictions_per_write > 0.25)
+        .map(|row| row.shards)
+        .collect();
+    let dearest = rows
+        .iter()
+        .max_by(|left, right| left.single_write_ns.total_cmp(&right.single_write_ns))
+        .expect("a row");
+    println!(
+        "   writes evict on {:?}, which is where the write cost is largest ({} \
+shards, {:.0}ns): reads promote the residents into the protected segment, a new \
+key is probationary and therefore the first victim, so once the probationary \
+room left over is smaller than the write set the writes evict each other",
+        evicting, dearest.shards, dearest.single_write_ns
+    );
+    let unexplained: Vec<usize> = rows
+        .iter()
+        .filter(|row| {
+            row.evictions_per_write <= 0.25 && row.single_write_ns > first.single_write_ns * 2.0
+        })
+        .map(|row| row.shards)
+        .collect();
+    if !unexplained.is_empty() {
+        println!(
+            "   not explained by that: {unexplained:?} -- more than twice the \
+one-shard write cost while barely evicting at all"
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row.evictions_per_write < 0.05),
+        "every shard count evicted, so this column cannot tell the two regimes \
+apart and is not evidence of either"
     );
 
     let read_separated =
