@@ -39,6 +39,7 @@
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,6 +60,54 @@ fn skewed_index(state: &mut u64) -> usize {
     let unit = ((*state >> 11) as f64) / ((1u64 << 53) as f64);
     let skewed = unit * unit * unit;
     ((skewed * KEY_SPACE as f64) as usize).min(KEY_SPACE - 1)
+}
+
+/// Early-vs-late hit rate with throughput held constant, and the pairs behind it.
+///
+/// The correlation below says whether the hit rate moved with the machine. This
+/// says what is left once it has: split the run in half, bin both halves by
+/// throughput, and compare inside each bin -- where both halves ran at nearly the
+/// same speed, so what differs is age. Each bin is weighted by the pairs it holds.
+///
+/// Restricting both halves to a shared throughput *range* and comparing their
+/// means is not the same thing and does not work. Driven on an eight-hour run: a
+/// 15..25 Kops/s band still had the second half averaging 23.1 Kops/s against the
+/// first half's 19.5, so the comparison carried most of the difference it was
+/// supposed to remove -- it reported -0.484 points where binning reports -0.110.
+fn throughput_controlled_drift(rates: &[f64], hit_rates: &[f64]) -> Option<(f64, usize)> {
+    /// Kops/s to a bin. Narrow enough that both halves ran at nearly one speed
+    /// inside it, wide enough that bins hold pairs rather than single intervals.
+    const BIN_KOPS: f64 = 2.0;
+    if rates.len() != hit_rates.len() || rates.len() < 8 {
+        return None;
+    }
+    let half = rates.len() / 2;
+    let mut bins: BTreeMap<i64, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for (index, (rate, hit)) in rates.iter().zip(hit_rates).enumerate() {
+        let key = (rate / BIN_KOPS).floor() as i64;
+        let entry = bins.entry(key).or_default();
+        if index < half {
+            entry.0.push(*hit);
+        } else {
+            entry.1.push(*hit);
+        }
+    }
+    let mut weight_total = 0_usize;
+    let mut weighted = 0.0_f64;
+    for (early, late) in bins.values() {
+        if early.is_empty() || late.is_empty() {
+            continue;
+        }
+        let early_mean = early.iter().sum::<f64>() / early.len() as f64;
+        let late_mean = late.iter().sum::<f64>() / late.len() as f64;
+        let weight = early.len().min(late.len());
+        weight_total += weight;
+        weighted += weight as f64 * (late_mean - early_mean);
+    }
+    if weight_total == 0 {
+        return None;
+    }
+    Some((weighted / weight_total as f64, weight_total))
 }
 
 /// Pearson correlation, or `None` if either series never varies.
@@ -419,6 +468,21 @@ the cache and not the box"
         None => println!(
             "  hit rate against throughput: not computable -- too few intervals, or \
 one series never moved"
+        ),
+    }
+    match throughput_controlled_drift(&rates, &hit_rates) {
+        Some((drift, pairs)) => println!(
+            "  second half against first, at matched throughput: {drift:+.3} points \
+over {pairs} paired intervals -- {}",
+            if drift.abs() < 0.25 {
+                "no decay this run can resolve"
+            } else {
+                "a movement load does not explain, which is worth a second run"
+            }
+        ),
+        None => println!(
+            "  matched-throughput comparison: not computable -- no throughput bin \
+holds intervals from both halves"
         ),
     }
 
