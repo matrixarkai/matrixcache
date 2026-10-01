@@ -23,6 +23,35 @@
 /// out. 160 is the usual choice and costs 16 bytes of ring per point.
 pub const CACHE_RING_POINTS_PER_WEIGHT: u32 = 160;
 
+/// Most bits of a hash the lookup table is indexed by.
+///
+/// The table holds one `u32` per slot, so sixteen bits is 256 KiB. Past that it
+/// costs more memory than the walk it saves, which is the thing it exists to
+/// avoid.
+const CACHE_RING_INDEX_MAX_BITS: u32 = 16;
+/// Fewest, so a one-node cluster does not carry a table larger than its ring.
+const CACHE_RING_INDEX_MIN_BITS: u32 = 4;
+
+/// Points a slot is aimed at holding.
+///
+/// One per slot is the obvious target and it buys nothing: four still fit in a
+/// cache line, so the scan is the same single miss, and the table is a quarter
+/// the size. At 64 nodes that is 16 KiB of table against a 160 KiB ring rather
+/// than 64 KiB.
+const CACHE_RING_INDEX_POINTS_PER_SLOT: usize = 4;
+
+/// Bits to index a ring of `points` by.
+///
+/// A ring too large for [`CACHE_RING_INDEX_POINTS_PER_SLOT`] at the cap gets the
+/// cap and a longer scan -- ten points at four thousand nodes, which is two
+/// cache lines rather than the twenty a binary search over the same ring
+/// touches.
+fn cache_ring_index_bits(points: usize) -> u32 {
+    let slots_wanted = points.div_ceil(CACHE_RING_INDEX_POINTS_PER_SLOT).max(1);
+    let wanted = usize::BITS - slots_wanted.leading_zeros();
+    wanted.clamp(CACHE_RING_INDEX_MIN_BITS, CACHE_RING_INDEX_MAX_BITS)
+}
+
 /// Relative capacity of a node, in units of one ordinary node.
 pub type CacheNodeWeight = u32;
 
@@ -102,6 +131,20 @@ pub struct CacheClusterTopology {
     /// Sorted by hash, then by node, so a hash collision between two nodes
     /// resolves the same way on every machine that builds this ring.
     ring: Vec<CacheRingPoint>,
+    /// Where in the ring each hash prefix begins.
+    ///
+    /// `prefix_index[slot]` is the first ring point whose hash is at or above
+    /// that slot's start, and there is one extra entry holding the ring's
+    /// length. A lookup reads one slot and then scans the handful of points
+    /// inside it, instead of binary searching the whole ring.
+    ///
+    /// The searching was never the cost. A binary search over a ten megabyte
+    /// ring is twenty probes, each landing on a different cache line and each
+    /// waiting on the one before it -- twenty dependent misses. The table makes
+    /// it one miss for the slot and one or two for the scan.
+    prefix_index: Vec<u32>,
+    /// Bits of a hash [`Self::prefix_index`] is indexed by.
+    index_bits: u32,
     points_per_weight: u32,
 }
 
@@ -128,6 +171,8 @@ impl CacheClusterTopology {
             live_domain: Vec::new(),
             domain_count: 0,
             ring: Vec::new(),
+            prefix_index: Vec::new(),
+            index_bits: CACHE_RING_INDEX_MIN_BITS,
             points_per_weight: points_per_weight.max(1),
         }
     }
@@ -313,6 +358,14 @@ impl CacheClusterTopology {
         self.ring.len()
     }
 
+    /// Slots in the ring's lookup table.
+    ///
+    /// Four bytes each, so this is what the table costs. Reported because it is
+    /// memory a caller did not ask for and should be able to see.
+    pub fn ring_index_slots(&self) -> usize {
+        self.prefix_index.len().saturating_sub(1)
+    }
+
     /// The node holding this key, or `None` if no node is live.
     pub fn owner(&self, key: &CacheKey) -> Option<&str> {
         self.owner_of_hash(cache_key_route_hash(key))
@@ -419,12 +472,23 @@ impl CacheClusterTopology {
     }
 
     /// The first ring point at or after `hash`, wrapping round to the first.
+    ///
+    /// One read of the lookup table, then a scan within that slot. Every point
+    /// in a slot shares the hash's leading bits, so a point at or after `hash`
+    /// is either inside this slot or is the slot's end -- which is already the
+    /// first point of the next one. Nothing before the slot can be the answer
+    /// and nothing after it can be a nearer one.
     fn first_point_at_or_after(&self, hash: u64) -> Option<usize> {
         if self.ring.is_empty() {
             return None;
         }
-        let found = self.ring.partition_point(|point| point.hash < hash);
-        Some(if found == self.ring.len() { 0 } else { found })
+        let slot = (hash >> (u64::BITS - self.index_bits)) as usize;
+        let mut point = self.prefix_index[slot] as usize;
+        let end = self.prefix_index[slot + 1] as usize;
+        while point < end && self.ring[point].hash < hash {
+            point += 1;
+        }
+        Some(if point == self.ring.len() { 0 } else { point })
     }
 
     fn rebuild_ring(&mut self) {
@@ -478,6 +542,29 @@ impl CacheClusterTopology {
             left.hash.cmp(&right.hash).then(left.node.cmp(&right.node))
         });
         self.ring = ring;
+        self.rebuild_prefix_index();
+    }
+
+    /// Rebuild the lookup table for the ring as it now stands.
+    ///
+    /// Walks the slots and the ring together once, so this costs the ring's
+    /// length plus the table's and not a search per slot.
+    fn rebuild_prefix_index(&mut self) {
+        self.index_bits = cache_ring_index_bits(self.ring.len());
+        let slots = 1usize << self.index_bits;
+        self.prefix_index.clear();
+        self.prefix_index.reserve(slots + 1);
+        let mut point = 0usize;
+        for slot in 0..slots {
+            let slot_start = (slot as u64) << (u64::BITS - self.index_bits);
+            while point < self.ring.len() && self.ring[point].hash < slot_start {
+                point += 1;
+            }
+            self.prefix_index.push(point as u32);
+        }
+        // One past the end, so a lookup in the last slot has somewhere to stop.
+        self.prefix_index.push(self.ring.len() as u32);
+        debug_assert_eq!(self.prefix_index.len(), slots + 1);
     }
 }
 

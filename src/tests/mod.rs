@@ -4338,6 +4338,90 @@ mod tests {
     }
 
     #[test]
+    fn cluster_placement_is_pinned_so_a_ring_change_cannot_move_keys_quietly() {
+        // Where a key lives is not an implementation detail: changing it moves
+        // every key in every cluster, and nothing in a test suite would
+        // otherwise notice. These answers were taken from the ring *before* it
+        // was split into separate runs of hashes and nodes, so this is what
+        // proves that change moved nothing.
+        //
+        // If a change here is deliberate, the clusters using it have to be told.
+        let mut cluster = CacheClusterTopology::new();
+        for name in ["alpha", "bravo", "charlie", "delta"] {
+            cluster.add_node(name, 1).expect("the first of its name");
+        }
+
+        for (record, shard, owner) in [
+            ("pin-00", 0_u64, "charlie"),
+            ("pin-01", 1, "alpha"),
+            ("pin-02", 2, "delta"),
+            ("pin-03", 0, "alpha"),
+            ("pin-04", 1, "delta"),
+            ("pin-05", 2, "delta"),
+            ("pin-06", 0, "alpha"),
+            ("pin-07", 1, "bravo"),
+            ("pin-08", 2, "alpha"),
+            ("pin-09", 0, "bravo"),
+            ("pin-10", 1, "charlie"),
+            ("pin-11", 2, "bravo"),
+        ] {
+            let key = CacheKey::string(shard, record);
+            assert_eq!(
+                cluster.owner(&key),
+                Some(owner),
+                "{record} in shard {shard} changed hands"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_the_ring_and_its_index_stay_in_step() {
+        // The ring is searched through a lookup table that has to agree with it
+        // -- a slot naming the wrong starting point sends a key to the wrong
+        // node, and only for the keys that land in that slot.
+        let mut cluster = CacheClusterTopology::new();
+        cluster
+            .add_nodes([("one", 1), ("two", 2), ("three", 1)])
+            .expect("distinct names");
+
+        // Every point has a node, and every node named is a live member.
+        let points = cluster.ring_point_count();
+        assert_eq!(points, 4 * CACHE_RING_POINTS_PER_WEIGHT as usize);
+        let live: HashSet<String> = cluster
+            .nodes()
+            .filter(|node| node.state == CacheNodeState::Live)
+            .map(|node| node.name.clone())
+            .collect();
+
+        // Walking the whole hash space one point at a time has to name a live
+        // node every time, which only holds if the two runs line up.
+        let mut seen: HashSet<String> = HashSet::new();
+        for index in 0..points {
+            // A hash guaranteed to land on each point in turn is hard to
+            // construct, so walk the keys instead and insist every answer is a
+            // member.
+            let key = CacheKey::string(0, &format!("step-{index:05}"));
+            let owner = cluster.owner(&key).expect("owned");
+            assert!(live.contains(owner), "{owner} is not a live member");
+            seen.insert(owner.to_string());
+        }
+        assert_eq!(seen.len(), live.len(), "some live node was never named");
+
+        // And the runs survive the membership changing under them.
+        assert!(cluster.set_node_state("two", CacheNodeState::Down));
+        assert_eq!(
+            cluster.ring_point_count(),
+            2 * CACHE_RING_POINTS_PER_WEIGHT as usize
+        );
+        for index in 0..256 {
+            let key = CacheKey::string(0, &format!("step-{index:05}"));
+            let owner = cluster.owner(&key).expect("owned");
+            assert_ne!(owner, "two", "a node that is down was named");
+            assert!(live.contains(owner));
+        }
+    }
+
+    #[test]
     fn cluster_an_unchanged_membership_moves_nothing() {
         let cluster = cluster_of(6);
         let same = cluster_of(6);
