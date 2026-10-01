@@ -88,12 +88,19 @@ jobs:
         #   mark-down-ms  marking one node down was 5.98ms at this size and is
         #                 0.02ms. 2 catches a ring rebuilt for a state change
         #                 with a hundredfold allowance.
+        #   plan-ms       planning a move is 1.8ms, against 5.4ms when it sorted
+        #                 the two rings' boundaries rather than merging them.
+        #                 That is three times, and so is the spread between this
+        #                 machine and a shared runner, so 25 is a catastrophe
+        #                 check like the lookup above -- not a claim to catch the
+        #                 sort coming back.
         run: |
           cargo run --locked --release --no-default-features --example cluster_routing_cost -- 512 \
             --json-output /tmp/matrixcache-routing.json \
             --max-owner-ns 20000 \
             --max-copies-ns 8000 \
             --max-mark-down-ms 2 \
+            --max-plan-ms 25 \
             --require-passed
           python3 -c "
           import json, sys
@@ -114,6 +121,10 @@ jobs:
           # reports the count per node step, so check it grew only with nodes.
           assert report['mark_down_ms'] < 2.0, report['mark_down_ms']
           assert report['worst_copies_ns'] < 8000, report['worst_copies_ns']
+          assert report['plan_one_ms'] < 25.0, report['plan_one_ms']
+          # A plan that moved nothing would pass every ceiling above and be
+          # useless, so insist it found work to do.
+          assert report['plan_handoffs'] > 0, report
           print('routing report ok:', report['worst_owner_ns'], 'ns worst lookup,',
                 report['worst_copies_ns'], 'ns worst copies,',
                 report['mark_down_ms'], 'ms mark-down')
