@@ -379,6 +379,14 @@ pub trait StringCacheApi {
     fn size_string(&self) -> usize;
 }
 
+/// What one entry is assumed to cost when nothing better is known.
+///
+/// Only the admission sketch uses this, to turn a byte capacity into the entry
+/// count it sizes itself for. Sixty-four is what that sizing assumed before it
+/// could be told otherwise, so leaving it alone leaves the sketch exactly the
+/// size it was.
+pub const DEFAULT_EXPECTED_ENTRY_BYTES: usize = 64;
+
 /// Bytes a `HashMap` has reserved for its table, keys and values included.
 ///
 /// Derived rather than measured: the standard library does not report what its
@@ -750,6 +758,13 @@ struct CacheInner {
     /// Whether a candidate colder than the entry it would evict is declined.
     /// Off by default: it changes what the cache keeps.
     admission_filter_enabled: bool,
+    /// What a caller expects one entry to cost, in bytes, used to turn a byte
+    /// capacity into the entry count the admission sketch is sized for.
+    ///
+    /// Sixty-four by default, which is what the sizing assumed before this was
+    /// a number anyone could set. See
+    /// [`MultiLayerCache::set_expected_entry_bytes`].
+    expected_entry_bytes: usize,
     /// Read-path statistics, updated through `&self` so a read can count
     /// itself while holding the cache lock shared.
     read_counters: ReadPathCounters,
@@ -1648,6 +1663,7 @@ impl MultiLayerCache {
                 // held and none of them read it.
                 access_frequency: FrequencySketch::unsized_until_enabled(),
                 admission_filter_enabled: false,
+                expected_entry_bytes: DEFAULT_EXPECTED_ENTRY_BYTES,
                 read_counters: ReadPathCounters::default(),
                 stats: CacheStats::default(),
             })),
@@ -2166,21 +2182,67 @@ impl MultiLayerCache {
             // Sized here rather than at construction, because this is the
             // first moment anything will read it.
             //
-            // Sized from the configured memory capacity, assuming values on
-            // the order of 64 bytes. The estimate only has to rank keys
-            // against each other, so being out by a factor either way costs
-            // accuracy rather than correctness.
+            // Sized from the memory capacity and what an entry costs, since
+            // the sketch counts keys and the capacity is in bytes.
             //
-            // Nothing is lost by waiting: recording a hit is behind this same
-            // flag, so a sketch built at construction would have been empty at
-            // this moment anyway.
-            let entries = (inner.tiering_policy.memory_capacity_bytes / 64).max(1);
+            // What an entry costs is measured when there is anything to
+            // measure, and taken from `expected_entry_bytes` when the cache is
+            // empty -- which is the usual case, because the filter is normally
+            // switched on at startup. A cache that is already full knows
+            // better than any setting, so it is asked first.
+            //
+            // Being out by a factor costs accuracy rather than correctness:
+            // the estimate only has to rank keys against each other. It is
+            // sized here rather than at construction because this is the first
+            // moment anything will read it, and nothing is lost by waiting --
+            // recording a hit is behind this same flag, so a sketch built
+            // earlier would have been empty now anyway.
+            let entry_bytes = if inner.memory.is_empty() {
+                inner.expected_entry_bytes
+            } else {
+                (inner.memory_bytes / inner.memory.len()).max(1)
+            };
+            let entries = (inner.tiering_policy.memory_capacity_bytes / entry_bytes).max(1);
             inner.access_frequency = FrequencySketch::with_capacity(entries);
         }
         // Deliberately not given back on the way off: a caller toggling the
         // filter keeps whatever the sketch has learned, which is what it did
         // before this was built lazily.
         inner.admission_filter_enabled = enabled;
+    }
+
+    /// Tells the cache what one entry is expected to cost, which is how the
+    /// admission sketch turns a byte capacity into an entry count.
+    ///
+    /// Set this before turning the admission filter on, because that is when
+    /// the sketch is sized. It has no effect otherwise, and no effect at all
+    /// on a cache that never enables the filter.
+    ///
+    /// **Why it matters.** The sketch holds thirty-two one-byte counters per
+    /// expected entry. Assuming sixty-four byte entries, a cache of a
+    /// gibibyte is taken to hold sixteen million of them and the sketch is
+    /// sized at half a gibibyte. If the entries are really four kibibytes
+    /// each, the cache holds a quarter of a million and the sketch needs
+    /// eight mebibytes -- so the assumption, left wrong, costs about five
+    /// hundred mebibytes of counters for keys that cannot exist.
+    ///
+    /// Being out by a factor costs accuracy rather than correctness: the
+    /// estimate only has to rank keys against each other. Being out by a
+    /// factor of sixty-four costs memory.
+    ///
+    /// Zero is treated as one, since a capacity divided by zero entries is
+    /// not a number of entries.
+    pub fn set_expected_entry_bytes(&self, bytes: usize) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.expected_entry_bytes = bytes.max(1);
+    }
+
+    /// What one entry is currently expected to cost.
+    pub fn expected_entry_bytes(&self) -> usize {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .expected_entry_bytes
     }
 
     /// Whether the admission filter is on.
@@ -8597,7 +8659,8 @@ impl CacheInner {
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
         //   `next_reconfigure_millis`, `eviction_handler_enabled`,
         //   `ssd_instance_only`, `cold_eviction_share_pct`,
-        //   `admission_filter_enabled`, `memory_replacement_policy`,
+        //   `admission_filter_enabled`, `expected_entry_bytes`,
+        //   `memory_replacement_policy`,
         //   `pmem_replacement_policy`, `ssd_replacement_policy`,
         //   `block_options`, `tiering_policy`, `read_counters`, `stats`.
         let fixed_bytes = self.disk_dir.capacity()
