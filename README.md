@@ -4,8 +4,10 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 
-`matrixcache` is a standalone, Rust-native multi-tier cache library extracted
-from TemporalStore and reusable by any Rust service. It manages a hot in-memory
+`matrixcache` is an **open-source**, standalone, Rust-native multi-tier cache
+library extracted from TemporalStore and reusable by any Rust service. It is
+licensed under Apache-2.0 and open to anyone, anywhere: use it, fork it, change
+it, ship it, and send the changes back if you want to. It manages a hot in-memory
 (DRAM) tier, a persistent-memory-like resident tier, and an SSD tier, with
 admission control, cross-tier eviction, read-through refill, pinned handles,
 invalidation, and asynchronous writeback with backpressure accounting.
@@ -413,9 +415,19 @@ MSRV is **1.88**, set by the `rocksdb` dependency behind the default
 
 ## Contributing, security, and license
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md),
-[`SECURITY.md`](SECURITY.md), and [`CHANGELOG.md`](CHANGELOG.md). Licensed under
-the Apache License, Version 2.0 ([`LICENSE`](LICENSE)).
+**Contributions are welcome from anyone.** You do not need to ask first and you
+do not need to be connected to this project: open an
+[issue](https://github.com/matrixarkai/MatrixCache/issues) if something is
+wrong, unclear or missing, or send a
+[pull request](https://github.com/matrixarkai/MatrixCache/pulls) if you would
+rather fix it yourself. Forks are expected rather than tolerated -- that is what
+an Apache-2.0 licence is for.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build and test a change,
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for how we behave towards each other,
+[`SECURITY.md`](SECURITY.md) for how to report something you would rather not
+file in public, and [`CHANGELOG.md`](CHANGELOG.md) for what has moved. Licensed
+under the Apache License, Version 2.0 ([`LICENSE`](LICENSE)).
 
 Product and crate names are trademarks; see [`TRADEMARKS.md`](TRADEMARKS.md).
 
