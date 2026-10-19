@@ -15031,6 +15031,91 @@ mod tests {
         );
     }
 
+    /// Counters the sketch holds for a capacity and an assumed entry size:
+    /// thirty-two one-byte counters per expected entry, rounded up to a power
+    /// of two.
+    fn expected_sketch_bytes(capacity: usize, entry_bytes: usize) -> usize {
+        ((capacity / entry_bytes).max(1) * 32).next_power_of_two()
+    }
+
+    #[test]
+    fn the_default_expected_entry_size_leaves_the_sketch_the_size_it_was() {
+        // The sizing used to assume sixty-four byte entries outright. Making
+        // that a number anyone can set must not change what an unchanged
+        // caller gets, or this is a silent behaviour change dressed as a
+        // setting.
+        const CAPACITY: usize = 1 << 24;
+        let cache = sketch_test_cache(CAPACITY, "entry-bytes-default");
+        assert_eq!(cache.expected_entry_bytes(), 64);
+
+        cache.set_admission_filter_enabled(true);
+        assert_eq!(
+            cache.footprint().sketch_bytes,
+            expected_sketch_bytes(CAPACITY, 64)
+        );
+    }
+
+    #[test]
+    fn telling_the_cache_what_an_entry_costs_sizes_the_sketch_for_it() {
+        // The defect this closes: the sketch counts keys, the capacity is in
+        // bytes, and turning one into the other needs to know what an entry
+        // costs. Assuming sixty-four when the entries are four kibibytes
+        // sizes it for sixty-four times the keys that can exist.
+        const CAPACITY: usize = 1 << 24;
+        let cache = sketch_test_cache(CAPACITY, "entry-bytes-set");
+
+        cache.set_expected_entry_bytes(4096);
+        assert_eq!(cache.expected_entry_bytes(), 4096);
+        cache.set_admission_filter_enabled(true);
+
+        let sized = cache.footprint().sketch_bytes;
+        assert_eq!(sized, expected_sketch_bytes(CAPACITY, 4096));
+        assert_eq!(
+            sized * 64,
+            expected_sketch_bytes(CAPACITY, 64),
+            "four-kibibyte entries are sixty-four times a sixty-four byte one, so the sketch for \
+             them should be sixty-four times smaller -- that factor is the whole saving"
+        );
+    }
+
+    #[test]
+    fn a_cache_with_entries_in_it_sizes_the_sketch_from_what_it_measured() {
+        // A cache that already holds entries knows what one costs better than
+        // any setting does, so it is asked first. The setting is deliberately
+        // wrong here, to show which of the two is used.
+        const CAPACITY: usize = 1 << 24;
+        const VALUE_BYTES: usize = 1024;
+        let cache = sketch_test_cache(CAPACITY, "entry-bytes-measured");
+        cache.set_expected_entry_bytes(64);
+
+        for index in 0..64 {
+            cache
+                .put(
+                    CacheKey::string(0, &format!("measured-{index:04}")),
+                    vec![0u8; VALUE_BYTES],
+                )
+                .expect("a cache with room must accept a put");
+        }
+        cache.set_admission_filter_enabled(true);
+
+        assert_eq!(
+            cache.footprint().sketch_bytes,
+            expected_sketch_bytes(CAPACITY, VALUE_BYTES),
+            "the cache held nothing but kibibyte entries, so it should have sized the sketch for \
+             kibibyte entries rather than for the sixty-four it was told"
+        );
+    }
+
+    #[test]
+    fn an_expected_entry_size_of_zero_is_treated_as_one() {
+        // A capacity divided by zero entries is not a number of entries.
+        let cache = sketch_test_cache(1 << 20, "entry-bytes-zero");
+        cache.set_expected_entry_bytes(0);
+        assert_eq!(cache.expected_entry_bytes(), 1);
+        cache.set_admission_filter_enabled(true);
+        assert!(cache.footprint().sketch_bytes > 0);
+    }
+
     #[test]
     fn turning_admission_off_again_keeps_the_sketch() {
         // Not freed on the way off, deliberately: a caller toggling the filter
