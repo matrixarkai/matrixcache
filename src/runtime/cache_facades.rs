@@ -3723,6 +3723,36 @@ impl CacheKeyOrder {
         self.iter().map(CacheKey::heap_bytes).sum()
     }
 
+    /// Bytes this order holds, split into the keys and everything else.
+    ///
+    /// Returned as a pair because the two answer different questions: the key
+    /// bytes are shared with whatever else holds the same keys, while the
+    /// structural bytes belong to this order alone.
+    ///
+    /// The node arena and the free list are counted at capacity rather than
+    /// length, because a `Vec` that has grown and shrunk still holds its high
+    /// water mark. The index's table is estimated -- see
+    /// [`estimated_table_bytes`] -- and the keys are counted once each, from
+    /// the nodes, since the index holds the same allocations.
+    pub(crate) fn footprint_bytes(&self) -> (usize, usize) {
+        let key_bytes = self
+            .iter()
+            .map(|key| std::mem::size_of::<CacheKey>() + key.heap_bytes())
+            .sum::<usize>()
+            // One `Arc` header per live key, plus the empty key every released
+            // node points at.
+            .saturating_add(self.len() * 2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<CacheKey>() + 2 * std::mem::size_of::<usize>());
+
+        let structural = (self.nodes.capacity() * std::mem::size_of::<CacheOrderNode>())
+            .saturating_add(self.free.capacity() * std::mem::size_of::<u32>())
+            .saturating_add(estimated_table_bytes::<Arc<CacheKey>, u32>(
+                self.index.capacity(),
+            ));
+
+        (key_bytes, structural)
+    }
+
     /// How many owners share a tracked key's single allocation.
     ///
     /// Two is the whole point: the node and the index both reach the same

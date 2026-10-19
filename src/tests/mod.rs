@@ -14980,6 +14980,201 @@ mod tests {
     }
 
     #[test]
+    fn the_footprint_counts_every_resident_copy_of_a_key() {
+        // Eighteen characters, a borrowed namespace and a borrowed selector,
+        // so each key owns eighteen heap bytes.
+        const KEY_HEAP: usize = 18;
+        const VALUE_BYTES: usize = 256;
+        const ENTRIES: usize = 64;
+
+        let dir = std::env::temp_dir().join("matrixcache-footprint-exact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(ENTRIES * VALUE_BYTES * 4, 0, 0).with_ssd_paths(vec![dir]),
+        );
+        for index in 0..ENTRIES {
+            cache
+                .put(
+                    CacheKey::string(0, &format!("footprint-key-{index:04}")),
+                    vec![0u8; VALUE_BYTES],
+                )
+                .expect("a cache with room must accept a put");
+        }
+
+        let footprint = cache.footprint();
+
+        assert_eq!(
+            footprint.memory_entries, ENTRIES,
+            "the denominator has to be the resident set, or every per-entry figure is wrong"
+        );
+        assert_eq!(
+            footprint.payload_bytes,
+            ENTRIES * VALUE_BYTES,
+            "payload is the one term the capacity bound counts, and it is exact"
+        );
+
+        // A key is resident three times: inline in the entry map, inline in
+        // the metadata map, and once behind the shared handle the recency
+        // order and its index both hold. The inline copies cost the struct
+        // plus the strings; the shared one costs those plus two words of
+        // handle. Each order also holds one empty key for its released nodes.
+        let key_size = std::mem::size_of::<CacheKey>();
+        let inline = key_size + KEY_HEAP;
+        let shared = key_size + KEY_HEAP + 2 * std::mem::size_of::<usize>();
+        let empty_per_order = key_size + 2 * std::mem::size_of::<usize>();
+        let expected_keys = ENTRIES * (inline + inline + shared) + 3 * empty_per_order;
+
+        assert_eq!(
+            footprint.key_bytes, expected_keys,
+            "key bytes should be {ENTRIES} entries times {} plus three empty keys; a difference \
+             means a copy was added, removed, or is going uncounted",
+            inline + inline + shared
+        );
+
+        // Worth stating as a ratio too, because this is the number the type
+        // exists to surface: the bookkeeping is a substantial fraction of a
+        // 256-byte entry, and all of it sits outside the capacity bound.
+        assert!(
+            footprint.amplification() > 1.0,
+            "a cache holding anything must hold more than its payload"
+        );
+        assert!(
+            footprint.overhead_bytes_per_entry() > 0.0,
+            "overhead per entry must be positive once there are entries"
+        );
+        assert_eq!(
+            footprint.total_bytes,
+            footprint.payload_bytes
+                + footprint.key_bytes
+                + footprint.metadata_bytes
+                + footprint.order_bytes
+                + footprint.table_bytes
+                + footprint.writeback_bytes
+                + footprint.sketch_bytes
+                + footprint.pin_bytes
+                + footprint.fixed_bytes,
+            "the total has to be its parts, or a term is being dropped"
+        );
+    }
+
+    #[test]
+    fn an_empty_cache_reports_no_entries_and_no_payload() {
+        let dir = std::env::temp_dir().join("matrixcache-footprint-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir]),
+        );
+
+        let footprint = cache.footprint();
+        assert_eq!(footprint.memory_entries, 0);
+        assert_eq!(footprint.payload_bytes, 0);
+        // Per-entry and ratio figures divide by something that is zero here,
+        // and must say zero rather than panic or report infinity.
+        assert_eq!(footprint.overhead_bytes_per_entry(), 0.0);
+        assert_eq!(footprint.amplification(), 0.0);
+        // An empty cache still costs something: the sketch is sized at
+        // construction, and this is why the per-entry figure has to be read
+        // with the entry count beside it.
+        assert!(
+            footprint.total_bytes > 0,
+            "an empty cache still holds its sketch and its paths"
+        );
+    }
+
+    /// Every field of `CacheInner` must be named in the footprint accounting:
+    /// counted, or written down as owning nothing.
+    ///
+    /// There is no allowlist on purpose. Adding a field and forgetting to
+    /// account for it fails here, and the only way to pass is to say what the
+    /// field costs -- including saying that it costs nothing. A footprint
+    /// audit on a sibling project published a figure that had silently
+    /// excluded four whole maps, and the scan meant to catch that could not
+    /// see them because its pattern could not match a two-parameter generic.
+    /// This one does not pattern-match types at all.
+    #[test]
+    fn every_field_of_the_cache_is_named_in_the_footprint_accounting() {
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+
+        // The struct body: from its opening brace to the first closing brace
+        // in column zero, which is where a top-level item ends.
+        let struct_start = SOURCE
+            .find("struct CacheInner {")
+            .expect("the cache's own struct must be in this file");
+        let struct_body = &SOURCE[struct_start..];
+        let struct_end = struct_body
+            .find("\n}")
+            .expect("the struct must be closed");
+        let struct_body = &struct_body[..struct_end];
+
+        let mut fields = Vec::new();
+        for line in struct_body.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.starts_with("///")
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("#[")
+                || trimmed.is_empty()
+            {
+                continue;
+            }
+            let Some((name, _)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                fields.push(name.to_string());
+            }
+        }
+
+        // The parser has to be shown to work, or a change in formatting turns
+        // this test into one that reads no fields and passes.
+        assert!(
+            fields.len() >= 40,
+            "only {} fields parsed out of the cache struct, so this test is not reading it \
+             properly and would pass whatever the accounting did: {:?}",
+            fields.len(),
+            fields
+        );
+        for expected in ["memory", "metadata", "memory_order", "pins", "access_frequency"] {
+            assert!(
+                fields.iter().any(|field| field == expected),
+                "the parser missed the {expected} field, so it is not reading the struct properly"
+            );
+        }
+
+        // The accounting function's body: from its signature to the first
+        // closing brace at method indentation.
+        let fn_start = SOURCE
+            .find("\n    fn footprint(&self) -> CacheFootprint {")
+            .expect("the accounting must be in this file");
+        let fn_body = &SOURCE[fn_start..];
+        let fn_end = fn_body
+            .find("\n    }")
+            .expect("the accounting must be closed");
+        let fn_body = &fn_body[..fn_end];
+
+        // Prove the right function was found. Two public methods forward to
+        // this one and share its signature; landing on either of those gives a
+        // body that names no fields, which reads as fifty unaccounted fields
+        // rather than as the parse error it is.
+        assert!(
+            fn_body.contains("memory_payload"),
+            "the body found is not the accounting itself but something that forwards to it"
+        );
+
+        let missing: Vec<&String> = fields
+            .iter()
+            .filter(|field| !fn_body.contains(field.as_str()))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these fields of the cache are not named in the footprint accounting, so whatever \
+             they hold is missing from the total: {missing:?}. Either count the field or say in \
+             the accounting's own comment why it owns nothing."
+        );
+    }
+
+    #[test]
     fn a_page_selector_reserves_exactly_what_it_writes() {
         // The selector stays resident for as long as the entry does, so
         // capacity above its length is waste, repeated once per structure
