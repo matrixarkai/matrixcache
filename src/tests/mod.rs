@@ -3915,13 +3915,13 @@ mod tests {
             shard_id: 0,
             record_key: "ab".to_string(),
             namespace: std::borrow::Cow::Borrowed("string"),
-            selector: "c".to_string(),
+            selector: std::borrow::Cow::Borrowed("c"),
         };
         let split_late = CacheKey {
             shard_id: 0,
             record_key: "a".to_string(),
             namespace: std::borrow::Cow::Borrowed("string"),
-            selector: "bc".to_string(),
+            selector: std::borrow::Cow::Borrowed("bc"),
         };
         assert_ne!(split_early, split_late);
         assert_ne!(
@@ -3936,13 +3936,13 @@ mod tests {
             shard_id: 0,
             record_key: "a\u{0}b".to_string(),
             namespace: std::borrow::Cow::Borrowed("string"),
-            selector: "c".to_string(),
+            selector: std::borrow::Cow::Borrowed("c"),
         };
         let zero_in_selector = CacheKey {
             shard_id: 0,
             record_key: "a".to_string(),
             namespace: std::borrow::Cow::Borrowed("string"),
-            selector: "b\u{0}c".to_string(),
+            selector: std::borrow::Cow::Borrowed("b\u{0}c"),
         };
         assert_ne!(zero_in_record, zero_in_selector);
         assert_ne!(
@@ -3956,13 +3956,13 @@ mod tests {
             shard_id: 0,
             record_key: "b".to_string(),
             namespace: std::borrow::Cow::Borrowed("ab"),
-            selector: "value".to_string(),
+            selector: std::borrow::Cow::Borrowed("value"),
         };
         let short_namespace = CacheKey {
             shard_id: 0,
             record_key: "b".to_string(),
             namespace: std::borrow::Cow::Borrowed("a"),
-            selector: "value".to_string(),
+            selector: std::borrow::Cow::Borrowed("value"),
         };
         assert_ne!(
             cache_key_routing_bytes(&long_namespace),
@@ -14961,9 +14961,13 @@ mod tests {
     }
 
     /// Heap bytes one `order_key` owns: `order-key-NNNN` is fourteen
-    /// characters, the selector `value` is five, the namespace is borrowed and
-    /// so free, and `to_string` allocates exactly the length it is given.
-    const ORDER_KEY_HEAP_BYTES: usize = 14 + 5;
+    /// characters, and `to_string` allocates exactly the length it is given.
+    ///
+    /// The namespace and the selector are both borrowed literals and own
+    /// nothing. This was `14 + 5` while the selector was a `String`: the five
+    /// is the `value` literal, which every key of this kind used to allocate
+    /// and none of them does now.
+    const ORDER_KEY_HEAP_BYTES: usize = 14;
 
     #[test]
     fn an_order_key_owns_the_heap_bytes_the_tests_below_assume() {
@@ -14972,6 +14976,58 @@ mod tests {
             key.heap_bytes(),
             ORDER_KEY_HEAP_BYTES,
             "the other tests in this group price retained keys with this constant, so it has to              be what a key actually owns rather than what it was once measured at"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_selector_costs_nothing_in_struct_size() {
+        // The reason the field could change at all: a `Cow<str>` is the same
+        // twenty-four bytes as a `String`, because its discriminant fits in a
+        // niche. Had it been wider, every resident copy of every key would
+        // have grown by eight bytes and the borrow would not have paid for
+        // itself.
+        assert_eq!(std::mem::size_of::<std::borrow::Cow<'static, str>>(), 24);
+        assert_eq!(std::mem::size_of::<String>(), 24);
+        assert_eq!(
+            std::mem::size_of::<CacheKey>(),
+            80,
+            "a key is a shard id, a record key, a namespace and a selector; if this has grown, a \
+             borrowed selector is costing more than it saves"
+        );
+    }
+
+    #[test]
+    fn a_literal_selector_owns_no_heap() {
+        // `string` and `set_members` name their part of the record with a
+        // literal, so the only heap a key of either kind owns is its record
+        // key. Each of these used to allocate its selector as well.
+        let plain = CacheKey::string(0, "abcdefgh");
+        assert_eq!(
+            plain.heap_bytes(),
+            8,
+            "a plain key owns its eight-character record key and nothing else; the five-byte \
+             `value` selector must be borrowed"
+        );
+
+        let members = CacheKey::set_members(0, "abcdefgh");
+        assert_eq!(
+            members.heap_bytes(),
+            8,
+            "a set key's `members` selector is a literal too"
+        );
+    }
+
+    #[test]
+    fn a_computed_selector_is_still_owned() {
+        // The literals are the common case, not the only one: a selector that
+        // is built rather than named has to be owned, and must still be
+        // counted.
+        let field = CacheKey::hash(0, "abcdefgh", "a-field");
+        assert_eq!(
+            field.heap_bytes(),
+            8 + 7,
+            "a hash key owns its record key and its field name, which is not a literal and \
+             cannot be borrowed"
         );
     }
 
@@ -15045,7 +15101,7 @@ mod tests {
                 shard_id: 0,
                 record_key,
                 namespace: std::borrow::Cow::Borrowed("string"),
-                selector: "value".to_string(),
+                selector: std::borrow::Cow::Borrowed("value"),
             },
             built_with,
         )
@@ -19339,7 +19395,7 @@ fn every_manifest_key_shape() -> Vec<CacheKey> {
             shard_id: 8,
             record_key: awkward.to_string(),
             namespace: std::borrow::Cow::Owned(awkward.to_string()),
-            selector: awkward.to_string(),
+            selector: std::borrow::Cow::Owned(awkward.to_string()),
         });
     }
     for length in [1usize, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 255] {
