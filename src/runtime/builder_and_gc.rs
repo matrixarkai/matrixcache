@@ -1156,7 +1156,7 @@ impl CacheInner {
         self.metadata.remove(key);
         self.stats.expired_removals = self.stats.expired_removals.saturating_add(1);
         if let Some((tier, value)) = departing {
-            self.record_eviction(tier, key.clone(), value, CacheRemovalCause::Expired);
+            self.record_eviction(tier, key, &value, CacheRemovalCause::Expired);
         }
     }
 
@@ -1677,7 +1677,7 @@ impl CacheInner {
         true
     }
 
-    fn put_ssd_bypass_if_absent(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+    fn put_ssd_bypass_if_absent(&mut self, key: CacheKey, value: &[u8]) -> bool {
         if self.disk_index.contains_key(&key) || self.ssd_capacity_bytes == 0 {
             return false;
         }
@@ -1692,7 +1692,7 @@ impl CacheInner {
                 self.stats.ssd_oversize_rejections.saturating_add(1);
             return false;
         }
-        let Ok(block) = encode_cache_block(&value, self.block_options) else {
+        let Ok(block) = encode_cache_block(value, self.block_options) else {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         };
@@ -1751,7 +1751,7 @@ impl CacheInner {
         false
     }
 
-    fn demote_memory_victim(&mut self, key: &CacheKey, value: &[u8]) -> bool {
+    fn demote_memory_victim(&mut self, key: &CacheKey, value: &Arc<[u8]>) -> bool {
         if !self.eviction_handler_enabled || !self.demotion_is_worthwhile(key) {
             return false;
         }
@@ -1769,22 +1769,25 @@ impl CacheInner {
                     self.stats.demotions_already_resident.saturating_add(1);
                 return true;
             }
-            return self.put_pmem(key.clone(), value.to_vec());
+            // The same allocation the memory tier was holding, handed down
+            // rather than copied: it is leaving one map for another, and both
+            // of them hold the bytes behind a handle.
+            return self.put_pmem_shared(key.clone(), Arc::clone(value));
         }
         if self.ssd_capacity_bytes > 0 {
-            return self.put_ssd_bypass_if_absent(key.clone(), value.to_vec());
+            return self.put_ssd_bypass_if_absent(key.clone(), value);
         }
         false
     }
 
-    fn demote_pmem_victim(&mut self, key: &CacheKey, value: &[u8]) -> bool {
+    fn demote_pmem_victim(&mut self, key: &CacheKey, value: &Arc<[u8]>) -> bool {
         if !self.eviction_handler_enabled
             || self.ssd_capacity_bytes == 0
             || !self.demotion_is_worthwhile(key)
         {
             return false;
         }
-        self.put_ssd_bypass_if_absent(key.clone(), value.to_vec())
+        self.put_ssd_bypass_if_absent(key.clone(), value)
     }
 
     fn refill_from_ssd(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
@@ -1837,8 +1840,8 @@ impl CacheInner {
             let demoted = self.demote_memory_victim(&victim, &old_value);
             self.record_eviction(
                 CacheTier::Memory,
-                victim.clone(),
-                old_value.to_vec(),
+                &victim,
+                &old_value,
                 removal_cause(reason),
             );
             self.stats.memory_evictions = self.stats.memory_evictions.saturating_add(1);
@@ -1883,12 +1886,7 @@ impl CacheInner {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old_value.len());
             let demoted = self.demote_pmem_victim(&victim, &old_value);
             let _ = self.persist_pmem_delete(&victim);
-            self.record_eviction(
-                CacheTier::Pmem,
-                victim.clone(),
-                old_value.to_vec(),
-                removal_cause(reason),
-            );
+            self.record_eviction(CacheTier::Pmem, &victim, &old_value, removal_cause(reason));
             self.stats.pmem_evictions = self.stats.pmem_evictions.saturating_add(1);
             self.stats.pmem_eviction_capacity = self.stats.pmem_eviction_capacity.saturating_add(1);
             if !demoted
@@ -1931,8 +1929,8 @@ impl CacheInner {
             self.disk_order.remove(&victim);
             self.record_eviction(
                 CacheTier::Ssd,
-                victim.clone(),
-                evicted_value.clone(),
+                &victim,
+                &evicted_value,
                 removal_cause(reason),
             );
             self.ssd_bytes = self.ssd_bytes.saturating_sub(removed_bytes);
@@ -2282,11 +2280,21 @@ impl CacheInner {
         }
     }
 
+    /// Queues an eviction for whatever is listening, and copies the entry's
+    /// bytes **only if something is**.
+    ///
+    /// Borrowed rather than owned on purpose. A record carries an owned key
+    /// and an owned value because a handler may read it long after the entry
+    /// is gone, but the callers used to build both of those before getting
+    /// here -- so an eviction copied the whole payload and cloned the key
+    /// whether or not any handler existed to be given them, and the handler
+    /// is off by default. The copies now happen on the one branch that needs
+    /// them.
     fn record_eviction(
         &mut self,
         tier: CacheTier,
-        key: CacheKey,
-        value: Vec<u8>,
+        key: &CacheKey,
+        value: &[u8],
         cause: CacheRemovalCause,
     ) {
         // The metric counts evictions and needs no value, so it is recorded
@@ -2298,8 +2306,8 @@ impl CacheInner {
             self.pending_eviction_records
                 .push_back(CacheEvictionRecord {
                     tier,
-                    key,
-                    value,
+                    key: key.clone(),
+                    value: value.to_vec(),
                     cause,
                 });
         }

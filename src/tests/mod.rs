@@ -7568,7 +7568,7 @@ mod tests {
 
         let admitted = {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
-            inner.put_ssd_bypass_if_absent(key.clone(), b"value-that-cannot-be-recorded".to_vec())
+            inner.put_ssd_bypass_if_absent(key.clone(), b"value-that-cannot-be-recorded")
         };
 
         assert!(
@@ -7620,7 +7620,7 @@ mod tests {
         fs::create_dir_all(&manifest_path).unwrap();
         {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
-            inner.put_ssd_bypass_if_absent(key.clone(), b"orphan-payload".to_vec());
+            inner.put_ssd_bypass_if_absent(key.clone(), b"orphan-payload");
         }
         drop(cache);
 
@@ -15223,6 +15223,58 @@ mod tests {
             5,
             "five owners and no more: the entry map, the metadata map, the order's node, the \
              order's index, and the handle this test is itself holding"
+        );
+    }
+
+    #[test]
+    fn a_demotion_hands_the_lower_tier_the_bytes_it_already_has() {
+        // An entry leaving the memory tier for the persistent one is not a new
+        // value, it is the same value one tier down. Both tiers hold their
+        // payloads behind a handle, so the demotion should pass the handle
+        // rather than copy the bytes -- checked by address, because equal
+        // bytes would pass either way.
+        let dir = std::env::temp_dir().join("matrixcache-demotion-shares");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pmem_dir = std::env::temp_dir().join("matrixcache-demotion-shares-pmem");
+        let _ = std::fs::remove_dir_all(&pmem_dir);
+        let _ = std::fs::create_dir_all(&pmem_dir);
+
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 1 << 20, 0)
+                .with_ssd_paths(vec![dir])
+                .with_pmem_paths(vec![pmem_dir]),
+        );
+
+        let key = CacheKey::string(0, "demoted-key");
+        cache
+            .put(key.clone(), vec![7u8; 128])
+            .expect("a cache with room must accept a put");
+
+        let mut inner = cache.inner.write().expect("cache lock poisoned");
+        // What the demotion checks before it will do anything.
+        inner.eviction_handler_enabled = true;
+        inner.tiering_policy.data_placement = CacheDataPlacement::Tiered;
+
+        let held = Arc::clone(
+            inner
+                .memory
+                .get(&key)
+                .expect("the memory tier must hold the value"),
+        );
+        assert!(
+            inner.demote_memory_victim(&key, &held),
+            "the persistent tier has room and the entry is not expired, so the demotion must \
+             happen -- otherwise this test asserts nothing below"
+        );
+
+        let demoted = inner
+            .pmem
+            .get(&key)
+            .expect("the persistent tier must now hold the value");
+        assert!(
+            Arc::ptr_eq(demoted, &held),
+            "the persistent tier holds a different allocation, so the demotion copied the whole \
+             payload instead of handing over the one it was given"
         );
     }
 
