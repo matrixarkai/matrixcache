@@ -669,7 +669,15 @@ struct CacheInner {
     ttl_in_use: bool,
     tiering_policy: CacheTieringPolicy,
     block_options: CacheBlockOptions,
-    memory: HashMap<CacheKey, Arc<[u8]>>,
+    /// Keyed on a shared handle, not on the key itself.
+    ///
+    /// The entry map, the metadata map and the memory tier's recency order all
+    /// hold the same key, and each used to hold its own copy of the struct --
+    /// seventy-two bytes, three times, plus a table slot sized to carry it.
+    /// They now hold one `Arc<CacheKey>` between them, so a slot carries a
+    /// pointer. Lookups are unaffected: `Arc<CacheKey>` borrows as a
+    /// `CacheKey`, so `get`, `remove` and `contains_key` still take `&CacheKey`.
+    memory: HashMap<Arc<CacheKey>, Arc<[u8]>>,
     pmem: HashMap<CacheKey, Arc<[u8]>>,
     disk_index: HashMap<CacheKey, u64>,
     disk_order: CacheKeyOrder,
@@ -735,7 +743,7 @@ struct CacheInner {
     memory_replacement_policy: CacheReplacementPolicy,
     pmem_replacement_policy: CacheReplacementPolicy,
     ssd_replacement_policy: CacheReplacementPolicy,
-    metadata: HashMap<CacheKey, CacheEntryMeta>,
+    metadata: HashMap<Arc<CacheKey>, CacheEntryMeta>,
     /// How often keys have been asked for recently, including keys that are
     /// not resident. Consulted at admission; see `admission_filter_enabled`.
     access_frequency: FrequencySketch,
@@ -1796,7 +1804,7 @@ impl MultiLayerCache {
             .metadata
             .iter()
             .filter(|(_, meta)| meta.is_expired(now_millis))
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| CacheKey::clone(key))
             .collect();
         for key in &expired {
             inner.remove_expired_entry(key);
@@ -8419,6 +8427,33 @@ impl ZeroCopyCacheApi for ShardedMultiLayerCache {
     }
 }
 impl CacheInner {
+    /// The one handle this cache uses for `key`, taken from whichever
+    /// structure already holds it, or made if none does.
+    ///
+    /// This is what makes the sharing actually happen. The entry map, the
+    /// metadata map and the recency order are written by different functions
+    /// at different moments, so threading a handle between them would mean
+    /// changing every signature on the way. Each asks here instead, and
+    /// because they all ask the same question they all get the same answer:
+    /// one `CacheKey` per entry rather than three.
+    ///
+    /// The cost is a lookup. The entry map is asked first because it is the
+    /// one most likely to hold the key already, and a miss on all three is
+    /// the first write of that key, where the allocation was going to happen
+    /// anyway.
+    fn shared_key(&self, key: &CacheKey) -> Arc<CacheKey> {
+        if let Some((held, _)) = self.memory.get_key_value(key) {
+            return Arc::clone(held);
+        }
+        if let Some((held, _)) = self.metadata.get_key_value(key) {
+            return Arc::clone(held);
+        }
+        if let Some(held) = self.memory_order.shared_handle(key) {
+            return held;
+        }
+        Arc::new(key.clone())
+    }
+
     /// Where this shard's bytes are. See [`CacheFootprint`].
     ///
     /// Every field of this struct that owns heap is named below, and a test
@@ -8441,9 +8476,10 @@ impl CacheInner {
         for key in self
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(self.pmem.keys())
             .chain(self.disk_index.keys())
-            .chain(self.metadata.keys())
+            .chain(self.metadata.keys().map(|key| key.as_ref()))
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
             .chain(self.disk_order.iter())
@@ -8454,30 +8490,42 @@ impl CacheInner {
             }
         }
 
-        // `memory` and `pmem`: payload behind a shared handle, key inline in
-        // the table slot.
-        let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
-        let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
-        let memory_keys: usize = self
+        // The key struct behind each shared handle, charged **once per
+        // allocation**. The entry map, the metadata map and the recency order
+        // reach the same `Arc<CacheKey>` for a memory-tier entry, so charging
+        // per holder would report three structs where there is one. Their
+        // table slots hold a pointer each, which `table_bytes` counts.
+        let mut counted_keys = std::collections::HashSet::new();
+        let mut shared_key_bytes = 0usize;
+        for held in self
             .memory
             .keys()
-            .map(|key| key_size + key.owned_heap_bytes())
-            .sum();
-        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.owned_heap_bytes()).sum();
+            .chain(self.metadata.keys())
+            .chain(self.memory_order.shared_handles())
+            .chain(self.pmem_order.shared_handles())
+            .chain(self.disk_order.shared_handles())
+        {
+            if counted_keys.insert(Arc::as_ptr(held)) {
+                shared_key_bytes = shared_key_bytes.saturating_add(
+                    2 * std::mem::size_of::<usize>()
+                        + key_size
+                        + held.owned_heap_bytes(),
+                );
+            }
+        }
 
-        // `disk_index`: key inline, a file offset as the value.
+        let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
+        let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
+
+        // `pmem` and `disk_index` still hold the key itself rather than a
+        // handle, so each pays for its own struct inline in the table slot.
+        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.owned_heap_bytes()).sum();
         let disk_keys: usize = self
             .disk_index
             .keys()
             .map(|key| key_size + key.owned_heap_bytes())
             .sum();
 
-        // `metadata`: key inline, fixed-size metadata as the value.
-        let metadata_keys: usize = self
-            .metadata
-            .keys()
-            .map(|key| key_size + key.owned_heap_bytes())
-            .sum();
         let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
 
         // The three orders, each reporting its keys apart from its structure.
@@ -8564,19 +8612,21 @@ impl CacheInner {
             + self.pending_eviction_metric_tiers.capacity() * std::mem::size_of::<CacheTier>();
 
         // The tables themselves, less the keys and values counted above.
-        let table_bytes = estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.memory.capacity())
-            + estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.pmem.capacity())
-            + estimated_table_bytes::<CacheKey, u64>(self.disk_index.capacity())
-            + estimated_table_bytes::<CacheKey, CacheEntryMeta>(self.metadata.capacity());
+        let table_bytes =
+            estimated_table_bytes::<Arc<CacheKey>, Arc<[u8]>>(self.memory.capacity())
+                + estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.pmem.capacity())
+                + estimated_table_bytes::<CacheKey, u64>(self.disk_index.capacity())
+                + estimated_table_bytes::<Arc<CacheKey>, CacheEntryMeta>(
+                    self.metadata.capacity(),
+                );
 
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
             payload_bytes: memory_payload + pmem_payload,
             key_bytes: shared_character_bytes
-                + memory_keys
+                + shared_key_bytes
                 + pmem_keys
                 + disk_keys
-                + metadata_keys
                 + memory_order_keys
                 + pmem_order_keys
                 + disk_order_keys,
@@ -9345,6 +9395,7 @@ impl MultiLayerCache {
             inner
                 .memory
                 .keys()
+                .map(|key| key.as_ref())
                 .chain(inner.pmem.keys())
                 .chain(inner.disk_index.keys())
                 .filter(|key| {
@@ -9368,6 +9419,7 @@ impl MultiLayerCache {
         let memory_keys = inner
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .filter(|key| key.shard_id == shard_id)
             .cloned()
@@ -9427,6 +9479,7 @@ impl MultiLayerCache {
         let slot_keys = inner
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| key.shard_id == shard_id && key.selector.starts_with(&prefix))
@@ -9489,6 +9542,7 @@ impl MultiLayerCache {
         let segment_keys = inner
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| {
@@ -9548,6 +9602,7 @@ impl MultiLayerCache {
         let keys = inner
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| key.shard_id == shard_id)
@@ -9613,6 +9668,7 @@ impl MultiLayerCache {
         let keys = inner
             .memory
             .keys()
+            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .cloned()
