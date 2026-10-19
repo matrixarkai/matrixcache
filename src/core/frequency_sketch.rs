@@ -93,6 +93,21 @@ impl FrequencySketch {
     /// A capacity of zero still yields a usable sketch -- one counter that
     /// saturates immediately -- rather than an empty one that would panic on
     /// the first index.
+    /// A sketch for a cache whose admission filter is off.
+    ///
+    /// Sized for nothing, because nothing will ask it anything: every use of
+    /// the sketch -- recording a hit as well as estimating a frequency -- sits
+    /// behind the admission filter's own flag, so while that flag is off this
+    /// structure is written to and read by nobody.
+    ///
+    /// It is the smallest table the mask arithmetic allows rather than an
+    /// absent one, so the field stays a `FrequencySketch` and the three places
+    /// that use it need no unwrapping. Thirty-two counters, against the half a
+    /// gibibyte a full one costs for a gibibyte of capacity.
+    pub fn unsized_until_enabled() -> Self {
+        Self::with_capacity(0)
+    }
+
     pub fn with_capacity(entries: usize) -> Self {
         let width = (entries.max(1) * COUNTERS_PER_ENTRY).next_power_of_two();
         Self {

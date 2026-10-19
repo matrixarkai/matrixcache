@@ -14979,6 +14979,98 @@ mod tests {
         );
     }
 
+    fn sketch_test_cache(capacity: usize, name: &str) -> MultiLayerCache {
+        let dir = std::env::temp_dir().join(format!("matrixcache-sketch-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        MultiLayerCache::with_options(
+            CacheOptions::new(capacity, 0, 0).with_ssd_paths(vec![dir]),
+        )
+    }
+
+    #[test]
+    fn a_cache_that_never_enables_admission_holds_almost_no_sketch() {
+        // A full sketch is next_power_of_two(capacity / 2) bytes: half a
+        // gibibyte for a gibibyte of capacity. Every use of it -- recording a
+        // hit as much as estimating a frequency -- is behind the admission
+        // filter's flag, which is off by default, so a cache that never turns
+        // the filter on must not be paying for it.
+        for capacity in [1 << 20, 1 << 24, 1 << 30] {
+            let cache = sketch_test_cache(capacity, &format!("off-{capacity}"));
+            assert!(!cache.admission_filter_enabled());
+            let sketch = cache.footprint().sketch_bytes;
+            assert!(
+                sketch <= 64,
+                "a cache of {capacity} bytes with the admission filter off holds {sketch} bytes \
+                 of sketch; it would once have held {}",
+                (capacity / 2).next_power_of_two()
+            );
+        }
+    }
+
+    #[test]
+    fn enabling_admission_sizes_the_sketch() {
+        const CAPACITY: usize = 1 << 24;
+        let cache = sketch_test_cache(CAPACITY, "on");
+
+        let before = cache.footprint().sketch_bytes;
+        cache.set_admission_filter_enabled(true);
+        let after = cache.footprint().sketch_bytes;
+
+        // The precondition: the filter being off has to be what made it small,
+        // or this test proves nothing about the switch.
+        assert!(before <= 64, "the sketch should start unsized, got {before}");
+        assert_eq!(
+            after,
+            (CAPACITY / 2).next_power_of_two(),
+            "turning the filter on must size the sketch exactly as a cache built with it on \
+             would have"
+        );
+    }
+
+    #[test]
+    fn turning_admission_off_again_keeps_the_sketch() {
+        // Not freed on the way off, deliberately: a caller toggling the filter
+        // keeps what the sketch has learned, which is what happened before it
+        // was built lazily.
+        const CAPACITY: usize = 1 << 22;
+        let cache = sketch_test_cache(CAPACITY, "toggle");
+
+        cache.set_admission_filter_enabled(true);
+        let enabled = cache.footprint().sketch_bytes;
+        cache.set_admission_filter_enabled(false);
+        let disabled = cache.footprint().sketch_bytes;
+        cache.set_admission_filter_enabled(true);
+        let re_enabled = cache.footprint().sketch_bytes;
+
+        assert_eq!(enabled, (CAPACITY / 2).next_power_of_two());
+        assert_eq!(disabled, enabled, "the sketch is kept across a disable");
+        assert_eq!(
+            re_enabled, enabled,
+            "re-enabling must not build a second sketch on top of the first"
+        );
+    }
+
+    #[test]
+    fn the_admission_filter_still_works_when_its_sketch_is_built_lazily() {
+        // The filter's own behaviour, over the switch that now builds its
+        // sketch: a key asked for repeatedly has to beat one asked for once.
+        // If the lazy sketch were wired up wrongly, the estimates would be
+        // flat and the filter would admit everything.
+        let cache = sketch_test_cache(4096, "works");
+        cache.set_admission_filter_enabled(true);
+
+        let hot = CacheKey::string(0, "hot-key");
+        for _ in 0..40 {
+            let _ = cache.get(&hot);
+        }
+
+        let sketch = cache.footprint().sketch_bytes;
+        assert!(
+            sketch > 64,
+            "the filter is on, so its sketch must have been sized: {sketch}"
+        );
+    }
+
     #[test]
     fn the_footprint_counts_every_resident_copy_of_a_key() {
         // Eighteen characters, a borrowed namespace and a borrowed selector,

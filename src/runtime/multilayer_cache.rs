@@ -1633,13 +1633,12 @@ impl MultiLayerCache {
                 pmem_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 ssd_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 metadata: HashMap::new(),
-                // Sized from the configured memory capacity, assuming values
-                // on the order of 64 bytes. The estimate only has to rank keys
-                // against each other, so being out by a factor either way costs
-                // accuracy rather than correctness.
-                access_frequency: FrequencySketch::with_capacity(
-                    (tiering_policy.memory_capacity_bytes / 64).max(1),
-                ),
+                // Not sized until the admission filter is turned on. A full
+                // sketch is `next_power_of_two(capacity / 2)` bytes -- half a
+                // gibibyte for a gibibyte of capacity -- and the filter is off
+                // by default, so this used to be the largest thing many caches
+                // held and none of them read it.
+                access_frequency: FrequencySketch::unsized_until_enabled(),
                 admission_filter_enabled: false,
                 read_counters: ReadPathCounters::default(),
                 stats: CacheStats::default(),
@@ -2155,6 +2154,24 @@ impl MultiLayerCache {
     /// frequencies.
     pub fn set_admission_filter_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
+        if enabled && !inner.admission_filter_enabled {
+            // Sized here rather than at construction, because this is the
+            // first moment anything will read it.
+            //
+            // Sized from the configured memory capacity, assuming values on
+            // the order of 64 bytes. The estimate only has to rank keys
+            // against each other, so being out by a factor either way costs
+            // accuracy rather than correctness.
+            //
+            // Nothing is lost by waiting: recording a hit is behind this same
+            // flag, so a sketch built at construction would have been empty at
+            // this moment anyway.
+            let entries = (inner.tiering_policy.memory_capacity_bytes / 64).max(1);
+            inner.access_frequency = FrequencySketch::with_capacity(entries);
+        }
+        // Deliberately not given back on the way off: a caller toggling the
+        // filter keeps whatever the sketch has learned, which is what it did
+        // before this was built lazily.
         inner.admission_filter_enabled = enabled;
     }
 
@@ -8479,7 +8496,8 @@ impl CacheInner {
                 self.async_writeback_positions.capacity(),
             ));
 
-        // `access_frequency`: sized once at construction.
+        // `access_frequency`: sized when the admission filter is turned on,
+        // and a few dozen bytes until then.
         let sketch_bytes = self.access_frequency.footprint_bytes();
 
         // Per-cache rather than per-entry: `disk_dir`, `pmem_paths`, and the
