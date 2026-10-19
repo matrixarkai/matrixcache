@@ -14980,6 +14980,58 @@ mod tests {
     }
 
     #[test]
+    fn a_page_selector_reserves_exactly_what_it_writes() {
+        // The selector stays resident for as long as the entry does, so
+        // capacity above its length is waste, repeated once per structure
+        // holding the key. Capacity below its length would mean the buffer
+        // grew, which is a second allocation on the path that builds the key.
+        //
+        // All four shapes, the widest value each field can take, and zero.
+        let cases = [
+            CacheKey::page(0, 7, 4096, 512),
+            CacheKey::page_with_slot(0, 7, 8192, 512, Some(3)),
+            CacheKey::page_with_slot(0, 7, 8192, 512, None),
+            CacheKey::page_with_slot_generation(0, 7, 8192, 512, Some(3), Some(7)),
+            CacheKey::page_with_slot_generation(0, 7, 8192, 512, None, Some(7)),
+            CacheKey::page_with_slot_generation(
+                0,
+                7,
+                u64::MAX,
+                u64::MAX,
+                Some(u32::MAX),
+                Some(u64::MAX),
+            ),
+            CacheKey::page(0, 7, 0, 0),
+        ];
+
+        let mut widest = 0;
+        for key in cases {
+            let std::borrow::Cow::Owned(selector) = &key.selector else {
+                panic!("a page selector is built rather than named, so it must be owned");
+            };
+            assert_eq!(
+                selector.len(),
+                selector.capacity(),
+                "selector {:?} reserved {} bytes to hold {}",
+                selector,
+                selector.capacity(),
+                selector.len()
+            );
+            widest = widest.max(selector.len());
+        }
+
+        // The flat reservation this replaced was sixty-four bytes, which the
+        // widest shape exceeds -- so it was not merely generous, it was also
+        // too small and had to grow. Asserted so that claim stays true rather
+        // than being something measured once.
+        assert!(
+            widest > 64,
+            "the widest selector is {widest} bytes, so a flat sixty-four would have been enough \
+             after all and the second half of this change's reasoning is wrong"
+        );
+    }
+
+    #[test]
     fn a_borrowed_selector_costs_nothing_in_struct_size() {
         // The reason the field could change at all: a `Cow<str>` is the same
         // twenty-four bytes as a `String`, because its discriminant fits in a
