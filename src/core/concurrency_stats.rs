@@ -225,8 +225,19 @@ fn page_selector(
     length: u64,
 ) -> String {
     use std::fmt::Write as _;
-    // "slot-" + u32 + ":gen-" + u64 + ":" + u64 + ":" + u64, generously.
-    let mut selector = String::with_capacity(64);
+    // Reserved exactly, because this string stays resident for as long as the
+    // entry does and is held once per structure that holds the key. A flat
+    // sixty-four was both too much and too little: the common shape writes
+    // eight bytes of it, and a slot with a generation and three wide numbers
+    // needs more than sixty-four and had to grow.
+    let mut capacity = decimal_width(offset) + 1 + decimal_width(length);
+    if let Some(slot) = routing_slot {
+        capacity += "slot-".len() + decimal_width(u64::from(slot)) + 1;
+    }
+    if let Some(generation) = generation {
+        capacity += "gen-".len() + decimal_width(generation) + 1;
+    }
+    let mut selector = String::with_capacity(capacity);
     if let Some(slot) = routing_slot {
         selector.push_str("slot-");
         let _ = write!(selector, "{slot}:");
