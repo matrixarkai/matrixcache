@@ -8138,6 +8138,61 @@ impl ShardedMultiLayerCache {
             .unwrap_or(COLD_EVICTION_SHARE_PCT_DEFAULT)
     }
 
+    /// Turns the admission filter on or off, on every shard.
+    ///
+    /// Each shard keeps its own frequency sketch, because each decides its own
+    /// admissions from its own entries. A key only ever reaches one shard, so a
+    /// sketch shared between them would be answering questions about keys its
+    /// shard will never see.
+    ///
+    /// **This was not reachable on a sharded cache at all.** The single-shard
+    /// type has had the setter since the filter was added, and the sharded one
+    /// aggregates the admission statistics, so a caller could watch a filter it
+    /// had no way to switch on.
+    ///
+    /// See [`MultiLayerCache::set_admission_filter_enabled`] for what the
+    /// filter does, and [`Self::set_expected_entry_bytes`] for what its sketch
+    /// costs.
+    pub fn set_admission_filter_enabled(&self, enabled: bool) {
+        for shard in self.shards.iter() {
+            shard.set_admission_filter_enabled(enabled);
+        }
+    }
+
+    /// Whether the admission filter is on.
+    ///
+    /// Reads shard zero; the setter writes all of them and nothing else can
+    /// turn one shard's filter on alone.
+    pub fn admission_filter_enabled(&self) -> bool {
+        self.shards
+            .first()
+            .map(MultiLayerCache::admission_filter_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Tells every shard what one entry is expected to cost.
+    ///
+    /// Each shard sizes its own sketch from its own slice of the capacity, so
+    /// this has to reach all of them, or the ones it missed size themselves
+    /// from the sixty-four byte assumption.
+    ///
+    /// Set it before turning the admission filter on, which is when the
+    /// sketches are built. See
+    /// [`MultiLayerCache::set_expected_entry_bytes`].
+    pub fn set_expected_entry_bytes(&self, bytes: usize) {
+        for shard in self.shards.iter() {
+            shard.set_expected_entry_bytes(bytes);
+        }
+    }
+
+    /// What one entry is expected to cost, as every shard was told.
+    pub fn expected_entry_bytes(&self) -> usize {
+        self.shards
+            .first()
+            .map(MultiLayerCache::expected_entry_bytes)
+            .unwrap_or(DEFAULT_EXPECTED_ENTRY_BYTES)
+    }
+
     pub fn try_set_replacement_policy_for_tier(
         &self,
         tier: CacheTier,

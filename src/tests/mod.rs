@@ -14999,6 +14999,92 @@ mod tests {
         )
     }
 
+    fn sharded_sketch_cache(capacity: usize, shards: usize, name: &str) -> ShardedMultiLayerCache {
+        let dir = std::env::temp_dir().join(format!("matrixcache-sharded-sketch-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        ShardedMultiLayerCache::with_options(
+            CacheOptions::new(capacity, 0, 0).with_ssd_paths(vec![dir]),
+            shards,
+        )
+    }
+
+    #[test]
+    fn a_sharded_cache_can_turn_its_admission_filter_on() {
+        // It could not: the setter lived on the single-shard type only, while
+        // the sharded type aggregated the admission statistics -- so a caller
+        // could watch a filter it had no way to switch on.
+        const CAPACITY: usize = 1 << 24;
+        let cache = sharded_sketch_cache(CAPACITY, 8, "on");
+
+        assert!(!cache.admission_filter_enabled());
+        let before = cache.footprint().sketch_bytes;
+        assert!(
+            before <= 8 * 64,
+            "with the filter off each of the eight shards holds a few dozen bytes of sketch, \
+             got {before}"
+        );
+
+        cache.set_admission_filter_enabled(true);
+        assert!(cache.admission_filter_enabled());
+        assert_eq!(
+            cache.footprint().sketch_bytes,
+            (CAPACITY / 2).next_power_of_two(),
+            "every shard should have sized its own sketch from its own slice of the capacity"
+        );
+    }
+
+    #[test]
+    fn a_sharded_cache_tells_every_shard_what_an_entry_costs() {
+        // Each shard sizes its own sketch, so the hint has to reach all of
+        // them; one that missed it would size itself from the sixty-four byte
+        // assumption and the total would land between the two answers.
+        const CAPACITY: usize = 1 << 24;
+        let told = sharded_sketch_cache(CAPACITY, 8, "told");
+        told.set_expected_entry_bytes(4096);
+        assert_eq!(told.expected_entry_bytes(), 4096);
+        told.set_admission_filter_enabled(true);
+
+        let default = sharded_sketch_cache(CAPACITY, 8, "default");
+        default.set_admission_filter_enabled(true);
+
+        assert_eq!(
+            told.footprint().sketch_bytes * 64,
+            default.footprint().sketch_bytes,
+            "four-kibibyte entries are sixty-four times a sixty-four byte one, so every shard's \
+             sketch should be sixty-four times smaller -- a shard that missed the hint would \
+             leave the total short of that factor"
+        );
+    }
+
+    #[test]
+    fn sharding_does_not_change_what_the_sketch_costs() {
+        // Each shard rounds its own sketch up to a power of two, so rounding
+        // once per shard could have cost more than rounding once. It does not:
+        // the capacity is split evenly and the roundings sum to the same total.
+        //
+        // Asserted rather than assumed, because it is the kind of thing a
+        // change to how capacity is split would quietly break -- and the
+        // capacities here are deliberately not all powers of two.
+        for capacity in [1usize << 24, 5_120_000, 100_000_000] {
+            let mut totals = Vec::new();
+            for shards in [1usize, 2, 8, 64] {
+                let cache =
+                    sharded_sketch_cache(capacity, shards, &format!("even-{capacity}-{shards}"));
+                cache.set_admission_filter_enabled(true);
+                totals.push((shards, cache.footprint().sketch_bytes));
+            }
+            let (_, first) = totals[0];
+            for (shards, total) in &totals {
+                assert_eq!(
+                    *total, first,
+                    "a capacity of {capacity} over {shards} shards holds {total} bytes of sketch \
+                     where one shard holds {first}; splitting the capacity has started costing \
+                     something per shard"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_cache_that_never_enables_admission_holds_almost_no_sketch() {
         // A full sketch is next_power_of_two(capacity / 2) bytes: half a
