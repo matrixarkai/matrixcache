@@ -14960,6 +14960,121 @@ mod tests {
         order.iter().cloned().collect()
     }
 
+    /// Heap bytes one `order_key` owns: `order-key-NNNN` is fourteen
+    /// characters, the selector `value` is five, the namespace is borrowed and
+    /// so free, and `to_string` allocates exactly the length it is given.
+    const ORDER_KEY_HEAP_BYTES: usize = 14 + 5;
+
+    #[test]
+    fn an_order_key_owns_the_heap_bytes_the_tests_below_assume() {
+        let key = order_key(0);
+        assert_eq!(
+            key.heap_bytes(),
+            ORDER_KEY_HEAP_BYTES,
+            "the other tests in this group price retained keys with this constant, so it has to              be what a key actually owns rather than what it was once measured at"
+        );
+    }
+
+    #[test]
+    fn a_released_node_does_not_keep_its_keys_heap_alive() {
+        let mut order = CacheKeyOrder::new();
+        for index in 0..8 {
+            order.push_back(order_key(index));
+        }
+        assert_eq!(order.live_key_bytes(), 8 * ORDER_KEY_HEAP_BYTES);
+        assert_eq!(order.released_key_bytes(), 0, "nothing has been released yet");
+
+        for index in 0..8 {
+            assert!(order.remove(&order_key(index)));
+        }
+
+        // The precondition. Without it this test passes over an empty free
+        // list and says nothing at all about released nodes.
+        assert_eq!(
+            order.released_nodes(),
+            8,
+            "all eight nodes must be on the free list for the next assertion to be about them"
+        );
+        assert_eq!(order.len(), 0);
+        assert_eq!(
+            order.released_key_bytes(),
+            0,
+            "a node on the free list held its old key, so an order that had shrunk kept a copy of              every key it used to hold -- {} bytes here",
+            8 * ORDER_KEY_HEAP_BYTES
+        );
+    }
+
+    #[test]
+    fn popping_the_coldest_key_leaves_no_copy_in_its_node() {
+        let mut order = CacheKeyOrder::new();
+        for index in 0..4 {
+            order.push_back(order_key(index));
+        }
+
+        let popped = order.pop_front().expect("four keys are present");
+        assert_eq!(popped, order_key(0));
+        assert_eq!(popped.heap_bytes(), ORDER_KEY_HEAP_BYTES);
+
+        assert_eq!(
+            order.released_nodes(),
+            1,
+            "the popped key's node must be on the free list"
+        );
+        assert_eq!(
+            order.released_key_bytes(),
+            0,
+            "no copy of the popped key may remain in the node it came from"
+        );
+        assert_eq!(order.live_key_bytes(), 3 * ORDER_KEY_HEAP_BYTES);
+        assert_eq!(order_keys(&order), (1..4).map(order_key).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn retain_drops_the_keys_it_discards() {
+        let mut order = CacheKeyOrder::new();
+        for index in 0..6 {
+            order.push_back(order_key(index));
+        }
+
+        order.retain(|key| key == &order_key(2) || key == &order_key(5));
+
+        assert_eq!(order.len(), 2);
+        assert_eq!(
+            order.released_nodes(),
+            4,
+            "the four discarded nodes must be on the free list"
+        );
+        assert_eq!(
+            order.released_key_bytes(),
+            0,
+            "a discarded key may not stay resident in the node it was discarded from"
+        );
+        assert_eq!(order.live_key_bytes(), 2 * ORDER_KEY_HEAP_BYTES);
+        assert_eq!(order_keys(&order), vec![order_key(2), order_key(5)]);
+    }
+
+    #[test]
+    fn reusing_a_released_node_still_holds_exactly_one_key() {
+        let mut order = CacheKeyOrder::new();
+        for index in 0..3 {
+            order.push_back(order_key(index));
+        }
+        assert!(order.remove(&order_key(1)));
+        assert_eq!(order.released_nodes(), 1);
+
+        // The reused slot must end up holding the new key and nothing else:
+        // clearing the key on release must not have left the slot in a state
+        // where `alloc` adds a second one.
+        order.push_back(order_key(99));
+        assert_eq!(order.released_nodes(), 0, "the free node must have been reused");
+        assert_eq!(order.live_key_bytes(), 3 * ORDER_KEY_HEAP_BYTES);
+        assert_eq!(order.released_key_bytes(), 0);
+        assert_eq!(
+            order_keys(&order),
+            vec![order_key(0), order_key(2), order_key(99)]
+        );
+    }
+
     #[test]
     fn cache_key_order_tracks_recency_from_front_to_back() {
         let mut order = CacheKeyOrder::new();
