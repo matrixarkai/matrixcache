@@ -1667,10 +1667,10 @@ impl CacheInner {
         self.stats.pmem_admission_accepted = self.stats.pmem_admission_accepted.saturating_add(1);
         self.stats.pmem_fills = self.stats.pmem_fills.saturating_add(1);
         let shared = self.shared_key(&key);
-        if let Some(old) = self.pmem.insert(shared, Arc::clone(&value)) {
+        if let Some(old) = self.pmem.insert(Arc::clone(&shared), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
-            self.pmem_order.push_back_if_absent(key);
+            self.pmem_order.push_back_if_absent_shared(shared);
         }
         self.pmem_bytes = self.pmem_bytes.saturating_add(value.len());
         self.evict_pmem_to_capacity_since(eviction_started);
@@ -1724,8 +1724,9 @@ impl CacheInner {
             return false;
         }
         let shared = self.shared_key(&key);
-        self.disk_index.insert(shared, block_len as u64);
-        self.disk_order.push_back_if_absent(key.clone());
+        self.disk_index
+            .insert(Arc::clone(&shared), block_len as u64);
+        self.disk_order.push_back_if_absent_shared(shared);
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
