@@ -15227,6 +15227,71 @@ mod tests {
     }
 
     #[test]
+    fn a_tiers_order_takes_the_handle_its_index_already_holds() {
+        // A tier writes a key into its index and then into its recency order.
+        // Those are two structures holding one entry's key, so they have to
+        // hold one key -- the order used to wrap the key in a handle of its
+        // own, which is a second key struct for every entry in that tier.
+        let dir = std::env::temp_dir().join("matrixcache-order-shares");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pmem_dir = std::env::temp_dir().join("matrixcache-order-shares-pmem");
+        let _ = std::fs::remove_dir_all(&pmem_dir);
+        let _ = std::fs::create_dir_all(&pmem_dir);
+
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 1 << 20, 1 << 20)
+                .with_ssd_paths(vec![dir])
+                .with_pmem_paths(vec![pmem_dir]),
+        );
+
+        let ssd_key = CacheKey::string(0, "ssd-resident-key");
+        let pmem_key = CacheKey::string(0, "pmem-resident-key");
+        {
+            let mut inner = cache.inner.write().expect("cache lock poisoned");
+            assert!(
+                inner.put_ssd_bypass_if_absent(ssd_key.clone(), b"ssd-payload"),
+                "the SSD tier has room and must take the key, or nothing below is being tested"
+            );
+            assert!(
+                inner.put_pmem(pmem_key.clone(), b"pmem-payload".to_vec()),
+                "the persistent tier has room and must take the key"
+            );
+        }
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+
+        let in_index = inner
+            .disk_index
+            .keys()
+            .find(|held| held.as_ref() == &ssd_key)
+            .expect("the SSD index must hold the key");
+        let in_order = inner
+            .disk_order
+            .shared_handle(&ssd_key)
+            .expect("the SSD order must hold the key");
+        assert!(
+            Arc::ptr_eq(in_index, &in_order),
+            "the SSD index and the SSD order hold different keys, so the order allocated one of \
+             its own"
+        );
+
+        let in_pmem = inner
+            .pmem
+            .keys()
+            .find(|held| held.as_ref() == &pmem_key)
+            .expect("the persistent map must hold the key");
+        let in_pmem_order = inner
+            .pmem_order
+            .shared_handle(&pmem_key)
+            .expect("the persistent order must hold the key");
+        assert!(
+            Arc::ptr_eq(in_pmem, &in_pmem_order),
+            "the persistent map and its order hold different keys, so the order allocated one of \
+             its own"
+        );
+    }
+
+    #[test]
     fn a_demotion_hands_the_lower_tier_the_bytes_it_already_has() {
         // An entry leaving the memory tier for the persistent one is not a new
         // value, it is the same value one tier down. Both tiers hold their

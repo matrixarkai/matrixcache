@@ -8898,10 +8898,13 @@ impl CacheInner {
         }
         self.write_ssd_block(&key, &block)?;
         let shared = self.shared_key(&key);
-        if let Some(old_len) = self.disk_index.insert(shared, block_len as u64) {
+        if let Some(old_len) = self
+            .disk_index
+            .insert(Arc::clone(&shared), block_len as u64)
+        {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
         }
-        self.disk_order.push_back_if_absent(key.clone());
+        self.disk_order.push_back_if_absent_shared(shared);
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.record_metadata(
             &key,
@@ -9133,10 +9136,13 @@ impl CacheInner {
         }
         for entry in staged_ssd {
             let shared = self.shared_key(&entry.key);
-            if let Some(old_len) = self.disk_index.insert(shared, entry.block_len) {
+            if let Some(old_len) = self
+                .disk_index
+                .insert(Arc::clone(&shared), entry.block_len)
+            {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
             }
-            self.disk_order.push_back_if_absent(entry.key.clone());
+            self.disk_order.push_back_if_absent_shared(shared);
             self.ssd_bytes = self.ssd_bytes.saturating_add(entry.block_len);
             self.record_metadata(
                 &entry.key,
@@ -9208,10 +9214,11 @@ impl CacheInner {
                     block_len as u64
                 };
                 let shared = self.shared_key(&key);
-                if let Some(old_len) = self.disk_index.insert(shared, block_len) {
+                if let Some(old_len) = self.disk_index.insert(Arc::clone(&shared), block_len)
+                {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
-                self.disk_order.push_back_if_absent(key.clone());
+                self.disk_order.push_back_if_absent_shared(shared);
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block_len);
                 self.record_metadata(
                     &key,
@@ -9270,10 +9277,13 @@ impl CacheInner {
                 self.evict_ssd_for(block_len as u64);
                 self.write_ssd_block(&key, &block)?;
                 let shared = self.shared_key(&key);
-                if let Some(old_len) = self.disk_index.insert(shared, block_len as u64) {
+                if let Some(old_len) = self
+                    .disk_index
+                    .insert(Arc::clone(&shared), block_len as u64)
+                {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
-                self.disk_order.push_back_if_absent(key.clone());
+                self.disk_order.push_back_if_absent_shared(shared);
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
                 self.record_metadata(
                     &key,
@@ -9427,15 +9437,17 @@ impl CacheInner {
                     > self.ssd_capacity_bytes as u64
                 {
                     let shared = self.shared_key(key);
-                    self.disk_index.insert(shared, indexed_old_len);
-                    self.disk_order.push_back_if_absent(key.clone());
+                    self.disk_index
+                        .insert(Arc::clone(&shared), indexed_old_len);
+                    self.disk_order.push_back_if_absent_shared(shared);
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
                     return Err(CacheError::CapacityExceeded);
                 }
                 self.write_ssd_block(key, &block)?;
                 let shared = self.shared_key(key);
-                self.disk_index.insert(shared, block.len() as u64);
-                self.disk_order.push_back_if_absent(key.clone());
+                self.disk_index
+                    .insert(Arc::clone(&shared), block.len() as u64);
+                self.disk_order.push_back_if_absent_shared(shared);
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block.len() as u64);
                 self.record_metadata(
                     key,
