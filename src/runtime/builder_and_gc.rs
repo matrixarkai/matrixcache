@@ -945,7 +945,8 @@ impl CacheInner {
                 report.recovered_bytes = report.recovered_bytes.saturating_add(block_len);
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
-                self.metadata.entry(key).or_insert(CacheEntryMeta {
+                let shared = self.shared_key(&key);
+                self.metadata.entry(shared).or_insert(CacheEntryMeta {
                     block_kind,
                     routing_slot,
                     hotness: AtomicU32::new(0),
@@ -1018,7 +1019,8 @@ impl CacheInner {
                 report.recovered_bytes = report.recovered_bytes.saturating_add(block_len);
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
-                self.metadata.entry(key).or_insert(CacheEntryMeta {
+                let shared = self.shared_key(&key);
+                self.metadata.entry(shared).or_insert(CacheEntryMeta {
                     block_kind,
                     routing_slot,
                     hotness: AtomicU32::new(0),
@@ -1222,8 +1224,9 @@ impl CacheInner {
             meta.set_ttl(self.default_ttl_millis, epoch);
             return;
         }
+        let shared = self.shared_key(key);
         self.metadata.insert(
-            key.clone(),
+            shared,
             CacheEntryMeta {
                 block_kind,
                 routing_slot,
@@ -1266,8 +1269,9 @@ impl CacheInner {
             let block_kind = infer_block_kind(key);
             let before = initial_hotness(block_kind, block_bytes);
             let hotness = before.saturating_add(1);
+            let shared = self.shared_key(key);
             self.metadata.insert(
-                key.clone(),
+                shared,
                 CacheEntryMeta {
                     block_kind,
                     routing_slot: extract_routing_slot(key),
@@ -1582,7 +1586,11 @@ impl CacheInner {
         }
         self.stats.memory_admission_accepted += 1;
         self.stats.memory_fills += 1;
-        if let Some(old) = self.memory.insert(key.clone(), Arc::clone(&value)) {
+        // One handle for the entry map and the recency order both, taken from
+        // whatever already holds this key -- the metadata map, if the write
+        // path reached it first.
+        let shared = self.shared_key(&key);
+        if let Some(old) = self.memory.insert(Arc::clone(&shared), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
             // An overwrite is an access. The access order alone does not settle
             // it -- the eviction score weighs hotness before recency, so a
@@ -1594,7 +1602,7 @@ impl CacheInner {
                 let before = meta.hotness.fetch_add(1, Ordering::Relaxed);
                 // Counted the same way a read counts it. Raising hotness
                 // without this would let an entry cross the threshold by being
-                // written and never appear in , which is a
+                // written and never appear in `hotness_promotions`, which is a
                 // counter quietly ceasing to mean what it says.
                 if before < threshold && before.saturating_add(1) >= threshold {
                     self.read_counters
@@ -1603,7 +1611,7 @@ impl CacheInner {
                 }
             }
         } else {
-            self.memory_order.push_back_if_absent(key);
+            self.memory_order.push_back_if_absent_shared(shared);
         }
         self.memory_bytes += value_len;
         self.evict_memory_to_capacity_since(eviction_started);

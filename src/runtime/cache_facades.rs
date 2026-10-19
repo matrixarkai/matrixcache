@@ -3492,10 +3492,20 @@ impl CacheKeyOrder {
     /// that is missing, which keeps the order consistent with an index that
     /// already holds the key.
     pub fn push_back_if_absent(&mut self, key: CacheKey) {
-        if self.index.contains_key(&key) {
+        self.push_back_if_absent_shared(Arc::new(key));
+    }
+
+    /// As [`Self::push_back_if_absent`], taking a key the caller already holds
+    /// a handle to.
+    ///
+    /// This is how an entry ends up with **one** key between every structure
+    /// that holds it. A caller that has already put the key in the entry map
+    /// or the metadata map passes that same handle here, and the order stores
+    /// it rather than allocating a second copy of the key.
+    pub(crate) fn push_back_if_absent_shared(&mut self, key: Arc<CacheKey>) {
+        if self.index.contains_key(key.as_ref()) {
             return;
         }
-        let key = Arc::new(key);
         let node = self.alloc(Arc::clone(&key));
         self.link_back(node);
         // Index first: the insertion point is balanced against `len()`, and
@@ -3507,6 +3517,32 @@ impl CacheKeyOrder {
         // honours the insertion spec, because this is a new entry and that is
         // exactly the case the spec governs.
         self.link_access_insert(node);
+    }
+
+    /// Every handle this order holds, in no particular order.
+    ///
+    /// For an accounting that needs to charge a key allocation once however
+    /// many structures reach it: these can be compared by address against the
+    /// handles the tier maps hold.
+    pub(crate) fn shared_handles(&self) -> impl Iterator<Item = &Arc<CacheKey>> + '_ {
+        let mut cursor = self.head;
+        std::iter::from_fn(move || {
+            if cursor == CACHE_ORDER_NIL {
+                return None;
+            }
+            let node = &self.nodes[cursor as usize];
+            cursor = node.next;
+            Some(&node.key)
+        })
+    }
+
+    /// The handle this order holds for `key`, if it is tracked.
+    ///
+    /// Lets another structure take a share of the same key rather than
+    /// allocating its own copy of it.
+    pub(crate) fn shared_handle(&self, key: &CacheKey) -> Option<Arc<CacheKey>> {
+        let node = *self.index.get(key)?;
+        Some(Arc::clone(&self.nodes[node as usize].key))
     }
 
     /// Insert `key` as least recently used, or move it there if already present.
@@ -3735,18 +3771,12 @@ impl CacheKeyOrder {
     /// [`estimated_table_bytes`] -- and the keys are counted once each, from
     /// the nodes, since the index holds the same allocations.
     pub(crate) fn footprint_bytes(&self) -> (usize, usize) {
-        // One `CacheKey` struct per key, inside the `Arc` allocation the node
-        // and the index both point at. Those two pointers are counted in the
-        // node arena and the index table below, not here, and the record key's
-        // characters are shared with the tier maps so the caller charges them.
-        let key_bytes = self
-            .iter()
-            .map(|key| std::mem::size_of::<CacheKey>() + key.owned_heap_bytes())
-            .sum::<usize>()
-            // One `Arc<CacheKey>` header per live key, and the empty key every
-            // released node points at.
-            .saturating_add(self.len() * 2 * std::mem::size_of::<usize>())
-            .saturating_add(std::mem::size_of::<CacheKey>() + 2 * std::mem::size_of::<usize>());
+        // The keys this order holds are the same allocations the tier maps
+        // hold, so the caller charges them once each by address and this
+        // reports only what belongs to the order alone. The one exception is
+        // the empty key its released nodes point at, which nothing else
+        // reaches.
+        let key_bytes = std::mem::size_of::<CacheKey>() + 2 * std::mem::size_of::<usize>();
 
         let structural = (self.nodes.capacity() * std::mem::size_of::<CacheOrderNode>())
             .saturating_add(self.free.capacity() * std::mem::size_of::<u32>())

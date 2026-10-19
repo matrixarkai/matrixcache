@@ -10561,7 +10561,11 @@ mod tests {
         };
         assert_eq!(
             order_keys(&inner.memory_order),
-            inner.memory.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            inner
+                .memory
+                .keys()
+                .map(|held| CacheKey::clone(held))
+                .collect::<std::collections::HashSet<_>>(),
             "memory order and memory tier disagree"
         );
         assert_eq!(
@@ -15072,12 +15076,11 @@ mod tests {
     }
 
     #[test]
-    fn the_tiers_that_hold_a_key_share_its_characters() {
-        // The whole value of a shared handle depends on this: the entry map,
-        // the metadata map and the recency order each hold a `CacheKey`, and
-        // if those three were built from the characters rather than from each
-        // other then nothing is shared and the handle costs a word for
-        // nothing. Checked by address, since equal strings prove nothing.
+    fn the_structures_that_hold_a_key_share_one_copy_of_it() {
+        // The whole value of the sharing depends on this: the entry map, the
+        // metadata map and the recency order all have to reach the *same*
+        // key, not merely an equal one. Checked by address, since equal keys
+        // would prove nothing at all.
         let dir = std::env::temp_dir().join("matrixcache-key-sharing");
         let _ = std::fs::remove_dir_all(&dir);
         let cache = MultiLayerCache::with_options(
@@ -15093,30 +15096,40 @@ mod tests {
         let in_memory = inner
             .memory
             .keys()
-            .find(|held| *held == &key)
+            .find(|held| held.as_ref() == &key)
             .expect("the entry map must hold the key");
         let in_metadata = inner
             .metadata
             .keys()
-            .find(|held| *held == &key)
+            .find(|held| held.as_ref() == &key)
             .expect("the metadata map must hold the key");
         let in_order = inner
             .memory_order
-            .iter()
-            .find(|held| *held == &key)
+            .shared_handle(&key)
             .expect("the recency order must hold the key");
 
-        assert_eq!(
-            in_memory.record_key.as_ptr(),
-            in_metadata.record_key.as_ptr(),
-            "the entry map and the metadata map hold the key's characters at different \
-             addresses, so they are not sharing them"
+        // The same handle, not two handles over the same characters: one
+        // `CacheKey` exists for this entry, and all three structures point at
+        // it. `ptr_eq` is the whole claim -- equal keys would prove nothing,
+        // and equal character addresses would still allow three copies of the
+        // struct around them.
+        assert!(
+            std::sync::Arc::ptr_eq(in_memory, in_metadata),
+            "the entry map and the metadata map hold different keys, so each is paying for its \
+             own copy of the struct"
         );
+        assert!(
+            std::sync::Arc::ptr_eq(in_memory, &in_order),
+            "the entry map and the recency order hold different keys, so each is paying for its \
+             own copy of the struct"
+        );
+
+        // Three holders, one allocation: the strong count says so.
         assert_eq!(
-            in_memory.record_key.as_ptr(),
-            in_order.record_key.as_ptr(),
-            "the entry map and the recency order hold the key's characters at different \
-             addresses, so they are not sharing them"
+            std::sync::Arc::strong_count(in_memory),
+            5,
+            "five owners and no more: the entry map, the metadata map, the order's node, the \
+             order's index, and the handle this test is itself holding"
         );
     }
 
@@ -15154,37 +15167,38 @@ mod tests {
             "payload is the one term the capacity bound counts, and it is exact"
         );
 
-        // Three copies of the key *struct* are resident -- the entry map, the
-        // metadata map, and one inside the recency order's `Arc`, which its
-        // node and its index both point at -- while the key's characters are
-        // resident **once**, behind the handle all three share.
+        // **One** key per entry, reached by four structures: the entry map,
+        // the metadata map, and the recency order's node and index. So the
+        // struct is resident once and the characters are resident once, each
+        // behind a handle of its own, and the pointers the four hold are
+        // counted among the tables rather than here.
         let key_size = std::mem::size_of::<CacheKey>();
         let handle = 2 * std::mem::size_of::<usize>();
 
-        // The characters, once per key, with the handle's own two words.
+        // The characters, once per key, behind their own handle.
         let characters = ENTRIES * (handle + KEY_HEAP);
-        // The struct, per holder. Nothing is owned outright: this key's
-        // namespace and selector are both borrowed literals.
-        let structs = ENTRIES * key_size * 3;
-        // A handle for each live key the order holds...
-        let order_handles = ENTRIES * handle;
-        // ...and the one empty key each of the three orders points its
-        // released nodes at.
+        // The key struct, once per key, behind the handle the four share.
+        // Nothing is owned outright: this key's namespace and selector are
+        // both borrowed literals.
+        let structs = ENTRIES * (handle + key_size);
+        // And the one empty key each of the three orders points its released
+        // nodes at.
         let empty_keys = 3 * (key_size + handle);
-        let expected_keys = characters + structs + order_handles + empty_keys;
+        let expected_keys = characters + structs + empty_keys;
 
         assert_eq!(
             footprint.key_bytes, expected_keys,
-            "key bytes should be {characters} of characters, {structs} of struct over three \
-             holders, {order_handles} of handles and {empty_keys} of empty keys; a difference \
-             means a copy was added, removed, or is going uncounted"
+            "key bytes should be {characters} of characters, {structs} of key struct and \
+             {empty_keys} of empty keys; a difference means a copy was added, removed, or is \
+             going uncounted"
         );
 
-        // The point of the shared handle, stated as a quantity: the characters
-        // are a fraction of what four copies of them would be.
+        // The point of it, as a quantity: one struct per entry, not one per
+        // structure that holds the entry.
         assert!(
-            characters < ENTRIES * KEY_HEAP * 2,
-            "the characters are being charged more than twice over, so they are not shared"
+            footprint.key_bytes < ENTRIES * key_size * 2,
+            "the key struct is being charged more than twice per entry, so the four structures \
+             that hold a key are not sharing one"
         );
 
         // Worth stating as a ratio too, because this is the number the type
