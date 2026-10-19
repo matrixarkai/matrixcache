@@ -1346,7 +1346,7 @@ impl CacheManifestRecord {
     fn from_entry(key: &CacheKey, block_len: u64) -> Self {
         Self {
             shard_id: key.shard_id,
-            record_key: key.record_key.clone(),
+            record_key: key.record_key.to_string(),
             // The record is a manifest line: always owned, whether the key it came from borrowed
             // its namespace or not.
             namespace: key.namespace.to_string(),
@@ -1358,7 +1358,7 @@ impl CacheManifestRecord {
     fn key(&self) -> CacheKey {
         CacheKey {
             shard_id: self.shard_id,
-            record_key: self.record_key.clone(),
+            record_key: std::sync::Arc::from(self.record_key.as_str()),
             // Read out of a manifest, so it is owned rather than one of the literals.
             namespace: std::borrow::Cow::Owned(self.namespace.clone()),
             selector: std::borrow::Cow::Owned(self.selector.clone()),
@@ -1455,7 +1455,7 @@ impl CacheManifestOp {
         }
         Some(Self::Delete(CacheKey {
             shard_id,
-            record_key,
+            record_key: std::sync::Arc::from(record_key),
             // The one place that produces an owned namespace rather than one
             // of the handful of literals, which is why the field is a `Cow`.
             // The selector is read off the same line and is owned for the
@@ -8429,6 +8429,31 @@ impl CacheInner {
     fn footprint(&self) -> CacheFootprint {
         let key_size = std::mem::size_of::<CacheKey>();
 
+        // A key's record characters sit behind a shared handle, so every
+        // structure holding the same key reaches the same allocation. They are
+        // charged **once per allocation** rather than once per holder --
+        // charging per holder would report three times what is there. The
+        // struct itself is not shared and is charged per holder, as is
+        // anything a copy owns outright: a computed selector, or a namespace
+        // read back from a manifest.
+        let mut counted_characters = std::collections::HashSet::new();
+        let mut shared_character_bytes = 0usize;
+        for key in self
+            .memory
+            .keys()
+            .chain(self.pmem.keys())
+            .chain(self.disk_index.keys())
+            .chain(self.metadata.keys())
+            .chain(self.memory_order.iter())
+            .chain(self.pmem_order.iter())
+            .chain(self.disk_order.iter())
+        {
+            if counted_characters.insert(key.shared_heap_address()) {
+                shared_character_bytes =
+                    shared_character_bytes.saturating_add(key.shared_heap_bytes());
+            }
+        }
+
         // `memory` and `pmem`: payload behind a shared handle, key inline in
         // the table slot.
         let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
@@ -8436,22 +8461,22 @@ impl CacheInner {
         let memory_keys: usize = self
             .memory
             .keys()
-            .map(|key| key_size + key.heap_bytes())
+            .map(|key| key_size + key.owned_heap_bytes())
             .sum();
-        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.heap_bytes()).sum();
+        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.owned_heap_bytes()).sum();
 
         // `disk_index`: key inline, a file offset as the value.
         let disk_keys: usize = self
             .disk_index
             .keys()
-            .map(|key| key_size + key.heap_bytes())
+            .map(|key| key_size + key.owned_heap_bytes())
             .sum();
 
         // `metadata`: key inline, fixed-size metadata as the value.
         let metadata_keys: usize = self
             .metadata
             .keys()
-            .map(|key| key_size + key.heap_bytes())
+            .map(|key| key_size + key.owned_heap_bytes())
             .sum();
         let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
 
@@ -8468,7 +8493,7 @@ impl CacheInner {
                 let keys: usize = pins
                     .entries
                     .keys()
-                    .map(|key| key_size + key.heap_bytes())
+                    .map(|key| key_size + key.owned_heap_bytes())
                     .sum();
                 keys + estimated_table_bytes::<CacheKey, PinnedEntry>(pins.entries.capacity())
             })
@@ -8480,7 +8505,7 @@ impl CacheInner {
         let writeback_values: usize = self
             .async_writeback_queue
             .iter()
-            .map(|job| job.value.capacity() + key_size + job.key.heap_bytes())
+            .map(|job| job.value.capacity() + key_size + job.key.owned_heap_bytes())
             .sum();
         let writeback_bytes = writeback_values
             .saturating_add(
@@ -8489,7 +8514,7 @@ impl CacheInner {
             .saturating_add(
                 self.async_writeback_positions
                     .keys()
-                    .map(|key| key_size + key.heap_bytes())
+                    .map(|key| key_size + key.owned_heap_bytes())
                     .sum::<usize>(),
             )
             .saturating_add(estimated_table_bytes::<CacheKey, u64>(
@@ -8547,7 +8572,8 @@ impl CacheInner {
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
             payload_bytes: memory_payload + pmem_payload,
-            key_bytes: memory_keys
+            key_bytes: shared_character_bytes
+                + memory_keys
                 + pmem_keys
                 + disk_keys
                 + metadata_keys
@@ -9324,7 +9350,7 @@ impl MultiLayerCache {
                 .filter(|key| {
                     key.shard_id == shard_id
                         && key.namespace == namespace
-                        && key.record_key == record_key
+                        && key.record_key.as_ref() == record_key
                 })
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>()
@@ -9466,7 +9492,7 @@ impl MultiLayerCache {
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| {
-                key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key
+                key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key
             })
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
@@ -9496,13 +9522,13 @@ impl MultiLayerCache {
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
         inner.memory_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
+            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
         });
         inner.pmem_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
+            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
         });
         inner.disk_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key == record_key)
+            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
         });
         inner.stats.invalidations = inner
             .stats
@@ -9552,7 +9578,7 @@ impl MultiLayerCache {
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace.into_owned(),
-                    record_key: key.record_key,
+                    record_key: key.record_key.to_string(),
                     selector: key.selector.into_owned(),
                     memory_bytes,
                     pmem_bytes,
@@ -9616,7 +9642,7 @@ impl MultiLayerCache {
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace.into_owned(),
-                    record_key: key.record_key,
+                    record_key: key.record_key.to_string(),
                     selector: key.selector.into_owned(),
                     memory_bytes,
                     pmem_bytes,

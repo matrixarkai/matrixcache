@@ -767,7 +767,7 @@ impl CacheInner {
         }
         Some(CacheKey {
             shard_id,
-            record_key,
+            record_key: std::sync::Arc::from(record_key),
             // Decoded from a manifest line, so both of these are owned rather
             // than one of the literals.
             namespace: std::borrow::Cow::Owned(namespace),
