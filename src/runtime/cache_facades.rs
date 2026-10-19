@@ -3564,7 +3564,11 @@ impl CacheKeyOrder {
             return None;
         }
         let node = self.head;
-        let key = self.nodes[node as usize].key.clone();
+        // Taken, not cloned. The node is about to be released, so its key is
+        // about to be dead; moving it out hands the caller the same key for
+        // no allocation, where a clone allocated a second copy of every
+        // string in it on the eviction path.
+        let key = std::mem::replace(&mut self.nodes[node as usize].key, CacheKey::empty());
         self.unlink(node);
         self.unlink_access(node);
         self.index.remove(&key);
@@ -3581,7 +3585,11 @@ impl CacheKeyOrder {
         while cursor != CACHE_ORDER_NIL {
             let next = self.nodes[cursor as usize].next;
             if !predicate(&self.nodes[cursor as usize].key) {
-                let key = self.nodes[cursor as usize].key.clone();
+                // Taken rather than cloned, as in `pop_front`: this key is
+                // being dropped, so it only has to live long enough to find
+                // its own index entry.
+                let key =
+                    std::mem::replace(&mut self.nodes[cursor as usize].key, CacheKey::empty());
                 self.index.remove(&key);
                 self.unlink(cursor);
                 self.unlink_access(cursor);
@@ -3650,7 +3658,51 @@ impl CacheKeyOrder {
     }
 
     fn release(&mut self, node: u32) {
+        // Drop the key here rather than leaving it for whenever the slot is
+        // next reused.
+        //
+        // A released node keeps its fields until `alloc` overwrites them, so
+        // the key of a removed entry stayed resident for as long as the slot
+        // sat on the free list -- which, for an order that has shrunk, is
+        // every key it used to hold and will not hold again. `remove` had
+        // already taken the index entry out, so that copy was unreachable as
+        // well as dead.
+        //
+        // Nothing reads a released node: the lists are walked by link, `alloc`
+        // overwrites every field, and this is the only way onto the free list.
+        // Where the caller wanted the key, it has already been moved out and
+        // this replaces one empty key with another.
+        self.nodes[node as usize].key = CacheKey::empty();
         self.free.push(node);
+    }
+
+    /// Heap bytes held by keys in nodes that are on the free list.
+    ///
+    /// Zero is the right answer and the reason this exists: it is how the test
+    /// for the release path above states its claim as a quantity rather than
+    /// as a behaviour, so a regression is a number that moved.
+    #[cfg(test)]
+    pub(crate) fn released_key_bytes(&self) -> usize {
+        self.free
+            .iter()
+            .map(|index| self.nodes[*index as usize].key.heap_bytes())
+            .sum()
+    }
+
+    /// Heap bytes held by keys in nodes that are still linked.
+    #[cfg(test)]
+    pub(crate) fn live_key_bytes(&self) -> usize {
+        self.iter().map(CacheKey::heap_bytes).sum()
+    }
+
+    /// Nodes sitting on the free list, waiting to be reused.
+    ///
+    /// A test asserting that released nodes hold no key bytes has to show
+    /// there are released nodes to hold them, or it passes whenever the arena
+    /// happens to be empty and says nothing.
+    #[cfg(test)]
+    pub(crate) fn released_nodes(&self) -> usize {
+        self.free.len()
     }
 
     fn link_back(&mut self, node: u32) {

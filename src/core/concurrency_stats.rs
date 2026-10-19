@@ -330,6 +330,51 @@ impl CacheKey {
             .saturating_add(self.namespace.len())
             .saturating_add(self.selector.len())
     }
+
+    /// Bytes this key owns on the heap, wherever it is stored.
+    ///
+    /// Capacity rather than length, because capacity is what is resident: a
+    /// `String` built into a sized buffer holds exactly its length, but one
+    /// grown by repeated appends can hold up to twice it, and the cache pays
+    /// for what is held rather than for what is used.
+    ///
+    /// The struct itself is not counted. A key is stored inline in whatever
+    /// holds it -- a hash-table slot, a node in a recency order -- so a caller
+    /// adding up copies knows how many there are and adds
+    /// `size_of::<CacheKey>()` per copy; this is the part that is separately on
+    /// the heap for each one.
+    ///
+    /// A borrowed namespace costs nothing, which is the point of the `Cow`.
+    ///
+    /// Test-only for now: every caller is a test, and the lib target is built
+    /// on its own with warnings denied, where an unused private method is an
+    /// error rather than a warning.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let namespace = match &self.namespace {
+            std::borrow::Cow::Borrowed(_) => 0,
+            std::borrow::Cow::Owned(owned) => owned.capacity(),
+        };
+        self.record_key
+            .capacity()
+            .saturating_add(self.selector.capacity())
+            .saturating_add(namespace)
+    }
+
+    /// A key holding nothing, for overwriting one that is no longer needed.
+    ///
+    /// This is not a key any record has: it exists so a structure that keeps a
+    /// slot alive after the entry in it has gone can drop the key's heap at
+    /// that moment rather than when the slot is next reused. Both of its
+    /// strings are empty, so it owns no heap at all and costs nothing to hold.
+    pub(crate) fn empty() -> Self {
+        Self {
+            shard_id: 0,
+            record_key: String::new(),
+            namespace: std::borrow::Cow::Borrowed(""),
+            selector: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
