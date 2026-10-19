@@ -686,8 +686,8 @@ struct CacheInner {
     /// pointer. Lookups are unaffected: `Arc<CacheKey>` borrows as a
     /// `CacheKey`, so `get`, `remove` and `contains_key` still take `&CacheKey`.
     memory: HashMap<Arc<CacheKey>, Arc<[u8]>>,
-    pmem: HashMap<CacheKey, Arc<[u8]>>,
-    disk_index: HashMap<CacheKey, u64>,
+    pmem: HashMap<Arc<CacheKey>, Arc<[u8]>>,
+    disk_index: HashMap<Arc<CacheKey>, u64>,
     disk_order: CacheKeyOrder,
     /// Everything about which entries are pinned, behind its own lock.
     ///
@@ -716,7 +716,7 @@ struct CacheInner {
     /// A sequence number, not an index: popping from the front of the queue
     /// would shift every index, and re-deriving them meant rebuilding this
     /// whole map on every drain. The current index is `sequence - head`.
-    async_writeback_positions: HashMap<CacheKey, u64>,
+    async_writeback_positions: HashMap<Arc<CacheKey>, u64>,
     /// How many write-back jobs have ever been popped.
     async_writeback_head: u64,
     /// The floor for the refresh window, in milliseconds. Zero always moves the
@@ -1074,7 +1074,7 @@ struct PinnedEntry {
 
 #[derive(Debug, Default)]
 struct CachePinState {
-    entries: HashMap<CacheKey, PinnedEntry>,
+    entries: HashMap<Arc<CacheKey>, PinnedEntry>,
     pin_operations: u64,
     unpin_operations: u64,
     /// Reads answered with a handle rather than a copy. Kept here because it
@@ -4754,7 +4754,8 @@ impl MultiLayerCache {
                 });
                 inner.async_writeback_queue_bytes =
                     inner.async_writeback_queue_bytes.saturating_add(value_len);
-                inner.async_writeback_positions.insert(key, sequence);
+                let shared = inner.shared_key(&key);
+                inner.async_writeback_positions.insert(shared, sequence);
                 enqueued = enqueued.saturating_add(1);
             } else {
                 rejected.push(CacheWritebackJob { key, value });
@@ -5318,7 +5319,7 @@ impl MultiLayerCache {
             let mut pins = inner.pins_for(key);
             if key_pinned && removed_pinned_bytes > 0 {
                 pins.entries
-                    .entry(key.clone())
+                    .entry(inner.shared_key(key))
                     .or_default()
                     .removed_bytes = Some(removed_pinned_bytes);
             } else {
@@ -8504,13 +8505,28 @@ impl CacheInner {
     /// the first write of that key, where the allocation was going to happen
     /// anyway.
     fn shared_key(&self, key: &CacheKey) -> Arc<CacheKey> {
+        // Asked in the order a key is most likely to be found, so the common
+        // case is one lookup. The metadata map is second because every
+        // memory-tier entry has an entry in it.
         if let Some((held, _)) = self.memory.get_key_value(key) {
             return Arc::clone(held);
         }
         if let Some((held, _)) = self.metadata.get_key_value(key) {
             return Arc::clone(held);
         }
+        if let Some((held, _)) = self.pmem.get_key_value(key) {
+            return Arc::clone(held);
+        }
+        if let Some((held, _)) = self.disk_index.get_key_value(key) {
+            return Arc::clone(held);
+        }
         if let Some(held) = self.memory_order.shared_handle(key) {
+            return held;
+        }
+        if let Some(held) = self.pmem_order.shared_handle(key) {
+            return held;
+        }
+        if let Some(held) = self.disk_order.shared_handle(key) {
             return held;
         }
         Arc::new(key.clone())
@@ -8539,8 +8555,8 @@ impl CacheInner {
             .memory
             .keys()
             .map(|key| key.as_ref())
-            .chain(self.pmem.keys())
-            .chain(self.disk_index.keys())
+            .chain(self.pmem.keys().map(|key| key.as_ref()))
+            .chain(self.disk_index.keys().map(|key| key.as_ref()))
             .chain(self.metadata.keys().map(|key| key.as_ref()))
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
@@ -8559,10 +8575,18 @@ impl CacheInner {
         // table slots hold a pointer each, which `table_bytes` counts.
         let mut counted_keys = std::collections::HashSet::new();
         let mut shared_key_bytes = 0usize;
+        // Every stripe's lock, taken once and held for both the walk below
+        // and the pin accounting further down. Asking `all_pins` a second
+        // time while these are alive deadlocks against itself.
+        let pin_stripes = self.all_pins();
         for held in self
             .memory
             .keys()
             .chain(self.metadata.keys())
+            .chain(self.pmem.keys())
+            .chain(self.disk_index.keys())
+            .chain(self.async_writeback_positions.keys())
+            .chain(pin_stripes.iter().flat_map(|pins| pins.entries.keys()))
             .chain(self.memory_order.shared_handles())
             .chain(self.pmem_order.shared_handles())
             .chain(self.disk_order.shared_handles())
@@ -8579,15 +8603,6 @@ impl CacheInner {
         let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
         let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
 
-        // `pmem` and `disk_index` still hold the key itself rather than a
-        // handle, so each pays for its own struct inline in the table slot.
-        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.owned_heap_bytes()).sum();
-        let disk_keys: usize = self
-            .disk_index
-            .keys()
-            .map(|key| key_size + key.owned_heap_bytes())
-            .sum();
-
         let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
 
         // The three orders, each reporting its keys apart from its structure.
@@ -8596,16 +8611,10 @@ impl CacheInner {
         let (disk_order_keys, disk_order_structure) = self.disk_order.footprint_bytes();
 
         // `pins`: one stripe per lock, each with its own map of pinned keys.
-        let pin_bytes: usize = self
-            .all_pins()
+        let pin_bytes: usize = pin_stripes
             .iter()
             .map(|pins| {
-                let keys: usize = pins
-                    .entries
-                    .keys()
-                    .map(|key| key_size + key.owned_heap_bytes())
-                    .sum();
-                keys + estimated_table_bytes::<CacheKey, PinnedEntry>(pins.entries.capacity())
+                estimated_table_bytes::<Arc<CacheKey>, PinnedEntry>(pins.entries.capacity())
             })
             .sum::<usize>()
             + self.pins.capacity() * std::mem::size_of::<Mutex<CachePinState>>();
@@ -8621,13 +8630,7 @@ impl CacheInner {
             .saturating_add(
                 self.async_writeback_queue.capacity() * std::mem::size_of::<CacheWritebackJob>(),
             )
-            .saturating_add(
-                self.async_writeback_positions
-                    .keys()
-                    .map(|key| key_size + key.owned_heap_bytes())
-                    .sum::<usize>(),
-            )
-            .saturating_add(estimated_table_bytes::<CacheKey, u64>(
+            .saturating_add(estimated_table_bytes::<Arc<CacheKey>, u64>(
                 self.async_writeback_positions.capacity(),
             ));
 
@@ -8688,8 +8691,6 @@ impl CacheInner {
             payload_bytes: memory_payload + pmem_payload,
             key_bytes: shared_character_bytes
                 + shared_key_bytes
-                + pmem_keys
-                + disk_keys
                 + memory_order_keys
                 + pmem_order_keys
                 + disk_order_keys,
@@ -8896,7 +8897,8 @@ impl CacheInner {
             self.stats.compression_bytes_saved += value.len().saturating_sub(block.len()) as u64;
         }
         self.write_ssd_block(&key, &block)?;
-        if let Some(old_len) = self.disk_index.insert(key.clone(), block_len as u64) {
+        let shared = self.shared_key(&key);
+        if let Some(old_len) = self.disk_index.insert(shared, block_len as u64) {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
         }
         self.disk_order.push_back_if_absent(key.clone());
@@ -9130,7 +9132,8 @@ impl CacheInner {
             }
         }
         for entry in staged_ssd {
-            if let Some(old_len) = self.disk_index.insert(entry.key.clone(), entry.block_len) {
+            let shared = self.shared_key(&entry.key);
+            if let Some(old_len) = self.disk_index.insert(shared, entry.block_len) {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
             }
             self.disk_order.push_back_if_absent(entry.key.clone());
@@ -9204,7 +9207,8 @@ impl CacheInner {
                     self.write_ssd_block(&key, &block)?;
                     block_len as u64
                 };
-                if let Some(old_len) = self.disk_index.insert(key.clone(), block_len) {
+                let shared = self.shared_key(&key);
+                if let Some(old_len) = self.disk_index.insert(shared, block_len) {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
                 self.disk_order.push_back_if_absent(key.clone());
@@ -9265,7 +9269,8 @@ impl CacheInner {
                 let block_len = block.len();
                 self.evict_ssd_for(block_len as u64);
                 self.write_ssd_block(&key, &block)?;
-                if let Some(old_len) = self.disk_index.insert(key.clone(), block_len as u64) {
+                let shared = self.shared_key(&key);
+                if let Some(old_len) = self.disk_index.insert(shared, block_len as u64) {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
                 self.disk_order.push_back_if_absent(key.clone());
@@ -9294,7 +9299,7 @@ impl CacheInner {
                     if self.is_pinned(key) {
                         self.pins_for(key)
                             .entries
-                            .entry(key.clone())
+                            .entry(self.shared_key(key))
                             .or_default()
                             .removed_bytes = Some(value.len());
                     }
@@ -9307,7 +9312,7 @@ impl CacheInner {
                     if self.is_pinned(key) {
                         self.pins_for(key)
                             .entries
-                            .entry(key.clone())
+                            .entry(self.shared_key(key))
                             .or_default()
                             .removed_bytes = Some(value.len());
                     }
@@ -9421,13 +9426,15 @@ impl CacheInner {
                 if self.ssd_bytes.saturating_add(block.len() as u64)
                     > self.ssd_capacity_bytes as u64
                 {
-                    self.disk_index.insert(key.clone(), indexed_old_len);
+                    let shared = self.shared_key(key);
+                    self.disk_index.insert(shared, indexed_old_len);
                     self.disk_order.push_back_if_absent(key.clone());
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
                     return Err(CacheError::CapacityExceeded);
                 }
                 self.write_ssd_block(key, &block)?;
-                self.disk_index.insert(key.clone(), block.len() as u64);
+                let shared = self.shared_key(key);
+                self.disk_index.insert(shared, block.len() as u64);
                 self.disk_order.push_back_if_absent(key.clone());
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block.len() as u64);
                 self.record_metadata(
@@ -9458,7 +9465,6 @@ impl MultiLayerCache {
             inner
                 .memory
                 .keys()
-                .map(|key| key.as_ref())
                 .chain(inner.pmem.keys())
                 .chain(inner.disk_index.keys())
                 .filter(|key| {
@@ -9482,7 +9488,6 @@ impl MultiLayerCache {
         let memory_keys = inner
             .memory
             .keys()
-            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .filter(|key| key.shard_id == shard_id)
             .cloned()
@@ -9542,7 +9547,6 @@ impl MultiLayerCache {
         let slot_keys = inner
             .memory
             .keys()
-            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| key.shard_id == shard_id && key.selector.starts_with(&prefix))
@@ -9605,7 +9609,6 @@ impl MultiLayerCache {
         let segment_keys = inner
             .memory
             .keys()
-            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| {
@@ -9665,7 +9668,6 @@ impl MultiLayerCache {
         let keys = inner
             .memory
             .keys()
-            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| key.shard_id == shard_id)
@@ -9695,9 +9697,9 @@ impl MultiLayerCache {
                 let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
-                    namespace: key.namespace.into_owned(),
+                    namespace: key.namespace.to_string(),
                     record_key: key.record_key.to_string(),
-                    selector: key.selector.into_owned(),
+                    selector: key.selector.to_string(),
                     memory_bytes,
                     pmem_bytes,
                     disk_bytes,
@@ -9731,7 +9733,6 @@ impl MultiLayerCache {
         let keys = inner
             .memory
             .keys()
-            .map(|key| key.as_ref())
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .cloned()
@@ -9760,9 +9761,9 @@ impl MultiLayerCache {
                 let meta = inner.metadata.get(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
-                    namespace: key.namespace.into_owned(),
+                    namespace: key.namespace.to_string(),
                     record_key: key.record_key.to_string(),
-                    selector: key.selector.into_owned(),
+                    selector: key.selector.to_string(),
                     memory_bytes,
                     pmem_bytes,
                     disk_bytes,

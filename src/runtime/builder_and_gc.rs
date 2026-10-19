@@ -611,12 +611,15 @@ impl CacheInner {
             Err(err) => Err(err),
         }
     }
-    fn delete_ssd_blocks(&mut self, keys: &[CacheKey]) -> Result<(), CacheError> {
+    fn delete_ssd_blocks<K>(&mut self, keys: &[K]) -> Result<(), CacheError>
+    where
+        K: std::borrow::Borrow<CacheKey>,
+    {
         if keys.is_empty() {
             return Ok(());
         }
         for key in keys {
-            let _ = fs::remove_file(self.disk_path(key));
+            let _ = fs::remove_file(self.disk_path(key.borrow()));
         }
         // A store with no capacity holds nothing and accepts nothing: its own
         // `delete_batch` returns `Ok(())` without looking at the keys. Encoding
@@ -625,7 +628,10 @@ impl CacheInner {
         if !self.ssd_store.holds_blocks() {
             return Ok(());
         }
-        let store_keys = keys.iter().map(Self::ssd_store_key).collect::<Vec<_>>();
+        let store_keys = keys
+            .iter()
+            .map(|key| Self::ssd_store_key(key.borrow()))
+            .collect::<Vec<_>>();
         self.ssd_store.delete_batch(&store_keys).map(|_| ())
     }
 
@@ -935,7 +941,10 @@ impl CacheInner {
                 };
                 let key = record.key();
                 let block_len = block_len as u64;
-                if recovered_index.insert(key.clone(), block_len).is_some() {
+                if recovered_index
+                    .insert(self.shared_key(&key), block_len)
+                    .is_some()
+                {
                     report.skipped_files = report.skipped_files.saturating_add(1);
                     continue;
                 }
@@ -1009,7 +1018,10 @@ impl CacheInner {
                     continue;
                 }
                 let block_len = metadata.len().max(record.block_len);
-                if recovered_index.insert(key.clone(), block_len).is_some() {
+                if recovered_index
+                    .insert(self.shared_key(&key), block_len)
+                    .is_some()
+                {
                     report.skipped_files = report.skipped_files.saturating_add(1);
                     continue;
                 }
@@ -1654,7 +1666,8 @@ impl CacheInner {
         }
         self.stats.pmem_admission_accepted = self.stats.pmem_admission_accepted.saturating_add(1);
         self.stats.pmem_fills = self.stats.pmem_fills.saturating_add(1);
-        if let Some(old) = self.pmem.insert(key.clone(), Arc::clone(&value)) {
+        let shared = self.shared_key(&key);
+        if let Some(old) = self.pmem.insert(shared, Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
             self.pmem_order.push_back_if_absent(key);
@@ -1710,7 +1723,8 @@ impl CacheInner {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
-        self.disk_index.insert(key.clone(), block_len as u64);
+        let shared = self.shared_key(&key);
+        self.disk_index.insert(shared, block_len as u64);
         self.disk_order.push_back_if_absent(key.clone());
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
@@ -2370,7 +2384,7 @@ impl CacheInner {
                     // Still held, so remember what the handle is worth now the
                     // tier no longer has it.
                     pins.entries
-                        .entry(key.clone())
+                        .entry(self.shared_key(key))
                         .or_default()
                         .removed_bytes = Some(removed_pinned_bytes);
                 } else {
@@ -2520,7 +2534,7 @@ impl CacheInner {
             while cursor < updates.len() && updates[cursor].0 == stripe {
                 let index = updates[cursor].1;
                 let (key, bytes, count) = &counts[index];
-                let entry = pins.entries.entry(key.clone()).or_default();
+                let entry = pins.entries.entry(self.shared_key(key)).or_default();
                 entry.handles = entry.handles.saturating_add(*count as u64);
                 entry.handle_bytes = entry.handle_bytes.max(*bytes);
                 pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
@@ -2552,7 +2566,7 @@ impl CacheInner {
             while cursor < updates.len() && updates[cursor].0 == stripe {
                 let index = updates[cursor].1;
                 let (key, bytes, handles, handle_hits) = &counts[index];
-                let entry = pins.entries.entry(key.clone()).or_default();
+                let entry = pins.entries.entry(self.shared_key(key)).or_default();
                 entry.handles = entry.handles.saturating_add(*handles as u64);
                 entry.handle_bytes = entry.handle_bytes.max(*bytes);
                 pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
@@ -2572,7 +2586,7 @@ impl CacheInner {
         let mut pins = self.pins_for(key);
         // One lookup for the whole handle: the count and its size are the same
         // entry, so they cannot be found separately or updated apart.
-        let entry = pins.entries.entry(key.clone()).or_default();
+        let entry = pins.entries.entry(self.shared_key(key)).or_default();
         entry.handles = entry.handles.saturating_add(1);
         entry.handle_bytes = entry.handle_bytes.max(bytes);
         pins.pin_operations = pins.pin_operations.saturating_add(1);
@@ -2586,7 +2600,7 @@ impl CacheInner {
         // One guard for the count and the size together: they describe the
         // same handle and must not be seen apart.
         let mut pins = self.pins_for(key);
-        let entry = pins.entries.entry(key.clone()).or_default();
+        let entry = pins.entries.entry(self.shared_key(key)).or_default();
         entry.handles = entry.handles.saturating_add(1);
         if let Some(bytes) = bytes {
             entry.handle_bytes = entry.handle_bytes.max(bytes);

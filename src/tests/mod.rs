@@ -10570,12 +10570,20 @@ mod tests {
         );
         assert_eq!(
             order_keys(&inner.pmem_order),
-            inner.pmem.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            inner
+                .pmem
+                .keys()
+                .map(|held| CacheKey::clone(held))
+                .collect::<std::collections::HashSet<_>>(),
             "pmem order and pmem tier disagree"
         );
         assert_eq!(
             order_keys(&inner.disk_order),
-            inner.disk_index.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            inner
+                .disk_index
+                .keys()
+                .map(|held| CacheKey::clone(held))
+                .collect::<std::collections::HashSet<_>>(),
             "disk order and disk tier disagree"
         );
     }
@@ -15215,6 +15223,61 @@ mod tests {
             5,
             "five owners and no more: the entry map, the metadata map, the order's node, the \
              order's index, and the handle this test is itself holding"
+        );
+    }
+
+    #[test]
+    fn every_tier_that_holds_a_key_shares_one_copy_of_it() {
+        // A key can be in the entry map, the metadata map, the
+        // persistent-memory map and the SSD index at once, and in the recency
+        // order of each tier it is in. Each of those used to hold its own
+        // `CacheKey`. They all have to reach the same one now, or the handle
+        // costs a word per holder and saves nothing.
+        let dir = std::env::temp_dir().join("matrixcache-tier-sharing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 1 << 20, 0).with_ssd_paths(vec![dir]),
+        );
+
+        let key = CacheKey::string(0, "every-tier-key");
+        cache
+            .put(key.clone(), vec![0u8; 128])
+            .expect("a cache with room must accept a put");
+        {
+            let mut inner = cache.inner.write().expect("cache lock poisoned");
+            assert!(
+                inner.put_pmem(key.clone(), vec![0u8; 128]),
+                "the persistent tier has room and must take the key"
+            );
+        }
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let in_memory = inner
+            .memory
+            .keys()
+            .find(|held| held.as_ref() == &key)
+            .expect("the entry map must hold the key");
+        let in_metadata = inner
+            .metadata
+            .keys()
+            .find(|held| held.as_ref() == &key)
+            .expect("the metadata map must hold the key");
+        // The precondition: a second tier map really does hold it, or the
+        // assertion below is about one map and says nothing new.
+        let in_pmem = inner
+            .pmem
+            .keys()
+            .find(|held| held.as_ref() == &key)
+            .expect("the persistent-memory map must hold the key");
+
+        assert!(
+            std::sync::Arc::ptr_eq(in_memory, in_metadata),
+            "the metadata map holds a different key from the entry map"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(in_memory, in_pmem),
+            "the persistent-memory map holds a different key from the entry map, so each tier is \
+             paying for a copy of the struct of its own"
         );
     }
 
