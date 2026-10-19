@@ -8,17 +8,17 @@
 //! find those values again sits outside that bound. This prints it, term by
 //! term.
 //!
-//! The overhead has two parts, and they are reported separately because they
-//! are charged for different things:
+//! Almost all of the overhead is charged **per entry** -- the keys, the
+//! metadata, the recency orders and the hash tables. That makes it ruinous for
+//! small entries and rounding error for large ones, and flat in the value
+//! size, which the self-check below asserts.
 //!
-//! * **Per entry** -- the keys, the metadata, the recency orders and the hash
-//!   tables. Ruinous for small entries, rounding error for large ones, and
-//!   flat in the value size, which the self-check below asserts.
-//! * **Per unit of configured capacity** -- the admission sketch, which is
-//!   sized from `memory_capacity_bytes` at construction and does not depend on
-//!   what is actually resident. It is reported against capacity rather than
-//!   against the entry count, because dividing it by entries would describe it
-//!   as something it is not.
+//! The one term that is not per entry is the admission sketch, which is sized
+//! from `memory_capacity_bytes` when the admission filter is switched on. With
+//! the filter off -- the default -- it is a few dozen bytes whatever the
+//! capacity. The last section measures both, because the difference between
+//! them is large: a sketch sized for a gibibyte of capacity is half a
+//! gibibyte.
 //!
 //! ```text
 //! cargo run --release --no-default-features --example footprint_report
@@ -56,8 +56,6 @@ struct Row {
     total: usize,
     /// Overhead charged per entry: everything but the sketch.
     per_entry: f64,
-    /// The sketch, against the capacity it was sized from.
-    sketch_per_capacity: f64,
     amplification: f64,
 }
 
@@ -97,9 +95,39 @@ fn measure(value_bytes: usize) -> Row {
         other: footprint.writeback_bytes + footprint.pin_bytes + footprint.fixed_bytes,
         total: footprint.total_bytes,
         per_entry: per_entry_terms as f64 / ENTRIES as f64,
-        sketch_per_capacity: footprint.sketch_bytes as f64 / capacity as f64,
         amplification: footprint.amplification(),
     }
+}
+
+/// The sketch with the admission filter off and then on, per capacity.
+///
+/// Two caches rather than one toggled, so the "off" figure is what a cache
+/// that never enables the filter actually holds rather than what one holds
+/// before being switched.
+fn measure_sketch() -> Vec<(usize, usize, usize)> {
+    [1usize << 20, 1 << 24, 1 << 28, 1 << 30]
+        .into_iter()
+        .map(|capacity| {
+            let off_dir = std::env::temp_dir().join(format!("matrixcache-sketch-off-{capacity}"));
+            let on_dir = std::env::temp_dir().join(format!("matrixcache-sketch-on-{capacity}"));
+            let _ = std::fs::remove_dir_all(&off_dir);
+            let _ = std::fs::remove_dir_all(&on_dir);
+
+            let off = MultiLayerCache::with_options(
+                CacheOptions::new(capacity, 0, 0).with_ssd_paths(vec![off_dir]),
+            );
+            let on = MultiLayerCache::with_options(
+                CacheOptions::new(capacity, 0, 0).with_ssd_paths(vec![on_dir]),
+            );
+            on.set_admission_filter_enabled(true);
+
+            (
+                capacity,
+                off.footprint().sketch_bytes,
+                on.footprint().sketch_bytes,
+            )
+        })
+        .collect()
 }
 
 fn main() {
@@ -153,16 +181,20 @@ fn main() {
     }
 
     println!();
-    println!("  the admission sketch -- sized from capacity, not from the resident set");
+    println!("  the admission sketch, which is the one term not charged per entry");
     println!();
     println!(
-        "  {:>6}  {:>14}  {:>14}  {:>10}",
-        "value", "capacity", "sketch", "ratio"
+        "  {:>14}  {:>14}  {:>14}  {:>10}",
+        "capacity", "filter off", "filter on", "on/capacity"
     );
-    for row in &rows {
+    let sketches = measure_sketch();
+    for (capacity, off, on) in &sketches {
         println!(
-            "  {:>6}  {:>14}  {:>14}  {:>9.3}x",
-            row.value_bytes, row.capacity, row.sketch, row.sketch_per_capacity
+            "  {:>14}  {:>14}  {:>14}  {:>9.3}x",
+            capacity,
+            off,
+            on,
+            *on as f64 / *capacity as f64
         );
     }
 
@@ -192,27 +224,39 @@ fn main() {
         ));
     }
 
-    // And the sketch must move with capacity rather than with the resident
-    // set, which is the whole reason it is reported apart from the rest.
-    let ratios: Vec<f64> = rows.iter().map(|row| row.sketch_per_capacity).collect();
-    let ratio_low = ratios.iter().cloned().fold(f64::MAX, f64::min);
-    let ratio_high = ratios.iter().cloned().fold(f64::MIN, f64::max);
-    if ratio_high / ratio_low > 2.0 {
+    // With the filter off the sketch must not grow with capacity at all. That
+    // is the claim the table above makes, and it is the one worth guarding:
+    // the sketch was once the largest thing many caches held.
+    let off_sizes: Vec<usize> = sketches.iter().map(|(_, off, _)| *off).collect();
+    let off_largest = off_sizes.iter().copied().max().unwrap_or(0);
+    if off_largest > 1024 {
         failures.push(format!(
-            "the sketch is {ratio_low:.3}x to {ratio_high:.3}x of capacity across these arms, so \
-             it does not track capacity cleanly either and this example cannot say what it is \
-             charged per"
+            "a cache with the admission filter off holds up to {off_largest} bytes of sketch, \
+             which is not the few dozen the table claims"
         ));
+    }
+
+    // And with the filter on it must be sized from capacity, or the filter has
+    // been quietly left without an estimator.
+    for (capacity, _, on) in &sketches {
+        let expected = (capacity / 2).next_power_of_two();
+        if *on != expected {
+            failures.push(format!(
+                "with the filter on, a cache of {capacity} bytes holds {on} bytes of sketch where \
+                 {expected} was expected; the filter needs its estimator sized from capacity"
+            ));
+        }
     }
 
     if failures.is_empty() {
         println!("self-checks: passed");
         println!();
         println!(
-            "The sketch holds {:.1}% of the configured capacity, on a cache whose admission",
-            ratio_low * 100.0
+            "With the admission filter off, which is the default, the sketch holds {} bytes",
+            off_largest
         );
-        println!("filter is off by default and which has never been asked to use it.");
+        println!("whatever the capacity. Switched on, it is sized from capacity: half a");
+        println!("gibibyte for a gibibyte, which is why it waits to be asked for.");
     } else {
         println!("self-checks: FAILED");
         for failure in &failures {
@@ -230,7 +274,7 @@ fn main() {
                 "    {{\"value_bytes\": {}, \"capacity\": {}, \"payload\": {}, \"keys\": {}, \
                  \"metadata\": {}, \"orders\": {}, \"tables\": {}, \"sketch\": {}, \
                  \"other\": {}, \"total\": {}, \"per_entry_overhead\": {:.1}, \
-                 \"sketch_per_capacity\": {:.4}, \"amplification\": {:.3}}}{}\n",
+                 \"amplification\": {:.3}}}{}\n",
                 row.value_bytes,
                 row.capacity,
                 row.payload,
@@ -242,7 +286,6 @@ fn main() {
                 row.other,
                 row.total,
                 row.per_entry,
-                row.sketch_per_capacity,
                 row.amplification,
                 if index + 1 == rows.len() { "" } else { "," }
             ));
