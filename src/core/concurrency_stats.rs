@@ -183,7 +183,19 @@ pub struct CacheKey {
     /// Serde writes a `Cow<str>` exactly as it writes a `String`, and `Ord`/`Hash`/`Eq` work on the
     /// `str` either way, so the manifest format, the map lookups and the ordering are unchanged.
     pub namespace: std::borrow::Cow<'static, str>,
-    pub selector: String,
+    /// Which part of the record this key names.
+    ///
+    /// Almost always one of a handful of literals -- `value` for a plain
+    /// string, `members` for a set -- which a `Cow` holds without allocating,
+    /// exactly as `namespace` above does. It still holds an owned string for
+    /// the keys that compute one: a hash field, a feature query's window, a
+    /// page's offset and length.
+    ///
+    /// `Cow<'static, str>` is the same twenty-four bytes as a `String`, so
+    /// this costs nothing per copy and saves the allocation whenever the
+    /// selector is a literal -- which is once per key built, on the read and
+    /// write paths both.
+    pub selector: std::borrow::Cow<'static, str>,
 }
 
 /// `segment-00000000000000000008`, built directly.
@@ -233,7 +245,7 @@ impl CacheKey {
             shard_id,
             record_key: key.to_string(),
             namespace: std::borrow::Cow::Borrowed("string"),
-            selector: "value".to_string(),
+            selector: std::borrow::Cow::Borrowed("value"),
         }
     }
 
@@ -242,7 +254,7 @@ impl CacheKey {
             shard_id,
             record_key: key.to_string(),
             namespace: std::borrow::Cow::Borrowed("hash"),
-            selector: field.to_string(),
+            selector: std::borrow::Cow::Owned(field.to_string()),
         }
     }
 
@@ -251,7 +263,7 @@ impl CacheKey {
             shard_id,
             record_key: key.to_string(),
             namespace: std::borrow::Cow::Borrowed("set"),
-            selector: "members".to_string(),
+            selector: std::borrow::Cow::Borrowed("members"),
         }
     }
 
@@ -266,7 +278,10 @@ impl CacheKey {
             shard_id,
             record_key: key.to_string(),
             namespace: std::borrow::Cow::Borrowed("feature"),
-            selector: format!("{start_ms}:{end_ms}:{}", count.unwrap_or(5000)),
+            selector: std::borrow::Cow::Owned(format!(
+                "{start_ms}:{end_ms}:{}",
+                count.unwrap_or(5000)
+            )),
         }
     }
 
@@ -275,7 +290,7 @@ impl CacheKey {
             shard_id,
             record_key: segment_record_key(page_segment_id),
             namespace: std::borrow::Cow::Borrowed("page"),
-            selector: page_selector(None, None, offset, length),
+            selector: std::borrow::Cow::Owned(page_selector(None, None, offset, length)),
         }
     }
 
@@ -286,7 +301,8 @@ impl CacheKey {
         length: u64,
         routing_slot: Option<u32>,
     ) -> Self {
-        let selector = page_selector(routing_slot, None, offset, length);
+        let selector =
+            std::borrow::Cow::Owned(page_selector(routing_slot, None, offset, length));
         Self {
             shard_id,
             record_key: segment_record_key(page_segment_id),
@@ -306,10 +322,10 @@ impl CacheKey {
         let Some(generation) = generation else {
             return Self::page_with_slot(shard_id, page_segment_id, offset, length, routing_slot);
         };
-        let selector = match routing_slot {
+        let selector = std::borrow::Cow::Owned(match routing_slot {
             Some(slot) => page_selector(Some(slot), Some(generation), offset, length),
             None => page_selector(None, Some(generation), offset, length),
-        };
+        });
         Self {
             shard_id,
             record_key: segment_record_key(page_segment_id),
@@ -351,14 +367,16 @@ impl CacheKey {
     /// error rather than a warning.
     #[cfg(test)]
     pub(crate) fn heap_bytes(&self) -> usize {
-        let namespace = match &self.namespace {
+        // Nothing when the value borrows one of the literals, its capacity
+        // when it owns one.
+        let owned_capacity = |value: &std::borrow::Cow<'static, str>| match value {
             std::borrow::Cow::Borrowed(_) => 0,
             std::borrow::Cow::Owned(owned) => owned.capacity(),
         };
         self.record_key
             .capacity()
-            .saturating_add(self.selector.capacity())
-            .saturating_add(namespace)
+            .saturating_add(owned_capacity(&self.selector))
+            .saturating_add(owned_capacity(&self.namespace))
     }
 
     /// A key holding nothing, for overwriting one that is no longer needed.
@@ -372,7 +390,7 @@ impl CacheKey {
             shard_id: 0,
             record_key: String::new(),
             namespace: std::borrow::Cow::Borrowed(""),
-            selector: String::new(),
+            selector: std::borrow::Cow::Borrowed(""),
         }
     }
 }

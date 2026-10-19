@@ -768,9 +768,10 @@ impl CacheInner {
         Some(CacheKey {
             shard_id,
             record_key,
-            // Decoded from a manifest line, so it is owned rather than one of the literals.
+            // Decoded from a manifest line, so both of these are owned rather
+            // than one of the literals.
             namespace: std::borrow::Cow::Owned(namespace),
-            selector,
+            selector: std::borrow::Cow::Owned(selector),
         })
     }
 

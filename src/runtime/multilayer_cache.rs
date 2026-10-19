@@ -1235,7 +1235,7 @@ impl CacheManifestRecord {
             // The record is a manifest line: always owned, whether the key it came from borrowed
             // its namespace or not.
             namespace: key.namespace.to_string(),
-            selector: key.selector.clone(),
+            selector: key.selector.to_string(),
             block_len,
         }
     }
@@ -1246,7 +1246,7 @@ impl CacheManifestRecord {
             record_key: self.record_key.clone(),
             // Read out of a manifest, so it is owned rather than one of the literals.
             namespace: std::borrow::Cow::Owned(self.namespace.clone()),
-            selector: self.selector.clone(),
+            selector: std::borrow::Cow::Owned(self.selector.clone()),
         }
     }
 
@@ -1342,9 +1342,11 @@ impl CacheManifestOp {
             shard_id,
             record_key,
             // The one place that produces an owned namespace rather than one
-            // of the handful of literals, which is why the field is a .
+            // of the handful of literals, which is why the field is a `Cow`.
+            // The selector is read off the same line and is owned for the
+            // same reason.
             namespace: namespace.into(),
-            selector,
+            selector: std::borrow::Cow::Owned(selector),
         }))
     }
 }
@@ -9250,7 +9252,7 @@ impl MultiLayerCache {
                     shard_id: key.shard_id,
                     namespace: key.namespace.into_owned(),
                     record_key: key.record_key,
-                    selector: key.selector,
+                    selector: key.selector.into_owned(),
                     memory_bytes,
                     pmem_bytes,
                     disk_bytes,
@@ -9314,7 +9316,7 @@ impl MultiLayerCache {
                     shard_id: key.shard_id,
                     namespace: key.namespace.into_owned(),
                     record_key: key.record_key,
-                    selector: key.selector,
+                    selector: key.selector.into_owned(),
                     memory_bytes,
                     pmem_bytes,
                     disk_bytes,
