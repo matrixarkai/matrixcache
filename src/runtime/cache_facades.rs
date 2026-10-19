@@ -3334,7 +3334,14 @@ const CACHE_ORDER_NIL: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 struct CacheOrderNode {
-    key: CacheKey,
+    /// The key this node orders, shared with the index that finds it.
+    ///
+    /// Held behind an `Arc` because the index needs the same key to look the
+    /// node up by, and a second inline copy cost eighty bytes of struct and a
+    /// second allocation of each of its strings. One allocation now carries
+    /// both, which takes this node from a hundred and four bytes to
+    /// thirty-two and the index's slot from eighty-eight to sixteen.
+    key: Arc<CacheKey>,
     prev: u32,
     next: u32,
     access_prev: u32,
@@ -3361,7 +3368,7 @@ struct CacheOrderNode {
 pub struct CacheKeyOrder {
     nodes: Vec<CacheOrderNode>,
     free: Vec<u32>,
-    index: HashMap<CacheKey, u32>,
+    index: HashMap<Arc<CacheKey>, u32>,
     head: u32,
     tail: u32,
     access_head: u32,
@@ -3377,6 +3384,14 @@ pub struct CacheKeyOrder {
     /// New entries are placed with `len() >> spec` entries closer to eviction
     /// than themselves. Zero puts them at the most-recently-used end.
     insertion_spec: u8,
+    /// The key a released node is given, so releasing one costs a reference
+    /// count rather than an allocation.
+    ///
+    /// One allocation per order, shared by every node on the free list. A
+    /// released node has to hold *some* key to keep the field's type simple
+    /// for the eighteen places that read it, and this is the cheapest key
+    /// there is: both of its strings are empty, so it owns no heap.
+    empty_key: Arc<CacheKey>,
 }
 
 impl Default for CacheKeyOrder {
@@ -3398,6 +3413,7 @@ impl CacheKeyOrder {
             access_insert: CACHE_ORDER_NIL,
             access_cold: 0,
             insertion_spec: 0,
+            empty_key: Arc::new(CacheKey::empty()),
         }
     }
 
@@ -3440,7 +3456,7 @@ impl CacheKeyOrder {
         if self.tail == CACHE_ORDER_NIL {
             return None;
         }
-        Some(&self.nodes[self.tail as usize].key)
+        Some(self.nodes[self.tail as usize].key.as_ref())
     }
 
     /// Least recently used key.
@@ -3448,7 +3464,7 @@ impl CacheKeyOrder {
         if self.head == CACHE_ORDER_NIL {
             return None;
         }
-        Some(&self.nodes[self.head as usize].key)
+        Some(self.nodes[self.head as usize].key.as_ref())
     }
 
     /// Append `key` as most recently used, or move it there if already present.
@@ -3460,7 +3476,10 @@ impl CacheKeyOrder {
             self.link_access_back(node);
             return;
         }
-        let node = self.alloc(key.clone());
+        // One allocation for the key, shared by the node and the index,
+        // where this used to clone every string in it for the second copy.
+        let key = Arc::new(key);
+        let node = self.alloc(Arc::clone(&key));
         self.link_back(node);
         self.link_access_back(node);
         self.index.insert(key, node);
@@ -3476,7 +3495,8 @@ impl CacheKeyOrder {
         if self.index.contains_key(&key) {
             return;
         }
-        let node = self.alloc(key.clone());
+        let key = Arc::new(key);
+        let node = self.alloc(Arc::clone(&key));
         self.link_back(node);
         // Index first: the insertion point is balanced against `len()`, and
         // linking before the index knows about this node leaves it balancing
@@ -3498,7 +3518,8 @@ impl CacheKeyOrder {
             self.link_access_front(node);
             return;
         }
-        let node = self.alloc(key.clone());
+        let key = Arc::new(key);
+        let node = self.alloc(Arc::clone(&key));
         self.link_front(node);
         self.link_access_front(node);
         self.index.insert(key, node);
@@ -3568,12 +3589,18 @@ impl CacheKeyOrder {
         // about to be dead; moving it out hands the caller the same key for
         // no allocation, where a clone allocated a second copy of every
         // string in it on the eviction path.
-        let key = std::mem::replace(&mut self.nodes[node as usize].key, CacheKey::empty());
+        let empty = Arc::clone(&self.empty_key);
+        let key = std::mem::replace(&mut self.nodes[node as usize].key, empty);
         self.unlink(node);
         self.unlink_access(node);
         self.index.remove(&key);
         self.release(node);
-        Some(key)
+        // The index held the only other reference and has just dropped it, so
+        // this unwraps and the key is moved out for nothing. The fallback
+        // cannot be reached through this type's own methods -- only a clone of
+        // the whole order shares a key -- but a clone is the right answer if
+        // one ever does, rather than a panic.
+        Some(Arc::try_unwrap(key).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     /// Keep only the keys for which `predicate` returns true. Order preserved.
@@ -3584,12 +3611,12 @@ impl CacheKeyOrder {
         let mut cursor = self.head;
         while cursor != CACHE_ORDER_NIL {
             let next = self.nodes[cursor as usize].next;
-            if !predicate(&self.nodes[cursor as usize].key) {
+            if !predicate(self.nodes[cursor as usize].key.as_ref()) {
                 // Taken rather than cloned, as in `pop_front`: this key is
                 // being dropped, so it only has to live long enough to find
                 // its own index entry.
-                let key =
-                    std::mem::replace(&mut self.nodes[cursor as usize].key, CacheKey::empty());
+                let empty = Arc::clone(&self.empty_key);
+                let key = std::mem::replace(&mut self.nodes[cursor as usize].key, empty);
                 self.index.remove(&key);
                 self.unlink(cursor);
                 self.unlink_access(cursor);
@@ -3635,7 +3662,7 @@ impl CacheKeyOrder {
         }
     }
 
-    fn alloc(&mut self, key: CacheKey) -> u32 {
+    fn alloc(&mut self, key: Arc<CacheKey>) -> u32 {
         if let Some(index) = self.free.pop() {
             let node = &mut self.nodes[index as usize];
             node.key = key;
@@ -3672,7 +3699,8 @@ impl CacheKeyOrder {
         // overwrites every field, and this is the only way onto the free list.
         // Where the caller wanted the key, it has already been moved out and
         // this replaces one empty key with another.
-        self.nodes[node as usize].key = CacheKey::empty();
+        let empty = Arc::clone(&self.empty_key);
+        self.nodes[node as usize].key = empty;
         self.free.push(node);
     }
 
@@ -3685,7 +3713,7 @@ impl CacheKeyOrder {
     pub(crate) fn released_key_bytes(&self) -> usize {
         self.free
             .iter()
-            .map(|index| self.nodes[*index as usize].key.heap_bytes())
+            .map(|index| self.nodes[*index as usize].key.as_ref().heap_bytes())
             .sum()
     }
 
@@ -3693,6 +3721,17 @@ impl CacheKeyOrder {
     #[cfg(test)]
     pub(crate) fn live_key_bytes(&self) -> usize {
         self.iter().map(CacheKey::heap_bytes).sum()
+    }
+
+    /// How many owners share a tracked key's single allocation.
+    ///
+    /// Two is the whole point: the node and the index both reach the same
+    /// `CacheKey` rather than each holding their own. One would mean they had
+    /// drifted back to separate copies, which is what this guards.
+    #[cfg(test)]
+    pub(crate) fn key_strong_count(&self, key: &CacheKey) -> Option<usize> {
+        let node = *self.index.get(key)?;
+        Some(Arc::strong_count(&self.nodes[node as usize].key))
     }
 
     /// Nodes sitting on the free list, waiting to be reused.
@@ -3984,7 +4023,7 @@ impl<'a> Iterator for CacheKeyOrderAccessIter<'a> {
         }
         let node = &self.order.nodes[self.cursor as usize];
         self.cursor = node.access_next;
-        Some(&node.key)
+        Some(node.key.as_ref())
     }
 }
 
@@ -3997,7 +4036,7 @@ impl<'a> Iterator for CacheKeyOrderRevIter<'a> {
         }
         let node = &self.order.nodes[self.cursor as usize];
         self.cursor = node.prev;
-        Some(&node.key)
+        Some(node.key.as_ref())
     }
 }
 
@@ -4010,6 +4049,6 @@ impl<'a> Iterator for CacheKeyOrderIter<'a> {
         }
         let node = &self.order.nodes[self.cursor as usize];
         self.cursor = node.next;
-        Some(&node.key)
+        Some(node.key.as_ref())
     }
 }

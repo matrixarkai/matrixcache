@@ -15029,6 +15029,86 @@ mod tests {
         assert_eq!(order_keys(&order), (1..4).map(order_key).collect::<Vec<_>>());
     }
 
+    /// A key whose `record_key` has capacity to spare, so that a copy can be
+    /// told from a move: a cloned `String` is allocated at exactly its length,
+    /// while a moved one keeps the capacity it was built with.
+    fn roomy_key(record: &str, capacity: usize) -> (CacheKey, usize) {
+        let mut record_key = String::with_capacity(capacity);
+        record_key.push_str(record);
+        let built_with = record_key.capacity();
+        assert!(
+            built_with > record_key.len(),
+            "the discriminator needs capacity above length to mean anything"
+        );
+        (
+            CacheKey {
+                shard_id: 0,
+                record_key,
+                namespace: std::borrow::Cow::Borrowed("string"),
+                selector: "value".to_string(),
+            },
+            built_with,
+        )
+    }
+
+    #[test]
+    fn an_order_holds_one_key_for_its_node_and_its_index() {
+        let mut order = CacheKeyOrder::new();
+        order.push_back(order_key(0));
+
+        assert_eq!(
+            order.key_strong_count(&order_key(0)),
+            Some(2),
+            "the node and the index must reach the same key; one owner means each has its              own copy again, which is eighty bytes of struct and a second allocation of every              string in the key"
+        );
+        assert_eq!(
+            order.live_key_bytes(),
+            ORDER_KEY_HEAP_BYTES,
+            "the shared key's strings must be resident once, not twice"
+        );
+    }
+
+    #[test]
+    fn inserting_a_key_does_not_copy_its_strings() {
+        let (key, built_with) = roomy_key("order-key-0000", 128);
+
+        let mut order = CacheKeyOrder::new();
+        order.push_back(key);
+
+        assert_eq!(
+            order.front().expect("one key is present").record_key.capacity(),
+            built_with,
+            "the stored key was allocated afresh at its own length, so inserting copied the              key's strings rather than taking the one it was given"
+        );
+    }
+
+    #[test]
+    fn popping_the_coldest_key_moves_it_rather_than_copying_it() {
+        let (key, built_with) = roomy_key("order-key-0000", 128);
+
+        let mut order = CacheKeyOrder::new();
+        order.push_back(key);
+        let popped = order.pop_front().expect("one key is present");
+
+        assert_eq!(
+            popped.record_key.capacity(),
+            built_with,
+            "the popped key was allocated afresh at its own length, so it was copied out of its              node rather than moved out of it"
+        );
+    }
+
+    #[test]
+    fn an_order_node_does_not_carry_a_key_inline() {
+        // Thirty-two bytes: a pointer to the shared key, four link indices and
+        // a flag. Putting a `CacheKey` back inline would make it a hundred and
+        // four, which is the regression this number exists to catch.
+        assert_eq!(
+            std::mem::size_of::<CacheOrderNode>(),
+            32,
+            "a node must reference its key rather than contain it"
+        );
+    }
+
     #[test]
     fn retain_drops_the_keys_it_discards() {
         let mut order = CacheKeyOrder::new();
