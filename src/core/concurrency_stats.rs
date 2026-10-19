@@ -175,7 +175,7 @@ impl NumaInfo {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     pub shard_id: ShardId,
-    pub record_key: String,
+    pub record_key: std::sync::Arc<str>,
     /// Always one of a handful of literals in practice -- `page`, `hash`, `string`, `set`,
     /// `feature`. A `Cow` holds those without allocating, and still holds an owned String for the
     /// one caller that produces one: `decode_line`, reading a namespace back out of a manifest.
@@ -254,7 +254,7 @@ impl CacheKey {
     pub fn string(shard_id: ShardId, key: &str) -> Self {
         Self {
             shard_id,
-            record_key: key.to_string(),
+            record_key: std::sync::Arc::from(key),
             namespace: std::borrow::Cow::Borrowed("string"),
             selector: std::borrow::Cow::Borrowed("value"),
         }
@@ -263,7 +263,7 @@ impl CacheKey {
     pub fn hash(shard_id: ShardId, key: &str, field: &str) -> Self {
         Self {
             shard_id,
-            record_key: key.to_string(),
+            record_key: std::sync::Arc::from(key),
             namespace: std::borrow::Cow::Borrowed("hash"),
             selector: std::borrow::Cow::Owned(field.to_string()),
         }
@@ -272,7 +272,7 @@ impl CacheKey {
     pub fn set_members(shard_id: ShardId, key: &str) -> Self {
         Self {
             shard_id,
-            record_key: key.to_string(),
+            record_key: std::sync::Arc::from(key),
             namespace: std::borrow::Cow::Borrowed("set"),
             selector: std::borrow::Cow::Borrowed("members"),
         }
@@ -287,7 +287,7 @@ impl CacheKey {
     ) -> Self {
         Self {
             shard_id,
-            record_key: key.to_string(),
+            record_key: std::sync::Arc::from(key),
             namespace: std::borrow::Cow::Borrowed("feature"),
             selector: std::borrow::Cow::Owned(format!(
                 "{start_ms}:{end_ms}:{}",
@@ -299,7 +299,7 @@ impl CacheKey {
     pub fn page(shard_id: ShardId, page_segment_id: u64, offset: u64, length: u64) -> Self {
         Self {
             shard_id,
-            record_key: segment_record_key(page_segment_id),
+            record_key: std::sync::Arc::from(segment_record_key(page_segment_id).as_str()),
             namespace: std::borrow::Cow::Borrowed("page"),
             selector: std::borrow::Cow::Owned(page_selector(None, None, offset, length)),
         }
@@ -316,7 +316,7 @@ impl CacheKey {
             std::borrow::Cow::Owned(page_selector(routing_slot, None, offset, length));
         Self {
             shard_id,
-            record_key: segment_record_key(page_segment_id),
+            record_key: std::sync::Arc::from(segment_record_key(page_segment_id).as_str()),
             namespace: std::borrow::Cow::Borrowed("page"),
             selector,
         }
@@ -339,7 +339,7 @@ impl CacheKey {
         });
         Self {
             shard_id,
-            record_key: segment_record_key(page_segment_id),
+            record_key: std::sync::Arc::from(segment_record_key(page_segment_id).as_str()),
             namespace: std::borrow::Cow::Borrowed("page"),
             selector,
         }
@@ -371,19 +371,47 @@ impl CacheKey {
     /// `size_of::<CacheKey>()` per copy; this is the part that is separately on
     /// the heap for each one.
     ///
-    /// A borrowed namespace or selector costs nothing, which is the point of
-    /// the `Cow`.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        // Nothing when the value borrows one of the literals, its capacity
-        // when it owns one.
+    /// Bytes of this key's heap that **every copy of it shares**: the record
+    /// key's characters, and the handle's own counts.
+    ///
+    /// Cloning a key clones a handle, so these bytes exist once however many
+    /// structures hold the key. An accounting that charged them per holder
+    /// would report three times what is there.
+    pub(crate) fn shared_heap_bytes(&self) -> usize {
+        // Two words of strong and weak count, then the characters.
+        (2 * std::mem::size_of::<usize>()).saturating_add(self.record_key.len())
+    }
+
+    /// Bytes of this key's heap that **each copy pays separately**.
+    ///
+    /// Nothing when the namespace and the selector borrow their literals,
+    /// which is the usual case and the point of the `Cow`. A computed one --
+    /// a hash field, a page's offset and length -- is owned, and cloning the
+    /// key clones the string, so those bytes are per copy.
+    pub(crate) fn owned_heap_bytes(&self) -> usize {
         let owned_capacity = |value: &std::borrow::Cow<'static, str>| match value {
             std::borrow::Cow::Borrowed(_) => 0,
             std::borrow::Cow::Owned(owned) => owned.capacity(),
         };
-        self.record_key
-            .capacity()
-            .saturating_add(owned_capacity(&self.selector))
-            .saturating_add(owned_capacity(&self.namespace))
+        owned_capacity(&self.selector).saturating_add(owned_capacity(&self.namespace))
+    }
+
+    /// The characters this key holds, shared and owned together, without the
+    /// handle's own counts.
+    ///
+    /// This is what a test asking "is anything of this key still resident"
+    /// wants: the empty key a released node points at reads as zero here,
+    /// where counting the handle's two words would make every released node
+    /// look like it was holding something.
+    #[cfg(test)]
+    pub(crate) fn content_heap_bytes(&self) -> usize {
+        self.record_key.len().saturating_add(self.owned_heap_bytes())
+    }
+
+    /// The address of this key's shared characters, for telling one
+    /// allocation from another when adding them up.
+    pub(crate) fn shared_heap_address(&self) -> *const u8 {
+        self.record_key.as_ptr()
     }
 
     /// A key holding nothing, for overwriting one that is no longer needed.
@@ -395,7 +423,7 @@ impl CacheKey {
     pub(crate) fn empty() -> Self {
         Self {
             shard_id: 0,
-            record_key: String::new(),
+            record_key: std::sync::Arc::from(""),
             namespace: std::borrow::Cow::Borrowed(""),
             selector: std::borrow::Cow::Borrowed(""),
         }

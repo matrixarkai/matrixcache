@@ -340,7 +340,7 @@ impl CachePinnedHandle {
 
     pub fn buffer(&self) -> CacheBuffer {
         CacheBuffer {
-            key: self.key.record_key.clone(),
+            key: self.key.record_key.to_string(),
             value: Arc::clone(&self.value),
             logical_size: None,
             tier: Some(self.tier),
@@ -419,7 +419,7 @@ impl CacheScopedHandle {
     pub fn buffer(&self) -> CacheBuffer {
         let handle = self.handle.as_ref().expect("cache scoped handle");
         CacheBuffer::from_handle(
-            handle.key.record_key.clone(),
+            handle.key.record_key.to_string(),
             self.cache.clone(),
             handle.clone_with_cache(&self.cache),
         )

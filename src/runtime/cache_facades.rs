@@ -3713,14 +3713,14 @@ impl CacheKeyOrder {
     pub(crate) fn released_key_bytes(&self) -> usize {
         self.free
             .iter()
-            .map(|index| self.nodes[*index as usize].key.as_ref().heap_bytes())
+            .map(|index| self.nodes[*index as usize].key.as_ref().content_heap_bytes())
             .sum()
     }
 
     /// Heap bytes held by keys in nodes that are still linked.
     #[cfg(test)]
     pub(crate) fn live_key_bytes(&self) -> usize {
-        self.iter().map(CacheKey::heap_bytes).sum()
+        self.iter().map(CacheKey::content_heap_bytes).sum()
     }
 
     /// Bytes this order holds, split into the keys and everything else.
@@ -3735,12 +3735,16 @@ impl CacheKeyOrder {
     /// [`estimated_table_bytes`] -- and the keys are counted once each, from
     /// the nodes, since the index holds the same allocations.
     pub(crate) fn footprint_bytes(&self) -> (usize, usize) {
+        // One `CacheKey` struct per key, inside the `Arc` allocation the node
+        // and the index both point at. Those two pointers are counted in the
+        // node arena and the index table below, not here, and the record key's
+        // characters are shared with the tier maps so the caller charges them.
         let key_bytes = self
             .iter()
-            .map(|key| std::mem::size_of::<CacheKey>() + key.heap_bytes())
+            .map(|key| std::mem::size_of::<CacheKey>() + key.owned_heap_bytes())
             .sum::<usize>()
-            // One `Arc` header per live key, plus the empty key every released
-            // node points at.
+            // One `Arc<CacheKey>` header per live key, and the empty key every
+            // released node points at.
             .saturating_add(self.len() * 2 * std::mem::size_of::<usize>())
             .saturating_add(std::mem::size_of::<CacheKey>() + 2 * std::mem::size_of::<usize>());
 

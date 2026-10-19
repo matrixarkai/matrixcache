@@ -3913,13 +3913,13 @@ mod tests {
         // would route to one node and each would answer for the other.
         let split_early = CacheKey {
             shard_id: 0,
-            record_key: "ab".to_string(),
+            record_key: std::sync::Arc::from("ab"),
             namespace: std::borrow::Cow::Borrowed("string"),
             selector: std::borrow::Cow::Borrowed("c"),
         };
         let split_late = CacheKey {
             shard_id: 0,
-            record_key: "a".to_string(),
+            record_key: std::sync::Arc::from("a"),
             namespace: std::borrow::Cow::Borrowed("string"),
             selector: std::borrow::Cow::Borrowed("bc"),
         };
@@ -3934,13 +3934,13 @@ mod tests {
         // `String` can hold one.
         let zero_in_record = CacheKey {
             shard_id: 0,
-            record_key: "a\u{0}b".to_string(),
+            record_key: std::sync::Arc::from("a\u{0}b"),
             namespace: std::borrow::Cow::Borrowed("string"),
             selector: std::borrow::Cow::Borrowed("c"),
         };
         let zero_in_selector = CacheKey {
             shard_id: 0,
-            record_key: "a".to_string(),
+            record_key: std::sync::Arc::from("a"),
             namespace: std::borrow::Cow::Borrowed("string"),
             selector: std::borrow::Cow::Borrowed("b\u{0}c"),
         };
@@ -3954,13 +3954,13 @@ mod tests {
         // The namespace is variable length too.
         let long_namespace = CacheKey {
             shard_id: 0,
-            record_key: "b".to_string(),
+            record_key: std::sync::Arc::from("b"),
             namespace: std::borrow::Cow::Borrowed("ab"),
             selector: std::borrow::Cow::Borrowed("value"),
         };
         let short_namespace = CacheKey {
             shard_id: 0,
-            record_key: "b".to_string(),
+            record_key: std::sync::Arc::from("b"),
             namespace: std::borrow::Cow::Borrowed("a"),
             selector: std::borrow::Cow::Borrowed("value"),
         };
@@ -9677,7 +9677,7 @@ mod tests {
                 .iter()
                 .any(|(_, existing): &(String, String)| existing == &device)
             {
-                routed.push((key.record_key.clone(), device));
+                routed.push((key.record_key.to_string(), device));
             }
             if routed.len() == 2 {
                 break;
@@ -14973,7 +14973,7 @@ mod tests {
     fn an_order_key_owns_the_heap_bytes_the_tests_below_assume() {
         let key = order_key(0);
         assert_eq!(
-            key.heap_bytes(),
+            key.content_heap_bytes(),
             ORDER_KEY_HEAP_BYTES,
             "the other tests in this group price retained keys with this constant, so it has to              be what a key actually owns rather than what it was once measured at"
         );
@@ -15072,6 +15072,55 @@ mod tests {
     }
 
     #[test]
+    fn the_tiers_that_hold_a_key_share_its_characters() {
+        // The whole value of a shared handle depends on this: the entry map,
+        // the metadata map and the recency order each hold a `CacheKey`, and
+        // if those three were built from the characters rather than from each
+        // other then nothing is shared and the handle costs a word for
+        // nothing. Checked by address, since equal strings prove nothing.
+        let dir = std::env::temp_dir().join("matrixcache-key-sharing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir]),
+        );
+
+        let key = CacheKey::string(0, "shared-characters-key");
+        cache
+            .put(key.clone(), vec![0u8; 64])
+            .expect("a cache with room must accept a put");
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let in_memory = inner
+            .memory
+            .keys()
+            .find(|held| *held == &key)
+            .expect("the entry map must hold the key");
+        let in_metadata = inner
+            .metadata
+            .keys()
+            .find(|held| *held == &key)
+            .expect("the metadata map must hold the key");
+        let in_order = inner
+            .memory_order
+            .iter()
+            .find(|held| *held == &key)
+            .expect("the recency order must hold the key");
+
+        assert_eq!(
+            in_memory.record_key.as_ptr(),
+            in_metadata.record_key.as_ptr(),
+            "the entry map and the metadata map hold the key's characters at different \
+             addresses, so they are not sharing them"
+        );
+        assert_eq!(
+            in_memory.record_key.as_ptr(),
+            in_order.record_key.as_ptr(),
+            "the entry map and the recency order hold the key's characters at different \
+             addresses, so they are not sharing them"
+        );
+    }
+
+    #[test]
     fn the_footprint_counts_every_resident_copy_of_a_key() {
         // Eighteen characters, a borrowed namespace and a borrowed selector,
         // so each key owns eighteen heap bytes.
@@ -15105,22 +15154,37 @@ mod tests {
             "payload is the one term the capacity bound counts, and it is exact"
         );
 
-        // A key is resident three times: inline in the entry map, inline in
-        // the metadata map, and once behind the shared handle the recency
-        // order and its index both hold. The inline copies cost the struct
-        // plus the strings; the shared one costs those plus two words of
-        // handle. Each order also holds one empty key for its released nodes.
+        // Three copies of the key *struct* are resident -- the entry map, the
+        // metadata map, and one inside the recency order's `Arc`, which its
+        // node and its index both point at -- while the key's characters are
+        // resident **once**, behind the handle all three share.
         let key_size = std::mem::size_of::<CacheKey>();
-        let inline = key_size + KEY_HEAP;
-        let shared = key_size + KEY_HEAP + 2 * std::mem::size_of::<usize>();
-        let empty_per_order = key_size + 2 * std::mem::size_of::<usize>();
-        let expected_keys = ENTRIES * (inline + inline + shared) + 3 * empty_per_order;
+        let handle = 2 * std::mem::size_of::<usize>();
+
+        // The characters, once per key, with the handle's own two words.
+        let characters = ENTRIES * (handle + KEY_HEAP);
+        // The struct, per holder. Nothing is owned outright: this key's
+        // namespace and selector are both borrowed literals.
+        let structs = ENTRIES * key_size * 3;
+        // A handle for each live key the order holds...
+        let order_handles = ENTRIES * handle;
+        // ...and the one empty key each of the three orders points its
+        // released nodes at.
+        let empty_keys = 3 * (key_size + handle);
+        let expected_keys = characters + structs + order_handles + empty_keys;
 
         assert_eq!(
             footprint.key_bytes, expected_keys,
-            "key bytes should be {ENTRIES} entries times {} plus three empty keys; a difference \
-             means a copy was added, removed, or is going uncounted",
-            inline + inline + shared
+            "key bytes should be {characters} of characters, {structs} of struct over three \
+             holders, {order_handles} of handles and {empty_keys} of empty keys; a difference \
+             means a copy was added, removed, or is going uncounted"
+        );
+
+        // The point of the shared handle, stated as a quantity: the characters
+        // are a fraction of what four copies of them would be.
+        assert!(
+            characters < ENTRIES * KEY_HEAP * 2,
+            "the characters are being charged more than twice over, so they are not shared"
         );
 
         // Worth stating as a ratio too, because this is the number the type
@@ -15329,7 +15393,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<String>(), 24);
         assert_eq!(
             std::mem::size_of::<CacheKey>(),
-            80,
+            72,
             "a key is a shard id, a record key, a namespace and a selector; if this has grown, a \
              borrowed selector is costing more than it saves"
         );
@@ -15342,7 +15406,7 @@ mod tests {
         // key. Each of these used to allocate its selector as well.
         let plain = CacheKey::string(0, "abcdefgh");
         assert_eq!(
-            plain.heap_bytes(),
+            plain.content_heap_bytes(),
             8,
             "a plain key owns its eight-character record key and nothing else; the five-byte \
              `value` selector must be borrowed"
@@ -15350,7 +15414,7 @@ mod tests {
 
         let members = CacheKey::set_members(0, "abcdefgh");
         assert_eq!(
-            members.heap_bytes(),
+            members.content_heap_bytes(),
             8,
             "a set key's `members` selector is a literal too"
         );
@@ -15363,7 +15427,7 @@ mod tests {
         // counted.
         let field = CacheKey::hash(0, "abcdefgh", "a-field");
         assert_eq!(
-            field.heap_bytes(),
+            field.content_heap_bytes(),
             8 + 7,
             "a hash key owns its record key and its field name, which is not a literal and \
              cannot be borrowed"
@@ -15408,7 +15472,7 @@ mod tests {
 
         let popped = order.pop_front().expect("four keys are present");
         assert_eq!(popped, order_key(0));
-        assert_eq!(popped.heap_bytes(), ORDER_KEY_HEAP_BYTES);
+        assert_eq!(popped.content_heap_bytes(), ORDER_KEY_HEAP_BYTES);
 
         assert_eq!(
             order.released_nodes(),
@@ -15424,17 +15488,15 @@ mod tests {
         assert_eq!(order_keys(&order), (1..4).map(order_key).collect::<Vec<_>>());
     }
 
-    /// A key whose `record_key` has capacity to spare, so that a copy can be
-    /// told from a move: a cloned `String` is allocated at exactly its length,
-    /// while a moved one keeps the capacity it was built with.
-    fn roomy_key(record: &str, capacity: usize) -> (CacheKey, usize) {
-        let mut record_key = String::with_capacity(capacity);
-        record_key.push_str(record);
-        let built_with = record_key.capacity();
-        assert!(
-            built_with > record_key.len(),
-            "the discriminator needs capacity above length to mean anything"
-        );
+    /// A key, and the address of the characters it was built with.
+    ///
+    /// A record key is a shared handle and so exactly sized, which leaves no
+    /// spare capacity to tell a copy from a move by. The address is the better
+    /// discriminator anyway: if the characters were not copied, whatever ends
+    /// up holding the key points at this same allocation.
+    fn traceable_key(record: &str) -> (CacheKey, *const u8) {
+        let record_key: std::sync::Arc<str> = std::sync::Arc::from(record);
+        let address = record_key.as_ptr();
         (
             CacheKey {
                 shard_id: 0,
@@ -15442,7 +15504,7 @@ mod tests {
                 namespace: std::borrow::Cow::Borrowed("string"),
                 selector: std::borrow::Cow::Borrowed("value"),
             },
-            built_with,
+            address,
         )
     }
 
@@ -15465,30 +15527,30 @@ mod tests {
 
     #[test]
     fn inserting_a_key_does_not_copy_its_strings() {
-        let (key, built_with) = roomy_key("order-key-0000", 128);
+        let (key, address) = traceable_key("order-key-0000");
 
         let mut order = CacheKeyOrder::new();
         order.push_back(key);
 
         assert_eq!(
-            order.front().expect("one key is present").record_key.capacity(),
-            built_with,
-            "the stored key was allocated afresh at its own length, so inserting copied the              key's strings rather than taking the one it was given"
+            order.front().expect("one key is present").record_key.as_ptr(),
+            address,
+            "the stored key's characters are at a different address, so inserting copied them rather than taking a share of the ones it was given"
         );
     }
 
     #[test]
     fn popping_the_coldest_key_moves_it_rather_than_copying_it() {
-        let (key, built_with) = roomy_key("order-key-0000", 128);
+        let (key, address) = traceable_key("order-key-0000");
 
         let mut order = CacheKeyOrder::new();
         order.push_back(key);
         let popped = order.pop_front().expect("one key is present");
 
         assert_eq!(
-            popped.record_key.capacity(),
-            built_with,
-            "the popped key was allocated afresh at its own length, so it was copied out of its              node rather than moved out of it"
+            popped.record_key.as_ptr(),
+            address,
+            "the popped key's characters are at a different address, so it was copied out of its node rather than moved out of it"
         );
     }
 
@@ -19110,7 +19172,7 @@ mod tests {
             recorder
                 .lock()
                 .expect("recorder poisoned")
-                .push(record.key.record_key.clone());
+                .push(record.key.record_key.to_string());
         });
 
         let hinted = || CacheAdmissionRequest {
@@ -19215,11 +19277,11 @@ mod tests {
 fn page_cache_keys_keep_their_exact_bytes() {
     let plain = CacheKey::page(1, 8, 8192, 512);
     assert_eq!(plain.namespace, "page");
-    assert_eq!(plain.record_key, "segment-00000000000000000008");
+    assert_eq!(&*plain.record_key, "segment-00000000000000000008");
     assert_eq!(plain.selector, "8192:512");
 
     let with_slot = CacheKey::page_with_slot(1, 8, 8192, 512, Some(3));
-    assert_eq!(with_slot.record_key, "segment-00000000000000000008");
+    assert_eq!(&*with_slot.record_key, "segment-00000000000000000008");
     assert_eq!(with_slot.selector, "slot-3:8192:512");
 
     let without_slot = CacheKey::page_with_slot(1, 8, 8192, 512, None);
@@ -19239,10 +19301,13 @@ fn page_cache_keys_keep_their_exact_bytes() {
     // A large segment id still pads to twenty digits, and one that overflows the padding is not
     // truncated -- both are what the format string did.
     assert_eq!(
-        CacheKey::page(1, 12_345_678_901_234_567_890, 0, 1).record_key,
+        &*CacheKey::page(1, 12_345_678_901_234_567_890, 0, 1).record_key,
         "segment-12345678901234567890"
     );
-    assert_eq!(CacheKey::page(1, 0, 0, 1).record_key, "segment-00000000000000000000");
+    assert_eq!(
+        &*CacheKey::page(1, 0, 0, 1).record_key,
+        "segment-00000000000000000000"
+    );
 
     // Distinct inputs stay distinct: the by-hand builder joins fields with the same separators, so
     // two different pages cannot collapse onto one key.
@@ -19732,7 +19797,7 @@ fn every_manifest_key_shape() -> Vec<CacheKey> {
     for awkward in ["", "with\ttab", "with\nnewline", "non-ascii-\u{00e9}\u{4e2d}", "v1"] {
         shapes.push(CacheKey {
             shard_id: 8,
-            record_key: awkward.to_string(),
+            record_key: std::sync::Arc::from(awkward),
             namespace: std::borrow::Cow::Owned(awkward.to_string()),
             selector: std::borrow::Cow::Owned(awkward.to_string()),
         });
