@@ -379,6 +379,121 @@ pub trait StringCacheApi {
     fn size_string(&self) -> usize;
 }
 
+/// Bytes a `HashMap` has reserved for its table, keys and values included.
+///
+/// Derived rather than measured: the standard library does not report what its
+/// table allocation is, so this reconstructs it from the documented layout --
+/// a power-of-two number of buckets holding at most seven eighths of them,
+/// each bucket one `(K, V)` slot plus one control byte.
+///
+/// The keys' and values' own heap is **not** included, because only the caller
+/// knows how to walk it. Every figure derived from this is an estimate, and
+/// [`CacheFootprint`] says which of its fields carry one.
+fn estimated_table_bytes<K, V>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    // `capacity` is what the map can hold before it grows; invert the load
+    // factor to get the bucket count, which is then rounded up to a power of
+    // two.
+    let buckets = (capacity * 8 / 7).next_power_of_two();
+    buckets * (std::mem::size_of::<(K, V)>() + 1)
+}
+
+/// Where a cache's bytes are, split by what is holding them.
+///
+/// **The capacity bound counts payload only.** `memory_capacity_bytes` is a
+/// bound on the bytes of the values handed to `put`; everything the cache
+/// allocates in order to find those values again -- the key, once per
+/// structure that holds it, the recency orders, the per-entry metadata, the
+/// hash tables carrying all of it -- sits outside that bound. This is that
+/// outside.
+///
+/// Two things to know before quoting a number from here.
+///
+/// These are **byte counts, not resident set size**: they are what the cache
+/// asked the allocator for, with no allowance for the allocator's own headers
+/// or for fragmentation. The real resident cost is somewhat higher.
+///
+/// The `table_bytes` field is **estimated** from the documented load factor,
+/// because the standard library does not report its table allocation. Every
+/// other field is exact: a capacity, a length, or a `size_of`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheFootprint {
+    /// Resident entries in the memory tier: the denominator for every
+    /// per-entry figure derived from this.
+    pub memory_entries: usize,
+    /// Entry payloads across the memory and persistent-memory tiers. This is
+    /// the term, and the only term, the capacity bound counts.
+    pub payload_bytes: usize,
+    /// Every resident copy of every key: the struct wherever it is stored
+    /// inline, plus the strings it owns, plus a header for each key held
+    /// behind a shared handle.
+    pub key_bytes: usize,
+    /// Per-entry metadata.
+    pub metadata_bytes: usize,
+    /// The recency orders -- node arenas and free lists -- excluding the keys
+    /// in them, which are counted in `key_bytes`.
+    pub order_bytes: usize,
+    /// Hash-table slots and control bytes, excluding the keys and values held
+    /// in them. **Estimated**; see the type's own documentation.
+    pub table_bytes: usize,
+    /// Queued write-backs: the values waiting to be written and the index that
+    /// finds them.
+    pub writeback_bytes: usize,
+    /// The admission frequency sketch, which is sized once at construction.
+    pub sketch_bytes: usize,
+    /// Pin bookkeeping, across every stripe.
+    pub pin_bytes: usize,
+    /// Per-cache rather than per-entry: the tier paths, and the queues that
+    /// carry eviction records to a callback.
+    pub fixed_bytes: usize,
+    /// Every field above except `memory_entries`, added up.
+    pub total_bytes: usize,
+}
+
+impl CacheFootprint {
+    /// Everything that is not payload.
+    pub fn overhead_bytes(&self) -> usize {
+        self.total_bytes.saturating_sub(self.payload_bytes)
+    }
+
+    /// Overhead per resident memory-tier entry, or zero when there are none.
+    ///
+    /// Zero for an empty cache rather than a division by zero, and worth
+    /// remembering that an empty cache still has `fixed_bytes` -- so read this
+    /// with `memory_entries` beside it, not on its own.
+    pub fn overhead_bytes_per_entry(&self) -> f64 {
+        if self.memory_entries == 0 {
+            return 0.0;
+        }
+        self.overhead_bytes() as f64 / self.memory_entries as f64
+    }
+
+    /// Total bytes held per byte of payload. One would mean no overhead at
+    /// all; zero means there is no payload to compare against.
+    pub fn amplification(&self) -> f64 {
+        if self.payload_bytes == 0 {
+            return 0.0;
+        }
+        self.total_bytes as f64 / self.payload_bytes as f64
+    }
+
+    fn add(&mut self, other: &CacheFootprint) {
+        self.memory_entries += other.memory_entries;
+        self.payload_bytes += other.payload_bytes;
+        self.key_bytes += other.key_bytes;
+        self.metadata_bytes += other.metadata_bytes;
+        self.order_bytes += other.order_bytes;
+        self.table_bytes += other.table_bytes;
+        self.writeback_bytes += other.writeback_bytes;
+        self.sketch_bytes += other.sketch_bytes;
+        self.pin_bytes += other.pin_bytes;
+        self.fixed_bytes += other.fixed_bytes;
+        self.total_bytes += other.total_bytes;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheWritebackJob {
     pub key: CacheKey,
@@ -6086,6 +6201,19 @@ impl ShardedMultiLayerCache {
             .sum()
     }
 
+    /// Where this cache's bytes are, added up over its shards.
+    ///
+    /// Each shard is read in turn rather than all at once, so the total can
+    /// span an instant in which another thread wrote. It is a diagnostic, and
+    /// holding every shard to make it exact would stall the whole cache.
+    pub fn footprint(&self) -> CacheFootprint {
+        let mut total = CacheFootprint::default();
+        for shard in self.shards.iter() {
+            total.add(&shard.footprint());
+        }
+        total
+    }
+
     pub fn stats(&self) -> CacheStats {
         // The sharded counters live on the cache rather than on any shard, so
         // they are read here and the per-shard fold below adds to them. Every
@@ -8274,6 +8402,161 @@ impl ZeroCopyCacheApi for ShardedMultiLayerCache {
     }
 }
 impl CacheInner {
+    /// Where this shard's bytes are. See [`CacheFootprint`].
+    ///
+    /// Every field of this struct that owns heap is named below, and a test
+    /// asserts that -- so adding a field without accounting for it fails
+    /// rather than quietly going missing from the total. That check exists
+    /// because an audit of a sibling project reported a figure that had
+    /// excluded four whole maps.
+    fn footprint(&self) -> CacheFootprint {
+        let key_size = std::mem::size_of::<CacheKey>();
+
+        // `memory` and `pmem`: payload behind a shared handle, key inline in
+        // the table slot.
+        let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
+        let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
+        let memory_keys: usize = self
+            .memory
+            .keys()
+            .map(|key| key_size + key.heap_bytes())
+            .sum();
+        let pmem_keys: usize = self.pmem.keys().map(|key| key_size + key.heap_bytes()).sum();
+
+        // `disk_index`: key inline, a file offset as the value.
+        let disk_keys: usize = self
+            .disk_index
+            .keys()
+            .map(|key| key_size + key.heap_bytes())
+            .sum();
+
+        // `metadata`: key inline, fixed-size metadata as the value.
+        let metadata_keys: usize = self
+            .metadata
+            .keys()
+            .map(|key| key_size + key.heap_bytes())
+            .sum();
+        let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
+
+        // The three orders, each reporting its keys apart from its structure.
+        let (memory_order_keys, memory_order_structure) = self.memory_order.footprint_bytes();
+        let (pmem_order_keys, pmem_order_structure) = self.pmem_order.footprint_bytes();
+        let (disk_order_keys, disk_order_structure) = self.disk_order.footprint_bytes();
+
+        // `pins`: one stripe per lock, each with its own map of pinned keys.
+        let pin_bytes: usize = self
+            .all_pins()
+            .iter()
+            .map(|pins| {
+                let keys: usize = pins
+                    .entries
+                    .keys()
+                    .map(|key| key_size + key.heap_bytes())
+                    .sum();
+                keys + estimated_table_bytes::<CacheKey, PinnedEntry>(pins.entries.capacity())
+            })
+            .sum::<usize>()
+            + self.pins.capacity() * std::mem::size_of::<Mutex<CachePinState>>();
+
+        // `async_writeback_queue` and `async_writeback_positions`: the values
+        // waiting to be written, their keys, and the index that finds them.
+        let writeback_values: usize = self
+            .async_writeback_queue
+            .iter()
+            .map(|job| job.value.capacity() + key_size + job.key.heap_bytes())
+            .sum();
+        let writeback_bytes = writeback_values
+            .saturating_add(
+                self.async_writeback_queue.capacity() * std::mem::size_of::<CacheWritebackJob>(),
+            )
+            .saturating_add(
+                self.async_writeback_positions
+                    .keys()
+                    .map(|key| key_size + key.heap_bytes())
+                    .sum::<usize>(),
+            )
+            .saturating_add(estimated_table_bytes::<CacheKey, u64>(
+                self.async_writeback_positions.capacity(),
+            ));
+
+        // `access_frequency`: sized once at construction.
+        let sketch_bytes = self.access_frequency.footprint_bytes();
+
+        // Per-cache rather than per-entry: `disk_dir`, `pmem_paths`, and the
+        // two queues that carry eviction records out to a callback.
+        //
+        // Deliberately not counted, and why. Every field of the struct is
+        // named here or above, because a test requires it: the only way to
+        // leave a field out of the total is to say what it costs.
+        //
+        // Boxed closures, whose captured size cannot be asked for:
+        //   `access_record_callback`, `eviction_callback`,
+        //   `eviction_metric_callback`.
+        //
+        // The SSD tier's own bytes, which live on a drive rather than in this
+        // cache's resident set: `ssd_store`, `ssd_write_budget`.
+        //
+        // Owns no heap -- a number, a flag, an atomic or an enum:
+        //   `started`, `auto_recover_on_start`, `ssd_block_durability`,
+        //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
+        //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
+        //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
+        //   `async_writeback_head`, `async_writeback_queue_bytes`,
+        //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
+        //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
+        //   `next_reconfigure_millis`, `eviction_handler_enabled`,
+        //   `ssd_instance_only`, `cold_eviction_share_pct`,
+        //   `admission_filter_enabled`, `memory_replacement_policy`,
+        //   `pmem_replacement_policy`, `ssd_replacement_policy`,
+        //   `block_options`, `tiering_policy`, `read_counters`, `stats`.
+        let fixed_bytes = self.disk_dir.capacity()
+            + self
+                .pmem_paths
+                .iter()
+                .map(|path| path.capacity())
+                .sum::<usize>()
+            + self.pmem_paths.capacity() * std::mem::size_of::<PathBuf>()
+            + self.pending_eviction_records.capacity()
+                * std::mem::size_of::<CacheEvictionRecord>()
+            + self.pending_eviction_metric_tiers.capacity() * std::mem::size_of::<CacheTier>();
+
+        // The tables themselves, less the keys and values counted above.
+        let table_bytes = estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.memory.capacity())
+            + estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.pmem.capacity())
+            + estimated_table_bytes::<CacheKey, u64>(self.disk_index.capacity())
+            + estimated_table_bytes::<CacheKey, CacheEntryMeta>(self.metadata.capacity());
+
+        let mut footprint = CacheFootprint {
+            memory_entries: self.memory.len(),
+            payload_bytes: memory_payload + pmem_payload,
+            key_bytes: memory_keys
+                + pmem_keys
+                + disk_keys
+                + metadata_keys
+                + memory_order_keys
+                + pmem_order_keys
+                + disk_order_keys,
+            metadata_bytes,
+            order_bytes: memory_order_structure + pmem_order_structure + disk_order_structure,
+            table_bytes,
+            writeback_bytes,
+            sketch_bytes,
+            pin_bytes,
+            fixed_bytes,
+            total_bytes: 0,
+        };
+        footprint.total_bytes = footprint.payload_bytes
+            + footprint.key_bytes
+            + footprint.metadata_bytes
+            + footprint.order_bytes
+            + footprint.table_bytes
+            + footprint.writeback_bytes
+            + footprint.sketch_bytes
+            + footprint.pin_bytes
+            + footprint.fixed_bytes;
+        footprint
+    }
+
     /// Write, then forget the entry if no tier took it.
     ///
     /// The per-entry metadata is recorded before the value is offered to a
@@ -9344,6 +9627,15 @@ impl MultiLayerCache {
                 .then(left.selector.cmp(&right.selector))
         });
         entries
+    }
+
+    /// Where this cache's bytes are. See [`CacheFootprint`].
+    ///
+    /// Walks every resident entry, so this is a diagnostic rather than
+    /// something to call per request.
+    pub fn footprint(&self) -> CacheFootprint {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        inner.footprint()
     }
 
     pub fn stats(&self) -> CacheStats {

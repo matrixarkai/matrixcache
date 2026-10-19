@@ -80,6 +80,14 @@ pub struct FrequencySketch {
 }
 
 impl FrequencySketch {
+    /// Bytes the counter table occupies.
+    ///
+    /// Sized once when the sketch is built and never resized, so capacity and
+    /// length are the same here.
+    pub(crate) fn footprint_bytes(&self) -> usize {
+        self.counters.capacity() * std::mem::size_of::<std::sync::atomic::AtomicU8>()
+    }
+
     /// Sizes a sketch for a cache holding roughly `entries` values.
     ///
     /// A capacity of zero still yields a usable sketch -- one counter that

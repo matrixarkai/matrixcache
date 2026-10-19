@@ -371,12 +371,8 @@ impl CacheKey {
     /// `size_of::<CacheKey>()` per copy; this is the part that is separately on
     /// the heap for each one.
     ///
-    /// A borrowed namespace costs nothing, which is the point of the `Cow`.
-    ///
-    /// Test-only for now: every caller is a test, and the lib target is built
-    /// on its own with warnings denied, where an unused private method is an
-    /// error rather than a warning.
-    #[cfg(test)]
+    /// A borrowed namespace or selector costs nothing, which is the point of
+    /// the `Cow`.
     pub(crate) fn heap_bytes(&self) -> usize {
         // Nothing when the value borrows one of the literals, its capacity
         // when it owns one.
