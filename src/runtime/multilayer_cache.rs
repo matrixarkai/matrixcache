@@ -9577,7 +9577,7 @@ impl CacheInner {
             self.stats.compressed_puts += 1;
             self.stats.compression_bytes_saved += value.len().saturating_sub(block.len()) as u64;
         }
-        self.write_ssd_block(key, &block)?;
+        self.write_ssd_block(key, block)?;
         let shared = self.shared_key(key);
         if let Some(old_len) = self
             .disk_index
@@ -9893,7 +9893,7 @@ impl CacheInner {
                 } else {
                     let block_len = block.len();
                     self.evict_ssd_for(block_len as u64);
-                    self.write_ssd_block(&key, &block)?;
+                    self.write_ssd_block(&key, block)?;
                     block_len as u64
                 };
                 let shared = self.shared_key(&key);
@@ -9958,7 +9958,7 @@ impl CacheInner {
                 let block = encode_cache_block(&value, self.block_options)?;
                 let block_len = block.len();
                 self.evict_ssd_for(block_len as u64);
-                self.write_ssd_block(&key, &block)?;
+                self.write_ssd_block(&key, block)?;
                 let shared = self.shared_key(&key);
                 if let Some(old_len) = self
                     .disk_index
@@ -10123,12 +10123,14 @@ impl CacheInner {
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
                     return Err(CacheError::CapacityExceeded);
                 }
-                self.write_ssd_block(key, &block)?;
+                // Read before the write, which now takes the bytes: the three
+                // uses below are the length, not the block.
+                let block_len = block.len() as u64;
+                self.write_ssd_block(key, block)?;
                 let shared = self.shared_key(key);
-                self.disk_index
-                    .insert(Arc::clone(&shared), block.len() as u64);
+                self.disk_index.insert(Arc::clone(&shared), block_len);
                 self.disk_order.push_back_if_absent_shared(shared);
-                self.ssd_bytes = self.ssd_bytes.saturating_add(block.len() as u64);
+                self.ssd_bytes = self.ssd_bytes.saturating_add(block_len);
                 self.record_metadata(
                     key,
                     infer_block_kind(key),
@@ -10137,7 +10139,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                self.append_disk_manifest_put(key, block.len() as u64)?;
+                self.append_disk_manifest_put(key, block_len)?;
                 Ok(())
             }
             CacheTier::Reject => Err(CacheError::UnsupportedTier(tier)),

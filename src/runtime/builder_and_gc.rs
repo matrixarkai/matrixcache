@@ -509,24 +509,35 @@ impl CacheInner {
         Ok(blocks)
     }
 
-    fn write_ssd_block(&mut self, key: &CacheKey, block: &[u8]) -> Result<(), CacheError> {
+    /// Writes one encoded block, taking ownership so the store gets the bytes
+    /// rather than a copy of them.
+    ///
+    /// It used to take a borrow and hand `block.to_vec()` to the store: one
+    /// full copy of the payload per SSD write, on a path whose whole job is
+    /// moving those bytes. [`Self::write_ssd_blocks`] below already took the
+    /// batch by value for exactly this reason, and the order here is now the
+    /// order it uses -- the file first, because it borrows, then the store,
+    /// which moves.
+    ///
+    /// That order is the one behavioural change: on a failure the halves land
+    /// the other way round from before. Neither order can lose a block the
+    /// manifest points at -- that line is appended by the caller only after
+    /// this returns -- so what a failure can leave behind is a file nothing
+    /// points at, which recovery ignores because recovery reads the manifest.
+    fn write_ssd_block(&mut self, key: &CacheKey, block: Vec<u8>) -> Result<(), CacheError> {
         self.charge_ssd_write(block.len() as u64);
-        self.ssd_store
-            .put(&Self::ssd_store_key(key), block.to_vec())
-            .map(|_| ())?;
-        #[cfg(feature = "rocksdb-ssd")]
-        {
-            Ok(())
-        }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             let path = self.disk_path(key);
             let parent = path.parent().unwrap_or(&self.disk_dir).to_path_buf();
             let durable = self.ssd_block_durability;
             creating_the_directory_if_missing(&parent, || {
-                write_cache_block_atomic(&path, block, durable)
-            })
+                write_cache_block_atomic(&path, &block, durable)
+            })?;
         }
+        self.ssd_store
+            .put(&Self::ssd_store_key(key), block)
+            .map(|_| ())
     }
 
     /// Writes a batch of encoded blocks, taking ownership so the store gets the
@@ -1882,7 +1893,7 @@ impl CacheInner {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
-        if self.write_ssd_block(key, &block).is_err() {
+        if self.write_ssd_block(key, block).is_err() {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
