@@ -170,11 +170,20 @@ where
     (released, counts_by_key.into_iter().collect())
 }
 
-fn coalesce_key_indexes(entries: Vec<(usize, CacheKey)>) -> Vec<(CacheKey, Vec<usize>)> {
+/// Group requested positions by the key they asked for.
+///
+/// The keys are **borrowed** from whatever the caller is iterating, which
+/// outlives the read. They used to be copied: once per candidate on the small
+/// path, and on the large path once per candidate plus once more into the
+/// lookup map -- so n candidates over u distinct keys cost n + u key copies
+/// before a single block had been read.
+fn coalesce_key_indexes<'a>(
+    entries: Vec<(usize, &'a CacheKey)>,
+) -> Vec<(&'a CacheKey, Vec<usize>)> {
     if entries.len() <= SMALL_BATCH_DEDUP_LIMIT {
-        let mut grouped = Vec::<(CacheKey, Vec<usize>)>::new();
+        let mut grouped = Vec::<(&'a CacheKey, Vec<usize>)>::new();
         for (index, key) in entries {
-            if let Some((_, indexes)) = grouped.iter_mut().find(|(existing, _)| existing == &key) {
+            if let Some((_, indexes)) = grouped.iter_mut().find(|(existing, _)| *existing == key) {
                 indexes.push(index);
             } else {
                 grouped.push((key, vec![index]));
@@ -183,13 +192,13 @@ fn coalesce_key_indexes(entries: Vec<(usize, CacheKey)>) -> Vec<(CacheKey, Vec<u
         return grouped;
     }
 
-    let mut positions_by_key = HashMap::<CacheKey, usize>::new();
-    let mut grouped = Vec::<(CacheKey, Vec<usize>)>::new();
+    let mut positions_by_key = HashMap::<&'a CacheKey, usize>::new();
+    let mut grouped = Vec::<(&'a CacheKey, Vec<usize>)>::new();
     for (index, key) in entries {
-        if let Some(position) = positions_by_key.get(&key).copied() {
+        if let Some(position) = positions_by_key.get(key).copied() {
             grouped[position].1.push(index);
         } else {
-            positions_by_key.insert(key.clone(), grouped.len());
+            positions_by_key.insert(key, grouped.len());
             grouped.push((key, vec![index]));
         }
     }
@@ -3130,7 +3139,7 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let mut ssd_candidates = Vec::<(usize, CacheKey)>::new();
+        let mut ssd_candidates = Vec::<(usize, &CacheKey)>::new();
         let now_millis = CoarseClock::now_millis();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -3157,7 +3166,7 @@ impl MultiLayerCache {
                         continue;
                     }
                 }
-                ssd_candidates.push((index, key.clone()));
+                ssd_candidates.push((index, key));
             }
         }
 
@@ -3169,7 +3178,7 @@ impl MultiLayerCache {
 
         let candidate_keys = unique_ssd_candidates
             .iter()
-            .map(|(key, _)| key)
+            .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -3179,10 +3188,24 @@ impl MultiLayerCache {
             let Some(block) = block else {
                 continue;
             };
-            let value = decode_cache_block(&block)?;
-            for index in positions {
+            // The decode already allocated these bytes. Every position but the
+            // last takes a copy; the last takes the original, so a key asked
+            // for once -- the common case -- copies nothing.
+            let mut decoded = Some(decode_cache_block(&block)?);
+            let last = positions.len().saturating_sub(1);
+            for (offset, index) in positions.into_iter().enumerate() {
+                let value = if offset == last {
+                    decoded
+                        .take()
+                        .expect("the last position takes the decoded bytes once")
+                } else {
+                    decoded
+                        .as_ref()
+                        .expect("earlier positions copy the decoded bytes")
+                        .clone()
+                };
                 results[index] = Some(CacheReadResult {
-                    value: value.clone(),
+                    value,
                     tier: CacheReadTier::Ssd,
                 });
             }

@@ -11353,6 +11353,87 @@ mod tests {
     }
 
     #[test]
+    fn grouping_candidates_by_key_borrows_them() {
+        // The SSD candidates of a batch read carry the position they answer
+        // and the key they asked for. The key used to be a copy -- once per
+        // candidate, and on the large path once more into the grouping map, so
+        // n candidates over u distinct keys cost n + u key copies before a
+        // block had been read. They are borrowed from the caller's slice now,
+        // which outlives the read.
+        //
+        // Pointer identity sees this, as it did for the batch key coalescing:
+        // a copy compares equal to what it came from but sits at a different
+        // address.
+        //
+        // Both branches, because they are different code -- one scans a
+        // vector, the other builds a map.
+        for count in [4usize, SMALL_BATCH_DEDUP_LIMIT + 8] {
+            // A computed selector, so a copy would really have allocated.
+            let keys: Vec<CacheKey> = (0..count)
+                .map(|i| CacheKey::page(7, (i % 3) as u64, 4096, 512))
+                .collect();
+            let entries: Vec<(usize, &CacheKey)> = keys.iter().enumerate().collect();
+
+            let grouped = coalesce_key_indexes(entries);
+
+            assert_eq!(
+                grouped.len(),
+                3.min(count),
+                "a batch of {count} over three distinct keys should group to three"
+            );
+            let mut seen = 0usize;
+            for (key, positions) in &grouped {
+                let first = keys
+                    .iter()
+                    .position(|candidate| candidate == *key)
+                    .expect("a grouped key must be one of the requested keys");
+                assert!(
+                    std::ptr::eq(*key, &keys[first]),
+                    "the grouped key is a copy rather than a pointer into the caller's slice"
+                );
+                for position in positions {
+                    assert_eq!(&keys[*position], *key, "position {position} grouped wrongly");
+                }
+                seen += positions.len();
+            }
+            assert_eq!(seen, count, "every requested position must be grouped once");
+        }
+    }
+
+    #[test]
+    fn a_duplicated_key_in_an_ssd_batch_answers_both_positions() {
+        // The decoded bytes used to be copied once per requested position.
+        // The last position takes the original now, so a key asked for once
+        // copies nothing -- which means the loop hands out the moved value and
+        // the copies in the right order, and getting that backwards would
+        // either panic on the `take` or answer a position with nothing.
+        let cache = ssd_only_then_refilling_cache("duplicated-ssd-batch");
+        let key = CacheKey::string(7, "duplicated-ssd-batch");
+        park_on_ssd(&cache, &key, b"payload-bytes");
+        let other = CacheKey::string(7, "duplicated-ssd-batch-absent");
+
+        let results = cache
+            .get_batch_no_promotion(&[key.clone(), other, key.clone()])
+            .expect("get_batch_no_promotion");
+
+        assert_eq!(results.len(), 3);
+        for position in [0usize, 2] {
+            let answered = results[position]
+                .as_ref()
+                .unwrap_or_else(|| panic!("position {position} was not answered"));
+            assert_eq!(
+                answered.value, b"payload-bytes",
+                "position {position} got the wrong bytes"
+            );
+            assert_eq!(answered.tier, CacheReadTier::Ssd);
+        }
+        assert!(
+            results[1].is_none(),
+            "the absent key must not be answered"
+        );
+    }
+
+    #[test]
     fn a_pinned_insert_allocates_its_payload_once() {
         // `insert_pinned_sized` took the write lock to bump a counter, released
         // it, and called `put_sized` -- which took the lock again -- handing it
