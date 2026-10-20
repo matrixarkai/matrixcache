@@ -153,34 +153,6 @@ fn coalesce_batch_positions_borrowed<'a>(
     positions_by_key
 }
 
-fn coalesce_batch_positions(keys: &[CacheKey]) -> Vec<(CacheKey, Vec<usize>)> {
-    let mut positions_by_key = Vec::<(CacheKey, Vec<usize>)>::new();
-    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
-        for (position, key) in keys.iter().enumerate() {
-            if let Some((_, positions)) = positions_by_key
-                .iter_mut()
-                .find(|(existing, _)| existing == key)
-            {
-                positions.push(position);
-            } else {
-                positions_by_key.push((key.clone(), vec![position]));
-            }
-        }
-        return positions_by_key;
-    }
-
-    let mut unique_positions = HashMap::<CacheKey, usize>::new();
-    for (position, key) in keys.iter().cloned().enumerate() {
-        if let Some(unique_position) = unique_positions.get(&key).copied() {
-            positions_by_key[unique_position].1.push(position);
-        } else {
-            unique_positions.insert(key.clone(), positions_by_key.len());
-            positions_by_key.push((key, vec![position]));
-        }
-    }
-    positions_by_key
-}
-
 fn coalesce_release_counts<I>(handles: I) -> (usize, Vec<(CacheKey, usize)>)
 where
     I: IntoIterator<Item = CachePinnedHandle>,
@@ -7629,15 +7601,15 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = empty_batch_results(keys.len());
-        let positions_by_key = coalesce_batch_positions(keys);
+        let positions_by_key = coalesce_batch_positions_borrowed(keys);
         for (key, positions) in positions_by_key {
-            let Some(handle) = self.acquire_no_promotion(&key)? else {
+            let Some(handle) = self.acquire_no_promotion(key)? else {
                 continue;
             };
             let first_position = positions[0];
             results[first_position] = Some(handle);
             for position in positions.into_iter().skip(1) {
-                let cloned = self.shard_for_key(&key).clone_handle(
+                let cloned = self.shard_for_key(key).clone_handle(
                     results[first_position]
                         .as_ref()
                         .expect("first sharded batch handle is installed"),
@@ -7721,15 +7693,15 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
         let mut results = empty_batch_results(keys.len());
-        let positions_by_key = coalesce_batch_positions(keys);
+        let positions_by_key = coalesce_batch_positions_borrowed(keys);
         for (key, positions) in positions_by_key {
-            let Some(handle) = self.acquire(&key)? else {
+            let Some(handle) = self.acquire(key)? else {
                 continue;
             };
             let first_position = positions[0];
             results[first_position] = Some(handle);
             for position in positions.into_iter().skip(1) {
-                let cloned = self.shard_for_key(&key).clone_handle(
+                let cloned = self.shard_for_key(key).clone_handle(
                     results[first_position]
                         .as_ref()
                         .expect("first sharded batch handle is installed"),

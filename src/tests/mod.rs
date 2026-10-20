@@ -11536,6 +11536,55 @@ mod tests {
     }
 
     #[test]
+    fn the_sharded_local_batch_readers_answer_every_repeated_position() {
+        // Found by planting, not by reading. Both sharded local readers
+        // acquire once per distinct key and clone the handle for the repeats,
+        // and making them drop one of those repeats left all 571 tests green.
+        // A cross-shard batch under the fanout threshold is the only way into
+        // these two readers, and nothing was asking them for a key twice.
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
+        let repeated = CacheKey::string(9, "sharded-local-repeat");
+        let remote = CacheKey::string(10, "sharded-local-remote");
+        cache.put(repeated.clone(), b"repeated".to_vec()).unwrap();
+        cache.put(remote.clone(), b"remote".to_vec()).unwrap();
+        assert_ne!(
+            cache.shard_index_for_key(&repeated),
+            cache.shard_index_for_key(&remote),
+            "precondition: the batch has to span shards, or it takes the single-shard path"
+        );
+
+        let batch = [repeated.clone(), remote.clone(), repeated.clone()];
+        assert!(
+            batch.len() < ShardedMultiLayerCache::BATCH_FANOUT_THRESHOLD,
+            "precondition: and stay under the threshold, or it takes the fanout path"
+        );
+        for promoting in [false, true] {
+            let handles = if promoting {
+                cache.acquire_batch(&batch)
+            } else {
+                cache.acquire_batch_no_promotion(&batch)
+            }
+            .expect("sharded local batch acquire");
+            assert_eq!(handles.len(), 3);
+            for (position, expected) in [
+                (0usize, &b"repeated"[..]),
+                (1, &b"remote"[..]),
+                (2, &b"repeated"[..]),
+            ] {
+                let handle = handles[position].as_ref().unwrap_or_else(|| {
+                    panic!("position {position} was not answered (promoting: {promoting})")
+                });
+                assert_eq!(
+                    handle.value(),
+                    expected,
+                    "position {position} got the wrong bytes (promoting: {promoting})"
+                );
+            }
+            cache.release_batch(handles.into_iter().flatten().collect());
+        }
+    }
+
+    #[test]
     fn grouping_batch_positions_can_borrow_its_keys() {
         // Five batch readers group requested positions by key, and the
         // grouping copied the keys: once per distinct key on the small path,
@@ -11543,10 +11592,23 @@ mod tests {
         // then copied again into its lookup map -- once per requested key plus
         // once per distinct one.
         //
-        // The borrowing form is added alongside rather than replacing it,
-        // because each reader's deferred state is shaped differently and
-        // several unrelated vectors in those functions share the same tuple
-        // type. `get_batch` is on it; the others follow.
+        // All five readers are on the borrowing form now, so the copying one
+        // has been deleted and this test no longer has a twin to compare
+        // against. It asserts the grouping's own properties instead, which is
+        // the better check anyway: two forms can agree on a shared mistake.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+        assert!(
+            !SOURCE.contains("fn coalesce_batch_positions(keys:"),
+            "the copying grouping came back"
+        );
+        assert_eq!(
+            SOURCE
+                .matches("coalesce_batch_positions_borrowed(keys)")
+                .count(),
+            5,
+            "all five batch readers have to group on the borrowing form"
+        );
+
         for count in [4usize, SMALL_BATCH_DEDUP_LIMIT + 8] {
             // A computed selector, so a copy would really have allocated.
             let keys: Vec<CacheKey> = (0..count)
@@ -11554,30 +11616,60 @@ mod tests {
                 .collect();
 
             let grouped = coalesce_batch_positions_borrowed(&keys);
-            let copied = coalesce_batch_positions(&keys);
 
+            let distinct = keys.iter().collect::<std::collections::HashSet<_>>().len();
             assert_eq!(
                 grouped.len(),
-                copied.len(),
-                "the two forms must group a batch of {count} identically"
+                distinct,
+                "a batch of {count} has to group into one entry per distinct key"
             );
 
-            let mut seen = 0usize;
-            for (borrowed, owned) in grouped.iter().zip(copied.iter()) {
-                assert_eq!(borrowed.0, &owned.0, "the two forms disagree on a key");
-                assert_eq!(borrowed.1, owned.1, "the two forms disagree on positions");
-
+            let mut answered = vec![false; count];
+            let mut previous_first = None::<usize>;
+            for (key, positions) in &grouped {
                 let first = keys
                     .iter()
-                    .position(|candidate| candidate == borrowed.0)
+                    .position(|candidate| candidate == *key)
                     .expect("a grouped key must be one of the requested keys");
                 assert!(
-                    std::ptr::eq(borrowed.0, &keys[first]),
-                    "the borrowing form handed back a copy rather than a pointer into the                      caller's slice"
+                    std::ptr::eq(*key, &keys[first]),
+                    "the grouping handed back a copy rather than a pointer into the \
+                     caller's slice"
                 );
-                seen += borrowed.1.len();
+                assert_eq!(
+                    positions[0], first,
+                    "a group has to start at its key's first occurrence"
+                );
+                if let Some(previous_first) = previous_first {
+                    assert!(
+                        previous_first < positions[0],
+                        "groups have to stay in first-occurrence order: the readers \
+                         install the acquired handle at positions[0] and clone it for \
+                         the rest"
+                    );
+                }
+                previous_first = Some(positions[0]);
+
+                let mut ascending = positions.iter().copied();
+                let mut last = ascending.next().expect("a group cannot be empty");
+                for position in ascending {
+                    assert!(last < position, "positions within a group have to ascend");
+                    last = position;
+                }
+
+                for &position in positions {
+                    assert!(!answered[position], "position {position} was grouped twice");
+                    answered[position] = true;
+                    assert_eq!(
+                        &keys[position], *key,
+                        "position {position} was grouped under the wrong key"
+                    );
+                }
             }
-            assert_eq!(seen, count, "every requested position must be grouped once");
+            assert!(
+                answered.iter().all(|grouped| *grouped),
+                "every requested position has to be grouped"
+            );
         }
     }
 
