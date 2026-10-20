@@ -950,6 +950,23 @@ struct CacheInner {
     /// `size()` silently wrong, and maintaining one correctly means touching
     /// four write sites and thirteen removal sites.
     pinned_removals_seen: AtomicBool,
+    /// Lines appended to the disk manifest since it was last written whole.
+    ///
+    /// The manifest is append-only: one line per block written, and the line
+    /// is the same bytes every time the same key is rewritten. Measured on the
+    /// non-RocksDB backend -- two thousand writes of **one** key left two
+    /// thousand identical lines and 142,000 bytes of durable metadata for a
+    /// single live entry, and recovery reads that file, so recovery grew with
+    /// the write history rather than the live set.
+    ///
+    /// Counted so that the whole-manifest rewrite the bulk invalidations
+    /// already use can be triggered by length as well.
+    ///
+    /// Absent with RocksDB, which keeps its own index and writes no manifest:
+    /// an unread field is dead code, and `-D warnings` makes that an error in
+    /// the arm this crate is published with.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    manifest_appends: AtomicU64,
     /// Coarse-clock millisecond at which an entry stops being servable, for
     /// the entries that have one.
     ///
@@ -1885,6 +1902,8 @@ impl MultiLayerCache {
                 default_ttl_millis: 0,
                 ttl_in_use: false,
                 pinned_removals_seen: AtomicBool::new(false),
+                #[cfg(not(feature = "rocksdb-ssd"))]
+                manifest_appends: AtomicU64::new(0),
                 expiries: HashMap::new(),
                 tiering_policy,
                 block_options,
@@ -9284,7 +9303,7 @@ impl CacheInner {
         //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
-        //   `pinned_removals_seen`,
+        //   `pinned_removals_seen`, `manifest_appends`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
         //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
