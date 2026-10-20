@@ -23818,3 +23818,112 @@ fn the_footprint_counts_what_the_ssd_store_holds_in_memory() {
 
     assert!(cache.stop(), "the cache did not stop cleanly");
 }
+
+/// `total_bytes` has to be every byte term added up.
+///
+/// Dropping a term from that sum is invisible. Planted exactly that -- deleted
+/// `+ footprint.ssd_store_bytes` from the total -- and all 587 tests passed,
+/// the report's self-checks passed, and the only published figure that was
+/// wrong was the one everything else is divided by. The per-term tests cannot
+/// catch it, because each of them reads its own term.
+///
+/// The destructuring is the load-bearing part. It names every field and uses
+/// no `..`, so a term added to the footprint and left out of this sum is a
+/// compile error rather than a term nothing weighs.
+#[test]
+fn the_footprint_total_is_every_byte_term_added_up() {
+    const ENTRIES: usize = 200;
+    const VALUE_BYTES: usize = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path().to_path_buf(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 26,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+
+    for index in 0..ENTRIES {
+        cache
+            .put(
+                CacheKey::string(0, &format!("identity-{index:04}")),
+                vec![b'v'; VALUE_BYTES],
+            )
+            .expect("a cache with room must accept a put");
+    }
+    // Held, so the pin term is not zero while the identity is being checked.
+    let pinned = cache.acquire(&CacheKey::string(0, "identity-0199"));
+
+    let crate::CacheFootprint {
+        // Not bytes, so not in the sum.
+        memory_entries: _,
+        tracked_entries: _,
+        // Deliberately not in the sum: a `HashMap` stores its values inline, so
+        // these bytes are already inside `table_bytes`. Adding them counted 32
+        // bytes an entry twice, which is the bug that produced this exclusion.
+        metadata_bytes: _,
+        payload_bytes,
+        key_bytes,
+        order_bytes,
+        table_bytes,
+        writeback_bytes,
+        sketch_bytes,
+        ssd_store_bytes,
+        pin_bytes,
+        fixed_bytes,
+        eviction_queue_bytes,
+        total_bytes,
+    } = cache.footprint();
+
+    assert_eq!(
+        total_bytes,
+        payload_bytes
+            + key_bytes
+            + order_bytes
+            + table_bytes
+            + writeback_bytes
+            + sketch_bytes
+            + ssd_store_bytes
+            + pin_bytes
+            + fixed_bytes
+            + eviction_queue_bytes,
+        "the total is not the sum of the terms, so some term is weighed by nothing"
+    );
+
+    // An identity over terms that are all zero holds for the wrong reason, so
+    // the fixture has to actually populate the ones it claims to.
+    let mut unexercised = Vec::new();
+    for (name, value) in [
+        ("payload_bytes", payload_bytes),
+        ("key_bytes", key_bytes),
+        ("order_bytes", order_bytes),
+        ("table_bytes", table_bytes),
+        ("pin_bytes", pin_bytes),
+        ("fixed_bytes", fixed_bytes),
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        ("ssd_store_bytes", ssd_store_bytes),
+    ] {
+        if value == 0 {
+            unexercised.push(name);
+        }
+    }
+    assert!(
+        unexercised.is_empty(),
+        "the identity held over zeros for {unexercised:?}, which tests nothing"
+    );
+
+    drop(pinned);
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
