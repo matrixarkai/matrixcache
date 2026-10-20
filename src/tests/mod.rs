@@ -15218,6 +15218,116 @@ mod tests {
         }
     }
 
+    /// A cache with entries resident in the memory tier, the persistent-memory
+    /// tier and the disk index at once, which is the only shape in which the
+    /// tier tables are worth accounting for.
+    fn tiered_cache_holding(entries: usize, name: &str) -> MultiLayerCache {
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path(name),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 4096,
+                pmem_capacity_bytes: 1 << 20,
+                ssd_capacity_bytes: 1 << 24,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 0,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1 << 16,
+                max_pmem_block_bytes: 1 << 16,
+                max_ssd_block_bytes: 1 << 16,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        );
+        for i in 0..entries {
+            let key = CacheKey::string(7, &format!("{name}-{i:08}-padding-for-a-realistic-key"));
+            cache.put(key, vec![0u8; 256]).unwrap();
+        }
+        cache
+    }
+
+    #[test]
+    fn the_per_entry_overhead_counts_the_entries_the_cache_is_tracking() {
+        // A tiered cache holds its bookkeeping for every entry it tracks and
+        // its payload wherever the tier policy put it. Dividing the
+        // bookkeeping by the memory tier's population -- which is what this
+        // did -- reports the whole cache's overhead against whatever fraction
+        // of it happens to be in memory.
+        const ENTRIES: usize = 2000;
+        let cache = tiered_cache_holding(ENTRIES, "per-entry-denominator");
+        let footprint = cache.footprint();
+
+        assert_eq!(
+            footprint.tracked_entries, ENTRIES,
+            "every key put must be tracked by some tier, or the denominator is wrong in the              other direction"
+        );
+        assert!(
+            footprint.memory_entries * 10 < footprint.tracked_entries,
+            "precondition: this measures nothing unless most entries are outside the memory              tier -- memory {} of {} tracked",
+            footprint.memory_entries,
+            footprint.tracked_entries,
+        );
+
+        let honest = footprint.overhead_bytes_per_entry();
+        let by_memory_tier =
+            footprint.overhead_bytes() as f64 / footprint.memory_entries as f64;
+        assert!(
+            by_memory_tier > honest * 10.0,
+            "the old denominator should be visibly, not marginally, wrong: {by_memory_tier:.1}              against {honest:.1} bytes an entry"
+        );
+        assert!(
+            honest > 0.0 && honest < 2000.0,
+            "per-entry overhead of {honest:.1} bytes is outside anything this cache could              plausibly hold for one entry"
+        );
+    }
+
+    #[test]
+    fn the_tier_tables_are_charged_for_the_handle_they_hold() {
+        // `pmem` and `disk_index` were charged for an inline `CacheKey` in
+        // every bucket long after they had been changed to hold a shared
+        // handle. Both spellings type-check, so nothing caught it, and the
+        // footprint reported 64 bytes a bucket -- across two tables -- that
+        // were not there.
+        //
+        // The fix is that the charge now reads its types off the map it is
+        // charging for, so the stale spelling is not expressible. This test
+        // pins the magnitude of what it was reporting, which is the part worth
+        // quoting: it is the difference between an inline key and a pointer to
+        // one, once per bucket.
+        let cache = tiered_cache_holding(2000, "tier-tables-charged-for-the-handle");
+        let inner = cache.inner.read().expect("cache lock poisoned");
+
+        assert!(
+            inner.pmem.len() >= 1000 && inner.disk_index.len() >= 1000,
+            "precondition: the tiers have to be holding something or this measures nothing --              pmem {} disk_index {}",
+            inner.pmem.len(),
+            inner.disk_index.len(),
+        );
+
+        let honest = inner.footprint().table_bytes;
+        let stale = map_table_bytes(&inner.memory)
+            + estimated_table_bytes::<CacheKey, Arc<[u8]>>(inner.pmem.capacity())
+            + estimated_table_bytes::<CacheKey, u64>(inner.disk_index.capacity())
+            + map_table_bytes(&inner.metadata);
+
+        let inline_excess =
+            std::mem::size_of::<CacheKey>() - std::mem::size_of::<Arc<CacheKey>>();
+        let buckets = |capacity: usize| (capacity * 8 / 7).next_power_of_two();
+        let overcharged_buckets =
+            buckets(inner.pmem.capacity()) + buckets(inner.disk_index.capacity());
+
+        assert_eq!(
+            stale - honest,
+            inline_excess * overcharged_buckets,
+            "an inline key costs {inline_excess} bytes more than a handle to one, and it was              being charged once per bucket across {overcharged_buckets} buckets"
+        );
+        assert!(
+            honest < stale,
+            "the accounting must not charge for a key struct the map does not hold"
+        );
+    }
+
     #[test]
     fn a_cache_that_never_enables_admission_holds_almost_no_sketch() {
         // A full sketch is next_power_of_two(capacity / 2) bytes: half a

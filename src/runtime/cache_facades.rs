@@ -3780,9 +3780,7 @@ impl CacheKeyOrder {
 
         let structural = (self.nodes.capacity() * std::mem::size_of::<CacheOrderNode>())
             .saturating_add(self.free.capacity() * std::mem::size_of::<u32>())
-            .saturating_add(estimated_table_bytes::<Arc<CacheKey>, u32>(
-                self.index.capacity(),
-            ));
+            .saturating_add(map_table_bytes(&self.index));
 
         (key_bytes, structural)
     }

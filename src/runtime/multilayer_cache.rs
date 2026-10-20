@@ -397,6 +397,20 @@ pub const DEFAULT_EXPECTED_ENTRY_BYTES: usize = 64;
 /// The keys' and values' own heap is **not** included, because only the caller
 /// knows how to walk it. Every figure derived from this is an estimate, and
 /// [`CacheFootprint`] says which of its fields carry one.
+/// [`estimated_table_bytes`] for a map that is in hand, taking its key and
+/// value types from the map itself.
+///
+/// Prefer this. Naming the types at the call site means the accounting can
+/// disagree with the map it is accounting for, and it did: `pmem` and
+/// `disk_index` were charged for an inline `CacheKey` in every bucket long
+/// after they had been changed to hold a shared handle, so the footprint
+/// reported 64 bytes a bucket that were not there. The compiler cannot catch
+/// that, because both spellings type-check. It can only catch it if the types
+/// are never spelled.
+fn map_table_bytes<K, V, S>(map: &std::collections::HashMap<K, V, S>) -> usize {
+    estimated_table_bytes::<K, V>(map.capacity())
+}
+
 fn estimated_table_bytes<K, V>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
@@ -428,9 +442,23 @@ fn estimated_table_bytes<K, V>(capacity: usize) -> usize {
 /// other field is exact: a capacity, a length, or a `size_of`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheFootprint {
-    /// Resident entries in the memory tier: the denominator for every
-    /// per-entry figure derived from this.
+    /// Resident entries in the memory tier.
+    ///
+    /// **Not the entry count of a tiered cache.** A cache with a small memory
+    /// tier in front of PMEM and SSD holds most of what it is tracking outside
+    /// this number -- a fill of two thousand entries behind a four-kibibyte
+    /// memory tier leaves sixteen here. Divide per-entry overhead by
+    /// [`Self::tracked_entries`] instead, or by this one only when the cache
+    /// is memory-only.
     pub memory_entries: usize,
+    /// Distinct keys this cache is tracking, across the memory tier, the
+    /// persistent-memory tier and the disk index.
+    ///
+    /// This is the denominator for per-entry overhead, because the keys, the
+    /// metadata and the orders are held for every tracked entry whichever tier
+    /// its bytes are in. Counted by walking the three tiers and deduplicating,
+    /// since an entry resident in two of them is one entry.
+    pub tracked_entries: usize,
     /// Entry payloads across the memory and persistent-memory tiers. This is
     /// the term, and the only term, the capacity bound counts.
     pub payload_bytes: usize,
@@ -456,7 +484,9 @@ pub struct CacheFootprint {
     /// Per-cache rather than per-entry: the tier paths, and the queues that
     /// carry eviction records to a callback.
     pub fixed_bytes: usize,
-    /// Every field above except `memory_entries`, added up.
+    /// Every byte-counting field above, added up. The two entry counts,
+    /// `memory_entries` and `tracked_entries`, are not bytes and are not in
+    /// it.
     pub total_bytes: usize,
 }
 
@@ -466,16 +496,22 @@ impl CacheFootprint {
         self.total_bytes.saturating_sub(self.payload_bytes)
     }
 
-    /// Overhead per resident memory-tier entry, or zero when there are none.
+    /// Overhead per entry this cache is tracking, or zero when it tracks none.
+    ///
+    /// Divides by [`Self::tracked_entries`], which counts the keys held across
+    /// all three tiers. It used to divide by `memory_entries`, which is right
+    /// for a memory-only cache and badly wrong for a tiered one: the bookkeeping
+    /// is held for every tracked entry, so dividing it by the few that happen to
+    /// be memory-resident reported thousands of bytes an entry.
     ///
     /// Zero for an empty cache rather than a division by zero, and worth
     /// remembering that an empty cache still has `fixed_bytes` -- so read this
-    /// with `memory_entries` beside it, not on its own.
+    /// with `tracked_entries` beside it, not on its own.
     pub fn overhead_bytes_per_entry(&self) -> f64 {
-        if self.memory_entries == 0 {
+        if self.tracked_entries == 0 {
             return 0.0;
         }
-        self.overhead_bytes() as f64 / self.memory_entries as f64
+        self.overhead_bytes() as f64 / self.tracked_entries as f64
     }
 
     /// Total bytes held per byte of payload. One would mean no overhead at
@@ -489,6 +525,9 @@ impl CacheFootprint {
 
     fn add(&mut self, other: &CacheFootprint) {
         self.memory_entries += other.memory_entries;
+        // Shards partition the key space, so no key is tracked by two of them
+        // and the sum is a count of distinct keys.
+        self.tracked_entries += other.tracked_entries;
         self.payload_bytes += other.payload_bytes;
         self.key_bytes += other.key_bytes;
         self.metadata_bytes += other.metadata_bytes;
@@ -8669,6 +8708,21 @@ impl CacheInner {
             }
         }
 
+        // Distinct keys across the three tiers. An entry resident in both the
+        // memory and the persistent-memory tier is one entry, so this cannot
+        // be a sum of lengths. Diagnostic rather than hot, like the rest of
+        // this walk.
+        let mut tracked: std::collections::HashSet<&CacheKey> = std::collections::HashSet::new();
+        for key in self
+            .memory
+            .keys()
+            .chain(self.pmem.keys())
+            .chain(self.disk_index.keys())
+        {
+            tracked.insert(key.as_ref());
+        }
+        let tracked_entries = tracked.len();
+
         let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
         let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
 
@@ -8683,7 +8737,7 @@ impl CacheInner {
         let pin_bytes: usize = pin_stripes
             .iter()
             .map(|pins| {
-                estimated_table_bytes::<Arc<CacheKey>, PinnedEntry>(pins.entries.capacity())
+                map_table_bytes(&pins.entries)
             })
             .sum::<usize>()
             + self.pins.capacity() * std::mem::size_of::<Mutex<CachePinState>>();
@@ -8699,9 +8753,7 @@ impl CacheInner {
             .saturating_add(
                 self.async_writeback_queue.capacity() * std::mem::size_of::<CacheWritebackJob>(),
             )
-            .saturating_add(estimated_table_bytes::<Arc<CacheKey>, u64>(
-                self.async_writeback_positions.capacity(),
-            ));
+            .saturating_add(map_table_bytes(&self.async_writeback_positions));
 
         // `access_frequency`: sized when the admission filter is turned on,
         // and a few dozen bytes until then.
@@ -8747,16 +8799,14 @@ impl CacheInner {
             + self.pending_eviction_metric_tiers.capacity() * std::mem::size_of::<CacheTier>();
 
         // The tables themselves, less the keys and values counted above.
-        let table_bytes =
-            estimated_table_bytes::<Arc<CacheKey>, Arc<[u8]>>(self.memory.capacity())
-                + estimated_table_bytes::<CacheKey, Arc<[u8]>>(self.pmem.capacity())
-                + estimated_table_bytes::<CacheKey, u64>(self.disk_index.capacity())
-                + estimated_table_bytes::<Arc<CacheKey>, CacheEntryMeta>(
-                    self.metadata.capacity(),
-                );
+        let table_bytes = map_table_bytes(&self.memory)
+            + map_table_bytes(&self.pmem)
+            + map_table_bytes(&self.disk_index)
+            + map_table_bytes(&self.metadata);
 
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
+            tracked_entries,
             payload_bytes: memory_payload + pmem_payload,
             key_bytes: shared_character_bytes
                 + shared_key_bytes
