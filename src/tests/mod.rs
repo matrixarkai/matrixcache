@@ -935,6 +935,219 @@ mod tests {
     /// Written as one list rather than eighteen tests on purpose. The failure
     /// names every path that regressed, and a path added later is one line
     /// here rather than a test somebody has to remember to write.
+    /// A cache whose SSD tier is far too small for the fill and whose PMEM
+    /// tier is not, with write-through on, so a key reaches both tiers and
+    /// then loses its SSD copy to capacity while PMEM keeps serving it.
+    fn pmem_outliving_ssd_cache(name: &str) -> MultiLayerCache {
+        MultiLayerCache::with_tiering_policy(
+            unique_temp_path(name),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 512,
+                pmem_capacity_bytes: 1 << 20,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 0,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1 << 16,
+                max_pmem_block_bytes: 1 << 16,
+                max_ssd_block_bytes: 1 << 16,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        )
+    }
+
+    #[test]
+    fn an_ssd_eviction_leaves_a_pmem_resident_entry_its_metadata() {
+        // Evicting from SSD asked whether the memory tier still held the key
+        // and, if it did not, dropped the entry's metadata -- never asking the
+        // PMEM tier, which was still serving it. The two other eviction paths
+        // ask about all three tiers; this one asked about one.
+        let cache = pmem_outliving_ssd_cache("ssd-eviction-keeps-pmem-metadata");
+        for i in 0..200 {
+            let key = CacheKey::string(7, &format!("ssd-evicts-pmem-{i:05}"));
+            cache.put(key, vec![0u8; 256]).unwrap();
+        }
+
+        assert!(
+            cache.stats().ssd_evictions > 0,
+            "precondition: nothing is being measured unless the SSD tier evicted"
+        );
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let resident_in_pmem_only = inner
+            .pmem
+            .keys()
+            .filter(|key| !inner.disk_index.contains_key(key.as_ref()))
+            .count();
+        assert!(
+            resident_in_pmem_only > 0,
+            "precondition: some key has to be PMEM-resident with its SSD copy gone, or the              condition under test is never reached"
+        );
+
+        let stripped = inner
+            .pmem
+            .keys()
+            .filter(|key| !inner.metadata.contains_key(key.as_ref()))
+            .count();
+        assert_eq!(
+            stripped,
+            0,
+            "{stripped} of {} entries the PMEM tier is serving have no metadata at all",
+            inner.pmem.len(),
+        );
+    }
+
+    /// Writes `count` other entries, enough to turn the small SSD tier over.
+    fn churn_the_disk_tier(cache: &MultiLayerCache, name: &str, count: usize) {
+        for i in 1..count {
+            let key = CacheKey::string(7, &format!("{name}-{i:05}"));
+            cache.put(key, vec![0u8; 256]).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_entry_whose_disk_copy_was_evicted_still_expires() {
+        // The consequence worth testing, rather than the bookkeeping. The
+        // expiry lives in the metadata and `entry_expired` answers false when
+        // there is none, so an entry stripped by an SSD eviction stopped
+        // expiring -- it was served from PMEM for as long as it stayed there,
+        // whatever time to live it had been given.
+        //
+        // The time to live has to outlast the churn below, which takes most of
+        // a second, or the entry expires on its own before the condition under
+        // test is reached. That is asserted rather than assumed.
+        const TTL: Duration = Duration::from_millis(3000);
+        let cache = pmem_outliving_ssd_cache("expiry-survives-an-ssd-eviction");
+        let watched = CacheKey::string(7, "expiry-survives-00000");
+        cache
+            .put_with_ttl(watched.clone(), vec![0u8; 256], TTL)
+            .unwrap();
+        let written = std::time::Instant::now();
+        churn_the_disk_tier(&cache, "expiry-survives", 200);
+
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert!(
+                inner.pmem.contains_key(&watched),
+                "precondition: the PMEM tier has to still hold the watched key"
+            );
+            assert!(
+                !inner.disk_index.contains_key(&watched),
+                "precondition: the watched key's SSD copy has to have been evicted, or its                  metadata was never at risk"
+            );
+            assert!(
+                written.elapsed() < TTL,
+                "precondition: the churn outlasted the time to live, so the entry expired                  before the SSD eviction could strip it"
+            );
+            // The crisp form of the claim, before the behavioural one: the
+            // expiry is still recorded. With the bug this map has no entry for
+            // the key at all.
+            let meta = inner
+                .metadata
+                .get(&watched)
+                .expect("an entry the PMEM tier is serving keeps its metadata");
+            assert_ne!(
+                meta.expires_at_millis.load(Ordering::Relaxed),
+                0,
+                "the entry still has metadata but its expiry has been cleared, which makes it                  immortal just as losing the metadata did"
+            );
+        }
+
+        std::thread::sleep(TTL);
+        assert!(
+            cache.get(&watched).unwrap().is_none(),
+            "an entry past its time to live was served because an unrelated SSD eviction threw              away the metadata holding its expiry"
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_disk_copy_was_evicted_keeps_its_hit_history() {
+        // The other half of the same loss, in the opposite direction. A key
+        // with no metadata scores zero hotness, zero hits and epoch zero,
+        // which is the coldest thing in the cache -- so a stripped entry was
+        // also the first one given up under pressure.
+        //
+        // The SSD eviction is driven by shrinking the tier rather than by
+        // churn. Reading the watched key refreshes its place in the SSD
+        // recency order, and five hundred intervening writes still left its
+        // block resident; shrinking the tier evicts it for certain, and down
+        // the same `evict_ssd_to_capacity` path.
+        let cache = pmem_outliving_ssd_cache("hit-history-survives-an-ssd-eviction");
+        let watched = CacheKey::string(7, "hit-history-00000");
+        cache.put(watched.clone(), vec![0u8; 256]).unwrap();
+        for _ in 0..5 {
+            assert!(cache.get(&watched).unwrap().is_some());
+        }
+        let hits_before = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner
+                .metadata
+                .get(&watched)
+                .expect("the entry has metadata before anything evicts")
+                .hits
+                .load(Ordering::Relaxed)
+        };
+        assert!(
+            hits_before > 0,
+            "precondition: the reads have to have been counted or there is no history to lose"
+        );
+
+        // Push it out of the memory tier so the PMEM tier is what is left
+        // holding it; the SSD eviction below only strips metadata when the
+        // memory tier has let go.
+        //
+        // By shrinking the tier rather than by writing past it: five reads
+        // make this the hottest entry in the cache, and the replacement policy
+        // weighs hotness first, so eight intervening writes were evicted in
+        // front of it. Which is the policy behaving correctly, and the reason
+        // the setup cannot be a churn.
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        cache.set_capacity_for_tier(CacheTier::Memory, 512);
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert!(
+                !inner.memory.contains_key(&watched),
+                "precondition: the memory tier has to have let the key go"
+            );
+            assert!(
+                inner.pmem.contains_key(&watched),
+                "precondition: the PMEM tier has to be the one still holding it"
+            );
+            assert!(
+                inner.disk_index.contains_key(&watched),
+                "precondition: there has to be an SSD copy for the eviction to take"
+            );
+        }
+
+        let evictions_before = cache.stats().ssd_evictions;
+        cache.set_capacity_for_tier(CacheTier::Ssd, 1);
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        assert!(
+            cache.stats().ssd_evictions > evictions_before,
+            "precondition: shrinking the tier has to have evicted something"
+        );
+        assert!(
+            !inner.disk_index.contains_key(&watched),
+            "precondition: the watched key's SSD copy has to be gone"
+        );
+        assert!(
+            inner.pmem.contains_key(&watched),
+            "precondition: the PMEM tier still has to be serving it"
+        );
+        let meta = inner
+            .metadata
+            .get(&watched)
+            .expect("an entry the PMEM tier is serving keeps its metadata");
+        assert!(
+            meta.hits.load(Ordering::Relaxed) >= hits_before,
+            "the entry's hit count went backwards, so its history was rebuilt from nothing"
+        );
+    }
+
     #[test]
     fn no_read_serves_an_entry_that_has_expired() {
         fn fresh(dir: &std::path::Path, name: &str) -> (MultiLayerCache, CacheKey) {
