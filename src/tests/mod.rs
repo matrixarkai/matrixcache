@@ -15955,6 +15955,63 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_a_batch_borrows_its_keys_rather_than_copying_them() {
+        // The distinct keys of a batch are now pointers into the caller's
+        // slice. They used to be copies: one per distinct key on the small
+        // path, and on the large path -- which iterated `keys.iter().cloned()`
+        // and then cloned again into its lookup map -- one per *requested* key
+        // plus one per distinct key. A key copy is a 72-byte struct and a
+        // string allocation for each of its two `Cow` fields that is computed
+        // rather than a literal, so a batch read paid all of that before it
+        // had looked anything up.
+        //
+        // Pointer identity sees this directly, which is better than the
+        // compile-level contract the tier writes had to settle for: a copy is
+        // equal to what it was copied from, but it is not at the same address.
+        //
+        // Both branches, because they are different code: the small one scans
+        // a vector and the large one builds a map.
+        for count in [4usize, SMALL_BATCH_DEDUP_LIMIT + 8] {
+            // A computed selector, so a copy would have allocated and this is
+            // not measuring the free case.
+            let keys: Vec<CacheKey> = (0..count)
+                .map(|i| CacheKey::page(7, (i % 3) as u64, 4096, 512))
+                .collect();
+            let distinct = 3.min(count);
+
+            let (unique, requested) = coalesce_batch_keys(&keys);
+
+            assert_eq!(
+                unique.len(),
+                distinct,
+                "a batch of {count} keys over three distinct ones should coalesce to {distinct}"
+            );
+            assert_eq!(requested.len(), count, "every request must be answered");
+
+            // A duplicated request shares the first occurrence's entry, so the
+            // address to expect is that first occurrence rather than the
+            // request's own position. Getting that wrong is what the first
+            // version of this test did, and it reported the code as copying.
+            for (index, key) in unique.iter().enumerate() {
+                let first = keys
+                    .iter()
+                    .position(|candidate| candidate == *key)
+                    .expect("a distinct key must be one of the requested keys");
+                assert!(
+                    std::ptr::eq(*key, &keys[first]),
+                    "distinct key {index} is a copy rather than a pointer into the slice"
+                );
+            }
+            for (position, unique_position) in &requested {
+                assert_eq!(
+                    unique[*unique_position], &keys[*position],
+                    "request {position} was answered with the wrong key"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_put_gives_both_tiers_the_same_allocation() {
         // The admission decision for an ordinary write to a cache with both
         // resident tiers configured is `admit_memory: true, admit_pmem: true`
