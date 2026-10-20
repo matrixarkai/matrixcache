@@ -32,6 +32,8 @@ const VALUE_BYTES: usize = 1024;
 const RESIDENT: usize = 4096;
 const REPEATS: usize = 200;
 const BATCH: usize = 8;
+/// Entries resident in the cache that evicts on every write.
+const EVICTING_RESIDENT: usize = 256;
 
 fn key(index: usize) -> CacheKey {
     CacheKey::string(0, &format!("allocation-report-{index:08}"))
@@ -143,6 +145,34 @@ fn main() {
             .put(probe.clone(), value.clone())
             .expect("put must be accepted");
     }));
+    // The zero-copy write, against the copying one above: the caller already
+    // holds the bytes behind a handle, so nothing has to be allocated at all.
+    let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(value.clone());
+    rows.push(measure("put_shared, overwriting", 1, || {
+        cache
+            .put_shared(probe.clone(), std::sync::Arc::clone(&shared))
+            .expect("put must be accepted");
+    }));
+    // A cache at its capacity, so every write evicts. Selection weighs a
+    // window of candidates in a table, which is the largest allocation on any
+    // path in this report.
+    let tight = MultiLayerCache::with_options(CacheOptions::new(
+        EVICTING_RESIDENT * (VALUE_BYTES + 64),
+        0,
+        0,
+    ));
+    for index in 0..EVICTING_RESIDENT {
+        tight
+            .put(key(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+    let mut evicting = 1_000_000usize;
+    rows.push(measure("put, evicting", 1, || {
+        evicting += 1;
+        tight
+            .put(key(evicting), value.clone())
+            .expect("put must be accepted");
+    }));
 
     println!("Per operation, memory tier only, {VALUE_BYTES}-byte values, {RESIDENT} resident.");
     println!("One untimed pass first, so a table growing once is not charged to every call.");
@@ -242,6 +272,41 @@ fn main() {
                  single read does, which is more than one a key -- a position list is being \
                  given its own allocation again",
                 pinned.keys_asked, bookkeeping
+            ));
+        }
+    }
+
+    // The zero-copy write exists so that a caller holding an `Arc` can hand
+    // it over without a copy. A single allocation here means the handle is
+    // being copied after all.
+    match find("put_shared, overwriting") {
+        Some(row) if row.allocations == 0.0 && row.bytes == 0.0 => {}
+        Some(row) => failures.push(format!(
+            "put_shared allocates {:.2} times and {:.1} bytes for a value the caller already \
+             holds behind a handle",
+            row.allocations, row.bytes
+        )),
+        None => failures.push("the shared write is missing from the table".to_string()),
+    }
+
+    // And a write that evicts: selection weighs a window of candidates in a
+    // table, which was built from empty on every eviction -- 11.48
+    // allocations and 44,140 bytes for one write before it was sized for its
+    // window and its group key narrowed. The bound here is what stops it
+    // growing back.
+    if let (Some(evicting), Some(plain)) = (find("put, evicting"), find("put, overwriting")) {
+        if evicting.allocations > plain.allocations + 6.0 {
+            failures.push(format!(
+                "a write that evicts allocates {:.2} times against {:.2} for one that does not, \
+                 which is more than the eviction needs",
+                evicting.allocations, plain.allocations
+            ));
+        }
+        if evicting.bytes > 32_768.0 {
+            failures.push(format!(
+                "a write that evicts allocates {:.1} bytes, so the candidate table is being \
+                 grown from empty again",
+                evicting.bytes
             ));
         }
     }

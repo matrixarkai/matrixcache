@@ -788,10 +788,49 @@ impl<'a> SlotEvictionGroup<'a> {
 /// stands alone. Borrowing the key's parts keeps this free of allocation: the
 /// grouping used to render one `String` per resident entry per eviction, which
 /// on a cache at capacity is a per-write cost proportional to the cache size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy)]
 enum EvictionGroupKey<'a> {
     Slot(u32),
-    Object(&'a str, &'a str),
+    /// Every key of one object, which is its namespace and its record key.
+    ///
+    /// Holds the key rather than its two fields: two fat pointers are
+    /// thirty-two bytes against eight for one thin one, and this sits in a
+    /// table sized for the whole candidate window on every eviction. The
+    /// comparison and the hash below read exactly the two fields the variant
+    /// used to carry, so the grouping is unchanged.
+    Object(&'a CacheKey),
+}
+
+impl PartialEq for EvictionGroupKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Slot(left), Self::Slot(right)) => left == right,
+            (Self::Object(left), Self::Object(right)) => {
+                left.namespace == right.namespace && left.record_key == right.record_key
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EvictionGroupKey<'_> {}
+
+impl std::hash::Hash for EvictionGroupKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Slot(slot) => {
+                state.write_u8(0);
+                slot.hash(state);
+            }
+            Self::Object(key) => {
+                state.write_u8(1);
+                // The same two fields the equality above compares, so equal
+                // keys cannot hash apart.
+                key.namespace.hash(state);
+                key.record_key.hash(state);
+            }
+        }
+    }
 }
 
 /// A chosen victim plus how many candidate groups were weighed to find it.
