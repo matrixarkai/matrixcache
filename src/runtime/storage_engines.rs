@@ -2217,6 +2217,19 @@ impl StorageEngineRocksDb {
     /// it should be, and it is the whole store.
     #[cfg(not(feature = "rocksdb-ssd"))]
     fn journal_change(&mut self, key: &str, value: Option<&[u8]>) -> Result<(), CacheError> {
+        let record = Self::encode_journal_change(key, value);
+        self.append_journal_record(record)
+    }
+
+    /// Encode one change, touching no file and no `&mut self`.
+    ///
+    /// Split out from the writer so that the bytes being journaled can be read
+    /// straight out of the record map. Handing the writer a reference into the
+    /// map borrows `self` twice, and the write path used to resolve that by
+    /// cloning the record back out of the map -- a full payload copy on every
+    /// write to this tier, on top of this encoding.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn encode_journal_change(key: &str, value: Option<&[u8]>) -> Vec<u8> {
         let mut record = Vec::with_capacity(key.len() + value.map_or(0, <[u8]>::len) + 24);
         match value {
             Some(value) => {
@@ -2233,6 +2246,13 @@ impl StorageEngineRocksDb {
             }
         }
 
+        record
+    }
+
+    /// Append an encoded change, and take a fresh snapshot once enough have
+    /// built up.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn append_journal_record(&mut self, record: Vec<u8>) -> Result<(), CacheError> {
         let appended = record.len() as u64;
         if self.journal_file.is_none() {
             let path = self.journal_path();
@@ -2461,12 +2481,22 @@ impl StorageEngineRocksDb {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             self.records.insert(key.to_string(), value);
-            let recorded = self
-                .records
-                .get(key)
-                .expect("the record just inserted must be present")
-                .clone();
-            self.journal_change(key, Some(&recorded))?;
+            // The record must be in the map before it is journaled: an append
+            // can trigger a snapshot, and the snapshot is written from the
+            // map, so journaling first could write a record into a file that
+            // the snapshot then replaces. Encoding is a read, so the bytes go
+            // straight from the map into the encoding -- this used to clone
+            // the record back out of the map first.
+            let record = Self::encode_journal_change(
+                key,
+                Some(
+                    self.records
+                        .get(key)
+                        .expect("the record just inserted must be present")
+                        .as_slice(),
+                ),
+            );
+            self.append_journal_record(record)?;
         }
         Ok(view)
     }
@@ -2531,12 +2561,18 @@ impl StorageEngineRocksDb {
         {
             for (key, value) in coalesced {
                 self.records.insert(key.clone(), value);
-                let recorded = self
-                    .records
-                    .get(&key)
-                    .expect("the record just inserted must be present")
-                    .clone();
-                self.journal_change(&key, Some(&recorded))?;
+                // Encoded from the map, for the reason given in `put_view`:
+                // once per entry, this was a full payload copy per entry.
+                let record = Self::encode_journal_change(
+                    &key,
+                    Some(
+                        self.records
+                            .get(&key)
+                            .expect("the record just inserted must be present")
+                            .as_slice(),
+                    ),
+                );
+                self.append_journal_record(record)?;
             }
         }
         Ok(count)
@@ -3148,6 +3184,19 @@ impl StorageEngineMultiSsd {
             .into_iter()
             .map(|position| unique_values[position].clone())
             .collect())
+    }
+
+    /// Write without building a `CacheBuffer` around the value.
+    ///
+    /// [`StorageEngineApi::put`] returns a buffer holding the value, which
+    /// costs a copy of it, and the cache's SSD tier throws that buffer away.
+    pub fn put_view(
+        &mut self,
+        key: &str,
+        value: Vec<u8>,
+    ) -> Result<StringViewBuffer, CacheError> {
+        let index = self.storage_index(key)?;
+        self.storages[index].put_view(key, value)
     }
 
     pub fn put_batch(&mut self, entries: Vec<(String, Vec<u8>)>) -> Result<usize, CacheError> {

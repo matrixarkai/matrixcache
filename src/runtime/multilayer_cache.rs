@@ -1582,8 +1582,12 @@ impl SsdTierStore {
             // rather than an error so a caller that reaches it anyway is not broken by a tier
             // it was told is not there.
             Self::Disabled { .. } => Ok(()),
-            Self::Single(storage) => storage.put(key, value).map(|_| ()),
-            Self::Multi(storage) => storage.put(key, value).map(|_| ()),
+            // `put_view` rather than `put`: `put` returns a `CacheBuffer`
+            // holding the value, which costs a copy of the payload to build
+            // -- and the `map(|_| ())` here threw it away. The view it
+            // returns instead is a key and a length.
+            Self::Single(storage) => storage.put_view(key, value).map(|_| ()),
+            Self::Multi(storage) => storage.put_view(key, value).map(|_| ()),
         }
     }
 
@@ -1593,7 +1597,7 @@ impl SsdTierStore {
             Self::Single(storage) => storage.put_batch(entries).map(|_| ()),
             Self::Multi(storage) => {
                 for (key, value) in entries {
-                    storage.put(&key, value)?;
+                    storage.put_view(&key, value)?;
                 }
                 Ok(())
             }

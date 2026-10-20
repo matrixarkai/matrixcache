@@ -22,7 +22,10 @@
 
 use std::alloc::System;
 
-use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use matrixcache::{
+    CacheBlockOptions, CacheDataPlacement, CacheKey, CacheOptions, CacheTieringPolicy,
+    MultiLayerCache,
+};
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
 
 #[global_allocator]
@@ -174,6 +177,65 @@ fn main() {
             .expect("put must be accepted");
     }));
 
+    // A write that reaches the SSD tier, which no row above does. Everything
+    // measured so far is the memory tier: this path also compresses, frames a
+    // block, builds a manifest line and writes it, so it is the most expensive
+    // write the cache has -- and the one where a payload copy is easiest to
+    // hide.
+    //
+    // The two feature arms are NOT comparable here. With `rocksdb-ssd` the
+    // store's own allocations happen in a native library the counting
+    // allocator cannot see, so this row reports the Rust side only; without it
+    // the store is Rust and every byte it keeps is in the figure.
+    let ssd_dir = std::env::temp_dir().join("matrixcache-allocation-report-ssd");
+    let _ = std::fs::remove_dir_all(&ssd_dir);
+    let tiered = MultiLayerCache::with_tiering_policy(
+        ssd_dir.clone(),
+        CacheTieringPolicy {
+            // Room for a handful in memory, so writes go through to the tier
+            // rather than piling up in it.
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    // Incompressible, deliberately, and only for this row. The tier
+    // compresses what it writes, so a block of zeros makes every copy of the
+    // payload on this path cost almost nothing -- which is exactly what the
+    // row is here to measure. Measured on this fixture: removing two payload
+    // copies moved 54,274.6 bytes to 54,008.1 with zeros, a change of 266
+    // bytes for two copies of a 1,024-byte value, because the blocks being
+    // copied had compressed to about fifty bytes each.
+    //
+    // The rows above keep the zero-filled value, so their figures stay
+    // comparable with the ones already published for them.
+    let mut fill = 0x2545_f491_4f6c_dd1du64;
+    let incompressible: Vec<u8> = (0..VALUE_BYTES)
+        .map(|_| {
+            fill ^= fill << 13;
+            fill ^= fill >> 7;
+            fill ^= fill << 17;
+            (fill & 0xff) as u8
+        })
+        .collect();
+    let mut reaching_ssd = 2_000_000usize;
+    rows.push(measure("put, reaching the SSD tier", 1, || {
+        reaching_ssd += 1;
+        tiered
+            .put(key(reaching_ssd), incompressible.clone())
+            .expect("put must be accepted");
+    }));
+
     println!("Per operation, memory tier only, {VALUE_BYTES}-byte values, {RESIDENT} resident.");
     println!("One untimed pass first, so a table growing once is not charged to every call.");
     println!();
@@ -254,6 +316,43 @@ fn main() {
                 ));
             }
         }
+    }
+
+    // A write that reaches the SSD tier compresses, frames a block, builds a
+    // manifest line and writes it, so it is never going to be cheap. What it
+    // must not be paying for is copies of the payload that nothing reads. The
+    // bounds sit between what the path costs now and what it cost while
+    // `StorageEngineApi::put` built a `CacheBuffer` around every value for
+    // the tier to throw away, measured on this row's incompressible value:
+    //
+    //         backend   allocations       bytes
+    //      Rust before         33.12    62,580.2
+    //       Rust after         28.11    59,288.2
+    //   RocksDB before         16.11    58,193.6
+    //    RocksDB after         12.11    55,951.6
+    //
+    // Per arm, because the two are not comparable: this allocator sees Rust
+    // only, and with RocksDB the store's own bytes are allocated elsewhere.
+    // Three runs of the same binary moved the figures by 0.01 allocations and
+    // 8 bytes, so the margin here is wide rather than lucky.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const SSD_WRITE_ALLOCATIONS: f64 = 30.0;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const SSD_WRITE_BYTES: f64 = 60_500.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const SSD_WRITE_ALLOCATIONS: f64 = 14.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const SSD_WRITE_BYTES: f64 = 57_000.0;
+    match find("put, reaching the SSD tier") {
+        Some(row) if row.allocations <= SSD_WRITE_ALLOCATIONS && row.bytes <= SSD_WRITE_BYTES => {}
+        Some(row) => failures.push(format!(
+            "a write reaching the SSD tier allocates {:.2} times and {:.1} bytes, against \
+             {SSD_WRITE_ALLOCATIONS:.0} and {SSD_WRITE_BYTES:.0} -- a copy of the payload has \
+             come back to that path",
+            row.allocations, row.bytes
+        )),
+        None => failures
+            .push("the write that reaches the SSD tier is missing from the table".to_string()),
     }
 
     // A batch over distinct keys asks for exactly one position per key, and a
