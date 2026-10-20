@@ -1300,7 +1300,9 @@ fn cache_buffer_space(buffer: &CacheBuffer) -> usize {
 
 fn clone_cache_buffer(buffer: &CacheBuffer) -> CacheBuffer {
     CacheBuffer {
-        key: buffer.key().to_string(),
+        // The source buffer already holds the characters behind a handle, so
+        // this shares them rather than allocating a second copy.
+        key: Arc::clone(&buffer.key),
         value: Arc::clone(&buffer.value),
         logical_size: buffer.logical_size,
         tier: buffer.tier,

@@ -11353,6 +11353,45 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_shares_the_key_characters_rather_than_copying_them() {
+        // A `CacheBuffer` is the output of the zero-copy read path. Building
+        // one from a handle allocated a fresh `String` and copied the key's
+        // characters into it -- a copy of the key sitting beside bytes that
+        // were deliberately not copied.
+        //
+        // The address of the characters is what sees this; the string compared
+        // equal before.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::string(7, "buffer-shares-its-key-characters");
+        cache.put(key.clone(), vec![1u8; 128]).unwrap();
+
+        let handle = cache
+            .acquire(&key)
+            .expect("acquire")
+            .expect("the key is resident");
+        let held = handle.key.record_key.as_ptr();
+
+        let buffer = handle.buffer();
+        assert_eq!(buffer.key(), "buffer-shares-its-key-characters");
+        assert_eq!(
+            buffer.key().as_ptr(),
+            held,
+            "the buffer copied the key's characters instead of sharing the handle's"
+        );
+
+        // And a clone of a buffer shares with the buffer it came from.
+        let copy = clone_cache_buffer(&buffer);
+        assert_eq!(
+            copy.key().as_ptr(),
+            buffer.key().as_ptr(),
+            "cloning a buffer copied the key's characters instead of sharing them"
+        );
+        assert_eq!(copy.value(), buffer.value());
+
+        cache.release(handle);
+    }
+
+    #[test]
     fn a_shared_memory_read_hands_back_the_allocation_the_tier_holds() {
         // `get_memory` reads the memory tier and nothing else, so it already
         // holds the `Arc<[u8]>` the tier stores -- and then copied it into a

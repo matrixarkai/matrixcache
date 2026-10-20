@@ -340,7 +340,7 @@ impl CachePinnedHandle {
 
     pub fn buffer(&self) -> CacheBuffer {
         CacheBuffer {
-            key: self.key.record_key.to_string(),
+            key: Arc::clone(&self.key.record_key),
             value: Arc::clone(&self.value),
             logical_size: None,
             tier: Some(self.tier),
@@ -419,7 +419,7 @@ impl CacheScopedHandle {
     pub fn buffer(&self) -> CacheBuffer {
         let handle = self.handle.as_ref().expect("cache scoped handle");
         CacheBuffer::from_handle(
-            handle.key.record_key.to_string(),
+            Arc::clone(&handle.key.record_key),
             self.cache.clone(),
             handle.clone_with_cache(&self.cache),
         )
@@ -558,7 +558,18 @@ pub struct CacheReadResult {
 /// one holds an entry in the cache.
 #[derive(Debug)]
 pub struct CacheBuffer {
-    key: String,
+    /// The record key these bytes were read under.
+    ///
+    /// Shared with the `CacheKey` the read came from rather than copied out of
+    /// it. A buffer is the output of the zero-copy read path, and building one
+    /// from a handle used to allocate a fresh `String` and copy the key's
+    /// characters into it -- a copy of the key, sitting beside bytes that were
+    /// deliberately not copied. `record_key` is already an `Arc<str>`, so
+    /// taking a handle to it is a refcount bump.
+    ///
+    /// Private, and `key()` still hands out a `&str`, so this is invisible
+    /// from outside.
+    key: Arc<str>,
     value: Arc<[u8]>,
     logical_size: Option<usize>,
     tier: Option<CacheReadTier>,
@@ -624,7 +635,7 @@ fn coalesce_storage_delete_keys(keys: &[String]) -> Vec<String> {
 impl CacheBuffer {
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
         Self {
-            key: String::new(),
+            key: Arc::from(""),
             value: Arc::from(value.into()),
             logical_size: None,
             tier: None,
@@ -637,7 +648,7 @@ impl CacheBuffer {
         Self::new(value.into().into_bytes())
     }
 
-    fn from_handle(key: String, cache: MultiLayerCache, handle: CachePinnedHandle) -> Self {
+    fn from_handle(key: Arc<str>, cache: MultiLayerCache, handle: CachePinnedHandle) -> Self {
         Self {
             key,
             value: Arc::clone(&handle.value),
@@ -650,7 +661,7 @@ impl CacheBuffer {
 
     pub fn view(key: impl Into<String>, logical_size: usize) -> Self {
         Self {
-            key: key.into(),
+            key: Arc::from(key.into()),
             value: Arc::from(Vec::new()),
             logical_size: Some(logical_size),
             tier: None,
@@ -664,7 +675,7 @@ impl CacheBuffer {
     }
 
     pub fn set_key(&mut self, key: impl Into<String>) {
-        self.key = key.into();
+        self.key = Arc::from(key.into());
     }
 
     pub fn data(&self) -> &[u8] {
