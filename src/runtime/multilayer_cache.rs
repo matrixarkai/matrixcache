@@ -2694,8 +2694,14 @@ impl MultiLayerCache {
         };
         match block {
             Some(block) => {
-                let decoded = decode_cache_block(&block)?;
-                let value = Arc::<[u8]>::from(decoded.clone());
+                // One allocation for the bytes, shared with the tier they
+                // are refilled into. This read used to decode into a `Vec`,
+                // clone it, build an `Arc` from the clone, and then hand the
+                // `Vec` to `refill_from_ssd`, which built a *second* `Arc` --
+                // four payload-sized allocations, and a caller holding a
+                // different copy from the one the cache kept. The whole point
+                // of a shared read is that there is one.
+                let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 inner
@@ -2706,7 +2712,9 @@ impl MultiLayerCache {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
                 inner.record_hit(key, value.len());
-                if !inner.ssd_instance_only && !inner.refill_from_ssd(key.clone(), decoded) {
+                if !inner.ssd_instance_only
+                    && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&value))
+                {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.record_get_latency(started);
@@ -2902,8 +2910,14 @@ impl MultiLayerCache {
                                 inner.stats.compressed_hits.saturating_add(1);
                         }
                         inner.record_hit(&key, value.len());
+                        // `value` is already the `Arc<[u8]>` this batch
+                        // returns, so the tier takes a handle to it. The
+                        // `to_vec` that used to be here copied the payload so
+                        // that `refill_from_ssd` could copy it again into an
+                        // `Arc` -- two copies of the bytes to store what was
+                        // in hand.
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd(key, value.to_vec())
+                            && !inner.refill_from_ssd_shared(key, Arc::clone(&value))
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
