@@ -2580,7 +2580,7 @@ impl CacheInner {
         self.increment_pin_with_optional_size(key, Some(bytes));
     }
 
-    fn increment_pin_with_size_counts(&self, counts: &[(CacheKey, usize, usize)]) {
+    fn increment_pin_with_size_counts(&self, counts: &[(&CacheKey, usize, usize)]) {
         if counts.is_empty() {
             return;
         }
