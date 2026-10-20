@@ -3723,7 +3723,18 @@ impl MultiLayerCache {
         Ok(results)
     }
 
-    pub fn get_memory(&self, key: &CacheKey) -> Option<Vec<u8>> {
+    /// The memory tier's bytes, shared rather than copied.
+    ///
+    /// This tier holds an `Arc<[u8]>`, so a reader that parses the bytes and
+    /// drops them does not need a copy of its own -- and [`Self::get_memory`]
+    /// gives it one on every hit. There is no decode on this path and no lower
+    /// tier to fall through to, so unlike the tier-aware reads that return a
+    /// `CacheReadResult`, nothing here has to materialise a `Vec` at all.
+    ///
+    /// Reads only the memory tier, exactly as `get_memory` does: a key resident
+    /// further down is a miss here rather than a promotion. An expired entry is
+    /// reclaimed on the way, which is the same opportunity `get_memory` takes.
+    pub fn get_memory_shared(&self, key: &CacheKey) -> Option<Arc<[u8]>> {
         self.emit_access_record(CacheAccessRecordKind::Get, key);
         let mut inner = self.inner.write().expect("cache lock poisoned");
         if !inner.started {
@@ -3748,7 +3759,14 @@ impl MultiLayerCache {
         } else {
             inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
         }
-        value.map(|value| value.to_vec())
+        value
+    }
+
+    /// The memory tier's bytes, copied.
+    ///
+    /// [`Self::get_memory_shared`] is the same read without the copy.
+    pub fn get_memory(&self, key: &CacheKey) -> Option<Vec<u8>> {
+        self.get_memory_shared(key).map(|value| value.to_vec())
     }
 
     pub fn get_pinned_handle(
@@ -7020,6 +7038,14 @@ impl ShardedMultiLayerCache {
 
     pub fn get_memory(&self, key: &CacheKey) -> Option<Vec<u8>> {
         self.shard_for_key(key).get_memory(key)
+    }
+
+    /// The memory tier's bytes, shared rather than copied.
+    ///
+    /// Routed to the one shard that owns the key, as `get_memory` is. See
+    /// [`MultiLayerCache::get_memory_shared`].
+    pub fn get_memory_shared(&self, key: &CacheKey) -> Option<Arc<[u8]>> {
+        self.shard_for_key(key).get_memory_shared(key)
     }
 
     fn get_batch_with_shard_reader<F, T>(

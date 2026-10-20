@@ -11353,6 +11353,84 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_memory_read_hands_back_the_allocation_the_tier_holds() {
+        // `get_memory` reads the memory tier and nothing else, so it already
+        // holds the `Arc<[u8]>` the tier stores -- and then copied it into a
+        // `Vec` on the way out. One full payload copy per call,
+        // unconditionally, with no decode on the path and no lower tier to
+        // fall through to.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::string(7, "shared-memory-read");
+        cache.put(key.clone(), vec![6u8; 4096]).unwrap();
+
+        let value = cache
+            .get_memory_shared(&key)
+            .expect("the key is memory-resident");
+        assert_eq!(value.len(), 4096);
+
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            let resident = inner
+                .memory
+                .get(&key)
+                .expect("precondition: the memory tier has to hold the key");
+            assert!(
+                std::sync::Arc::ptr_eq(&value, resident),
+                "the read copied the bytes instead of sharing what the tier holds"
+            );
+        }
+
+        // The copying form still copies, and still agrees.
+        assert_eq!(
+            cache.get_memory(&key).as_deref(),
+            Some(&value[..]),
+            "the copying read must answer the same bytes"
+        );
+
+        // And it reads only this tier: a key the memory tier does not hold is
+        // a miss here rather than a promotion from below.
+        let absent = CacheKey::string(7, "shared-memory-read-absent");
+        assert!(cache.get_memory_shared(&absent).is_none());
+    }
+
+    #[test]
+    fn a_sharded_shared_memory_read_reaches_the_right_shard() {
+        // Forwarded, because a method on the single-shard type is unreachable
+        // on the type most likely to be holding a large cache otherwise.
+        let dir = unique_temp_path("sharded-shared-memory-read");
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir]),
+            4,
+        );
+        let key = CacheKey::string(7, "sharded-shared-memory-read");
+        cache.put(key.clone(), vec![2u8; 512]).unwrap();
+
+        let shared = cache
+            .get_memory_shared(&key)
+            .expect("the key is memory-resident");
+        assert_eq!(shared.len(), 512);
+        assert_eq!(
+            cache.get_memory(&key).as_deref(),
+            Some(&shared[..]),
+            "both forms must answer the same bytes"
+        );
+
+        // Identity too, not just agreement. Without this the test would pass
+        // for a forwarder that copied, and would read as though it had checked
+        // the thing the single-shard test checks.
+        let shard = cache.shard_for_key(&key);
+        let inner = shard.inner.read().expect("cache lock poisoned");
+        let resident = inner
+            .memory
+            .get(&key)
+            .expect("precondition: the owning shard has to hold the key");
+        assert!(
+            std::sync::Arc::ptr_eq(&shared, resident),
+            "the sharded forwarder copied the bytes instead of passing the shard's handle out"
+        );
+    }
+
+    #[test]
     fn a_shared_read_from_disk_hands_back_the_allocation_it_cached() {
         // The whole promise of a shared read is that the caller and the cache
         // hold one copy of the bytes. On an SSD hit they held two: the read
