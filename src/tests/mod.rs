@@ -11652,6 +11652,56 @@ mod tests {
     }
 
     #[test]
+    fn a_one_position_list_costs_no_allocation_and_no_extra_bytes() {
+        // Measured with the counting allocator: a pinned batch read over eight
+        // distinct keys allocated fifteen times, and eight of those were a
+        // vector holding a single `usize` -- one per key, every time.
+        //
+        // I expected the inline form to cost eight bytes a key for the
+        // discriminant, and wrote this assertion that way. It costs nothing: a
+        // `Vec`'s pointer is never null, so the position rides in that niche
+        // and the enum is the same twenty-four bytes as the vector it
+        // replaces. The grouping is strictly fewer allocations and no more
+        // bytes, and a batch of duplicated keys is no worse off than before.
+        assert_eq!(
+            std::mem::size_of::<BatchPositions>(),
+            std::mem::size_of::<Vec<usize>>(),
+            "the inline position rides in the vector pointer's niche; if this ever grows, the \
+             grouping starts paying it for every distinct key of every batch"
+        );
+
+        // One position: inline, and the list still behaves like a list.
+        let single = BatchPositions::new(7);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.first(), 7);
+        assert!(matches!(single, BatchPositions::One(7)));
+        assert_eq!(single.into_iter().collect::<Vec<_>>(), vec![7]);
+
+        // A second position promotes it, which is the case the grouping exists
+        // for and the only one that allocates.
+        let mut repeated = BatchPositions::new(3);
+        repeated.push(5);
+        repeated.push(11);
+        assert_eq!(repeated.len(), 3);
+        assert_eq!(repeated.first(), 3);
+        assert!(matches!(repeated, BatchPositions::Many(_)));
+        assert_eq!((&repeated).into_iter().collect::<Vec<_>>(), vec![3, 5, 11]);
+        assert_eq!(repeated.into_iter().collect::<Vec<_>>(), vec![3, 5, 11]);
+
+        // And the grouping hands back the inline form for a batch of distinct
+        // keys, which is what makes the saving happen at all.
+        let keys: Vec<CacheKey> = (0..4).map(|i| CacheKey::page(7, i, 4096, 512)).collect();
+        let grouped = coalesce_batch_positions_borrowed(&keys);
+        assert_eq!(grouped.len(), 4);
+        for (_, positions) in &grouped {
+            assert!(
+                matches!(positions, BatchPositions::One(_)),
+                "a key asked for once must not be given a vector of its own"
+            );
+        }
+    }
+
+    #[test]
     fn grouping_batch_positions_can_borrow_its_keys() {
         // Five batch readers group requested positions by key, and the
         // grouping copied the keys: once per distinct key on the small path,
@@ -11704,27 +11754,28 @@ mod tests {
                      caller's slice"
                 );
                 assert_eq!(
-                    positions[0], first,
+                    positions.first(),
+                    first,
                     "a group has to start at its key's first occurrence"
                 );
                 if let Some(previous_first) = previous_first {
                     assert!(
-                        previous_first < positions[0],
+                        previous_first < positions.first(),
                         "groups have to stay in first-occurrence order: the readers \
                          install the acquired handle at positions[0] and clone it for \
                          the rest"
                     );
                 }
-                previous_first = Some(positions[0]);
+                previous_first = Some(positions.first());
 
-                let mut ascending = positions.iter().copied();
+                let mut ascending = positions.into_iter();
                 let mut last = ascending.next().expect("a group cannot be empty");
                 for position in ascending {
                     assert!(last < position, "positions within a group have to ascend");
                     last = position;
                 }
 
-                for &position in positions {
+                for position in positions {
                     assert!(!answered[position], "position {position} was grouped twice");
                     answered[position] = true;
                     assert_eq!(

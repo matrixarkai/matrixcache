@@ -108,6 +108,108 @@ fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
     keys.iter().any(|key| !seen.insert(key))
 }
 
+/// The positions a batch asked one key for, without a heap allocation for the
+/// case of exactly one.
+///
+/// Measured: a pinned batch read over eight distinct keys allocated fifteen
+/// times, and eight of those were a vector holding a single `usize` -- one per
+/// key, every time, for a list that only grows when the same key is asked for
+/// twice. A duplicate still allocates, which is the case the grouping exists
+/// for and the rare one.
+#[derive(Debug)]
+enum BatchPositions {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl BatchPositions {
+    fn new(position: usize) -> Self {
+        Self::One(position)
+    }
+
+    fn push(&mut self, position: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, position]),
+            Self::Many(positions) => positions.push(position),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(positions) => positions.len(),
+        }
+    }
+
+    /// The first position this key answers, which is where a sharded reader
+    /// installs the handle it acquired before cloning it for the rest.
+    fn first(&self) -> usize {
+        match self {
+            Self::One(position) => *position,
+            Self::Many(positions) => positions[0],
+        }
+    }
+}
+
+/// Borrowed iteration, for a reader that keeps the list afterwards. The
+/// positions are `usize`, so the item is the position itself either way and
+/// nothing is copied that was not already a word.
+enum BatchPositionsRefIter<'a> {
+    One(Option<usize>),
+    Many(std::slice::Iter<'a, usize>),
+}
+
+impl Iterator for BatchPositionsRefIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::One(position) => position.take(),
+            Self::Many(positions) => positions.next().copied(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a BatchPositions {
+    type Item = usize;
+    type IntoIter = BatchPositionsRefIter<'a>;
+
+    fn into_iter(self) -> BatchPositionsRefIter<'a> {
+        match self {
+            BatchPositions::One(position) => BatchPositionsRefIter::One(Some(*position)),
+            BatchPositions::Many(positions) => BatchPositionsRefIter::Many(positions.iter()),
+        }
+    }
+}
+
+enum BatchPositionsIter {
+    One(Option<usize>),
+    Many(std::vec::IntoIter<usize>),
+}
+
+impl Iterator for BatchPositionsIter {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::One(position) => position.take(),
+            Self::Many(positions) => positions.next(),
+        }
+    }
+}
+
+impl IntoIterator for BatchPositions {
+    type Item = usize;
+    type IntoIter = BatchPositionsIter;
+
+    fn into_iter(self) -> BatchPositionsIter {
+        match self {
+            Self::One(position) => BatchPositionsIter::One(Some(position)),
+            Self::Many(positions) => BatchPositionsIter::Many(positions.into_iter()),
+        }
+    }
+}
+
 /// The distinct keys of a batch and which requested positions each answers,
 /// **borrowing** the keys from `keys`.
 ///
@@ -125,8 +227,8 @@ fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
 /// has moved, the copying form goes.
 fn coalesce_batch_positions_borrowed<'a>(
     keys: &'a [CacheKey],
-) -> Vec<(&'a CacheKey, Vec<usize>)> {
-    let mut positions_by_key = Vec::<(&'a CacheKey, Vec<usize>)>::new();
+) -> Vec<(&'a CacheKey, BatchPositions)> {
+    let mut positions_by_key = Vec::<(&'a CacheKey, BatchPositions)>::new();
     if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
         for (position, key) in keys.iter().enumerate() {
             if let Some((_, positions)) = positions_by_key
@@ -135,7 +237,7 @@ fn coalesce_batch_positions_borrowed<'a>(
             {
                 positions.push(position);
             } else {
-                positions_by_key.push((key, vec![position]));
+                positions_by_key.push((key, BatchPositions::new(position)));
             }
         }
         return positions_by_key;
@@ -147,7 +249,7 @@ fn coalesce_batch_positions_borrowed<'a>(
             positions_by_key[unique_position].1.push(position);
         } else {
             unique_positions.insert(key, positions_by_key.len());
-            positions_by_key.push((key, vec![position]));
+            positions_by_key.push((key, BatchPositions::new(position)));
         }
     }
     positions_by_key
@@ -3613,8 +3715,8 @@ impl MultiLayerCache {
         // Only what genuinely needs the cache exclusively is deferred: entries
         // past their time to live, entries whose access order needs moving,
         // entries with no metadata yet, and everything below the memory tier.
-        let mut deferred: Vec<(&CacheKey, Vec<usize>, Instant)> = Vec::new();
-        let mut memory_hits: Vec<(Vec<usize>, Arc<[u8]>)> = Vec::new();
+        let mut deferred: Vec<(&CacheKey, BatchPositions, Instant)> = Vec::new();
+        let mut memory_hits: Vec<(BatchPositions, Arc<[u8]>)> = Vec::new();
         let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
         {
@@ -4139,7 +4241,7 @@ impl MultiLayerCache {
 
         let now_millis = CoarseClock::now_millis();
         let mut expired_keys = Vec::new();
-        let mut ssd_candidates = Vec::<(&CacheKey, Vec<usize>)>::new();
+        let mut ssd_candidates = Vec::<(&CacheKey, BatchPositions)>::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -4214,7 +4316,7 @@ impl MultiLayerCache {
             let inner = self.inner.read().expect("cache lock poisoned");
             inner.read_ssd_blocks(&candidate_keys)?
         };
-        let mut decoded_hits = Vec::<(&CacheKey, Vec<usize>, Arc<[u8]>)>::new();
+        let mut decoded_hits = Vec::<(&CacheKey, BatchPositions, Arc<[u8]>)>::new();
         for ((key, positions), block) in ssd_candidates.into_iter().zip(blocks) {
             let Some(block) = block else {
                 continue;
@@ -4292,7 +4394,7 @@ impl MultiLayerCache {
 
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
 
-        let mut remaining = Vec::<(&CacheKey, Vec<usize>)>::new();
+        let mut remaining = Vec::<(&CacheKey, BatchPositions)>::new();
         let mut exclusive_work = Vec::<(&CacheKey, HitOutcome, usize)>::new();
         let now_millis = CoarseClock::now_millis();
         {
@@ -4357,7 +4459,7 @@ impl MultiLayerCache {
             }
         }
 
-        let mut ssd_candidates = Vec::<(&CacheKey, Vec<usize>, Instant)>::new();
+        let mut ssd_candidates = Vec::<(&CacheKey, BatchPositions, Instant)>::new();
         let mut needs_eviction_drain = false;
         {
             let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -7666,7 +7768,7 @@ impl ShardedMultiLayerCache {
             let Some(handle) = self.acquire_no_promotion(key)? else {
                 continue;
             };
-            let first_position = positions[0];
+            let first_position = positions.first();
             results[first_position] = Some(handle);
             for position in positions.into_iter().skip(1) {
                 let cloned = self.shard_for_key(key).clone_handle(
@@ -7758,7 +7860,7 @@ impl ShardedMultiLayerCache {
             let Some(handle) = self.acquire(key)? else {
                 continue;
             };
-            let first_position = positions[0];
+            let first_position = positions.first();
             results[first_position] = Some(handle);
             for position in positions.into_iter().skip(1) {
                 let cloned = self.shard_for_key(key).clone_handle(
