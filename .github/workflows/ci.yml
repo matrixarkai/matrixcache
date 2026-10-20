@@ -296,6 +296,12 @@ jobs:
             /tmp/matrixcache-eviction.json \
             /tmp/matrixcache-eviction.json
 
+      - name: Allocation report smoke
+        run: |
+          cargo run --locked --release --no-default-features --example allocation_report -- \
+            --json-output /tmp/matrixcache-allocations.json \
+            --require-passed
+
       - name: Footprint report smoke
         run: |
           cargo run --locked --release --no-default-features --example footprint_report -- \
