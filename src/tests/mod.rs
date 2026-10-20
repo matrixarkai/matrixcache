@@ -11353,6 +11353,64 @@ mod tests {
     }
 
     #[test]
+    fn the_writeback_depth_agrees_with_the_snapshot_it_stopped_building() {
+        // The sharded forwarders read one field out of a whole `CacheStats`,
+        // per shard, per call. The number is now read off the queue instead --
+        // so the thing to pin is that it is still the same number, for one
+        // shard and for several.
+        //
+        // The size below is what a snapshot costs: it is asserted as a floor
+        // rather than printed, because if `CacheStats` ever became small the
+        // reason for this change would weaken and the comment would be stale.
+        assert!(
+            std::mem::size_of::<CacheStats>() > 1000,
+            "a snapshot is {} bytes across 147 counters; this change exists because that was              being built per shard to read one of them",
+            std::mem::size_of::<CacheStats>()
+        );
+
+        for shards in [1usize, 4] {
+            let dir = unique_temp_path(&format!("writeback-depth-{shards}"));
+            let cache = ShardedMultiLayerCache::with_options(
+                CacheOptions::new(1 << 20, 0, 1 << 20).with_ssd_paths(vec![dir]),
+                shards,
+            );
+            cache.start().unwrap();
+
+            assert_eq!(cache.async_writeback_queue_depth(), 0);
+            assert_eq!(cache.async_writeback_queue_bytes(), 0);
+
+            let mut queued = 0u64;
+            let mut bytes = 0u64;
+            for i in 0..12 {
+                let key = CacheKey::string(7, &format!("writeback-depth-{shards}-{i:04}"));
+                let value = vec![0u8; 64 + i];
+                if cache.enqueue_async_writeback(key, value.clone()).is_ok() {
+                    queued += 1;
+                    bytes += value.len() as u64;
+                }
+            }
+            assert!(
+                queued > 0,
+                "precondition: nothing was queued, so there is no depth to compare"
+            );
+
+            let stats = cache.stats();
+            assert_eq!(
+                cache.async_writeback_queue_depth(),
+                stats.async_writeback_queue_depth,
+                "{shards} shards: the cheap read and the snapshot disagree on depth"
+            );
+            assert_eq!(
+                cache.async_writeback_queue_bytes(),
+                stats.async_writeback_queue_bytes,
+                "{shards} shards: the cheap read and the snapshot disagree on bytes"
+            );
+            assert_eq!(cache.async_writeback_queue_depth(), queued);
+            assert_eq!(cache.async_writeback_queue_bytes(), bytes);
+        }
+    }
+
+    #[test]
     fn a_buffer_shares_the_key_characters_rather_than_copying_them() {
         // A `CacheBuffer` is the output of the zero-copy read path. Building
         // one from a handle allocated a fresh `String` and copied the key's
