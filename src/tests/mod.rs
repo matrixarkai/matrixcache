@@ -11353,6 +11353,55 @@ mod tests {
     }
 
     #[test]
+    fn the_put_chain_borrows_the_key_it_only_reads() {
+        // Nothing in `put_with_request_inner` consumes the key -- every use is
+        // a borrow. That became true when the tier writes were changed to take
+        // `&CacheKey`; before then the inner function handed the key to
+        // `put_memory(key, ..)` by value. The chain above it went on taking
+        // owned keys, so five sites cloned to feed it, and `put` is the
+        // crate's primary write path.
+        //
+        // Read off the source, because the copies removed were transient --
+        // made, passed down, dropped -- and this crate forbids unsafe code and
+        // so cannot install a counting allocator to see an allocation that did
+        // not happen.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+
+        for signature in [
+            "fn put_with_request(\n        &mut self,\n        key: &CacheKey,",
+            "fn put_with_request_shared(\n        &mut self,\n        key: &CacheKey,",
+            "fn put_with_request_inner(\n        &mut self,\n        key: &CacheKey,",
+        ] {
+            assert!(
+                SOURCE.contains(signature),
+                "the put chain has gone back to taking an owned key: {}",
+                signature.replace('\n', " ")
+            );
+        }
+
+        // And no caller feeds it a copy. Checked per line rather than by
+        // matching `put_with_request(key.clone()`, because a clone can be
+        // spelled `&key.clone()` too -- which is exactly what a plant of this
+        // guard did, and the narrower check passed it.
+        let cloning: Vec<&str> = SOURCE
+            .lines()
+            .filter(|line| line.contains("put_with_request") && line.contains("key.clone()"))
+            .collect();
+        assert!(
+            cloning.is_empty(),
+            "a caller still clones the key for the put chain: {cloning:?}"
+        );
+
+        // The behavioural half is already covered by every test that writes
+        // and then reads, but assert the obvious thing once here so this test
+        // fails loudly rather than only on a string match if the chain breaks.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::page(7, 9, 4096, 512);
+        cache.put(key.clone(), vec![3u8; 64]).unwrap();
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(&[3u8; 64][..]));
+    }
+
+    #[test]
     fn pinning_does_not_require_giving_up_the_key() {
         // `pin` took a `CacheKey` by value and never consumed it -- the only
         // thing it did was `increment_pin(&key)` -- so a caller that still
