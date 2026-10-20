@@ -11353,6 +11353,63 @@ mod tests {
     }
 
     #[test]
+    fn the_pin_figures_add_up_across_every_stripe() {
+        // `pinned_bytes` used to be computed in a second pass over the pin
+        // stripes, after the other four figures had been folded and the guards
+        // dropped. It is in the same fold now.
+        //
+        // Behaviour preservation is already well covered -- seventeen
+        // assertions on `pinned_bytes` elsewhere, several of them exact -- so
+        // what this adds is the part those do not reach: the fold itself,
+        // across enough keys to land on more than one stripe. A fold that
+        // dropped a stripe, or counted one twice, would pass every
+        // single-key test.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let mut expected_bytes = 0u64;
+        let mut handles = Vec::new();
+        for index in 0..24usize {
+            let key = CacheKey::string(7, &format!("pin-stripe-fold-{index:04}"));
+            let value = vec![0u8; 32 + index];
+            cache.put(key.clone(), value.clone()).unwrap();
+            let handle = cache
+                .acquire(&key)
+                .expect("acquire")
+                .expect("the key was just written");
+            expected_bytes += value.len() as u64;
+            handles.push(handle);
+        }
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let stripes_touched = inner
+            .all_pins()
+            .iter()
+            .filter(|pins| !pins.entries.is_empty())
+            .count();
+        drop(inner);
+        assert!(
+            stripes_touched > 1,
+            "precondition: the keys landed on {stripes_touched} stripe(s), so this does not              exercise a fold across stripes"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.pinned_entries, 24,
+            "every pinned key has to be counted exactly once across the stripes"
+        );
+        assert_eq!(
+            stats.pinned_bytes, expected_bytes,
+            "the pinned bytes have to add up across the stripes too"
+        );
+
+        for handle in handles {
+            cache.release(handle);
+        }
+        let after = cache.stats();
+        assert_eq!(after.pinned_entries, 0);
+        assert_eq!(after.pinned_bytes, 0);
+    }
+
+    #[test]
     fn the_writeback_depth_agrees_with_the_snapshot_it_stopped_building() {
         // The sharded forwarders read one field out of a whole `CacheStats`,
         // per shard, per call. The number is now read off the queue instead --

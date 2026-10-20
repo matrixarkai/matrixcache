@@ -10094,16 +10094,44 @@ impl MultiLayerCache {
 
     pub fn stats(&self) -> CacheStats {
         let inner = self.inner.read().expect("cache lock poisoned");
-        // Every stripe held together, so the four figures describe one instant
-        // rather than four.
-        let (pinned_entries, pin_operations, unpin_operations, zero_copy_handle_hits) = {
+        // Every stripe held together, so these figures describe one instant
+        // rather than one each.
+        //
+        // `pinned_bytes` is in here too now. It used to come from
+        // `pinned_memory_bytes()` further down, which took every stripe's lock
+        // a second time -- so the one figure the comment above did not cover
+        // was the one describing a different instant from the other four, and
+        // the metrics path paid for two locking passes over every stripe to
+        // get there.
+        let (
+            pinned_entries,
+            pin_operations,
+            unpin_operations,
+            zero_copy_handle_hits,
+            pinned_bytes,
+        ) = {
             let stripes = inner.all_pins();
-            stripes.iter().fold((0, 0, 0, 0), |total, pins| {
+            stripes.iter().fold((0, 0, 0, 0, 0), |total, pins| {
+                let bytes = pins
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| {
+                        let memory_bytes =
+                            inner.memory.get(key).map(|value| value.len()).unwrap_or(0);
+                        let pmem_bytes =
+                            inner.pmem.get(key).map(|value| value.len()).unwrap_or(0);
+                        memory_bytes
+                            .max(pmem_bytes)
+                            .max(entry.handle_bytes)
+                            .max(entry.removed_bytes.unwrap_or(0)) as u64
+                    })
+                    .sum::<u64>();
                 (
                     total.0 + pins.entries.len() as u64,
                     total.1 + pins.pin_operations,
                     total.2 + pins.unpin_operations,
                     total.3 + pins.zero_copy_handle_hits,
+                    total.4 + bytes,
                 )
             })
         };
@@ -10123,7 +10151,7 @@ impl MultiLayerCache {
                 .read_counters
                 .shared_buffer_misses
                 .load(Ordering::Relaxed),
-            pinned_bytes: inner.pinned_memory_bytes(),
+            pinned_bytes,
             async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
             async_writeback_queue_bytes: inner.async_writeback_queue_bytes,
             memory_hits: inner.read_counters.memory_hits.load(Ordering::Relaxed),
