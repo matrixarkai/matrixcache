@@ -11353,6 +11353,71 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_batch_reads_without_copying_the_grouped_keys() {
+        // Second of the five readers onto the borrowing grouping. Its deferred
+        // state is three vectors -- the SSD candidates, the pin counts and the
+        // decoded hits -- and all three carried a copy of the key.
+        //
+        // The per-position clone in each handle stays: `CachePinnedHandle.key`
+        // is a public owned `CacheKey`, so that copy is the type's contract.
+        //
+        // Source-level for the grouping, because the copies removed were
+        // transient. Behavioural for the rest, since getting a borrowed
+        // grouping wrong shows up as a wrong answer rather than a wrong count.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+        let body = {
+            let start = SOURCE
+                .find("pub fn acquire_batch_no_promotion(")
+                .expect("acquire_batch_no_promotion must be in this file");
+            let rest = &SOURCE[start..];
+            let end = rest
+                .find("\n    pub fn acquire_batch(")
+                .expect("the next method must follow it");
+            &rest[..end]
+        };
+        assert!(
+            body.contains("coalesce_batch_positions_borrowed(keys)"),
+            "this reader should be on the borrowing grouping"
+        );
+        assert!(
+            !body.contains("coalesce_batch_positions(keys)"),
+            "this reader has gone back to the copying grouping"
+        );
+
+        // And it still answers correctly, including a duplicated key, which is
+        // what the grouping exists for.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let repeated = CacheKey::page(7, 7, 4096, 512);
+        let other = CacheKey::page(7, 8, 4096, 512);
+        cache.put(repeated.clone(), vec![1u8; 48]).unwrap();
+        cache.put(other.clone(), vec![2u8; 48]).unwrap();
+
+        let handles = cache
+            .acquire_batch_no_promotion(&[repeated.clone(), other.clone(), repeated.clone()])
+            .expect("acquire_batch_no_promotion");
+
+        assert_eq!(handles.len(), 3);
+        for (position, expected) in [(0usize, 1u8), (1, 2), (2, 1)] {
+            let handle = handles[position]
+                .as_ref()
+                .unwrap_or_else(|| panic!("position {position} was not answered"));
+            assert_eq!(
+                handle.value(),
+                &vec![expected; 48][..],
+                "position {position} got the wrong bytes"
+            );
+        }
+        // The duplicate counted once per handle handed out, not once per
+        // distinct key, which the grouping has to preserve.
+        assert_eq!(cache.stats().pinned_entries, 2);
+
+        for handle in handles.into_iter().flatten() {
+            cache.release(handle);
+        }
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
     fn grouping_batch_positions_can_borrow_its_keys() {
         // Five batch readers group requested positions by key, and the
         // grouping copied the keys: once per distinct key on the small path,

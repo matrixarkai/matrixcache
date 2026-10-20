@@ -4111,24 +4111,24 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        let positions_by_key = coalesce_batch_positions(keys);
+        let positions_by_key = coalesce_batch_positions_borrowed(keys);
 
         let now_millis = CoarseClock::now_millis();
         let mut expired_keys = Vec::new();
-        let mut ssd_candidates = Vec::<(CacheKey, Vec<usize>)>::new();
+        let mut ssd_candidates = Vec::<(&CacheKey, Vec<usize>)>::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut pin_counts = Vec::<(CacheKey, usize, usize)>::new();
+            let mut pin_counts = Vec::<(&CacheKey, usize, usize)>::new();
             for (key, positions) in positions_by_key {
-                if inner.entry_expired(&key, now_millis) {
+                if inner.entry_expired(key, now_millis) {
                     expired_keys.push(key);
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(&key).cloned() {
+                    if let Some(value) = inner.memory.get(key).cloned() {
                         let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -4141,7 +4141,7 @@ impl MultiLayerCache {
                         pin_counts.push((key, value.len(), occurrences));
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(&key).cloned() {
+                    if let Some(value) = inner.pmem.get(key).cloned() {
                         let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -4162,8 +4162,8 @@ impl MultiLayerCache {
         if !expired_keys.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             for key in expired_keys {
-                if inner.entry_expired(&key, now_millis) {
-                    inner.remove_expired_entry(&key);
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
                     inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
                     inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                 }
@@ -4176,13 +4176,13 @@ impl MultiLayerCache {
 
         let candidate_keys = ssd_candidates
             .iter()
-            .map(|(key, _)| key)
+            .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
             inner.read_ssd_blocks(&candidate_keys)?
         };
-        let mut decoded_hits = Vec::<(CacheKey, Vec<usize>, Arc<[u8]>)>::new();
+        let mut decoded_hits = Vec::<(&CacheKey, Vec<usize>, Arc<[u8]>)>::new();
         for ((key, positions), block) in ssd_candidates.into_iter().zip(blocks) {
             let Some(block) = block else {
                 continue;
@@ -4199,7 +4199,7 @@ impl MultiLayerCache {
         }
         let pin_counts = decoded_hits
             .iter()
-            .map(|(key, positions, value)| (key.clone(), value.len(), positions.len()))
+            .map(|(key, positions, value)| (*key, value.len(), positions.len()))
             .collect::<Vec<_>>();
         inner.increment_pin_with_size_counts(&pin_counts);
         for (key, positions, value) in decoded_hits {
