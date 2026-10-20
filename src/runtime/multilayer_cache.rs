@@ -731,6 +731,21 @@ struct CacheInner {
     /// use expiry, and this is what keeps it costing nothing: one bool test on
     /// the write path, and the sweep is never entered.
     ttl_in_use: bool,
+    /// Whether any entry has ever been removed from its tier while pinned.
+    ///
+    /// Such an entry still occupies memory and is no longer counted in
+    /// `memory_bytes`, so `size()` has to add its bytes back -- which it does
+    /// by locking every pin stripe and walking every pinned entry. For a cache
+    /// where that has never happened the answer is provably zero, and this
+    /// says so without taking a lock.
+    ///
+    /// **Set and never cleared.** That is what makes it safe rather than a
+    /// derived counter: the only error it can make is staying true after the
+    /// last such entry has gone, and that costs exactly the walk that used to
+    /// happen unconditionally. A counter that could drift *down* would make
+    /// `size()` silently wrong, and maintaining one correctly means touching
+    /// four write sites and thirteen removal sites.
+    pinned_removals_seen: AtomicBool,
     /// Coarse-clock millisecond at which an entry stops being servable, for
     /// the entries that have one.
     ///
@@ -1665,6 +1680,7 @@ impl MultiLayerCache {
                 ssd_write_budget: SsdWriteBudget::unlimited(),
                 default_ttl_millis: 0,
                 ttl_in_use: false,
+                pinned_removals_seen: AtomicBool::new(false),
                 expiries: HashMap::new(),
                 tiering_policy,
                 block_options,
@@ -5479,6 +5495,7 @@ impl MultiLayerCache {
         {
             let mut pins = inner.pins_for(key);
             if key_pinned && removed_pinned_bytes > 0 {
+                inner.pinned_removals_seen.store(true, Ordering::Relaxed);
                 pins.entries
                     .entry(inner.shared_key(key))
                     .or_default()
@@ -8919,6 +8936,7 @@ impl CacheInner {
         //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
+        //   `pinned_removals_seen`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
         //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
@@ -9590,6 +9608,7 @@ impl CacheInner {
                 if let Some(value) = self.memory.remove(key) {
                     self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
                     if self.is_pinned(key) {
+                        self.pinned_removals_seen.store(true, Ordering::Relaxed);
                         self.pins_for(key)
                             .entries
                             .entry(self.shared_key(key))
@@ -9603,6 +9622,7 @@ impl CacheInner {
                 if let Some(value) = self.pmem.remove(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
                     if self.is_pinned(key) {
+                        self.pinned_removals_seen.store(true, Ordering::Relaxed);
                         self.pins_for(key)
                             .entries
                             .entry(self.shared_key(key))
