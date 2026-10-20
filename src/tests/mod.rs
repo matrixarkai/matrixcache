@@ -23727,3 +23727,94 @@ fn a_tier_written_with_the_old_encoding_is_read_by_the_new_one() {
     }
     assert!(reopened.stop(), "the cache did not stop cleanly");
 }
+
+/// The footprint has to count what the SSD tier's store holds in memory.
+///
+/// Without RocksDB the store is a `HashMap<String, Vec<u8>>` with a disk
+/// snapshot and a journal behind it, so every block it was handed is resident:
+/// the bytes, plus a key that is the entry's `v1` manifest line, plus the table
+/// holding them. The footprint excluded all of it behind a note saying the
+/// tier's own bytes "live on a drive rather than in this cache's resident set",
+/// which is true of the RocksDB build and false of this one.
+///
+/// The bound is one key per demoted entry, deliberately, and not the payload:
+/// the values written here compress, so the store can hold far fewer bytes
+/// than the payload it was given while still holding every key.
+#[test]
+fn the_footprint_counts_what_the_ssd_store_holds_in_memory() {
+    const ENTRIES: usize = 200;
+    const VALUE_BYTES: usize = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path().to_path_buf(),
+        CacheTieringPolicy {
+            // Room for sixteen, so the rest demote and reach the store.
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 26,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+
+    for index in 0..ENTRIES {
+        cache
+            .put(
+                CacheKey::string(0, &format!("ssd-store-{index:04}")),
+                vec![b'v'; VALUE_BYTES],
+            )
+            .expect("a cache with room must accept a put");
+    }
+
+    let footprint = cache.footprint();
+    let demoted = footprint
+        .tracked_entries
+        .saturating_sub(footprint.memory_entries);
+    assert!(
+        demoted > 100,
+        "the fixture did not demote: {demoted} of {} entries left memory",
+        footprint.tracked_entries
+    );
+
+    #[cfg(feature = "rocksdb-ssd")]
+    assert_eq!(
+        footprint.ssd_store_bytes, 0,
+        "with RocksDB the store's bytes are allocated outside Rust and cannot be \
+         counted from here, so the term has to be zero rather than a guess"
+    );
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    {
+        // One key per demoted entry is the floor the store cannot get under,
+        // whatever the blocks compress to. The manifest line for one of these
+        // keys is around seventy bytes of hex text; thirty-two is a floor, not
+        // an estimate.
+        const STORE_KEY_FLOOR_BYTES: usize = 32;
+        assert!(
+            footprint.ssd_store_bytes >= demoted * STORE_KEY_FLOOR_BYTES,
+            "the store reports {} bytes resident for {demoted} demoted entries, less than \
+             the key it has to hold for each one",
+            footprint.ssd_store_bytes
+        );
+
+        // And the total has to carry it. A term the footprint computes and the
+        // total leaves out is a term nothing reads.
+        assert!(
+            footprint.total_bytes >= footprint.ssd_store_bytes,
+            "the total ({}) is smaller than the store term it is supposed to include ({})",
+            footprint.total_bytes,
+            footprint.ssd_store_bytes
+        );
+    }
+
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}

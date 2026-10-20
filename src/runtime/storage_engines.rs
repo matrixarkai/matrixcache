@@ -2038,6 +2038,42 @@ impl Clone for StorageEngineRocksDb {
 }
 
 impl StorageEngineRocksDb {
+    /// What this store holds in **memory**, which is not nothing.
+    ///
+    /// Without RocksDB the store is a `HashMap<String, Vec<u8>>` with a disk
+    /// snapshot and journal behind it, so every block it holds is resident:
+    /// the bytes, plus a key that is the entry's `v1` manifest line -- about
+    /// seventy bytes of hex text for a thirty-character key -- plus the table
+    /// holding them. The footprint used to exclude all of it on the grounds
+    /// that "the SSD tier's own bytes live on a drive rather than in this
+    /// cache's resident set", which is true of the RocksDB build and false of
+    /// this one.
+    ///
+    /// With RocksDB it is zero, and deliberately: those bytes are allocated by the
+    /// native library and this crate cannot see them. A zero here means "not counted",
+    /// not "not there", and the footprint's documentation says so.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            0
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        {
+            let contents: usize = self
+                .records
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum();
+            let table = if self.records.capacity() == 0 {
+                0
+            } else {
+                (self.records.capacity() * 8 / 7).next_power_of_two()
+                    * (std::mem::size_of::<(String, Vec<u8>)>() + 1)
+            };
+            contents + table
+        }
+    }
+
     #[cfg(not(feature = "rocksdb-ssd"))]
     const STORE_FILE_NAME: &'static str = "matrixcache_rocksdb_compat_store.bin";
     #[cfg(not(feature = "rocksdb-ssd"))]
@@ -2942,6 +2978,15 @@ pub struct StorageEngineMultiSsd {
 }
 
 impl StorageEngineMultiSsd {
+    /// What every store behind this one holds in memory. See
+    /// [`StorageEngineRocksDb::resident_bytes`].
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.storages
+            .iter()
+            .map(StorageEngineRocksDb::resident_bytes)
+            .sum()
+    }
+
     pub fn new(paths: impl IntoIterator<Item = String>, capacity: u64) -> Self {
         Self::with_type(paths, capacity, StorageEngineKind::Ssd)
     }

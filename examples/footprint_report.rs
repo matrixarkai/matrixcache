@@ -129,7 +129,19 @@ struct TieredRow {
     metadata: usize,
     orders: usize,
     tables: usize,
+    /// What the SSD tier's store holds in memory, which this arm reported as
+    /// nothing until today -- the footprint excluded it on the grounds that
+    /// the tier's bytes live on a drive, which is true of the RocksDB build
+    /// and false of this one, where the store is a map of blocks with a
+    /// snapshot and a journal behind it.
+    ssd_store: usize,
     per_tracked_entry: f64,
+    /// The same figure with the store counted. Reported beside rather than
+    /// inside, because how much the store holds depends on how many entries
+    /// the admission policy sent to the tier -- so it moves with the value
+    /// size, and folding it in would break the flatness the per-entry terms
+    /// genuinely have.
+    with_store_per_tracked_entry: f64,
 }
 
 fn measure_tiered(value_bytes: usize) -> TieredRow {
@@ -176,7 +188,10 @@ fn measure_tiered(value_bytes: usize) -> TieredRow {
         metadata: footprint.metadata_bytes,
         orders: footprint.order_bytes,
         tables: footprint.table_bytes,
+        ssd_store: footprint.ssd_store_bytes,
         per_tracked_entry: per_entry_terms as f64 / footprint.tracked_entries.max(1) as f64,
+        with_store_per_tracked_entry: (per_entry_terms + footprint.ssd_store_bytes) as f64
+            / footprint.tracked_entries.max(1) as f64,
     }
 }
 
@@ -417,7 +432,7 @@ fn main() {
     println!("  all three tiers configured, 2000 entries, most of them demoted");
     println!();
     println!(
-        "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>14}",
+        "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>10}  {:>14}",
         "value",
         "in mem",
         "tracked",
@@ -426,6 +441,7 @@ fn main() {
         "metadata",
         "orders",
         "tables",
+        "ssd store",
         "B/tracked entry"
     );
     let tiered: Vec<TieredRow> = [64usize, 256, 1024, 4096]
@@ -434,7 +450,7 @@ fn main() {
         .collect();
     for row in &tiered {
         println!(
-            "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>14.1}",
+            "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>10}  {:>14.1}",
             row.value_bytes,
             row.memory_entries,
             row.tracked_entries,
@@ -443,10 +459,29 @@ fn main() {
             row.metadata,
             row.orders,
             row.tables,
+            row.ssd_store,
             row.per_tracked_entry
         );
     }
 
+    println!();
+    println!(
+        "  and with the SSD store's resident bytes counted, which the arm above omitted until \
+         today:"
+    );
+    println!("  {:>6}  {:>16}", "value", "B/tracked entry");
+    for row in &tiered {
+        println!(
+            "  {:>6}  {:>16.1}",
+            row.value_bytes, row.with_store_per_tracked_entry
+        );
+    }
+    println!();
+    // Named, because this table reads off the memory-only rows measured near
+    // the top of this arm, not off the tiered rows printed just above it. It
+    // used to sit directly under the tiered table with nothing saying which
+    // numbers it was about.
+    println!("  amplification of the memory-only cache, resident over payload");
     println!();
     println!("  {:>6}  {:>14}", "value", "total/payload");
     for row in &rows {
@@ -544,6 +579,30 @@ fn main() {
                 "the tiered arm at {} byte values left {} of {} entries in the memory tier, so \
                  it is not measuring a tiered cache",
                 row.value_bytes, row.memory_entries, row.tracked_entries
+            ));
+        }
+    }
+
+    // The SSD store's resident bytes are the term this arm used to omit. With
+    // RocksDB it is zero, because those bytes are allocated by the native
+    // library and cannot be seen from here, so the check is one-sided: it may
+    // be zero, but if it is not it has to account for what the store cannot
+    // avoid holding -- one key per entry it was given, each of which is that
+    // entry's manifest line.
+    //
+    // NOT measured against the payload. That was the first version of this
+    // check and it failed: the values in this arm are all zeros, so the blocks
+    // compress to almost nothing and the store holds keys and table rather
+    // than bytes. A payload-relative bound says nothing about a compressed
+    // tier -- the same trap that made an earlier disk measurement meaningless.
+    const STORE_KEY_FLOOR_BYTES: usize = 32;
+    for row in &tiered {
+        let demoted = row.tracked_entries.saturating_sub(row.memory_entries);
+        if row.ssd_store > 0 && row.ssd_store < demoted * STORE_KEY_FLOOR_BYTES {
+            failures.push(format!(
+                "the SSD store reports {} bytes resident for the {} entries demoted out \
+                 of memory, which is less than the key it has to hold for each of them",
+                row.ssd_store, demoted
             ));
         }
     }

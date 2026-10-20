@@ -651,6 +651,14 @@ pub struct CacheFootprint {
     pub writeback_bytes: usize,
     /// The admission frequency sketch, which is sized once at construction.
     pub sketch_bytes: usize,
+    /// What the SSD tier's store holds in **memory**.
+    ///
+    /// Zero with RocksDB, where the store's bytes are allocated by the native
+    /// library and cannot be seen from here -- a zero means "not counted", not "not
+    /// there". Without it the store is a map of blocks with a disk snapshot
+    /// and journal behind it, so the blocks and their keys are resident, and
+    /// this is the term that says so.
+    pub ssd_store_bytes: usize,
     /// Pin bookkeeping, across every stripe.
     pub pin_bytes: usize,
     /// Per-cache rather than per-entry: the tier paths, and the queue of
@@ -716,6 +724,7 @@ impl CacheFootprint {
         self.table_bytes += other.table_bytes;
         self.writeback_bytes += other.writeback_bytes;
         self.sketch_bytes += other.sketch_bytes;
+        self.ssd_store_bytes += other.ssd_store_bytes;
         self.pin_bytes += other.pin_bytes;
         self.fixed_bytes += other.fixed_bytes;
         self.eviction_queue_bytes += other.eviction_queue_bytes;
@@ -1430,6 +1439,15 @@ enum SsdTierStore {
 }
 
 impl SsdTierStore {
+    /// What the store holds in memory, across however many stores it has.
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Disabled { .. } => 0,
+            Self::Single(store) => store.resident_bytes(),
+            Self::Multi(multi) => multi.resident_bytes(),
+        }
+    }
+
     fn new(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize) -> Self {
         if capacity_bytes == 0 {
             return Self::Disabled {
@@ -9295,8 +9313,12 @@ impl CacheInner {
         //   `access_record_callback`, `eviction_callback`,
         //   `eviction_metric_callback`.
         //
-        // The SSD tier's own bytes, which live on a drive rather than in this
-        // cache's resident set: `ssd_store`, `ssd_write_budget`.
+        // `ssd_write_budget` owns no heap. `ssd_store` is counted by
+        // `ssd_store_bytes` above: its bytes were excluded here on the grounds
+        // that they live on a drive rather than in this cache's resident set,
+        // which is true of the RocksDB build and false of the other one, where
+        // the store is a map of blocks with a snapshot and a journal behind
+        // it.
         //
         // Owns no heap -- a number, a flag, an atomic or an enum:
         //   `started`, `auto_recover_on_start`, `ssd_block_durability`,
@@ -9357,6 +9379,7 @@ impl CacheInner {
             table_bytes,
             writeback_bytes,
             sketch_bytes,
+            ssd_store_bytes: self.ssd_store.resident_bytes(),
             pin_bytes,
             fixed_bytes,
             eviction_queue_bytes,
@@ -9372,6 +9395,7 @@ impl CacheInner {
             + footprint.table_bytes
             + footprint.writeback_bytes
             + footprint.sketch_bytes
+            + footprint.ssd_store_bytes
             + footprint.pin_bytes
             + footprint.fixed_bytes
             + footprint.eviction_queue_bytes;
