@@ -4508,7 +4508,7 @@ impl MultiLayerCache {
         if !inner.started {
             return Err(CacheError::Stopped);
         }
-        let result = inner.put_with_request(key.clone(), value, None);
+        let result = inner.put_with_request(&key, value, None);
         inner.record_put_latency(started);
         drop(inner);
         if result.is_ok() {
@@ -4539,7 +4539,7 @@ impl MultiLayerCache {
         if !inner.started {
             return Err(CacheError::Stopped);
         }
-        let result = inner.put_with_request_shared(key.clone(), value, None);
+        let result = inner.put_with_request_shared(&key, value, None);
         inner.record_put_latency(started);
         drop(inner);
         if result.is_ok() {
@@ -4561,7 +4561,7 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         let request = inner.default_insert_request(&key, value.len(), logical_size);
-        let result = inner.put_with_request(key.clone(), value, Some(request));
+        let result = inner.put_with_request(&key, value, Some(request));
         inner.record_put_latency(started);
         drop(inner);
         if result.is_ok() {
@@ -4632,7 +4632,7 @@ impl MultiLayerCache {
         if !inner.started {
             return Err(CacheError::Stopped);
         }
-        let result = inner.put_with_request(key.clone(), value, Some(request));
+        let result = inner.put_with_request(&key, value, Some(request));
         inner.record_put_latency(started);
         drop(inner);
         if result.is_ok() {
@@ -9043,7 +9043,7 @@ impl CacheInner {
     /// miss.
     fn put_with_request(
         &mut self,
-        key: CacheKey,
+        key: &CacheKey,
         value: Vec<u8>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
@@ -9052,17 +9052,17 @@ impl CacheInner {
 
     fn put_with_request_shared(
         &mut self,
-        key: CacheKey,
+        key: &CacheKey,
         value: Arc<[u8]>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
-        let outcome = self.put_with_request_inner(key.clone(), value, request);
-        if !self.memory.contains_key(&key)
-            && !self.pmem.contains_key(&key)
-            && !self.disk_index.contains_key(&key)
+        let outcome = self.put_with_request_inner(key, value, request);
+        if !self.memory.contains_key(key)
+            && !self.pmem.contains_key(key)
+            && !self.disk_index.contains_key(key)
         {
-            self.metadata.remove(&key);
-            self.forget_expiry(&key);
+            self.metadata.remove(key);
+            self.forget_expiry(key);
         }
         outcome
     }
@@ -9077,7 +9077,7 @@ impl CacheInner {
     /// `Vec`: the SSD path only reads the bytes to encode a block from them.
     fn put_with_request_inner(
         &mut self,
-        key: CacheKey,
+        key: &CacheKey,
         value: Arc<[u8]>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
@@ -9087,10 +9087,10 @@ impl CacheInner {
         // sweeping just as much. Before admission rather than after, so room
         // an expired entry gives up can spare a live one from eviction.
         self.sweep_some_expired();
-        if !self.is_pinned(&key) {
-            self.pins_for(&key).entries.remove(&key);
+        if !self.is_pinned(key) {
+            self.pins_for(key).entries.remove(key);
         }
-        let request = request.unwrap_or_else(|| self.default_request(&key, value.len()));
+        let request = request.unwrap_or_else(|| self.default_request(key, value.len()));
         let decision = self.tiering_policy.decide(&request);
         let ssd_enabled = self.ssd_capacity_bytes > 0 || self.ssd_instance_only;
         let admit_ssd = ssd_enabled
@@ -9103,14 +9103,14 @@ impl CacheInner {
 
         if admit_memory {
             self.record_metadata(
-                &key,
+                key,
                 request.block_kind,
                 request.routing_slot,
                 value.len(),
                 request.hotness,
                 decision.reason,
             );
-            if !self.put_memory_shared(&key, Arc::clone(&value))
+            if !self.put_memory_shared(key, Arc::clone(&value))
                 && matches!(
                     self.tiering_policy.data_placement,
                     CacheDataPlacement::Tiered
@@ -9118,14 +9118,14 @@ impl CacheInner {
                 && self.pmem_capacity_bytes > 0
             {
                 self.record_metadata(
-                    &key,
+                    key,
                     request.block_kind,
                     request.routing_slot,
                     value.len(),
                     request.hotness,
                     CacheAdmissionReason::PersistentMemory,
                 );
-                pmem_admitted_via_memory_fallback = self.put_pmem_shared(&key, Arc::clone(&value));
+                pmem_admitted_via_memory_fallback = self.put_pmem_shared(key, Arc::clone(&value));
             }
         } else if !self.ssd_instance_only {
             self.stats.memory_admission_rejected += 1;
@@ -9138,19 +9138,19 @@ impl CacheInner {
             // A key gets here by having grown hot enough for the tiering
             // decision to route its rewrite past memory, which is exactly the
             // case of a key being written repeatedly.
-            self.drop_stale_tier_copy(&key, CacheTier::Memory);
+            self.drop_stale_tier_copy(key, CacheTier::Memory);
         }
 
         if admit_pmem && !pmem_admitted_via_memory_fallback {
             self.record_metadata(
-                &key,
+                key,
                 request.block_kind,
                 request.routing_slot,
                 value.len(),
                 request.hotness,
                 decision.reason,
             );
-            let _ = self.put_pmem_shared(&key, Arc::clone(&value));
+            let _ = self.put_pmem_shared(key, Arc::clone(&value));
         } else if !self.ssd_instance_only {
             self.stats.pmem_admission_rejected =
                 self.stats.pmem_admission_rejected.saturating_add(1);
@@ -9161,7 +9161,7 @@ impl CacheInner {
             // value here. That path lands in this branch too, and dropping the
             // copy it wrote would throw away the write it was making.
             if !pmem_admitted_via_memory_fallback {
-                self.drop_stale_tier_copy(&key, CacheTier::Pmem);
+                self.drop_stale_tier_copy(key, CacheTier::Pmem);
             }
         }
 
@@ -9185,7 +9185,7 @@ impl CacheInner {
         }
         // Ask the write budget before encoding: a block the budget will not let
         // through is not worth compressing first.
-        if !self.ssd_write_budget_admits(&key) {
+        if !self.ssd_write_budget_admits(key) {
             self.stats.puts += 1;
             return Ok(());
         }
@@ -9208,7 +9208,7 @@ impl CacheInner {
             return Ok(());
         }
         if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64
-            && self.incoming_ssd_block_is_colder_than_existing_groups(&key, &request, value.len())
+            && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len())
         {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             self.stats.writeback_backpressure_events =
@@ -9228,8 +9228,8 @@ impl CacheInner {
             self.stats.compressed_puts += 1;
             self.stats.compression_bytes_saved += value.len().saturating_sub(block.len()) as u64;
         }
-        self.write_ssd_block(&key, &block)?;
-        let shared = self.shared_key(&key);
+        self.write_ssd_block(key, &block)?;
+        let shared = self.shared_key(key);
         if let Some(old_len) = self
             .disk_index
             .insert(Arc::clone(&shared), block_len as u64)
@@ -9239,7 +9239,7 @@ impl CacheInner {
         self.disk_order.push_back_if_absent_shared(shared);
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.record_metadata(
-            &key,
+            key,
             request.block_kind,
             request.routing_slot,
             value.len(),
@@ -9249,7 +9249,7 @@ impl CacheInner {
         self.stats.puts += 1;
         self.stats.disk_fills += 1;
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
-        self.append_disk_manifest_put(&key, block_len as u64)?;
+        self.append_disk_manifest_put(key, block_len as u64)?;
         Ok(())
     }
 
