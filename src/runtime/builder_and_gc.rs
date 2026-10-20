@@ -1001,14 +1001,14 @@ impl CacheInner {
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
                 let shared = self.shared_key(&key);
-                self.metadata.entry(shared).or_insert(CacheEntryMeta {
+                self.metadata.entry(shared).or_insert(CacheEntryMeta::new(
                     block_kind,
                     routing_slot,
-                    hotness: AtomicU32::new(0),
-                    hits: AtomicU64::new(0),
-                    last_access_epoch: AtomicU64::new(0),
-                    admission_reason: CacheAdmissionReason::MemoryOnly,
-                });
+                    0,
+                    0,
+                    0,
+                    CacheAdmissionReason::MemoryOnly,
+                ));
             }
             self.disk_index = recovered_index;
             self.disk_order = recovered_order.into_iter().collect();
@@ -1077,14 +1077,14 @@ impl CacheInner {
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
                 let shared = self.shared_key(&key);
-                self.metadata.entry(shared).or_insert(CacheEntryMeta {
+                self.metadata.entry(shared).or_insert(CacheEntryMeta::new(
                     block_kind,
                     routing_slot,
-                    hotness: AtomicU32::new(0),
-                    hits: AtomicU64::new(0),
-                    last_access_epoch: AtomicU64::new(0),
-                    admission_reason: CacheAdmissionReason::MemoryOnly,
-                });
+                    0,
+                    0,
+                    0,
+                    CacheAdmissionReason::MemoryOnly,
+                ));
             }
 
             self.disk_index = recovered_index;
@@ -1103,7 +1103,7 @@ impl CacheInner {
                 .unwrap_or_else(|| infer_block_kind(key)),
             shard_id: key.shard_id,
             routing_slot: existing
-                .and_then(|meta| meta.routing_slot)
+                .and_then(|meta| meta.routing_slot())
                 .or_else(|| extract_routing_slot(key)),
             block_bytes,
             hotness: existing
@@ -1407,7 +1407,7 @@ impl CacheInner {
         let mut rewriting = false;
         if let Some(meta) = self.metadata.get_mut(key) {
             meta.block_kind = block_kind;
-            meta.routing_slot = routing_slot;
+            meta.set_routing_slot(routing_slot);
             meta.last_access_epoch.store(epoch, Ordering::Relaxed);
             meta.admission_reason = admission_reason;
             rewriting = true;
@@ -1424,16 +1424,14 @@ impl CacheInner {
         let shared = self.shared_key(key);
         self.metadata.insert(
             shared,
-            CacheEntryMeta {
+            CacheEntryMeta::new(
                 block_kind,
                 routing_slot,
-                hotness: AtomicU32::new(
-                    initial_hotness(block_kind, block_bytes).max(requested_hotness),
-                ),
-                hits: AtomicU64::new(0),
-                last_access_epoch: AtomicU64::new(epoch),
+                initial_hotness(block_kind, block_bytes).max(requested_hotness),
+                0,
+                epoch,
                 admission_reason,
-            },
+            ),
         );
     }
 
@@ -1450,7 +1448,7 @@ impl CacheInner {
         // every hit and then discarded it.
         let mut seen_at = None;
         let crossed_threshold = if let Some(entry) = self.metadata.get(key) {
-            entry.hits.fetch_add(1, Ordering::Relaxed);
+            entry.record_hits(1);
             let before = entry.hotness.fetch_add(1, Ordering::Relaxed);
             // Read, do not swap. This stamp records when the entry was
             // last MOVED in the access order; swapping here would make the
@@ -1468,14 +1466,14 @@ impl CacheInner {
             let shared = self.shared_key(key);
             self.metadata.insert(
                 shared,
-                CacheEntryMeta {
+                CacheEntryMeta::new(
                     block_kind,
-                    routing_slot: extract_routing_slot(key),
-                    hotness: AtomicU32::new(hotness),
-                    hits: AtomicU64::new(1),
-                    last_access_epoch: AtomicU64::new(epoch),
-                    admission_reason: CacheAdmissionReason::MemoryOnly,
-                },
+                    extract_routing_slot(key),
+                    hotness,
+                    1,
+                    epoch,
+                    CacheAdmissionReason::MemoryOnly,
+                ),
             );
             before < threshold && hotness >= threshold
         };
@@ -1520,7 +1518,7 @@ impl CacheInner {
         };
         let threshold = self.tiering_policy.memory_hotness_threshold;
         let occurrences = occurrences.max(1) as u64;
-        let hits_before = entry.hits.fetch_add(occurrences, Ordering::Relaxed);
+        let hits_before = entry.record_hits(occurrences);
         // A sampled hit signal for the admission sketch, and only when the
         // filter that consumes it is on -- a bool already in this cache line,
         // against ~1.6ns of sketch work nothing would read.
@@ -2285,7 +2283,7 @@ impl CacheInner {
                 let twice_read = self
                     .metadata
                     .get(key)
-                    .is_some_and(|meta| meta.hits.load(Ordering::Relaxed) >= SLRU_PROTECTED_HITS);
+                    .is_some_and(|meta| meta.hits() >= SLRU_PROTECTED_HITS);
                 if twice_read {
                     promote.push(key.clone());
                     continue;
@@ -3028,7 +3026,7 @@ impl CacheInner {
 fn eviction_score_of(meta: Option<&CacheEntryMeta>, segmented: bool) -> EvictionScore {
     match meta {
         Some(meta) => {
-            let hits = meta.hits.load(Ordering::Relaxed);
+            let hits = meta.hits();
             EvictionScore {
                 segment: u8::from(segmented && hits >= SLRU_PROTECTED_HITS),
                 hotness: meta.hotness.load(Ordering::Relaxed),
@@ -3050,7 +3048,7 @@ fn eviction_group_key_of<'a>(
     meta: Option<&CacheEntryMeta>,
     key: &'a CacheKey,
 ) -> EvictionGroupKey<'a> {
-    meta.and_then(|meta| meta.routing_slot)
+    meta.and_then(|meta| meta.routing_slot())
         .or_else(|| extract_routing_slot(key))
         .map(EvictionGroupKey::Slot)
         .unwrap_or(EvictionGroupKey::Object(key))

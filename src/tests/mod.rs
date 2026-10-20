@@ -1088,8 +1088,7 @@ mod tests {
                 .metadata
                 .get(&watched)
                 .expect("the entry has metadata before anything evicts")
-                .hits
-                .load(Ordering::Relaxed)
+                .hits()
         };
         assert!(
             hits_before > 0,
@@ -1144,7 +1143,7 @@ mod tests {
             .get(&watched)
             .expect("an entry the PMEM tier is serving keeps its metadata");
         assert!(
-            meta.hits.load(Ordering::Relaxed) >= hits_before,
+            meta.hits() >= hits_before,
             "the entry's hit count went backwards, so its history was rebuilt from nothing"
         );
     }
@@ -16871,10 +16870,17 @@ mod tests {
         // decides whether removing a field removes anything at all, and
         // removing the `routing_slot` option instead would have left this at
         // forty.
+        //
+        // 40 with the expiry on it, 32 without, and 24 since the hit counter
+        // became 32 bits and the routing slot traded its `Option` for a bool
+        // in padding -- both of which were needed, because either alone left
+        // alignment to round the struct back up to 32. This assertion is what
+        // caught that change, and it is the reason the figure is pinned rather
+        // than bounded.
         assert_eq!(
             std::mem::size_of::<CacheEntryMeta>(),
-            32,
-            "the metadata struct was 40 bytes with the expiry on it and is 32 without; a field              added back here costs eight bytes a bucket as well as its own size"
+            24,
+            "the metadata struct was 40 bytes with the expiry on it, 32 with a 64-bit hit              counter, and is 24 now; a field added back here costs eight bytes a bucket as              well as its own size"
         );
 
         let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
@@ -23926,4 +23932,75 @@ fn the_footprint_total_is_every_byte_term_added_up() {
 
     drop(pinned);
     assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// The narrowed metadata fields have to read back as what they replaced.
+///
+/// The size itself is pinned by `an_entry_carries_no_room_for_an_expiry_it
+/// _does_not_have`, which is the assertion that caught this change -- not
+/// repeated here, because two tests pinning one number means one of them
+/// lying later. What is here is the behaviour the narrowing could have
+/// broken: an `Option<u32>` replaced by a `u32` and a bool, and a 64-bit
+/// counter replaced by a 32-bit one that has to saturate rather than wrap.
+#[test]
+fn the_narrowed_metadata_fields_read_back_as_what_they_replaced() {
+    // The accessors have to be the `Option` they replaced, both ways.
+    let mut meta = crate::CacheEntryMeta::new(
+        CacheBlockKind::Object,
+        Some(7),
+        3,
+        1,
+        99,
+        CacheAdmissionReason::MemoryOnly,
+    );
+    assert_eq!(meta.routing_slot(), Some(7));
+    meta.set_routing_slot(None);
+    assert_eq!(meta.routing_slot(), None, "a slot set to none reads as none");
+    meta.set_routing_slot(Some(0));
+    assert_eq!(
+        meta.routing_slot(),
+        Some(0),
+        "slot zero is a slot, not an absence -- the presence bit is what says so"
+    );
+
+    // The hit counter saturates rather than wrapping. A wrap would make the
+    // hottest key in the cache momentarily the coldest.
+    let hot = crate::CacheEntryMeta::new(
+        CacheBlockKind::Object,
+        None,
+        0,
+        u32::MAX - 4,
+        0,
+        CacheAdmissionReason::MemoryOnly,
+    );
+    let before = hot.record_hits(1_000_000);
+    assert_eq!(
+        before,
+        u64::from(u32::MAX - 4),
+        "the count before the add is what is handed back"
+    );
+    assert_eq!(
+        hot.hits(),
+        u64::from(u32::MAX - 4),
+        "a counter above the ceiling stops counting instead of wrapping to zero"
+    );
+
+    // And one below the ceiling counts, including a batch larger than the
+    // cap on a single call -- which is clamped, not wrapped.
+    let warm = crate::CacheEntryMeta::new(
+        CacheBlockKind::Object,
+        None,
+        0,
+        0,
+        0,
+        CacheAdmissionReason::MemoryOnly,
+    );
+    assert_eq!(warm.record_hits(3), 0);
+    assert_eq!(warm.hits(), 3);
+    assert_eq!(warm.record_hits(u64::MAX), 3);
+    assert_eq!(
+        warm.hits(),
+        3 + (1 << 20),
+        "a single call adds at most the per-call cap"
+    );
 }

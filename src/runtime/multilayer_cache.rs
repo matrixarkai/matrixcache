@@ -1405,12 +1405,88 @@ struct CachePinState {
 /// reader of this struct already took it by reference.
 #[derive(Debug)]
 struct CacheEntryMeta {
-    block_kind: CacheBlockKind,
-    routing_slot: Option<u32>,
-    hotness: AtomicU32,
-    hits: AtomicU64,
+    /// Milliseconds, so it has to be 64 bits: a 32-bit millisecond clock
+    /// wraps in 49 days, and this is compared against `now` by subtraction.
     last_access_epoch: AtomicU64,
+    hotness: AtomicU32,
+    /// 32 bits, not 64, and saturating -- see [`Self::record_hits`].
+    hits: AtomicU32,
+    /// The routing slot, with its presence in the byte beside it rather than
+    /// in eight bytes of its own.
+    ///
+    /// `Option<u32>` has no spare bit pattern to put a discriminant in, so it
+    /// is eight bytes: four for the value and four for one bit. The bool
+    /// below lands in padding this struct already had.
+    ///
+    /// Read it through [`Self::routing_slot`], which hands back the `Option`.
+    routing_slot: u32,
+    block_kind: CacheBlockKind,
     admission_reason: CacheAdmissionReason,
+    routing_slot_present: bool,
+}
+
+/// Where the hit counter stops.
+///
+/// Half of `u32`, so that a single `fetch_add` from below it cannot overflow
+/// whatever it is handed, and so that the figure saturates rather than wraps:
+/// a key read two billion times is as hot as this cache needs to know, and a
+/// wrap would make it momentarily the coldest thing in the tier.
+const HITS_CEILING: u32 = 1 << 31;
+
+/// Most a single call may add, so the ceiling above is a real bound even with
+/// writers racing: it would take two thousand of them between one load and
+/// one add to reach `u32::MAX`.
+const HITS_MAX_PER_CALL: u64 = 1 << 20;
+
+impl CacheEntryMeta {
+    fn new(
+        block_kind: CacheBlockKind,
+        routing_slot: Option<u32>,
+        hotness: u32,
+        hits: u32,
+        last_access_epoch: u64,
+        admission_reason: CacheAdmissionReason,
+    ) -> Self {
+        Self {
+            last_access_epoch: AtomicU64::new(last_access_epoch),
+            hotness: AtomicU32::new(hotness),
+            hits: AtomicU32::new(hits),
+            routing_slot: routing_slot.unwrap_or(0),
+            block_kind,
+            admission_reason,
+            routing_slot_present: routing_slot.is_some(),
+        }
+    }
+
+    /// The routing slot this entry was admitted under, if it has one.
+    fn routing_slot(&self) -> Option<u32> {
+        self.routing_slot_present.then_some(self.routing_slot)
+    }
+
+    fn set_routing_slot(&mut self, routing_slot: Option<u32>) {
+        self.routing_slot_present = routing_slot.is_some();
+        self.routing_slot = routing_slot.unwrap_or(0);
+    }
+
+    /// Hits so far, widened: the counter is 32 bits and every figure it feeds
+    /// is 64, including the public `EvictionScore`.
+    fn hits(&self) -> u64 {
+        u64::from(self.hits.load(Ordering::Relaxed))
+    }
+
+    /// Count hits, handing back what the count was before.
+    ///
+    /// A load and a conditional add rather than a compare-and-swap loop,
+    /// because this runs on **every read**: the load is almost free beside the
+    /// add that follows it, and a CAS loop on one hot key is not.
+    fn record_hits(&self, occurrences: u64) -> u64 {
+        let seen = self.hits.load(Ordering::Relaxed);
+        if seen >= HITS_CEILING {
+            return u64::from(seen);
+        }
+        let add = occurrences.min(HITS_MAX_PER_CALL) as u32;
+        u64::from(self.hits.fetch_add(add, Ordering::Relaxed))
+    }
 }
 struct StagedSsdBatchWrite {
     key: CacheKey,
@@ -10427,13 +10503,11 @@ impl MultiLayerCache {
                     disk_bytes,
                     pinned,
                     block_kind: meta.map(|meta| meta.block_kind),
-                    routing_slot: meta.and_then(|meta| meta.routing_slot),
+                    routing_slot: meta.and_then(|meta| meta.routing_slot()),
                     hotness: meta
                         .map(|meta| meta.hotness.load(Ordering::Relaxed))
                         .unwrap_or_default(),
-                    hits: meta
-                        .map(|meta| meta.hits.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
+                    hits: meta.map(CacheEntryMeta::hits).unwrap_or_default(),
                     last_access_epoch: meta
                         .map(|meta| meta.last_access_epoch.load(Ordering::Relaxed))
                         .unwrap_or_default(),
@@ -10491,13 +10565,11 @@ impl MultiLayerCache {
                     disk_bytes,
                     pinned,
                     block_kind: meta.map(|meta| meta.block_kind),
-                    routing_slot: meta.and_then(|meta| meta.routing_slot),
+                    routing_slot: meta.and_then(|meta| meta.routing_slot()),
                     hotness: meta
                         .map(|meta| meta.hotness.load(Ordering::Relaxed))
                         .unwrap_or_default(),
-                    hits: meta
-                        .map(|meta| meta.hits.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
+                    hits: meta.map(CacheEntryMeta::hits).unwrap_or_default(),
                     last_access_epoch: meta
                         .map(|meta| meta.last_access_epoch.load(Ordering::Relaxed))
                         .unwrap_or_default(),
