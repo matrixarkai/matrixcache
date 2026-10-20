@@ -22,7 +22,10 @@
 
 use std::alloc::System;
 
-use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use matrixcache::{
+    CacheBlockOptions, CacheDataPlacement, CacheKey, CacheOptions, CacheTieringPolicy,
+    MultiLayerCache,
+};
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
 
 #[global_allocator]
@@ -171,6 +174,46 @@ fn main() {
         evicting += 1;
         tight
             .put(key(evicting), value.clone())
+            .expect("put must be accepted");
+    }));
+
+    // A write that reaches the SSD tier, which no row above does. Everything
+    // measured so far is the memory tier: this path also compresses, frames a
+    // block, builds a manifest line and writes it, so it is the most expensive
+    // write the cache has -- and the one where a payload copy is easiest to
+    // hide.
+    //
+    // The two feature arms are NOT comparable here. With `rocksdb-ssd` the
+    // store's own allocations happen in a native library the counting
+    // allocator cannot see, so this row reports the Rust side only; without it
+    // the store is Rust and every byte it keeps is in the figure.
+    let ssd_dir = std::env::temp_dir().join("matrixcache-allocation-report-ssd");
+    let _ = std::fs::remove_dir_all(&ssd_dir);
+    let tiered = MultiLayerCache::with_tiering_policy(
+        ssd_dir.clone(),
+        CacheTieringPolicy {
+            // Room for a handful in memory, so writes go through to the tier
+            // rather than piling up in it.
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    let mut reaching_ssd = 2_000_000usize;
+    rows.push(measure("put, reaching the SSD tier", 1, || {
+        reaching_ssd += 1;
+        tiered
+            .put(key(reaching_ssd), value.clone())
             .expect("put must be accepted");
     }));
 
