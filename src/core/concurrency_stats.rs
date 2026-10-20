@@ -250,6 +250,34 @@ fn page_selector(
     selector
 }
 
+/// A feature query's selector, in one exactly sized allocation.
+///
+/// `format!` sizes a string from nothing and grows it as the pieces arrive, so
+/// a selector over millisecond timestamps -- thirty-two characters of digits
+/// and two colons -- came out of it holding fifty-two bytes. That slack is
+/// resident for as long as the entry is, and it is held once per key
+/// allocation, which is what `page_selector` above reserves exactly to avoid.
+///
+/// The waste only shows up at realistic widths: three one-digit numbers give
+/// `format!` a capacity of exactly five, so a fixture with small values makes
+/// this look like it was never a problem.
+fn feature_selector(start_ms: u64, end_ms: u64, count: usize) -> String {
+    use std::fmt::Write as _;
+    let capacity = decimal_width(start_ms)
+        + 1
+        + decimal_width(end_ms)
+        + 1
+        + decimal_width(count as u64);
+    let mut selector = String::with_capacity(capacity);
+    let _ = write!(selector, "{start_ms}:{end_ms}:{count}");
+    debug_assert_eq!(
+        selector.len(),
+        capacity,
+        "the reservation has to be the length, not an estimate of it"
+    );
+    selector
+}
+
 impl CacheKey {
     pub fn string(shard_id: ShardId, key: &str) -> Self {
         Self {
@@ -289,9 +317,10 @@ impl CacheKey {
             shard_id,
             record_key: std::sync::Arc::from(key),
             namespace: std::borrow::Cow::Borrowed("feature"),
-            selector: std::borrow::Cow::Owned(format!(
-                "{start_ms}:{end_ms}:{}",
-                count.unwrap_or(5000)
+            selector: std::borrow::Cow::Owned(feature_selector(
+                start_ms,
+                end_ms,
+                count.unwrap_or(5000),
             )),
         }
     }

@@ -11585,6 +11585,73 @@ mod tests {
     }
 
     #[test]
+    fn a_computed_selector_reserves_exactly_what_it_writes() {
+        // Two of the key constructors compute their selector, and a computed
+        // selector is an allocation that stays resident for as long as the
+        // entry does, held once per key allocation. `page_selector` reserved
+        // exactly for that reason. The feature query's was left to `format!`,
+        // which sizes nothing up front and grows as the pieces arrive: it came
+        // out holding fifty-two bytes for a thirty-two-character selector.
+        //
+        // The widths are the point. Three one-digit numbers come out of
+        // `format!` with a capacity of exactly five, so a fixture with small
+        // values cannot tell an exact reservation from a grown one. These are
+        // millisecond timestamps, which is what the caller passes.
+        let feature = CacheKey::feature_query(
+            7,
+            "feature-selector-width",
+            1_700_000_000_000,
+            1_700_000_600_000,
+            Some(5_000),
+        );
+        let selector = match &feature.selector {
+            std::borrow::Cow::Owned(owned) => owned,
+            std::borrow::Cow::Borrowed(_) => panic!("a feature query computes its selector"),
+        };
+        assert_eq!(selector, "1700000000000:1700000600000:5000");
+        assert!(
+            selector.len() >= 32,
+            "the widths have to be realistic or the slack never appears: {}",
+            selector.len()
+        );
+        assert_eq!(
+            selector.capacity(),
+            selector.len(),
+            "a resident selector must not keep the slack its growth left"
+        );
+
+        // The guarantee the page selectors have had, at widths that would show
+        // a grown allocation.
+        for page in [
+            CacheKey::page(7, 1, 4_294_967_296, 1_048_576),
+            CacheKey::page_with_slot(7, 1, 4_294_967_296, 1_048_576, Some(4_000_000_000)),
+        ] {
+            let selector = match &page.selector {
+                std::borrow::Cow::Owned(owned) => owned,
+                std::borrow::Cow::Borrowed(_) => panic!("a page key computes its selector"),
+            };
+            assert!(
+                selector.len() >= 18,
+                "the widths have to be realistic or the slack never appears: {selector}"
+            );
+            assert_eq!(
+                selector.capacity(),
+                selector.len(),
+                "a resident selector must not keep the slack its growth left: {selector}"
+            );
+        }
+
+        // And the spelling, which catches a reintroduction rather than the
+        // concept: a `format!` straight into a resident `Cow::Owned` is the
+        // shape that grew.
+        const SOURCE: &str = include_str!("../core/concurrency_stats.rs");
+        assert!(
+            !SOURCE.contains("Cow::Owned(format!("),
+            "a resident selector cannot be sized by format!"
+        );
+    }
+
+    #[test]
     fn grouping_batch_positions_can_borrow_its_keys() {
         // Five batch readers group requested positions by key, and the
         // grouping copied the keys: once per distinct key on the small path,
