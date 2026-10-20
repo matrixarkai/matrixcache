@@ -18125,6 +18125,164 @@ mod tests {
     }
 
     #[test]
+    fn shrinking_and_compacting_run_safely_while_readers_are_working() {
+        // The shrink and the arena compaction were added to `invalidate`,
+        // `invalidate_batch`, `purge_expired` and `set_capacity_for_tier`, and
+        // they rewrite tables and renumber every node in the recency order
+        // while holding the cache. Nothing exercised those paths concurrently:
+        // the soak example never invalidates, purges or resizes, so a reader
+        // that held a node index across a lock boundary would not have been
+        // caught by anything.
+        //
+        // Readers here tolerate a miss -- the key may have just been
+        // invalidated -- but never a wrong answer, which is what a renumbering
+        // gone wrong would produce.
+        const KEYS: usize = 6_000;
+        /// Every ninety-third key survives, so the survivors are **scattered**
+        /// across the arena rather than being a prefix of it. A surviving
+        /// prefix makes the renumbering the identity map for exactly the keys
+        /// the assertions check, and the plant that skips the index rewrite
+        /// then passes -- which is what happened to the first version of this.
+        const STRIDE: usize = 93;
+        const READERS: usize = 4;
+
+        let key = |index: usize| CacheKey::string(0, &format!("concurrent-shrink-{index:08}"));
+        let byte = |index: usize| (index % 251) as u8;
+
+        let cache = Arc::new(MultiLayerCache::with_options(CacheOptions::new(1 << 30, 0, 0)));
+        for index in 0..KEYS {
+            cache.put(key(index), vec![byte(index); 64]).unwrap();
+        }
+
+        // Shared, and built before anything starts: each reader building its
+        // own six thousand keys took longer than the writer's whole run, so
+        // the overlap this test is about barely happened.
+        let probes: Arc<Vec<CacheKey>> = Arc::new((0..KEYS).map(key).collect());
+        // The overlap is arranged rather than raced for. Without this the test
+        // asserted a read count, which came out between 130 and 230 across
+        // runs and made the assertion the flaky part.
+        let ready = Arc::new(std::sync::Barrier::new(READERS + 1));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrong = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut readers = Vec::with_capacity(READERS);
+        for reader in 0..READERS {
+            let cache = Arc::clone(&cache);
+            let stop = Arc::clone(&stop);
+            let wrong = Arc::clone(&wrong);
+            let reads = Arc::clone(&reads);
+            let probes = Arc::clone(&probes);
+            let ready = Arc::clone(&ready);
+            readers.push(std::thread::spawn(move || {
+                let mut index = reader * 37;
+                ready.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    index = (index + 7) % KEYS;
+                    let probe = &probes[index];
+                    let expected = (index % 251) as u8;
+                    if let Ok(Some(value)) = cache.get_shared(probe) {
+                        if value.iter().any(|seen| *seen != expected) {
+                            wrong.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if let Ok(Some(handle)) = cache.acquire(probe) {
+                        if handle.value().iter().any(|seen| *seen != expected) {
+                            wrong.fetch_add(1, Ordering::Relaxed);
+                        }
+                        cache.release(handle);
+                    }
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // The writer crosses the shrink threshold several times on the way
+        // down: each pass quarters the live set, which is what triggers a
+        // rehash and a compaction.
+        let filled = cache.footprint();
+        ready.wait();
+        let doomed: Vec<usize> = (0..KEYS).filter(|index| index % STRIDE != 0).collect();
+        let (one_at_a_time, in_a_batch) = doomed.split_at(doomed.len() / 2);
+        for index in one_at_a_time {
+            cache.invalidate(&key(*index)).unwrap();
+        }
+        let batch: Vec<CacheKey> = in_a_batch.iter().map(|index| key(*index)).collect();
+        cache.invalidate_batch(&batch).unwrap();
+        cache.purge_expired();
+        cache.set_capacity_for_tier(CacheTier::Memory, 1 << 20);
+
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().expect("a reader panicked");
+        }
+
+        // That the readers were running is arranged by the barrier, so the
+        // count is information rather than a threshold -- it comes out in the
+        // low hundreds because the writer holds the cache for each rehash and
+        // each arena rebuild, which starves readers by design. Asserting a
+        // number here made the assertion the flaky part.
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the readers did not run at all"
+        );
+        assert_eq!(
+            wrong.load(Ordering::Relaxed),
+            0,
+            "a reader was handed bytes belonging to another key"
+        );
+        assert_eq!(cache.stats().pinned_entries, 0, "a handle was not released");
+
+        // The positive control: the shrink and the compaction have to have
+        // actually run, or this test is a concurrency test of nothing. Both
+        // terms are the ones those two paths give back.
+        let after = cache.footprint();
+        assert!(
+            after.table_bytes * 4 < filled.table_bytes,
+            "no shrink happened under the readers: {} against {} when full",
+            after.table_bytes,
+            filled.table_bytes
+        );
+        assert!(
+            after.order_bytes * 4 < filled.order_bytes,
+            "no compaction happened under the readers: {} against {} when full",
+            after.order_bytes,
+            filled.order_bytes
+        );
+
+        // The survivors are still there and still themselves.
+        let survivors: Vec<usize> = (0..KEYS).step_by(STRIDE).collect();
+        assert!(survivors.len() > 16, "precondition: there have to be survivors to check");
+        for index in &survivors {
+            let value = cache
+                .get_shared(&key(*index))
+                .expect("get_shared")
+                .expect("a key that was never invalidated");
+            assert!(
+                value.iter().all(|seen| *seen == byte(*index)),
+                "survivor {index} came back as someone else"
+            );
+        }
+
+        // And the order the compaction rewrote is sound.
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        inner
+            .memory_order
+            .check_access_invariants()
+            .expect("the recency order has to be sound after being renumbered under load");
+        // The invariant the reads above cannot see. A read is served from the
+        // tier's own map, so an index left pointing at the old positions
+        // corrupts eviction order while every read keeps working -- planted,
+        // and this is the assertion that catches it.
+        for index in &survivors {
+            let survivor = key(*index);
+            assert!(
+                inner.memory_order.index_points_at_its_key(&survivor),
+                "the order's index does not name the node holding {survivor:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_cache_that_shrank_gives_its_table_space_back() {
         // A `HashMap` never shrinks on its own. Measured before this: a cache
         // filled to twenty thousand entries and emptied down to a thousand

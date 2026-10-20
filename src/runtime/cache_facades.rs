@@ -3976,6 +3976,18 @@ impl CacheKeyOrder {
         }
     }
 
+    /// Whether the index entry for `key` names a node that holds that key.
+    ///
+    /// The invariant a renumbering breaks, and the one a read cannot see: a
+    /// read is served from the tier's own map, so an index pointing at the
+    /// wrong node corrupts eviction order while every read keeps working.
+    #[cfg(test)]
+    pub(crate) fn index_points_at_its_key(&self, key: &CacheKey) -> bool {
+        self.index
+            .get(key)
+            .is_some_and(|node| self.nodes[*node as usize].key.as_ref() == key)
+    }
+
     /// The arena's allocation, which is what compaction gives back.
     #[cfg(test)]
     pub(crate) fn node_capacity(&self) -> usize {
