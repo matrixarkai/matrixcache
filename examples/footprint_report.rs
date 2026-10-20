@@ -9,9 +9,16 @@
 //! term.
 //!
 //! Almost all of the overhead is charged **per entry** -- the keys, the
-//! metadata, the recency orders and the hash tables. That makes it ruinous for
-//! small entries and rounding error for large ones, and flat in the value
-//! size, which the self-check below asserts.
+//! recency orders and the hash tables. That makes it ruinous for small entries
+//! and rounding error for large ones, and flat in the value size, which the
+//! self-check below asserts.
+//!
+//! The `metadata` column is printed for decomposition and **not added**: a
+//! `HashMap` stores its values inline in the table it allocates, and the
+//! metadata map's value is a `CacheEntryMeta` rather than a handle to one, so
+//! those bytes are already in `tables`. They were added as well until today,
+//! which inflated every per-entry figure this report published by the size of
+//! that struct.
 //!
 //! The one term that is not per entry is the admission sketch, which is sized
 //! from `memory_capacity_bytes` when the admission filter is switched on. With
@@ -85,10 +92,7 @@ fn measure(value_bytes: usize) -> Row {
         "nothing may evict during the fill, or the denominator is wrong"
     );
 
-    let per_entry_terms = footprint.key_bytes
-        + footprint.metadata_bytes
-        + footprint.order_bytes
-        + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
 
     Row {
         value_bytes,
@@ -158,10 +162,7 @@ fn measure_tiered(value_bytes: usize) -> TieredRow {
     }
 
     let footprint = cache.footprint();
-    let per_entry_terms = footprint.key_bytes
-        + footprint.metadata_bytes
-        + footprint.order_bytes
-        + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
 
     TieredRow {
         value_bytes,
@@ -262,10 +263,7 @@ fn measure_shape(shape: &'static str, build: &dyn Fn(usize) -> CacheKey) -> Shap
 
     let sample = build(0);
     let (owned_selector, selector_slack) = selector_bytes(&sample);
-    let per_entry_terms = footprint.key_bytes
-        + footprint.metadata_bytes
-        + footprint.order_bytes
-        + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
 
     ShapeRow {
         shape,
@@ -313,7 +311,8 @@ fn main() {
     }
 
     println!();
-    println!("  the per-entry overhead -- keys, metadata, orders, tables");
+    println!("  the per-entry overhead -- keys, orders, tables");
+    println!("  (the metadata column above is inside tables, not beside it)");
     println!();
     println!(
         "  {:>6}  {:>16}  {:>22}",
