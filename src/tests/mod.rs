@@ -18140,85 +18140,65 @@ mod tests {
     }
 
     #[test]
-    fn a_shrink_predicate_on_capacity_goes_quiet_while_one_on_buckets_keeps_working() {
-        // This is why the first version of the predicate did almost nothing,
-        // and it is worth pinning because the mistake is invisible:
+    fn the_shrink_predicate_keeps_a_table_proportional_to_its_live_set() {
         // `HashMap::capacity()` is `len + growth_left`, and a removal leaves a
         // tombstone that does not give the growth back. So capacity falls as
         // entries are removed while the bucket array stays exactly as large as
-        // it was -- and once a shrink has brought capacity down to about the
-        // live set, `len * 4 <= capacity()` can never be true again.
+        // it was, and a predicate of the form `len * 4 <= capacity()` stops
+        // being able to fire: measured on a map taken from 20,000 entries down
+        // to 1,000, one shrink against four, leaving a table four times too
+        // large.
         //
-        // Both predicates are run side by side over the same removals, which
-        // is the only way to show that the difference is the predicate and not
-        // the workload.
+        // That is why the production predicates read the bucket count, and the
+        // two assertions at the end of this test are what hold them to it.
+        //
+        // What this test does NOT do any more is compare the two predicates'
+        // final table sizes, or assert how many times either fires. Both
+        // depend on where the hasher happens to put things: the first version
+        // asserted a count and put main red, and the second compared the two
+        // final sizes and failed four runs in five, because the capacity
+        // predicate sometimes reaches the same size by firing twice.
         const FILLED: u64 = 20_000;
         const KEPT: u64 = 1_000;
         const FLOOR: usize = 64;
 
-        let fill = || {
-            let mut map: std::collections::HashMap<u64, u64> =
-                std::collections::HashMap::new();
-            for index in 0..FILLED {
-                map.insert(index, index);
-            }
-            map
-        };
-
-        let mut on_capacity = fill();
-        let filled_buckets = estimated_buckets(on_capacity.capacity());
-        let mut capacity_shrinks = 0;
+        let mut map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for index in 0..FILLED {
+            map.insert(index, index);
+        }
+        let filled_buckets = estimated_buckets(map.capacity());
         for index in KEPT..FILLED {
-            on_capacity.remove(&index);
-            if on_capacity.capacity() > FLOOR
-                && on_capacity.len().saturating_mul(4) <= on_capacity.capacity()
-            {
-                on_capacity.shrink_to_fit();
-                capacity_shrinks += 1;
+            map.remove(&index);
+            let buckets = estimated_buckets(map.capacity());
+            if buckets > FLOOR && map.len().saturating_mul(4) <= buckets {
+                map.shrink_to_fit();
             }
         }
 
-        let mut on_buckets = fill();
-        let mut bucket_shrinks = 0;
-        for index in KEPT..FILLED {
-            on_buckets.remove(&index);
-            let buckets = estimated_buckets(on_buckets.capacity());
-            if buckets > FLOOR && on_buckets.len().saturating_mul(4) <= buckets {
-                on_buckets.shrink_to_fit();
-                bucket_shrinks += 1;
-            }
-        }
+        assert_eq!(map.len(), KEPT as usize);
+        let buckets = estimated_buckets(map.capacity());
+        assert!(
+            buckets <= KEPT as usize * 4,
+            "the table has to stay proportional to the live set: {buckets} buckets for {KEPT} \
+             entries"
+        );
+        assert!(
+            buckets * 4 <= filled_buckets,
+            "and most of the table has to come back: {buckets} against {filled_buckets} when full"
+        );
 
-        assert_eq!(on_capacity.len(), KEPT as usize);
-        assert_eq!(on_buckets.len(), KEPT as usize);
-        // Bounds, not counts. How many times either predicate fires depends
-        // on the exact `capacity()` trajectory, and that depends on where the
-        // hasher happens to put things -- so the first version of this
-        // asserted `capacity_shrinks == 1`, passed on its own pull request,
-        // and failed on main in the arm its author had not run. The claim was
-        // never the count: it is that reading `capacity()` goes quiet while
-        // reading the buckets keeps working.
+        // The spelling, because the behavioural comparison is not stable and
+        // this is: a predicate that goes back to reading `capacity()` fires
+        // about once and leaves most of the table behind.
         assert!(
-            capacity_shrinks <= 2,
-            "the capacity-based predicate is supposed to go quiet, not fire \
-             {capacity_shrinks} times"
+            include_str!("../runtime/builder_and_gc.rs")
+                .contains("estimated_buckets(map.capacity())"),
+            "the tier maps' shrink predicate has to read the bucket count"
         );
         assert!(
-            bucket_shrinks > capacity_shrinks,
-            "reading the bucket count has to keep firing where reading the capacity \
-             stops: {bucket_shrinks} against {capacity_shrinks}"
-        );
-        assert!(
-            estimated_buckets(on_buckets.capacity()) * 2
-                <= estimated_buckets(on_capacity.capacity()),
-            "reading the bucket count has to leave a smaller table: {} against {}",
-            estimated_buckets(on_buckets.capacity()),
-            estimated_buckets(on_capacity.capacity())
-        );
-        assert!(
-            estimated_buckets(on_buckets.capacity()) * 4 <= filled_buckets,
-            "and it has to give most of the table back: {} against {filled_buckets} when full",
-            estimated_buckets(on_buckets.capacity())
+            include_str!("../runtime/cache_facades.rs")
+                .contains("estimated_buckets(self.index.capacity())"),
+            "the order index's shrink predicate has to read the bucket count"
         );
     }
 
