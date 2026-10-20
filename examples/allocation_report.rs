@@ -209,11 +209,30 @@ fn main() {
         },
         CacheBlockOptions::default(),
     );
+    // Incompressible, deliberately, and only for this row. The tier
+    // compresses what it writes, so a block of zeros makes every copy of the
+    // payload on this path cost almost nothing -- which is exactly what the
+    // row is here to measure. Measured on this fixture: removing two payload
+    // copies moved 54,274.6 bytes to 54,008.1 with zeros, a change of 266
+    // bytes for two copies of a 1,024-byte value, because the blocks being
+    // copied had compressed to about fifty bytes each.
+    //
+    // The rows above keep the zero-filled value, so their figures stay
+    // comparable with the ones already published for them.
+    let mut fill = 0x2545_f491_4f6c_dd1du64;
+    let incompressible: Vec<u8> = (0..VALUE_BYTES)
+        .map(|_| {
+            fill ^= fill << 13;
+            fill ^= fill >> 7;
+            fill ^= fill << 17;
+            (fill & 0xff) as u8
+        })
+        .collect();
     let mut reaching_ssd = 2_000_000usize;
     rows.push(measure("put, reaching the SSD tier", 1, || {
         reaching_ssd += 1;
         tiered
-            .put(key(reaching_ssd), value.clone())
+            .put(key(reaching_ssd), incompressible.clone())
             .expect("put must be accepted");
     }));
 
