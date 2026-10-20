@@ -535,9 +535,18 @@ pub struct CacheFootprint {
     pub sketch_bytes: usize,
     /// Pin bookkeeping, across every stripe.
     pub pin_bytes: usize,
-    /// Per-cache rather than per-entry: the tier paths, and the queues that
-    /// carry eviction records to a callback.
+    /// Per-cache rather than per-entry: the tier paths, and the queue of
+    /// evicted tiers that carries the eviction *metric* to a callback.
     pub fixed_bytes: usize,
+    /// Evictions queued for a registered handler, which hold a **copy of the
+    /// evicted value**.
+    ///
+    /// Zero unless an eviction handler is both registered and enabled, which
+    /// is what gates the copy. While one is, this grows with every eviction
+    /// and falls when the queue is drained -- so it is neither per-entry nor
+    /// fixed, and it was previously reported as the array of record structs
+    /// alone, without the payload each record carries.
+    pub eviction_queue_bytes: usize,
     /// Every byte-counting field above, added up. The two entry counts,
     /// `memory_entries` and `tracked_entries`, are not bytes and are not in
     /// it.
@@ -591,6 +600,7 @@ impl CacheFootprint {
         self.sketch_bytes += other.sketch_bytes;
         self.pin_bytes += other.pin_bytes;
         self.fixed_bytes += other.fixed_bytes;
+        self.eviction_queue_bytes += other.eviction_queue_bytes;
         self.total_bytes += other.total_bytes;
     }
 }
@@ -1951,6 +1961,15 @@ impl MultiLayerCache {
         for key in &expired {
             inner.remove_expired_entry(key);
         }
+        drop(inner);
+        // Every other path that evicts hands its records to the handler before
+        // returning. This one did not: a cache whose only activity was expiry
+        // queued an owned copy of every expired value and delivered none of
+        // them until some unrelated call happened to drain the queue. The
+        // handler heard about a quiet expiry late, or -- for a cache that only
+        // ever sweeps -- not at all, while the copies accumulated with nothing
+        // bounding them.
+        self.drain_eviction_records();
         expired.len()
     }
 
@@ -8939,6 +8958,15 @@ impl CacheInner {
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
             .chain(self.disk_order.iter())
+            // Both queues hold an owned key, and after the entry is gone they
+            // can be its only holder. Chained rather than added separately so
+            // a key they share with a live entry is still counted once.
+            .chain(
+                self.pending_eviction_records
+                    .iter()
+                    .map(|record| &record.key),
+            )
+            .chain(self.async_writeback_queue.iter().map(|job| &job.key))
         {
             if counted_characters.insert(key.shared_heap_address()) {
                 shared_character_bytes =
@@ -9080,9 +9108,19 @@ impl CacheInner {
                 .map(|path| path.capacity())
                 .sum::<usize>()
             + self.pmem_paths.capacity() * std::mem::size_of::<PathBuf>()
-            + self.pending_eviction_records.capacity()
-                * std::mem::size_of::<CacheEvictionRecord>()
             + self.pending_eviction_metric_tiers.capacity() * std::mem::size_of::<CacheTier>();
+
+        // A queued record carries an owned copy of the evicted value and an
+        // owned key. The array of records was counted as a fixed cost; the
+        // copies hanging off it were not counted at all, and they are the
+        // whole payload of every eviction waiting for a handler.
+        let eviction_queue_bytes = self.pending_eviction_records.capacity()
+            * std::mem::size_of::<CacheEvictionRecord>()
+            + self
+                .pending_eviction_records
+                .iter()
+                .map(|record| record.value.capacity() + record.key.owned_heap_bytes())
+                .sum::<usize>();
 
         // The tables themselves, less the keys and values counted above.
         let table_bytes = map_table_bytes(&self.memory)
@@ -9109,6 +9147,7 @@ impl CacheInner {
             sketch_bytes,
             pin_bytes,
             fixed_bytes,
+            eviction_queue_bytes,
             total_bytes: 0,
         };
         // `metadata_bytes` is deliberately absent: the metadata map stores a
@@ -9122,7 +9161,8 @@ impl CacheInner {
             + footprint.writeback_bytes
             + footprint.sketch_bytes
             + footprint.pin_bytes
-            + footprint.fixed_bytes;
+            + footprint.fixed_bytes
+            + footprint.eviction_queue_bytes;
         footprint
     }
 
