@@ -3836,6 +3836,109 @@ impl CacheKeyOrder {
     /// and the free list holds every released one for reuse, so dropping
     /// either would leak arena slots. The index is a `HashMap` and has no such
     /// constraint, and it is the larger of the two per entry.
+    /// Rebuild the node arena densely, in eviction order.
+    ///
+    /// The arena cannot shrink by itself: **a node's index is its identity**.
+    /// The index map names nodes by position, both linked lists name them by
+    /// position, and the free list holds every released position so that it
+    /// can be handed out again. Dropping any of that would leak positions.
+    ///
+    /// Compaction is the way to give them back -- rebuild the arena in
+    /// eviction order and then rewrite every name. Measured: a cache taken
+    /// from 20,000 entries down to 1,000 held 786,432 bytes of arena and
+    /// 131,072 of free list for those 1,000 nodes, which was three quarters of
+    /// everything it still held.
+    ///
+    /// The new arena is laid out in eviction order, so the walk that evicts is
+    /// also the walk that is cheapest to read.
+    ///
+    /// Same threshold as the maps beside it, against `capacity` rather than
+    /// `len` because the capacity is what is held: a quarter full and above a
+    /// floor. After compaction the capacity is the live count, so this cannot
+    /// repeat until the arena has grown fourfold again.
+    pub(crate) fn compact_if_sparse(&mut self, floor: usize) {
+        let live = self.index.len();
+        if self.nodes.capacity() <= floor || live.saturating_mul(4) > self.nodes.capacity() {
+            return;
+        }
+
+        // Every allocated node is linked into the eviction list, and a
+        // released one is not, so the walk visits exactly the live nodes.
+        let mut remap = vec![CACHE_ORDER_NIL; self.nodes.len()];
+        let mut eviction_order = Vec::with_capacity(live);
+        let mut cursor = self.head;
+        while cursor != CACHE_ORDER_NIL {
+            let index = cursor as usize;
+            if remap[index] != CACHE_ORDER_NIL {
+                // A cycle. Compaction must not paper over a corrupt list, so
+                // leave the arena exactly as it is.
+                return;
+            }
+            remap[index] = eviction_order.len() as u32;
+            eviction_order.push(cursor);
+            cursor = self.nodes[index].next;
+        }
+        if eviction_order.len() != live {
+            // The list and the index disagree about what is live. Same answer:
+            // leave it alone rather than rebuild from a disagreement.
+            return;
+        }
+        // Equal counts are not the same set, and the index is about to be
+        // rewritten through `remap`: a value the walk never reached would be
+        // given `CACHE_ORDER_NIL` and point at nothing. One bounds-safe pass
+        // first, so a refusal stays a refusal rather than becoming the
+        // corruption it was refusing to build on.
+        if self.index.values().any(|&node| {
+            remap.get(node as usize).copied().unwrap_or(CACHE_ORDER_NIL) == CACHE_ORDER_NIL
+        }) {
+            return;
+        }
+
+        let cold: Vec<bool> = eviction_order
+            .iter()
+            .map(|&node| self.node_is_cold(node))
+            .collect();
+        let remapped = |node: u32| {
+            if node == CACHE_ORDER_NIL {
+                CACHE_ORDER_NIL
+            } else {
+                remap[node as usize]
+            }
+        };
+
+        let mut nodes = Vec::with_capacity(live);
+        for &old in &eviction_order {
+            let node = &self.nodes[old as usize];
+            nodes.push(CacheOrderNode {
+                // A reference count, not an allocation: the index holds the
+                // same key and is about to point at the new node.
+                key: Arc::clone(&node.key),
+                prev: remapped(node.prev),
+                next: remapped(node.next),
+                access_prev: remapped(node.access_prev),
+                access_next: remapped(node.access_next),
+            });
+        }
+
+        self.head = remapped(self.head);
+        self.tail = remapped(self.tail);
+        self.access_head = remapped(self.access_head);
+        self.access_tail = remapped(self.access_tail);
+        self.access_insert = remapped(self.access_insert);
+        for node in self.index.values_mut() {
+            *node = remap[*node as usize];
+        }
+
+        self.nodes = nodes;
+        self.free = Vec::new();
+        self.access_cold_bits = Vec::new();
+        for (node, &is_cold) in cold.iter().enumerate() {
+            if is_cold {
+                self.set_node_cold(node as u32, true);
+            }
+        }
+    }
+
     pub(crate) fn shrink_index_if_sparse(&mut self, floor: usize) {
         let buckets = estimated_buckets(self.index.capacity());
         if buckets > floor && self.index.len().saturating_mul(4) <= buckets {
@@ -3852,6 +3955,48 @@ impl CacheKeyOrder {
     pub(crate) fn key_strong_count(&self, key: &CacheKey) -> Option<usize> {
         let node = *self.index.get(key)?;
         Some(Arc::strong_count(&self.nodes[node as usize].key))
+    }
+
+    /// The key at the access insertion point, which is where the next entry
+    /// is placed.
+    ///
+    /// The **key**, not the position: compaction changes every position by
+    /// design, so a test comparing positions would fail for the one reason
+    /// that is not a bug -- and a test comparing nothing would miss an
+    /// insertion point left pointing at a different entry, which is a valid
+    /// position holding the wrong node.
+    #[cfg(test)]
+    pub(crate) fn access_insert_key(&self) -> Option<CacheKey> {
+        if self.access_insert == CACHE_ORDER_NIL {
+            None
+        } else {
+            Some(CacheKey::clone(
+                &self.nodes[self.access_insert as usize].key,
+            ))
+        }
+    }
+
+    /// The arena's allocation, which is what compaction gives back.
+    #[cfg(test)]
+    pub(crate) fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Which live keys are cold, sorted, so that a compaction can be checked
+    /// against the set it started with.
+    ///
+    /// Sorted rather than in arena order on purpose: compaction changes the
+    /// arena order by design, and a test that compared that would fail for
+    /// the one reason that is not a bug.
+    #[cfg(test)]
+    pub(crate) fn cold_keys(&self) -> Vec<CacheKey> {
+        let mut keys: Vec<CacheKey> = (0..self.nodes.len() as u32)
+            .filter(|&node| self.node_is_cold(node))
+            .filter(|&node| self.index.get(self.nodes[node as usize].key.as_ref()) == Some(&node))
+            .map(|node| CacheKey::clone(&self.nodes[node as usize].key))
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// Nodes sitting on the free list, waiting to be reused.

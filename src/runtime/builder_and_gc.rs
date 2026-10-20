@@ -1276,9 +1276,16 @@ impl CacheInner {
         if sparse(&self.expiries) {
             self.expiries.shrink_to_fit();
         }
-        self.memory_order.shrink_index_if_sparse(SHRINK_FLOOR);
-        self.pmem_order.shrink_index_if_sparse(SHRINK_FLOOR);
-        self.disk_order.shrink_index_if_sparse(SHRINK_FLOOR);
+        for order in [
+            &mut self.memory_order,
+            &mut self.pmem_order,
+            &mut self.disk_order,
+        ] {
+            order.shrink_index_if_sparse(SHRINK_FLOOR);
+            // The arena is the larger half: a node is 24 bytes and the free
+            // list holds a position for every one ever released.
+            order.compact_if_sparse(SHRINK_FLOOR);
+        }
     }
 
     fn entry_expired(&self, key: &CacheKey, now_millis: u64) -> bool {

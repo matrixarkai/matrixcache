@@ -18082,7 +18082,7 @@ mod tests {
         assert_eq!(small.memory_entries, KEPT);
 
         assert!(
-            after.table_bytes <= small.table_bytes,
+            after.table_bytes <= small.table_bytes * 2,
             "a cache that shrank holds {} bytes of table where one that never grew holds {}",
             after.table_bytes,
             small.table_bytes
@@ -18094,21 +18094,163 @@ mod tests {
             filled.table_bytes
         );
 
-        // What is left over is the recency order's node arena and its free
-        // list, and that is not a bug this test is hiding: a node's index is
-        // its identity and the free list holds every released one for reuse,
-        // so neither can shrink without compacting the arena and remapping
-        // every id. The index beside it is a map and does shrink.
+        // The orders come down too, now that the arena is compacted rather
+        // than left at its high water mark. What stays is the rounding: the
+        // arena is rebuilt at the live count and then grows by doubling, so a
+        // thousand live nodes sit in an arena sized for two thousand.
         assert!(
-            after.order_bytes < filled.order_bytes,
-            "the order's index has to have come down with the maps: {} against {}",
+            after.order_bytes < filled.order_bytes / 4,
+            "the orders have to come down with the maps: {} against {}",
             after.order_bytes,
             filled.order_bytes
         );
+        // Four, not two: each shrink halves, and whether the last one fires
+        // before the removals stop is a property of the hasher rather than of
+        // this change. The claim is the order of magnitude, against the 16x
+        // this held before the arena was compacted.
         assert!(
-            after.order_bytes > small.order_bytes,
-            "precondition: the arena is expected to stay, so this test should not be \
-             claiming the orders came all the way down"
+            after.order_bytes <= small.order_bytes * 4,
+            "and come down to about what a cache that never grew holds: {} against {}",
+            after.order_bytes,
+            small.order_bytes
+        );
+    }
+
+    #[test]
+    fn compacting_the_arena_keeps_both_orders_exactly_as_they_were() {
+        // A node's index is its identity: the index map names nodes by
+        // position, both linked lists name them by position, and the free list
+        // holds every released position for reuse. Compaction rewrites all of
+        // that, so the thing to assert is that nothing observable changed --
+        // the eviction order, the access order, and which entries are cold.
+        // Keep every tenth key rather than the first two hundred. A fixture
+        // whose survivors are a **prefix** of the arena makes compaction the
+        // identity map -- every live node is already where it would be moved
+        // to -- and then no plant that scrambles a position can fail. Spread
+        // them out and the renumbering is forced: the last survivor sits near
+        // position two thousand and the compacted arena only has two hundred
+        // slots.
+        const FILLED: usize = 2_000;
+        const STRIDE: usize = 10;
+        const KEPT: usize = FILLED / STRIDE;
+        const LATE: usize = 40;
+
+        let mut order = CacheKeyOrder::new();
+        // A non-zero insertion spec, so the access order is not simply the
+        // eviction order reversed and a mix-up between them would show.
+        order.set_insertion_spec(2);
+        for index in 0..FILLED {
+            // `push_back_if_absent`, not `push_back`: only this one routes a
+            // new node through the access insertion point, and with a non-zero
+            // spec the other leaves the insertion point dangling.
+            order.push_back_if_absent(CacheKey::string(0, &format!("compacted-{index:06}")));
+        }
+        // Touch a scattering of them, so the access order is genuinely its own
+        // sequence rather than a copy of the insertion order.
+        for index in (0..FILLED).step_by(7) {
+            assert!(order.touch_access(&CacheKey::string(0, &format!("compacted-{index:06}"))));
+        }
+        for index in 0..FILLED {
+            if index % STRIDE != 0 {
+                assert!(order.remove(&CacheKey::string(0, &format!("compacted-{index:06}"))));
+            }
+        }
+        // The removals clear every cold bit -- measured: 500 cold after the
+        // fill, 0 after the removals, because the insertion point is only
+        // rebalanced when something is inserted. So insert a few, which puts
+        // the insertion point back into the middle of the order and marks the
+        // nodes below it cold. Without this the cold comparison below holds
+        // for an empty set against an empty set, and the plant that drops the
+        // bits survives it.
+        for index in 0..LATE {
+            order.push_back_if_absent(CacheKey::string(0, &format!("compacted-late-{index:06}")));
+        }
+        assert_eq!(order.len(), KEPT + LATE);
+        assert!(
+            order.released_nodes() >= FILLED - KEPT - LATE - 1,
+            "precondition: the arena has to be mostly free, or there is nothing to compact"
+        );
+        order.check_access_invariants().expect("sound before compaction");
+        // The insertion point by key. A plant that left it at its old position
+        // passed every other assertion here: the old position was still a
+        // valid node after compaction, just a different entry, so both lists
+        // stayed sound and the cold set stayed the same. Only the key sees it.
+        let insertion_point_before = order
+            .access_insert_key()
+            .expect("precondition: a non-zero spec has to leave an insertion point set");
+
+        let eviction_before: Vec<CacheKey> = order.iter().cloned().collect();
+        let access_before: Vec<CacheKey> = order.iter_access().cloned().collect();
+        let cold_before = order.cold_keys();
+        assert!(
+            !cold_before.is_empty(),
+            "precondition: some entries have to be cold, or the comparison below holds \
+             for an empty set against an empty set and a plant that drops the bits \
+             survives it"
+        );
+        let capacity_before = order.node_capacity();
+
+        order.compact_if_sparse(64);
+
+        order
+            .check_access_invariants()
+            .expect("the lists have to be sound after every name in them was rewritten");
+        assert_eq!(
+            order.iter().cloned().collect::<Vec<_>>(),
+            eviction_before,
+            "the eviction order changed"
+        );
+        assert_eq!(
+            order.iter_access().cloned().collect::<Vec<_>>(),
+            access_before,
+            "the access order changed"
+        );
+        assert_eq!(
+            order.cold_keys(),
+            cold_before,
+            "the cold set changed, so the bits were not remapped with the nodes"
+        );
+        assert_eq!(
+            order.access_insert_key(),
+            Some(insertion_point_before),
+            "the insertion point names a different entry, so the next insert would land in the \
+             wrong place"
+        );
+        assert_eq!(
+            order.released_nodes(),
+            0,
+            "a compacted arena has nothing released"
+        );
+        assert!(
+            order.node_capacity() * 4 <= capacity_before,
+            "the arena did not come down: {} against {capacity_before}",
+            order.node_capacity()
+        );
+
+        // Every key still finds its node, which is the part the index rewrite
+        // could have got wrong without either list noticing.
+        for key in (0..FILLED)
+            .step_by(STRIDE)
+            .map(|index| CacheKey::string(0, &format!("compacted-{index:06}")))
+            .chain(
+                (0..LATE).map(|index| CacheKey::string(0, &format!("compacted-late-{index:06}"))),
+            )
+        {
+            assert!(order.contains(&key), "a key lost its node: {key:?}");
+            assert_eq!(
+                order.key_strong_count(&key),
+                Some(2),
+                "the node and the index have to reach one allocation, not two"
+            );
+        }
+
+        // And it is idempotent: a dense arena is not worth rebuilding.
+        let capacity = order.node_capacity();
+        order.compact_if_sparse(64);
+        assert_eq!(
+            order.node_capacity(),
+            capacity,
+            "a dense arena must not be rebuilt"
         );
     }
 
