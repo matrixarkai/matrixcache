@@ -24,6 +24,10 @@ zstd = "0.14"
 rocksdb = { version = "0.25", default-features = false, optional = true }
 
 [dev-dependencies]
+# A counting allocator, so the allocation claims in this crate can be measured
+# rather than argued from the source. The unsafe `GlobalAlloc` impl lives in
+# that crate, so this one keeps `unsafe_code = "forbid"`.
+stats_alloc = "=0.1.10"
 tempfile = "=3.27.0"
 
 [package.metadata.docs.rs]
