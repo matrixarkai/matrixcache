@@ -1206,6 +1206,29 @@ impl CacheInner {
     }
 
     /// Whether the entry under `key` has passed its time to live.
+    /// Drops an entry's metadata, but only if no tier still holds the key.
+    ///
+    /// The metadata map is keyed independently of the tiers and outlives any
+    /// one of them, so every removal has to ask all three. An entry that loses
+    /// its metadata while a tier can still serve it is not merely cheaper to
+    /// keep: [`Self::entry_expired`] reads the expiry out of the metadata and
+    /// answers `false` when there is none, so the entry stops expiring; and
+    /// `eviction_score_of` scores a key with no metadata as zero hotness, zero
+    /// hits and epoch zero, which is the coldest thing in the cache. Removing
+    /// it early therefore makes an entry both immortal against its time to live
+    /// and first out under pressure.
+    ///
+    /// The rule lives here rather than at the four sites that need it because
+    /// one of them had two thirds of it.
+    fn forget_metadata_unless_resident(&mut self, key: &CacheKey) {
+        if !self.memory.contains_key(key)
+            && !self.pmem.contains_key(key)
+            && !self.disk_index.contains_key(key)
+        {
+            self.metadata.remove(key);
+        }
+    }
+
     fn entry_expired(&self, key: &CacheKey, now_millis: u64) -> bool {
         self.metadata
             .get(key)
@@ -1838,7 +1861,9 @@ impl CacheInner {
                 continue;
             };
             self.memory_bytes = self.memory_bytes.saturating_sub(old_value.len());
-            let demoted = self.demote_memory_victim(&victim, &old_value);
+            // Answer not consulted: whatever tier this lands in is one
+            // the metadata rule below asks about.
+            let _ = self.demote_memory_victim(&victim, &old_value);
             self.record_eviction(
                 CacheTier::Memory,
                 &victim,
@@ -1849,12 +1874,9 @@ impl CacheInner {
             self.stats.eviction_capacity = self.stats.eviction_capacity.saturating_add(1);
             self.stats.memory_slot_evictions = self.stats.memory_slot_evictions.saturating_add(1);
             self.record_memory_eviction_reason(reason);
-            if !demoted
-                && !self.pmem.contains_key(&victim)
-                && !self.disk_index.contains_key(&victim)
-            {
-                self.metadata.remove(&victim);
-            }
+            // `demoted` is not tested any more: a demoted victim is in the
+            // PMEM tier, which the helper asks about.
+            self.forget_metadata_unless_resident(&victim);
             self.record_eviction_latency(eviction_started);
             if self.memory_bytes == before {
                 break;
@@ -1885,17 +1907,14 @@ impl CacheInner {
                 continue;
             };
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old_value.len());
-            let demoted = self.demote_pmem_victim(&victim, &old_value);
+            // Answer not consulted: whatever tier this lands in is one
+            // the metadata rule below asks about.
+            let _ = self.demote_pmem_victim(&victim, &old_value);
             let _ = self.persist_pmem_delete(&victim);
             self.record_eviction(CacheTier::Pmem, &victim, &old_value, removal_cause(reason));
             self.stats.pmem_evictions = self.stats.pmem_evictions.saturating_add(1);
             self.stats.pmem_eviction_capacity = self.stats.pmem_eviction_capacity.saturating_add(1);
-            if !demoted
-                && !self.memory.contains_key(&victim)
-                && !self.disk_index.contains_key(&victim)
-            {
-                self.metadata.remove(&victim);
-            }
+            self.forget_metadata_unless_resident(&victim);
             self.record_eviction_latency(eviction_started);
             if self.pmem_bytes == before {
                 break;
@@ -1939,9 +1958,10 @@ impl CacheInner {
             self.stats.ssd_eviction_capacity = self.stats.ssd_eviction_capacity.saturating_add(1);
             self.stats.ssd_slot_evictions = self.stats.ssd_slot_evictions.saturating_add(1);
             self.record_ssd_eviction_reason(reason);
-            if !self.memory.contains_key(&victim) {
-                self.metadata.remove(&victim);
-            }
+            // This asked about the memory tier alone, so evicting a key from
+            // SSD threw away the metadata of an entry the PMEM tier was still
+            // serving.
+            self.forget_metadata_unless_resident(&victim);
             victim_keys.push(victim);
             if self.ssd_bytes == before {
                 // Freed nothing this round; the memory and pmem loops bail out
@@ -2386,7 +2406,10 @@ impl CacheInner {
                 let _ = self.persist_pmem_delete(key);
             }
             self.pmem_order.remove(key);
-            self.metadata.remove(key);
+            // Unconditional until now, which was only safe because every live
+            // caller passes `remove_disk`. With it false the disk index keeps
+            // the key and the entry stays servable.
+            self.forget_metadata_unless_resident(key);
             {
                 let mut pins = self.pins_for(key);
                 if key_pinned && removed_pinned_bytes > 0 {

@@ -9459,12 +9459,7 @@ impl CacheInner {
             }
             CacheTier::Reject => return Err(CacheError::UnsupportedTier(tier)),
         }
-        if !self.memory.contains_key(key)
-            && !self.pmem.contains_key(key)
-            && !self.disk_index.contains_key(key)
-        {
-            self.metadata.remove(key);
-        }
+        self.forget_metadata_unless_resident(key);
         self.stats.invalidations = self.stats.invalidations.saturating_add(1);
         Ok(())
     }
