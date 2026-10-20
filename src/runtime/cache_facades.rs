@@ -404,8 +404,12 @@ impl CacheInstance {
         else {
             return Ok(None);
         };
+        // The handle's own key carries these characters behind a handle --
+        // they are the ones that were just looked up -- so the buffer shares
+        // them instead of allocating a copy of the caller's string.
+        let shared_key = Arc::clone(&handle.key.record_key);
         Ok(Some(CacheBuffer::from_handle(
-            key.to_string(),
+            shared_key,
             self.cache.clone(),
             handle,
         )))
