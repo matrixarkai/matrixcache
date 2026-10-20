@@ -1833,21 +1833,42 @@ impl MultiLayerCache {
         value: Vec<u8>,
         ttl: Duration,
     ) -> Result<(), CacheError> {
-        self.put(key.clone(), value)?;
         let ttl_millis = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
-        // One write lock, where this used to take a write lock to raise the
-        // flag and then a read lock to stamp the expiry atomically. The expiry
-        // no longer lives behind a shared handle, so there is nothing left for
-        // the second lock to do.
+        let started = Instant::now();
+
+        // The write and the expiry stamp under one lock.
+        //
+        // This used to call `put`, which takes the lock, writes, and releases
+        // it -- and then take the lock again to stamp the expiry. Two
+        // acquisitions, a key copy to hand `put` an owned key this still
+        // needed afterwards, and a window in between where the entry was
+        // resident with no expiry on it. An overwrite landing in that window
+        // took the stamp meant for the entry before it.
+        //
+        // The body below is `put`'s, with the stamp added before the lock is
+        // released; the latency, the eviction drain and the access record are
+        // recorded exactly as `put` records them.
         let mut inner = self.inner.write().expect("cache lock poisoned");
-        if ttl_millis > 0 {
-            inner.ttl_in_use = true;
+        if !inner.started {
+            return Err(CacheError::Stopped);
         }
-        if inner.metadata.contains_key(&key) {
-            let now_millis = CoarseClock::now_millis();
-            inner.set_entry_expiry(&key, ttl_millis, now_millis);
+        let result = inner.put_with_request(&key, value, None);
+        if result.is_ok() {
+            if ttl_millis > 0 {
+                inner.ttl_in_use = true;
+            }
+            if inner.metadata.contains_key(&key) {
+                let now_millis = CoarseClock::now_millis();
+                inner.set_entry_expiry(&key, ttl_millis, now_millis);
+            }
         }
-        Ok(())
+        inner.record_put_latency(started);
+        drop(inner);
+        if result.is_ok() {
+            self.drain_eviction_records();
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
+        }
+        result
     }
 
     /// Time to live given to entries that do not ask for their own.

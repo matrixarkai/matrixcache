@@ -11353,6 +11353,72 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_write_stamps_its_expiry_under_the_write_lock() {
+        // `put_with_ttl` used to call `put`, which takes the lock, writes and
+        // releases it -- and then take the lock again to stamp the expiry. Two
+        // acquisitions, a key copy to hand `put` an owned key this still
+        // needed afterwards, and a window in between where the entry was
+        // resident with no expiry on it.
+        //
+        // Source-level, because the copy was transient and the lock count is
+        // not observable from a test. What is checked is that it no longer
+        // delegates to `put` -- which is the only way the second acquisition
+        // comes back -- and that the stamp sits inside the locked region.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+        let body = {
+            let start = SOURCE
+                .find("pub fn put_with_ttl(")
+                .expect("put_with_ttl must be in this file");
+            let rest = &SOURCE[start..];
+            let end = rest.find("\n    }").expect("its body must be closed");
+            &rest[..end]
+        };
+
+        assert!(
+            body.contains("put_with_request(&key"),
+            "put_with_ttl should write through the borrowing chain directly"
+        );
+        assert!(
+            !body.contains("self.put("),
+            "put_with_ttl has gone back to delegating to `put`, which means a second lock              acquisition and a key copy"
+        );
+        assert!(
+            !body.contains("key.clone()"),
+            "put_with_ttl is copying the key again"
+        );
+        // The stamp has to be before the guard is dropped, or it is back to
+        // happening under a lock of its own.
+        let stamp = body
+            .find("set_entry_expiry")
+            .expect("it must still stamp the expiry");
+        let release = body.find("drop(inner)").expect("it must release the lock");
+        assert!(
+            stamp < release,
+            "the expiry is stamped after the write lock is released"
+        );
+
+        // And the behaviour, end to end, in the same call.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::page(7, 4, 4096, 512);
+        cache
+            .put_with_ttl(key.clone(), vec![5u8; 64], Duration::from_millis(60))
+            .unwrap();
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert_ne!(
+                inner.expiries.get(&key).copied().unwrap_or(0),
+                0,
+                "the write and its expiry have to be visible together"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            cache.get(&key).unwrap().is_none(),
+            "the entry should have expired"
+        );
+    }
+
+    #[test]
     fn the_put_chain_borrows_the_key_it_only_reads() {
         // Nothing in `put_with_request_inner` consumes the key -- every use is
         // a borrow. That became true when the tier writes were changed to take
