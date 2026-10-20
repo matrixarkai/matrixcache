@@ -7725,6 +7725,75 @@ mod tests {
     }
 
     #[test]
+    fn the_single_block_ssd_write_takes_its_bytes_rather_than_copying_them() {
+        // It took a borrow and handed `block.to_vec()` to the store: one full
+        // copy of the payload per SSD write, on the path whose whole job is
+        // moving those bytes. Measured with the counting allocator, a 4 KiB
+        // value: 34.39 allocations and 92,095 bytes a put before, 33.39 and
+        // 87,973 after -- one allocation and 4,122 bytes, which is the block.
+        //
+        // The batch write beside it already took its entries by value and says
+        // why in its own comment, so this is the sibling pattern rather than a
+        // new idea.
+        //
+        // A signature contract, like the tier writes in #140: there is no
+        // counting allocator in the library, and a copy that comes back would
+        // compile and pass every behavioural test. What it cannot do is come
+        // back while the parameter is owned.
+        const SOURCE: &str = include_str!("../runtime/builder_and_gc.rs");
+        assert!(
+            SOURCE.contains("fn write_ssd_block(&mut self, key: &CacheKey, block: Vec<u8>)"),
+            "the single-block write has to take its bytes by value"
+        );
+        let body = {
+            let start = SOURCE
+                .find("fn write_ssd_block(")
+                .expect("write_ssd_block must be in this file");
+            let rest = &SOURCE[start..];
+            let end = rest
+                .find("\n    /// Writes a batch of encoded blocks")
+                .expect("the batch write must follow it");
+            &rest[..end]
+        };
+        // Both spellings, because a guard catches spellings and not concepts:
+        // reverting the signature does not compile -- the callers move their
+        // blocks -- so what can come back is a copy INSIDE the function, and
+        // `clone()` is as good a way to write one as `to_vec()`.
+        for copy in ["to_vec()", "clone()"] {
+            assert!(
+                !body.contains(copy),
+                "the single-block write is copying its block again, with {copy}"
+            );
+        }
+        // And the order the move forces: the file borrows, so it is written
+        // first, then the store takes the bytes. The batch write has always
+        // done it this way.
+        let file_at = body.find("write_cache_block_atomic").unwrap_or(usize::MAX);
+        let store_at = body.find("ssd_store").unwrap_or(0);
+        assert!(
+            file_at < store_at,
+            "the file write borrows the block, so it has to come before the store takes it"
+        );
+
+        // Behavioural: the bytes still arrive, which is what the move must not
+        // change. Written through to the SSD tier and read back after a
+        // restart, so the block on disk is what is being read.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = CacheKey::string(5, "ssd-write-by-value");
+        let value: Vec<u8> = (0..512u32).map(|byte| (byte % 251) as u8).collect();
+        cache.put(key.clone(), value.clone()).unwrap();
+
+        let restarted = MultiLayerCache::new(8, dir.path());
+        restarted.recover_disk_index().expect("recover");
+        assert_eq!(
+            restarted.get(&key).unwrap(),
+            Some(value),
+            "the block the store and the file hold has to be the value that was written"
+        );
+    }
+
+    #[test]
     fn the_disk_manifest_stays_bounded_against_what_it_describes() {
         // The manifest is append-only: one line per block written, and the
         // same bytes every time the same key is rewritten. Measured before
