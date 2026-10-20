@@ -18140,7 +18140,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shrink_predicate_on_capacity_goes_quiet_after_one_shrink() {
+    fn a_shrink_predicate_on_capacity_goes_quiet_while_one_on_buckets_keeps_working() {
         // This is why the first version of the predicate did almost nothing,
         // and it is worth pinning because the mistake is invisible:
         // `HashMap::capacity()` is `len + growth_left`, and a removal leaves a
@@ -18191,14 +18191,22 @@ mod tests {
 
         assert_eq!(on_capacity.len(), KEPT as usize);
         assert_eq!(on_buckets.len(), KEPT as usize);
-        assert_eq!(
-            capacity_shrinks, 1,
-            "the capacity-based predicate is supposed to fire once and go quiet"
+        // Bounds, not counts. How many times either predicate fires depends
+        // on the exact `capacity()` trajectory, and that depends on where the
+        // hasher happens to put things -- so the first version of this
+        // asserted `capacity_shrinks == 1`, passed on its own pull request,
+        // and failed on main in the arm its author had not run. The claim was
+        // never the count: it is that reading `capacity()` goes quiet while
+        // reading the buckets keeps working.
+        assert!(
+            capacity_shrinks <= 2,
+            "the capacity-based predicate is supposed to go quiet, not fire \
+             {capacity_shrinks} times"
         );
         assert!(
-            bucket_shrinks >= 3,
-            "the bucket-based predicate should halve the table repeatedly, not {bucket_shrinks} \
-             times"
+            bucket_shrinks > capacity_shrinks,
+            "reading the bucket count has to keep firing where reading the capacity \
+             stops: {bucket_shrinks} against {capacity_shrinks}"
         );
         assert!(
             estimated_buckets(on_buckets.capacity()) * 2
