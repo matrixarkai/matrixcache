@@ -509,13 +509,24 @@ pub struct CacheFootprint {
     /// inline, plus the strings it owns, plus a header for each key held
     /// behind a shared handle.
     pub key_bytes: usize,
-    /// Per-entry metadata.
+    /// Per-entry metadata **content**, for decomposition only.
+    ///
+    /// A `HashMap` stores its values inline in the table it allocates, and the
+    /// metadata map's value is a `CacheEntryMeta` rather than a handle to one.
+    /// So these bytes are **inside `table_bytes`** and are not added to
+    /// `total_bytes`: they say how much of that table is metadata, which is
+    /// worth reporting, but adding them counted every entry's metadata twice.
     pub metadata_bytes: usize,
     /// The recency orders -- node arenas and free lists -- excluding the keys
     /// in them, which are counted in `key_bytes`.
     pub order_bytes: usize,
-    /// Hash-table slots and control bytes, excluding the keys and values held
-    /// in them. **Estimated**; see the type's own documentation.
+    /// Hash-table allocations: the bucket array and its control bytes.
+    ///
+    /// A bucket holds the key and value **inline**, so their own sizes are in
+    /// here -- the metadata struct, the handle words, the 8-byte expiry. What
+    /// is not in here is the heap those inline parts point at, which
+    /// `key_bytes` and `payload_bytes` count. **Estimated**; see the type's own
+    /// documentation.
     pub table_bytes: usize,
     /// Queued write-backs: the values waiting to be written and the index that
     /// finds them.
@@ -9013,10 +9024,15 @@ impl CacheInner {
 
         // `async_writeback_queue` and `async_writeback_positions`: the values
         // waiting to be written, their keys, and the index that finds them.
+        // `size_of::<CacheWritebackJob>()` below already covers the job's
+        // inline `CacheKey` and the `Vec`'s own three words, so only the heap
+        // they point at is counted here: the payload's buffer and the key's
+        // owned selector or namespace. Adding `key_size` here as well charged
+        // 72 bytes a queued job twice.
         let writeback_values: usize = self
             .async_writeback_queue
             .iter()
-            .map(|job| job.value.capacity() + key_size + job.key.owned_heap_bytes())
+            .map(|job| job.value.capacity() + job.key.owned_heap_bytes())
             .sum();
         let writeback_bytes = writeback_values
             .saturating_add(
@@ -9095,9 +9111,12 @@ impl CacheInner {
             fixed_bytes,
             total_bytes: 0,
         };
+        // `metadata_bytes` is deliberately absent: the metadata map stores a
+        // `CacheEntryMeta` inline in every bucket, so `table_bytes` already
+        // holds it. It was added here as well, which counted 32 bytes an entry
+        // twice and inflated every per-entry figure this type has reported.
         footprint.total_bytes = footprint.payload_bytes
             + footprint.key_bytes
-            + footprint.metadata_bytes
             + footprint.order_bytes
             + footprint.table_bytes
             + footprint.writeback_bytes

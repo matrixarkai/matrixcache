@@ -17684,7 +17684,6 @@ mod tests {
             footprint.total_bytes,
             footprint.payload_bytes
                 + footprint.key_bytes
-                + footprint.metadata_bytes
                 + footprint.order_bytes
                 + footprint.table_bytes
                 + footprint.writeback_bytes
@@ -17692,6 +17691,90 @@ mod tests {
                 + footprint.pin_bytes
                 + footprint.fixed_bytes,
             "the total has to be its parts, or a term is being dropped"
+        );
+        // `metadata_bytes` is not one of those parts, and this is the
+        // assertion that used to say otherwise: it added every field up and
+        // compared that to the total, which is the same arithmetic the total
+        // was built from, so it held whether or not a field belonged in it.
+        assert!(
+            footprint.metadata_bytes > 0,
+            "precondition: there has to be metadata, or the next assertion is vacuous"
+        );
+        assert_eq!(
+            footprint.total_bytes + footprint.metadata_bytes,
+            footprint.payload_bytes
+                + footprint.key_bytes
+                + footprint.metadata_bytes
+                + footprint.order_bytes
+                + footprint.table_bytes
+                + footprint.writeback_bytes
+                + footprint.sketch_bytes
+                + footprint.pin_bytes
+                + footprint.fixed_bytes,
+            "the metadata content is inside the table term and must not be added again"
+        );
+    }
+
+    #[test]
+    fn the_metadata_content_is_inside_the_table_that_holds_it() {
+        // A `HashMap` stores its (K, V) pairs **inline** in the one allocation
+        // it makes, and `estimated_table_bytes` multiplies the bucket count by
+        // exactly that pair's size. So a map whose value is a
+        // `CacheEntryMeta` rather than a handle to one carries the metadata in
+        // its buckets, and `metadata_bytes` describes bytes that `table_bytes`
+        // has already counted.
+        //
+        // Measured as the difference the value type makes, rather than argued:
+        // the same bucket count, costed with the value and without it.
+        const ENTRIES: usize = 1_000;
+        let with_value =
+            estimated_table_bytes::<std::sync::Arc<CacheKey>, CacheEntryMeta>(ENTRIES);
+        let handle_only = estimated_table_bytes::<std::sync::Arc<CacheKey>, ()>(ENTRIES);
+        assert!(
+            with_value - handle_only >= ENTRIES * std::mem::size_of::<CacheEntryMeta>(),
+            "the table term has to carry at least one metadata struct per entry: {with_value} \
+             against {handle_only} for {ENTRIES} entries of {} bytes each",
+            std::mem::size_of::<CacheEntryMeta>()
+        );
+
+        // And the same for the write-back queue, where the job holds its key
+        // by value: the key struct is inside the job, so the queue's own
+        // capacity term already pays for it.
+        assert!(
+            std::mem::size_of::<CacheWritebackJob>() >= std::mem::size_of::<CacheKey>(),
+            "the job stores its key inline, so the key struct cannot be charged beside the job"
+        );
+
+        // What it was worth, on a cache rather than in the abstract. The total
+        // used to carry the metadata twice, so it fell by exactly the content.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        for index in 0..ENTRIES {
+            cache
+                .put(
+                    CacheKey::string(0, &format!("metadata-inside-the-table-{index:06}")),
+                    vec![7u8; 64],
+                )
+                .expect("a cache with room must accept a put");
+        }
+        let footprint = cache.footprint();
+        assert_eq!(footprint.memory_entries, ENTRIES, "nothing may evict");
+        assert_eq!(
+            footprint.metadata_bytes,
+            ENTRIES * std::mem::size_of::<CacheEntryMeta>(),
+            "one metadata struct an entry"
+        );
+        assert!(
+            footprint.table_bytes > footprint.metadata_bytes,
+            "the table that holds the metadata has to be larger than the metadata in it"
+        );
+        assert!(
+            footprint.total_bytes
+                < footprint.payload_bytes
+                    + footprint.key_bytes
+                    + footprint.metadata_bytes
+                    + footprint.order_bytes
+                    + footprint.table_bytes,
+            "the total must not be the sum of terms that overlap"
         );
     }
 
