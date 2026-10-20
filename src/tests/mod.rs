@@ -15794,6 +15794,114 @@ mod tests {
         );
     }
 
+    /// A cache with room on the memory tier and the persistent-memory tier,
+    /// which is the shape in which a single put reaches both of them.
+    fn two_resident_tiers_cache(name: &str) -> MultiLayerCache {
+        MultiLayerCache::with_tiering_policy(
+            unique_temp_path(name),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1 << 20,
+                pmem_capacity_bytes: 1 << 20,
+                ssd_capacity_bytes: 0,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 0,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1 << 16,
+                max_pmem_block_bytes: 1 << 16,
+                max_ssd_block_bytes: 0,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions::default(),
+        )
+    }
+
+    #[test]
+    fn a_put_gives_both_tiers_the_same_allocation() {
+        // The admission decision for an ordinary write to a cache with both
+        // resident tiers configured is `admit_memory: true, admit_pmem: true`
+        // -- so this is the common path, not an exotic one. It used to hand
+        // each tier `value.clone()`, and each tier copied that clone into an
+        // `Arc` of its own: two payload copies, and two separate allocations
+        // of identical bytes resident at once.
+        //
+        // Pointer identity is the only thing that can see it. The bytes were
+        // equal before.
+        let cache = two_resident_tiers_cache("put-shares-one-allocation");
+        let key = CacheKey::string(7, "put-shares-one-allocation");
+        cache.put(key.clone(), vec![7u8; 4096]).unwrap();
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let in_memory = inner
+            .memory
+            .get(&key)
+            .expect("precondition: the memory tier has to have taken the write");
+        let in_pmem = inner
+            .pmem
+            .get(&key)
+            .expect("precondition: the PMEM tier has to have taken the write too, or there is                     nothing to share");
+        assert_eq!(&in_memory[..], &vec![7u8; 4096][..]);
+        assert!(
+            std::sync::Arc::ptr_eq(in_memory, in_pmem),
+            "the two tiers hold two allocations of the same 4096 bytes"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(in_memory),
+            2,
+            "one handle per tier and nobody else holding the write open"
+        );
+        drop(inner);
+
+        // And the accounting has to agree, or the change is invisible in the
+        // one place it is supposed to show up. Adding the two maps' value
+        // lengths reported 8192 bytes of payload for 4096 bytes of payload --
+        // and would have gone on reporting 8192 after the copy was removed.
+        let footprint = cache.footprint();
+        assert_eq!(
+            footprint.payload_bytes, 4096,
+            "an entry held by two tiers is one payload, not two"
+        );
+        assert_eq!(
+            footprint.tracked_entries, 1,
+            "and it is one entry, not two"
+        );
+    }
+
+    #[test]
+    fn a_batch_put_gives_both_tiers_the_same_allocation() {
+        // The batch path carried its own copy of the same three clone sites.
+        let cache = two_resident_tiers_cache("batch-put-shares-one-allocation");
+        let keys: Vec<CacheKey> = (0..4)
+            .map(|i| CacheKey::string(7, &format!("batch-put-shares-{i:04}")))
+            .collect();
+        let written = cache
+            .put_batch(
+                keys.iter()
+                    .map(|key| (key.clone(), vec![9u8; 1024]))
+                    .collect(),
+            )
+            .expect("the batch must be accepted");
+        assert_eq!(written, keys.len());
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        for key in &keys {
+            let in_memory = inner
+                .memory
+                .get(key)
+                .expect("precondition: the memory tier has to have taken the write");
+            let in_pmem = inner
+                .pmem
+                .get(key)
+                .expect("precondition: the PMEM tier has to have taken the write too");
+            assert!(
+                std::sync::Arc::ptr_eq(in_memory, in_pmem),
+                "the two tiers hold two allocations of the same bytes for {:?}",
+                key.record_key
+            );
+        }
+    }
+
     #[test]
     fn a_cache_that_never_enables_admission_holds_almost_no_sketch() {
         // A full sketch is next_power_of_two(capacity / 2) bytes: half a
@@ -16386,8 +16494,14 @@ mod tests {
         // this one and share its signature; landing on either of those gives a
         // body that names no fields, which reads as fifty unaccounted fields
         // rather than as the parse error it is.
+        //
+        // Checked against what the accounting cannot do without -- reading the
+        // cache's own maps -- rather than against a local variable's name. The
+        // sentinel used to be `memory_payload`, and renaming that local while
+        // deduplicating the payload term failed this test with a message about
+        // a parse error that had not happened.
         assert!(
-            fn_body.contains("memory_payload"),
+            fn_body.contains("self.memory") && fn_body.contains("self.metadata"),
             "the body found is not the accounting itself but something that forwards to it"
         );
 
