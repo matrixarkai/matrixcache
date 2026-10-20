@@ -4442,6 +4442,37 @@ impl MultiLayerCache {
         result
     }
 
+    /// Caches bytes the caller already holds behind a handle, without copying
+    /// them.
+    ///
+    /// The write-side counterpart to [`Self::get_shared`]. Every other write
+    /// takes a `Vec<u8>` and the cache copies it into an `Arc<[u8]>`, because
+    /// that is where a refcount lives beside the bytes and a `Vec` cannot be
+    /// handed over in place. A caller that already has an `Arc<[u8]>` -- one it
+    /// read out of this cache, or one it shares with something else -- had to
+    /// `to_vec` it and let the cache copy that, two payload-sized copies to
+    /// store bytes already in the right shape.
+    ///
+    /// The entry is placed exactly as [`Self::put`] places it, across whichever
+    /// tiers the admission decision admits. The value is immutable once cached,
+    /// so a caller keeping its own handle reads the same bytes whatever happens
+    /// to the entry afterwards.
+    pub fn put_shared(&self, key: CacheKey, value: Arc<[u8]>) -> Result<(), CacheError> {
+        let started = Instant::now();
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        if !inner.started {
+            return Err(CacheError::Stopped);
+        }
+        let result = inner.put_with_request_shared(key.clone(), value, None);
+        inner.record_put_latency(started);
+        drop(inner);
+        if result.is_ok() {
+            self.drain_eviction_records();
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
+        }
+        result
+    }
+
     pub fn put_sized(
         &self,
         key: CacheKey,
@@ -6823,6 +6854,15 @@ impl ShardedMultiLayerCache {
         self.shard_for_key(&key).put(key, value)
     }
 
+    /// Caches bytes the caller already holds behind a handle, without copying
+    /// them.
+    ///
+    /// Routed to the one shard that owns the key, as `put` is. See
+    /// [`MultiLayerCache::put_shared`].
+    pub fn put_shared(&self, key: CacheKey, value: Arc<[u8]>) -> Result<(), CacheError> {
+        self.shard_for_key(&key).put_shared(key, value)
+    }
+
     pub fn insert(&self, key: CacheKey, value: Vec<u8>, size: usize) -> Result<(), CacheError> {
         self.put_sized(key, value, size)
     }
@@ -8868,6 +8908,15 @@ impl CacheInner {
         value: Vec<u8>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
+        self.put_with_request_shared(key, Arc::<[u8]>::from(value), request)
+    }
+
+    fn put_with_request_shared(
+        &mut self,
+        key: CacheKey,
+        value: Arc<[u8]>,
+        request: Option<CacheAdmissionRequest>,
+    ) -> Result<(), CacheError> {
         let outcome = self.put_with_request_inner(key.clone(), value, request);
         if !self.memory.contains_key(&key)
             && !self.pmem.contains_key(&key)
@@ -8879,22 +8928,20 @@ impl CacheInner {
         outcome
     }
 
+    /// One allocation for the bytes, shared by every tier that takes them.
+    ///
+    /// This used to take a `Vec` and hand each tier `value.clone()`, and each
+    /// tier then copied that clone into an `Arc` of its own -- two
+    /// payload-sized copies for a write the memory tier accepted, four when the
+    /// PMEM tier took it as well, and in that case the two tiers held two
+    /// separate allocations of identical bytes. Nothing here needs an owned
+    /// `Vec`: the SSD path only reads the bytes to encode a block from them.
     fn put_with_request_inner(
         &mut self,
         key: CacheKey,
-        value: Vec<u8>,
+        value: Arc<[u8]>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
-        // One allocation for the bytes, shared by every tier that takes them.
-        //
-        // This used to hand each tier `value.clone()`, and each tier then
-        // copied that clone into an `Arc` of its own -- two payload-sized
-        // copies for a write the memory tier accepted, four when the PMEM tier
-        // took it as well, and in that case the two tiers held two separate
-        // allocations of identical bytes. Nothing after the tier writes needs
-        // an owned `Vec`: the SSD path only reads the bytes to encode a block
-        // from them.
-        let value = Arc::<[u8]>::from(value);
         // Reclaim a few lapsed entries before this write is placed. Done here
         // rather than inside the memory tier's admission: a cache with no
         // memory tier configured never reaches that, and its entries need
