@@ -54,17 +54,27 @@ fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
     results
 }
 
-fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>) {
-    let mut unique_keys = Vec::<CacheKey>::new();
+/// The distinct keys of a batch, and which request each one answers.
+///
+/// The unique keys are **borrowed from `keys`**, which the caller owns for as
+/// long as the read runs. They used to be cloned, which cost a key copy per
+/// distinct key on the small path and -- because the large path iterated
+/// `keys.iter().cloned()` and then cloned again into its lookup map -- a copy
+/// per *requested* key plus one per distinct key on the large one. A key copy
+/// is a 72-byte struct and a string allocation for each of its two `Cow`
+/// fields that is computed rather than a literal, so a batch read paid that
+/// before it had looked anything up.
+fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<&CacheKey>, Vec<(usize, usize)>) {
+    let mut unique_keys = Vec::<&CacheKey>::new();
     let mut requested_positions = Vec::with_capacity(keys.len());
     if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
         for (position, key) in keys.iter().enumerate() {
             let unique_position = unique_keys
                 .iter()
-                .position(|existing| existing == key)
+                .position(|existing| *existing == key)
                 .unwrap_or_else(|| {
                     let unique_position = unique_keys.len();
-                    unique_keys.push(key.clone());
+                    unique_keys.push(key);
                     unique_position
                 });
             requested_positions.push((position, unique_position));
@@ -72,13 +82,13 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<CacheKey>, Vec<(usize, usize)>
         return (unique_keys, requested_positions);
     }
 
-    let mut unique_positions = HashMap::<CacheKey, usize>::new();
-    for (position, key) in keys.iter().cloned().enumerate() {
-        let unique_position = if let Some(position) = unique_positions.get(&key).copied() {
+    let mut unique_positions = HashMap::<&CacheKey, usize>::new();
+    for (position, key) in keys.iter().enumerate() {
+        let unique_position = if let Some(position) = unique_positions.get(key).copied() {
             position
         } else {
             let position = unique_keys.len();
-            unique_positions.insert(key.clone(), position);
+            unique_positions.insert(key, position);
             unique_keys.push(key);
             position
         };
@@ -2838,6 +2848,10 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             for (unique_position, key) in unique_keys.iter().enumerate() {
+                // The unique keys are borrowed from the caller's slice now, so
+                // iterating them yields a double reference. Rebound once here
+                // rather than dereferenced at each of the dozen uses below.
+                let key: &CacheKey = key;
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
                     expired_keys.push((key.clone(), started));
