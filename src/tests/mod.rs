@@ -15818,6 +15818,94 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_put_stores_the_allocation_it_was_given() {
+        // The write-side counterpart to `get_shared`. Every other write takes
+        // a `Vec<u8>`, so a caller already holding an `Arc<[u8]>` had to
+        // `to_vec` it and let the cache copy that back into an `Arc` -- two
+        // payload copies to store bytes already in the right shape.
+        let cache = two_resident_tiers_cache("shared-put-stores-the-handle");
+        let key = CacheKey::string(7, "shared-put-stores-the-handle");
+        let value: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![3u8; 2048]);
+
+        cache
+            .put_shared(key.clone(), std::sync::Arc::clone(&value))
+            .expect("a cache with room must accept a shared put");
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let in_memory = inner
+            .memory
+            .get(&key)
+            .expect("precondition: the memory tier has to have taken the write");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, in_memory),
+            "the cache copied the bytes instead of taking the handle it was given"
+        );
+        let in_pmem = inner
+            .pmem
+            .get(&key)
+            .expect("precondition: the PMEM tier has to have taken the write too");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, in_pmem),
+            "the PMEM tier copied the bytes instead of sharing the caller's allocation"
+        );
+    }
+
+    #[test]
+    fn a_sharded_cache_also_stores_the_allocation_it_was_given() {
+        // Forwarded, because a method on the single-shard type is unreachable
+        // on the type most likely to be holding a large cache otherwise -- and
+        // `get_shared` is forwarded, so its counterpart has to be.
+        let dir = unique_temp_path("sharded-shared-put");
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir]),
+            4,
+        );
+        let key = CacheKey::string(7, "sharded-shared-put");
+        let value: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![5u8; 512]);
+
+        cache
+            .put_shared(key.clone(), std::sync::Arc::clone(&value))
+            .expect("a sharded cache with room must accept a shared put");
+
+        let read = cache
+            .get_shared(&key)
+            .expect("get_shared")
+            .expect("the key was just written");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, &read),
+            "the shared write and the shared read should be the same allocation end to end"
+        );
+    }
+
+    #[test]
+    fn bytes_read_without_a_copy_can_be_cached_again_without_one() {
+        // The case the pair exists for: bytes taken out of one cache and put
+        // into another never become a `Vec` on the way.
+        let first = two_resident_tiers_cache("round-trip-source");
+        let second = two_resident_tiers_cache("round-trip-destination");
+        let key = CacheKey::string(7, "round-trip");
+        first.put(key.clone(), vec![8u8; 1024]).unwrap();
+
+        let read = first
+            .get_shared(&key)
+            .expect("get_shared")
+            .expect("the key was just written");
+        second
+            .put_shared(key.clone(), std::sync::Arc::clone(&read))
+            .expect("the second cache must accept it");
+
+        let inner = second.inner.read().expect("cache lock poisoned");
+        let stored = inner
+            .memory
+            .get(&key)
+            .expect("precondition: the second cache has to have taken the write");
+        assert!(
+            std::sync::Arc::ptr_eq(&read, stored),
+            "the bytes were copied somewhere between the read and the write"
+        );
+    }
+
+    #[test]
     fn a_put_gives_both_tiers_the_same_allocation() {
         // The admission decision for an ordinary write to a cache with both
         // resident tiers configured is `admit_memory: true, admit_pmem: true`
