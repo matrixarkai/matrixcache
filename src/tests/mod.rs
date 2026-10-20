@@ -11353,6 +11353,52 @@ mod tests {
     }
 
     #[test]
+    fn grouping_batch_positions_can_borrow_its_keys() {
+        // Five batch readers group requested positions by key, and the
+        // grouping copied the keys: once per distinct key on the small path,
+        // and on the large path -- which iterated `keys.iter().cloned()` and
+        // then copied again into its lookup map -- once per requested key plus
+        // once per distinct one.
+        //
+        // The borrowing form is added alongside rather than replacing it,
+        // because each reader's deferred state is shaped differently and
+        // several unrelated vectors in those functions share the same tuple
+        // type. `get_batch` is on it; the others follow.
+        for count in [4usize, SMALL_BATCH_DEDUP_LIMIT + 8] {
+            // A computed selector, so a copy would really have allocated.
+            let keys: Vec<CacheKey> = (0..count)
+                .map(|i| CacheKey::page(7, (i % 3) as u64, 4096, 512))
+                .collect();
+
+            let grouped = coalesce_batch_positions_borrowed(&keys);
+            let copied = coalesce_batch_positions(&keys);
+
+            assert_eq!(
+                grouped.len(),
+                copied.len(),
+                "the two forms must group a batch of {count} identically"
+            );
+
+            let mut seen = 0usize;
+            for (borrowed, owned) in grouped.iter().zip(copied.iter()) {
+                assert_eq!(borrowed.0, &owned.0, "the two forms disagree on a key");
+                assert_eq!(borrowed.1, owned.1, "the two forms disagree on positions");
+
+                let first = keys
+                    .iter()
+                    .position(|candidate| candidate == borrowed.0)
+                    .expect("a grouped key must be one of the requested keys");
+                assert!(
+                    std::ptr::eq(borrowed.0, &keys[first]),
+                    "the borrowing form handed back a copy rather than a pointer into the                      caller's slice"
+                );
+                seen += borrowed.1.len();
+            }
+            assert_eq!(seen, count, "every requested position must be grouped once");
+        }
+    }
+
+    #[test]
     fn grouping_candidates_by_key_borrows_them() {
         // The SSD candidates of a batch read carry the position they answer
         // and the key they asked for. The key used to be a copy -- once per
