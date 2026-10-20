@@ -318,6 +318,43 @@ fn main() {
         }
     }
 
+    // A write that reaches the SSD tier compresses, frames a block, builds a
+    // manifest line and writes it, so it is never going to be cheap. What it
+    // must not be paying for is copies of the payload that nothing reads. The
+    // bounds sit between what the path costs now and what it cost while
+    // `StorageEngineApi::put` built a `CacheBuffer` around every value for
+    // the tier to throw away, measured on this row's incompressible value:
+    //
+    //         backend   allocations       bytes
+    //      Rust before         33.12    62,580.2
+    //       Rust after         28.11    59,288.2
+    //   RocksDB before         16.11    58,193.6
+    //    RocksDB after         12.11    55,951.6
+    //
+    // Per arm, because the two are not comparable: this allocator sees Rust
+    // only, and with RocksDB the store's own bytes are allocated elsewhere.
+    // Three runs of the same binary moved the figures by 0.01 allocations and
+    // 8 bytes, so the margin here is wide rather than lucky.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const SSD_WRITE_ALLOCATIONS: f64 = 30.0;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const SSD_WRITE_BYTES: f64 = 60_500.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const SSD_WRITE_ALLOCATIONS: f64 = 14.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const SSD_WRITE_BYTES: f64 = 57_000.0;
+    match find("put, reaching the SSD tier") {
+        Some(row) if row.allocations <= SSD_WRITE_ALLOCATIONS && row.bytes <= SSD_WRITE_BYTES => {}
+        Some(row) => failures.push(format!(
+            "a write reaching the SSD tier allocates {:.2} times and {:.1} bytes, against \
+             {SSD_WRITE_ALLOCATIONS:.0} and {SSD_WRITE_BYTES:.0} -- a copy of the payload has \
+             come back to that path",
+            row.allocations, row.bytes
+        )),
+        None => failures
+            .push("the write that reaches the SSD tier is missing from the table".to_string()),
+    }
+
     // A batch over distinct keys asks for exactly one position per key, and a
     // list holding one position does not need an allocation of its own. This is
     // the figure that moves if it goes back to a vector a key: measured at one
