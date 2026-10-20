@@ -129,6 +129,9 @@ struct TieredRow {
     metadata: usize,
     orders: usize,
     tables: usize,
+    /// Which map holds `tables`, so that a reader can see which one to go
+    /// after. The aggregate says how much and not where.
+    tables_by_map: matrixcache::CacheTableBytes,
     /// What the SSD tier's store holds in memory, which this arm reported as
     /// nothing until today -- the footprint excluded it on the grounds that
     /// the tier's bytes live on a drive, which is true of the RocksDB build
@@ -188,6 +191,7 @@ fn measure_tiered(value_bytes: usize) -> TieredRow {
         metadata: footprint.metadata_bytes,
         orders: footprint.order_bytes,
         tables: footprint.table_bytes,
+        tables_by_map: footprint.table_bytes_by_map,
         ssd_store: footprint.ssd_store_bytes,
         per_tracked_entry: per_entry_terms as f64 / footprint.tracked_entries.max(1) as f64,
         with_store_per_tracked_entry: (per_entry_terms + footprint.ssd_store_bytes) as f64
@@ -476,6 +480,37 @@ fn main() {
             row.value_bytes, row.with_store_per_tracked_entry
         );
     }
+    println!();
+    println!("  which map holds the table bytes, per tracked entry");
+    println!();
+    println!(
+        "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>9}  {:>8}",
+        "value", "memory", "pmem", "disk index", "metadata", "expiries", "total"
+    );
+    for row in &tiered {
+        let per_entry = |bytes: usize| bytes as f64 / row.tracked_entries.max(1) as f64;
+        let maps = row.tables_by_map;
+        println!(
+            "  {:>6}  {:>8.1}  {:>8.1}  {:>10.1}  {:>9.1}  {:>9.1}  {:>8.1}",
+            row.value_bytes,
+            per_entry(maps.memory),
+            per_entry(maps.pmem),
+            per_entry(maps.disk_index),
+            per_entry(maps.metadata),
+            per_entry(maps.expiries),
+            per_entry(maps.total())
+        );
+    }
+    println!();
+    println!(
+        "  The per-entry metadata map is the largest table in a tiered cache, larger than \
+         either"
+    );
+    println!(
+        "  tier map whose entries it describes: its value is held inline in the bucket rather \
+         than"
+    );
+    println!("  behind a handle, so the bucket is 8 + 24 + 1 bytes against 8 + 16 + 1.");
     println!();
     // Named, because this table reads off the memory-only rows measured near
     // the top of this arm, not off the tiered rows printed just above it. It

@@ -651,6 +651,17 @@ pub struct CacheFootprint {
     pub writeback_bytes: usize,
     /// The admission frequency sketch, which is sized once at construction.
     pub sketch_bytes: usize,
+    /// Which map holds [`Self::table_bytes`].
+    ///
+    /// A decomposition, **not** a term of its own: these five numbers add up
+    /// to that one, and the footprint's own test asserts that they do. It is
+    /// here because the aggregate says how much the tables cost and nothing
+    /// about which of them to go after -- and the answer was not the one I
+    /// would have guessed. In a tiered cache holding 2,000 entries the
+    /// per-entry metadata map is the largest table in the cache, larger than
+    /// either tier map whose entries it describes, because its value is
+    /// stored inline in the bucket rather than behind a handle.
+    pub table_bytes_by_map: CacheTableBytes,
     /// What the SSD tier's store holds in **memory**.
     ///
     /// Zero with RocksDB, where the store's bytes are allocated by the native
@@ -677,6 +688,45 @@ pub struct CacheFootprint {
     /// `memory_entries` and `tracked_entries`, are not bytes and are not in
     /// it.
     pub total_bytes: usize,
+}
+
+/// Which map holds a cache's table bytes.
+///
+/// Each number is the bucket array and control bytes of one `HashMap`, as
+/// [`CacheFootprint::table_bytes`] counts them -- the keys and values the
+/// buckets point at are counted by `key_bytes` and `payload_bytes`, and the
+/// per-entry metadata is counted here rather than there because its bucket
+/// holds it inline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheTableBytes {
+    /// The memory tier's map: a key handle and an `Arc<[u8]>` to a bucket.
+    pub memory: usize,
+    /// The PMEM tier's map, the same shape as the memory tier's.
+    pub pmem: usize,
+    /// The SSD tier's index: a key handle and a block length to a bucket.
+    pub disk_index: usize,
+    /// The per-entry metadata, held **inline** in its buckets, so this is the
+    /// one table here that holds its values rather than handles to them.
+    pub metadata: usize,
+    /// The expiries, which are empty -- and so free -- for a cache that was
+    /// never given a time to live.
+    pub expiries: usize,
+}
+
+impl CacheTableBytes {
+    /// The five parts added up, which has to equal
+    /// [`CacheFootprint::table_bytes`].
+    pub fn total(&self) -> usize {
+        self.memory + self.pmem + self.disk_index + self.metadata + self.expiries
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.memory += other.memory;
+        self.pmem += other.pmem;
+        self.disk_index += other.disk_index;
+        self.metadata += other.metadata;
+        self.expiries += other.expiries;
+    }
 }
 
 impl CacheFootprint {
@@ -724,6 +774,7 @@ impl CacheFootprint {
         self.table_bytes += other.table_bytes;
         self.writeback_bytes += other.writeback_bytes;
         self.sketch_bytes += other.sketch_bytes;
+        self.table_bytes_by_map.add(&other.table_bytes_by_map);
         self.ssd_store_bytes += other.ssd_store_bytes;
         self.pin_bytes += other.pin_bytes;
         self.fixed_bytes += other.fixed_bytes;
@@ -9437,13 +9488,19 @@ impl CacheInner {
                 .sum::<usize>();
 
         // The tables themselves, less the keys and values counted above.
-        let table_bytes = map_table_bytes(&self.memory)
-            + map_table_bytes(&self.pmem)
-            + map_table_bytes(&self.disk_index)
-            + map_table_bytes(&self.metadata)
+        // Decomposed per map, and then summed from that decomposition rather
+        // than beside it -- two additions of the same five numbers is one of
+        // them drifting later.
+        let table_bytes_by_map = CacheTableBytes {
+            memory: map_table_bytes(&self.memory),
+            pmem: map_table_bytes(&self.pmem),
+            disk_index: map_table_bytes(&self.disk_index),
+            metadata: map_table_bytes(&self.metadata),
             // `expiries` is empty, and so free, for a cache that never sets a
             // time to live.
-            + map_table_bytes(&self.expiries);
+            expiries: map_table_bytes(&self.expiries),
+        };
+        let table_bytes = table_bytes_by_map.total();
 
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
@@ -9459,6 +9516,7 @@ impl CacheInner {
             table_bytes,
             writeback_bytes,
             sketch_bytes,
+            table_bytes_by_map,
             ssd_store_bytes: self.ssd_store.resident_bytes(),
             pin_bytes,
             fixed_bytes,
