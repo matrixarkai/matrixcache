@@ -1016,12 +1016,20 @@ mod tests {
         // expiring -- it was served from PMEM for as long as it stayed there,
         // whatever time to live it had been given.
         //
-        // The time to live has to outlast the churn below, which takes most of
-        // a second, or the entry expires on its own before the condition under
-        // test is reached. That is asserted rather than assumed -- by reading
-        // the recorded expiry rather than by timing the churn, which is what
-        // the first version of this did and which flaked once under load.
-        const TTL: Duration = Duration::from_millis(5000);
+        // The time to live has to outlast the churn below, or the entry
+        // expires on its own before the condition under test is reached. That
+        // is asserted rather than assumed -- by reading the recorded expiry
+        // rather than by timing the churn, which is what the first version of
+        // this did and which flaked under load.
+        //
+        // Then it flaked again at five seconds, on a box running three other
+        // builds: two hundred writes through to an SSD tier is not bounded by
+        // anything this test controls. So the time to live is a minute now and
+        // the test does not wait for it -- it moves the recorded deadline into
+        // the past instead, which reaches the same condition in a way load
+        // cannot perturb. Sleeping out a deadline measures the host; moving
+        // the deadline measures the cache.
+        const TTL: Duration = Duration::from_secs(60);
         let cache = pmem_outliving_ssd_cache("expiry-survives-an-ssd-eviction");
         let watched = CacheKey::string(7, "expiry-survives-00000");
         cache
@@ -1057,7 +1065,24 @@ mod tests {
             );
         }
 
-        std::thread::sleep(TTL);
+        // Moved **in place**, with `get_mut`, and deliberately not inserted:
+        // inserting one would let this half pass on a cache that had thrown
+        // the entry's expiry away, which is the loss the test is about.
+        //
+        // The assertion that actually catches that loss is the `expect` above.
+        // Planted both halves of it to find out: stripping the metadata fails
+        // at "keeps its metadata", and stripping only the expiry fails at
+        // "keeps its expiry" -- neither reaches here. So this is the
+        // behavioural consequence, not the detector, and `get_mut` is what
+        // keeps it from becoming a detector that can never fire.
+        {
+            let mut inner = cache.inner.write().expect("cache lock poisoned");
+            let expires_at = inner
+                .expiries
+                .get_mut(&watched)
+                .expect("the expiry has to still be there to be moved");
+            *expires_at = CoarseClock::now_millis().saturating_sub(1);
+        }
         assert!(
             cache.get(&watched).unwrap().is_none(),
             "an entry past its time to live was served because an unrelated SSD eviction threw              away the metadata holding its expiry"
