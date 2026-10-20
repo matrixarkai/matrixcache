@@ -4485,15 +4485,36 @@ impl MultiLayerCache {
         value: Vec<u8>,
         logical_size: usize,
     ) -> Result<Option<CachePinnedHandle>, CacheError> {
-        {
+        let started = Instant::now();
+        // One allocation for the bytes. The write takes a handle to them and
+        // the SSD fallback below takes another; both used to copy the payload
+        // -- once because `put_sized` wanted an owned `Vec` while this function
+        // still needed its own, and once more inside it to build the `Arc`
+        // every tier stores.
+        let shared = Arc::<[u8]>::from(value);
+
+        // The counter and the write under one lock. Bumping the counter used
+        // to take the lock, release it, and let `put_sized` take it again.
+        let write_result = {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
             inner.stats.insert_pinned_operations =
                 inner.stats.insert_pinned_operations.saturating_add(1);
+            let request = inner.default_insert_request(&key, shared.len(), logical_size);
+            let result =
+                inner.put_with_request_shared(&key, Arc::clone(&shared), Some(request));
+            inner.record_put_latency(started);
+            result
+        };
+        // Recorded exactly as `put_sized` records them, outside the lock.
+        if write_result.is_ok() {
+            self.drain_eviction_records();
+            self.emit_access_record(CacheAccessRecordKind::Put, &key);
         }
-        self.put_sized(key.clone(), value.clone(), logical_size)?;
+        write_result?;
+
         // The write happened above; what is left is a lookup and a pin, and
         // neither needs the cache exclusively any more.
         let inner = self.inner.read().expect("cache lock poisoned");
@@ -4506,12 +4527,12 @@ impl MultiLayerCache {
             } else if let Some(pmem_value) = inner.pmem.get(&key).cloned() {
                 Some((pmem_value, CacheReadTier::Pmem))
             } else if inner.disk_index.contains_key(&key) || inner.ssd_block_exists(&key) {
-                Some((Arc::<[u8]>::from(value), CacheReadTier::Ssd))
+                Some((Arc::clone(&shared), CacheReadTier::Ssd))
             } else {
                 None
             }
         } else if inner.disk_index.contains_key(&key) || inner.ssd_block_exists(&key) {
-            Some((Arc::<[u8]>::from(value), CacheReadTier::Ssd))
+            Some((Arc::clone(&shared), CacheReadTier::Ssd))
         } else {
             None
         };

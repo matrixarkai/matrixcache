@@ -11353,6 +11353,85 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_insert_allocates_its_payload_once() {
+        // `insert_pinned_sized` took the write lock to bump a counter, released
+        // it, and called `put_sized` -- which took the lock again -- handing it
+        // `value.clone()`, because the original was still needed for the SSD
+        // fallback further down. So the payload was copied once for the call
+        // and again inside it to build the `Arc` every tier stores, and the
+        // fallback copied it a third time.
+        //
+        // It builds the `Arc` once now and everything takes a handle to it.
+        //
+        // Source-level for the counts, because the copies were transient and
+        // this crate forbids unsafe code and so cannot install a counting
+        // allocator. Behaviour is already covered -- seventeen `insert_pinned`
+        // assertions elsewhere in the suite -- and one is repeated here so a
+        // broken rewrite fails on more than a string match.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+        let body = {
+            let start = SOURCE
+                .find("pub fn insert_pinned_sized(")
+                .expect("insert_pinned_sized must be in this file");
+            let rest = &SOURCE[start..];
+            let end = rest.find("\n    }").expect("its body must be closed");
+            &rest[..end]
+        };
+
+        assert!(
+            !body.contains("put_sized("),
+            "the pinned insert has gone back to delegating to `put_sized`, which means a              second lock acquisition and a payload copy"
+        );
+        // Copy spellings, not the concept: this catches the forms that exist
+        // in this crate -- `value.clone()`, `to_vec`, a second `Arc::from` --
+        // and a determined rewrite could still copy some other way. Said
+        // plainly because a plant of this guard using `shared.to_vec()` walked
+        // past the first version of it.
+        for copy in ["value.clone()", ".to_vec()", "shared.clone()"] {
+            assert!(
+                !body.contains(copy),
+                "the pinned insert is copying the payload again, via {copy}"
+            );
+        }
+        assert_eq!(
+            body.matches("Arc::<[u8]>::from(value)").count(),
+            1,
+            "the payload should be turned into an `Arc` exactly once; every other use of it              should be a handle"
+        );
+        assert!(
+            body.matches("self.inner.write()").count() == 1,
+            "the counter bump and the write belong under one lock"
+        );
+
+        // And it still works.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::page(7, 6, 4096, 512);
+        let handle = cache
+            .insert_pinned_sized(key.clone(), vec![7u8; 96], 96)
+            .expect("insert_pinned_sized")
+            .expect("a cache with room returns a handle");
+        assert_eq!(handle.value(), &vec![7u8; 96][..]);
+        assert_eq!(cache.stats().pinned_entries, 1);
+
+        // The handle and the memory tier share one allocation, which is what
+        // the single `Arc` buys on this path.
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            let resident = inner
+                .memory
+                .get(&key)
+                .expect("precondition: the memory tier has to hold the entry");
+            assert!(
+                std::sync::Arc::ptr_eq(&handle.value, resident),
+                "the pinned handle and the tier should hold one allocation"
+            );
+        }
+
+        cache.release(handle);
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
     fn a_timed_write_stamps_its_expiry_under_the_write_lock() {
         // `put_with_ttl` used to call `put`, which takes the lock, writes and
         // releases it -- and then take the lock again to stamp the expiry. Two
