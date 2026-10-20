@@ -25,7 +25,10 @@
 //! cargo run --release --no-default-features --example footprint_report -- --json-output /tmp/matrixcache-footprint.json --require-passed
 //! ```
 
-use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
+use matrixcache::{
+    CacheBlockOptions, CacheDataPlacement, CacheKey, CacheOptions, CacheTieringPolicy,
+    MultiLayerCache,
+};
 
 const ENTRIES: usize = 20_000;
 const KEY_CHARS: usize = 32;
@@ -96,6 +99,76 @@ fn measure(value_bytes: usize) -> Row {
         total: footprint.total_bytes,
         per_entry: per_entry_terms as f64 / ENTRIES as f64,
         amplification: footprint.amplification(),
+    }
+}
+
+/// What a cache with all three tiers configured holds, per entry it tracks.
+///
+/// The memory-only table above is the common case, but it leaves out the two
+/// tables a tiered cache adds -- the PMEM map and the disk index -- and it
+/// divides by a denominator that happens to equal the entry count because
+/// every entry is memory-resident. In a tiered cache most entries are not, so
+/// the figure to read is overhead per *tracked* entry.
+struct TieredRow {
+    value_bytes: usize,
+    memory_entries: usize,
+    tracked_entries: usize,
+    payload: usize,
+    keys: usize,
+    metadata: usize,
+    orders: usize,
+    tables: usize,
+    per_tracked_entry: f64,
+}
+
+fn measure_tiered(value_bytes: usize) -> TieredRow {
+    const TIERED_ENTRIES: usize = 2_000;
+    let dir = std::env::temp_dir().join(format!("matrixcache-footprint-tiered-{value_bytes}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir,
+        CacheTieringPolicy {
+            // Deliberately far smaller than the fill, so entries demote to
+            // PMEM and the tier tables are populated. A memory tier with room
+            // for everything measures the table above a second time.
+            memory_capacity_bytes: 16 * value_bytes,
+            pmem_capacity_bytes: 1 << 24,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    let value = vec![0u8; value_bytes];
+    for index in 0..TIERED_ENTRIES {
+        cache
+            .put(key(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+
+    let footprint = cache.footprint();
+    let per_entry_terms = footprint.key_bytes
+        + footprint.metadata_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes;
+
+    TieredRow {
+        value_bytes,
+        memory_entries: footprint.memory_entries,
+        tracked_entries: footprint.tracked_entries,
+        payload: footprint.payload_bytes,
+        keys: footprint.key_bytes,
+        metadata: footprint.metadata_bytes,
+        orders: footprint.order_bytes,
+        tables: footprint.table_bytes,
+        per_tracked_entry: per_entry_terms as f64 / footprint.tracked_entries.max(1) as f64,
     }
 }
 
@@ -199,6 +272,40 @@ fn main() {
     }
 
     println!();
+    println!("  all three tiers configured, 2000 entries, most of them demoted");
+    println!();
+    println!(
+        "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>14}",
+        "value",
+        "in mem",
+        "tracked",
+        "payload",
+        "keys",
+        "metadata",
+        "orders",
+        "tables",
+        "B/tracked entry"
+    );
+    let tiered: Vec<TieredRow> = [64usize, 256, 1024, 4096]
+        .into_iter()
+        .map(measure_tiered)
+        .collect();
+    for row in &tiered {
+        println!(
+            "  {:>6}  {:>8}  {:>8}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>14.1}",
+            row.value_bytes,
+            row.memory_entries,
+            row.tracked_entries,
+            row.payload,
+            row.keys,
+            row.metadata,
+            row.orders,
+            row.tables,
+            row.per_tracked_entry
+        );
+    }
+
+    println!();
     println!("  {:>6}  {:>14}", "value", "total/payload");
     for row in &rows {
         println!("  {:>6}  {:>13.2}x", row.value_bytes, row.amplification);
@@ -221,6 +328,38 @@ fn main() {
             "the per-entry terms range from {smallest:.1} to {largest:.1} bytes across value \
              sizes, so one of them is charged per byte rather than per entry and the heading \
              above is wrong"
+        ));
+    }
+
+    // The tiered arm is worthless unless entries actually left the memory
+    // tier: a cache that held everything in memory would report the table
+    // above again under a different heading. This is the check an earlier
+    // version of this arm did not have, and it reported a difference of zero
+    // because nothing had demoted.
+    for row in &tiered {
+        if row.tracked_entries == 0 {
+            failures.push(format!(
+                "the tiered arm at {} byte values tracked no entries at all",
+                row.value_bytes
+            ));
+        } else if row.memory_entries * 4 > row.tracked_entries {
+            failures.push(format!(
+                "the tiered arm at {} byte values left {} of {} entries in the memory tier, so \
+                 it is not measuring a tiered cache",
+                row.value_bytes, row.memory_entries, row.tracked_entries
+            ));
+        }
+    }
+
+    // And the per-tracked-entry overhead must be flat in the value size here
+    // too, for the same reason it must be flat above.
+    let tiered_per_entry: Vec<f64> = tiered.iter().map(|row| row.per_tracked_entry).collect();
+    let tiered_smallest = tiered_per_entry.iter().cloned().fold(f64::MAX, f64::min);
+    let tiered_largest = tiered_per_entry.iter().cloned().fold(f64::MIN, f64::max);
+    if tiered_smallest > 0.0 && tiered_largest / tiered_smallest > 1.01 {
+        failures.push(format!(
+            "the tiered per-entry terms range from {tiered_smallest:.1} to {tiered_largest:.1} \
+             bytes across value sizes, so one of them is charged per byte"
         ));
     }
 
