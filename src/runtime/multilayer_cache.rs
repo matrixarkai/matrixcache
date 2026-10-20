@@ -549,6 +549,22 @@ fn map_table_bytes<K, V, S>(map: &std::collections::HashMap<K, V, S>) -> usize {
     estimated_table_bytes::<K, V>(map.capacity())
 }
 
+/// How many buckets a table of this capacity allocated.
+///
+/// **Not** a proxy for how full the table is: `HashMap::capacity()` is
+/// `len + growth_left`, and a removal leaves a tombstone that does not give
+/// the growth back -- so capacity falls as entries are removed while the
+/// bucket array stays exactly as large as it was. A shrink predicate written
+/// against `capacity()` therefore fires about once and then goes quiet, which
+/// is what the first version of [`CacheInner::shrink_tables_if_sparse`] did.
+fn estimated_buckets(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        (capacity * 8 / 7).next_power_of_two()
+    }
+}
+
 fn estimated_table_bytes<K, V>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
@@ -556,7 +572,7 @@ fn estimated_table_bytes<K, V>(capacity: usize) -> usize {
     // `capacity` is what the map can hold before it grows; invert the load
     // factor to get the bucket count, which is then rounded up to a power of
     // two.
-    let buckets = (capacity * 8 / 7).next_power_of_two();
+    let buckets = estimated_buckets(capacity);
     buckets * (std::mem::size_of::<(K, V)>() + 1)
 }
 
@@ -2063,6 +2079,7 @@ impl MultiLayerCache {
         for key in &expired {
             inner.remove_expired_entry(key);
         }
+        inner.shrink_tables_if_sparse();
         drop(inner);
         // Every other path that evicts hands its records to the handler before
         // returning. This one did not: a cache whose only activity was expiry
@@ -2126,6 +2143,7 @@ impl MultiLayerCache {
             }
             CacheTier::Reject => {}
         }
+        inner.shrink_tables_if_sparse();
         drop(inner);
         self.drain_eviction_records();
     }
@@ -5377,6 +5395,9 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         inner.invalidate_key_locked(key, true);
+        // One of the five ways a cache shrinks. The threshold has hysteresis,
+        // so this is a rehash once on the way down rather than per removal.
+        inner.shrink_tables_if_sparse();
         drop(inner);
         self.emit_access_record(CacheAccessRecordKind::Delete, key);
         Ok(())
@@ -5393,6 +5414,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             inner.invalidate_keys_locked(&unique_keys, true, Some(&unique_keys));
+            inner.shrink_tables_if_sparse();
             keys.len()
         };
         for key in keys {

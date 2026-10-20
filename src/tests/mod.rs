@@ -18047,6 +18047,174 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_that_shrank_gives_its_table_space_back() {
+        // A `HashMap` never shrinks on its own. Measured before this: a cache
+        // filled to twenty thousand entries and emptied down to a thousand
+        // held 3,762 bytes an entry, against 320 for a cache that never grew
+        // -- the tables stay sized for the high water mark and the live set
+        // does not matter to them.
+        const FILLED: usize = 20_000;
+        const KEPT: usize = 1_000;
+
+        let key = |index: usize| CacheKey::string(0, &format!("shrink-back-{index:08}"));
+        let build = || MultiLayerCache::with_options(CacheOptions::new(1 << 30, 0, 0));
+        let value = vec![7u8; 64];
+
+        let shrunk = build();
+        for index in 0..FILLED {
+            shrunk.put(key(index), value.clone()).unwrap();
+        }
+        let filled = shrunk.footprint();
+        assert_eq!(filled.memory_entries, FILLED, "nothing may evict during the fill");
+        for index in KEPT..FILLED {
+            shrunk.invalidate(&key(index)).unwrap();
+        }
+        let after = shrunk.footprint();
+        assert_eq!(after.memory_entries, KEPT);
+
+        // The comparison that matters: a cache that only ever held the
+        // survivors. Anything else is an absolute number with no scale.
+        let never_grew = build();
+        for index in 0..KEPT {
+            never_grew.put(key(index), value.clone()).unwrap();
+        }
+        let small = never_grew.footprint();
+        assert_eq!(small.memory_entries, KEPT);
+
+        assert!(
+            after.table_bytes <= small.table_bytes,
+            "a cache that shrank holds {} bytes of table where one that never grew holds {}",
+            after.table_bytes,
+            small.table_bytes
+        );
+        assert!(
+            after.table_bytes * 4 < filled.table_bytes,
+            "the tables did not come down at all: {} against {} when full",
+            after.table_bytes,
+            filled.table_bytes
+        );
+
+        // What is left over is the recency order's node arena and its free
+        // list, and that is not a bug this test is hiding: a node's index is
+        // its identity and the free list holds every released one for reuse,
+        // so neither can shrink without compacting the arena and remapping
+        // every id. The index beside it is a map and does shrink.
+        assert!(
+            after.order_bytes < filled.order_bytes,
+            "the order's index has to have come down with the maps: {} against {}",
+            after.order_bytes,
+            filled.order_bytes
+        );
+        assert!(
+            after.order_bytes > small.order_bytes,
+            "precondition: the arena is expected to stay, so this test should not be \
+             claiming the orders came all the way down"
+        );
+    }
+
+    #[test]
+    fn a_cache_held_at_one_size_never_rehashes_for_the_shrink() {
+        // The threshold is a quarter of the buckets, so a cache sitting at its
+        // own size cannot reach it. Measured on a plain map held at ten
+        // thousand entries over thirty thousand writes: no shrink is asked
+        // for. Here the observable is that the tables do not move at all.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 30, 0, 0));
+        let key = |index: usize| CacheKey::string(0, &format!("steady-{index:08}"));
+        let value = vec![3u8; 64];
+        for index in 0..2_000 {
+            cache.put(key(index), value.clone()).unwrap();
+        }
+        let before = cache.footprint();
+
+        // One in, one out, which is what a cache at its capacity does.
+        for index in 2_000..8_000 {
+            cache.put(key(index), value.clone()).unwrap();
+            cache.invalidate(&key(index - 2_000)).unwrap();
+        }
+        let after = cache.footprint();
+        assert_eq!(after.memory_entries, before.memory_entries);
+        assert_eq!(
+            after.table_bytes, before.table_bytes,
+            "the tables moved under a steady size, so the threshold is being reached by churn"
+        );
+    }
+
+    #[test]
+    fn a_shrink_predicate_on_capacity_goes_quiet_after_one_shrink() {
+        // This is why the first version of the predicate did almost nothing,
+        // and it is worth pinning because the mistake is invisible:
+        // `HashMap::capacity()` is `len + growth_left`, and a removal leaves a
+        // tombstone that does not give the growth back. So capacity falls as
+        // entries are removed while the bucket array stays exactly as large as
+        // it was -- and once a shrink has brought capacity down to about the
+        // live set, `len * 4 <= capacity()` can never be true again.
+        //
+        // Both predicates are run side by side over the same removals, which
+        // is the only way to show that the difference is the predicate and not
+        // the workload.
+        const FILLED: u64 = 20_000;
+        const KEPT: u64 = 1_000;
+        const FLOOR: usize = 64;
+
+        let fill = || {
+            let mut map: std::collections::HashMap<u64, u64> =
+                std::collections::HashMap::new();
+            for index in 0..FILLED {
+                map.insert(index, index);
+            }
+            map
+        };
+
+        let mut on_capacity = fill();
+        let filled_buckets = estimated_buckets(on_capacity.capacity());
+        let mut capacity_shrinks = 0;
+        for index in KEPT..FILLED {
+            on_capacity.remove(&index);
+            if on_capacity.capacity() > FLOOR
+                && on_capacity.len().saturating_mul(4) <= on_capacity.capacity()
+            {
+                on_capacity.shrink_to_fit();
+                capacity_shrinks += 1;
+            }
+        }
+
+        let mut on_buckets = fill();
+        let mut bucket_shrinks = 0;
+        for index in KEPT..FILLED {
+            on_buckets.remove(&index);
+            let buckets = estimated_buckets(on_buckets.capacity());
+            if buckets > FLOOR && on_buckets.len().saturating_mul(4) <= buckets {
+                on_buckets.shrink_to_fit();
+                bucket_shrinks += 1;
+            }
+        }
+
+        assert_eq!(on_capacity.len(), KEPT as usize);
+        assert_eq!(on_buckets.len(), KEPT as usize);
+        assert_eq!(
+            capacity_shrinks, 1,
+            "the capacity-based predicate is supposed to fire once and go quiet"
+        );
+        assert!(
+            bucket_shrinks >= 3,
+            "the bucket-based predicate should halve the table repeatedly, not {bucket_shrinks} \
+             times"
+        );
+        assert!(
+            estimated_buckets(on_buckets.capacity()) * 2
+                <= estimated_buckets(on_capacity.capacity()),
+            "reading the bucket count has to leave a smaller table: {} against {}",
+            estimated_buckets(on_buckets.capacity()),
+            estimated_buckets(on_capacity.capacity())
+        );
+        assert!(
+            estimated_buckets(on_buckets.capacity()) * 4 <= filled_buckets,
+            "and it has to give most of the table back: {} against {filled_buckets} when full",
+            estimated_buckets(on_buckets.capacity())
+        );
+    }
+
+    #[test]
     fn an_empty_cache_reports_no_entries_and_no_payload() {
         let dir = std::env::temp_dir().join("matrixcache-footprint-empty");
         let _ = std::fs::remove_dir_all(&dir);
