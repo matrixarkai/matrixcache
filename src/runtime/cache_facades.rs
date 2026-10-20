@@ -3830,6 +3830,19 @@ impl CacheKeyOrder {
         (key_bytes, structural)
     }
 
+    /// Give the index back the space a shrunken order no longer needs.
+    ///
+    /// The node arena cannot shrink with it: a node's index is its identity,
+    /// and the free list holds every released one for reuse, so dropping
+    /// either would leak arena slots. The index is a `HashMap` and has no such
+    /// constraint, and it is the larger of the two per entry.
+    pub(crate) fn shrink_index_if_sparse(&mut self, floor: usize) {
+        let buckets = estimated_buckets(self.index.capacity());
+        if buckets > floor && self.index.len().saturating_mul(4) <= buckets {
+            self.index.shrink_to_fit();
+        }
+    }
+
     /// How many owners share a tracked key's single allocation.
     ///
     /// Two is the whole point: the node and the index both reach the same

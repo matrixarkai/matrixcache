@@ -279,6 +279,69 @@ fn measure_shape(shape: &'static str, build: &dyn Fn(usize) -> CacheKey) -> Shap
     }
 }
 
+/// What a cache that shrank still holds, against one that never grew.
+///
+/// A `HashMap` never shrinks on its own, so the tables stay sized for the high
+/// water mark however few entries are left. Measured before the shrink was
+/// added: a cache taken from 20,000 entries down to 1,000 held 3,762 bytes an
+/// entry where a cache that never grew held 320.
+///
+/// The recency order's node arena is the part that stays: a node's index is
+/// its identity and the free list holds every released one for reuse, so
+/// neither can shrink without compacting the arena and remapping every id.
+struct ShrunkenRow {
+    label: &'static str,
+    entries: usize,
+    keys: usize,
+    orders: usize,
+    tables: usize,
+    per_entry: f64,
+}
+
+const SHRUNKEN_FILLED: usize = 20_000;
+const SHRUNKEN_KEPT: usize = 1_000;
+
+fn measure_shrunken() -> Vec<ShrunkenRow> {
+    let value = vec![0u8; 64];
+    let build = || MultiLayerCache::with_options(CacheOptions::new(1 << 30, 0, 0));
+    let row = |label: &'static str, cache: &MultiLayerCache| {
+        let footprint = cache.footprint();
+        let entries = footprint.tracked_entries.max(1);
+        ShrunkenRow {
+            label,
+            entries: footprint.tracked_entries,
+            keys: footprint.key_bytes,
+            orders: footprint.order_bytes,
+            tables: footprint.table_bytes,
+            per_entry: (footprint.key_bytes + footprint.order_bytes + footprint.table_bytes) as f64
+                / entries as f64,
+        }
+    };
+
+    let shrunk = build();
+    for index in 0..SHRUNKEN_FILLED {
+        shrunk
+            .put(key(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+    let mut rows = vec![row("after the fill", &shrunk)];
+    for index in SHRUNKEN_KEPT..SHRUNKEN_FILLED {
+        shrunk
+            .invalidate(&key(index))
+            .expect("a started cache must accept an invalidate");
+    }
+    rows.push(row("after shrinking", &shrunk));
+
+    let never_grew = build();
+    for index in 0..SHRUNKEN_KEPT {
+        never_grew
+            .put(key(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+    rows.push(row("never grew", &never_grew));
+    rows
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let json_output = args
@@ -386,6 +449,24 @@ fn main() {
     println!("  {:>6}  {:>14}", "value", "total/payload");
     for row in &rows {
         println!("  {:>6}  {:>13.2}x", row.value_bytes, row.amplification);
+    }
+    println!();
+
+    println!(
+        "  what a cache that shrank still holds ({SHRUNKEN_FILLED} entries down to \
+         {SHRUNKEN_KEPT}, 64-byte values)"
+    );
+    println!();
+    println!(
+        "  {:>16}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "cache", "entries", "keys", "orders", "tables", "B/entry"
+    );
+    let shrunken = measure_shrunken();
+    for row in &shrunken {
+        println!(
+            "  {:>16}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9.1}",
+            row.label, row.entries, row.keys, row.orders, row.tables, row.per_entry
+        );
     }
     println!();
 
@@ -499,6 +580,41 @@ fn main() {
                  {expected} was expected; the filter needs its estimator sized from capacity"
             ));
         }
+    }
+
+    // A cache that shrank must give its table space back: a `HashMap` never
+    // shrinks on its own, and the tables are the largest per-entry term.
+    match (
+        shrunken.iter().find(|row| row.label == "after shrinking"),
+        shrunken.iter().find(|row| row.label == "never grew"),
+        shrunken.iter().find(|row| row.label == "after the fill"),
+    ) {
+        (Some(after), Some(small), Some(filled)) => {
+            if after.tables > small.tables {
+                failures.push(format!(
+                    "a cache shrunk to {} entries holds {} bytes of table where one that never \
+                     grew holds {}; the tables are staying sized for the high water mark",
+                    after.entries, after.tables, small.tables
+                ));
+            }
+            if after.tables * 4 > filled.tables {
+                failures.push(format!(
+                    "the tables barely came down: {} against {} when full",
+                    after.tables, filled.tables
+                ));
+            }
+            // And the part that cannot come down, so that a future reader does
+            // not take the row above as a claim that everything does.
+            if after.orders <= small.orders {
+                failures.push(format!(
+                    "the orders came down to {} against {} for a cache that never grew, which \
+                     means the node arena shrank -- it cannot, so this arm is measuring \
+                     something other than what it says",
+                    after.orders, small.orders
+                ));
+            }
+        }
+        _ => failures.push("the shrunken arm lost one of its three rows".to_string()),
     }
 
     // A selector the cache keeps is held for the life of the entry and once
