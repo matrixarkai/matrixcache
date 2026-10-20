@@ -37,13 +37,17 @@ const HEADROOM: usize = 4;
 
 /// A key whose `record_key` is `KEY_CHARS` long, so the per-entry key cost is
 /// a stated quantity rather than whatever the example happened to produce.
-fn key(index: usize) -> CacheKey {
+fn record(index: usize) -> String {
     let digits = format!("{index:08}");
     let mut record = String::with_capacity(KEY_CHARS);
     record.push_str(&"k".repeat(KEY_CHARS - digits.len()));
     record.push_str(&digits);
     assert_eq!(record.len(), KEY_CHARS);
-    CacheKey::string(0, &record)
+    record
+}
+
+fn key(index: usize) -> CacheKey {
+    CacheKey::string(0, &record(index))
 }
 
 struct Row {
@@ -203,6 +207,77 @@ fn measure_sketch() -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
+/// What the *shape* of a key costs, which none of the tables above show.
+///
+/// Every row above uses `CacheKey::string`, whose namespace and selector are
+/// both literals the key borrows. That is the cheapest shape the cache has.
+/// The other constructors derive their record key or compute their selector,
+/// and a computed selector is a second allocation that stays resident for as
+/// long as the entry does -- held once per key allocation, which is once per
+/// entry.
+///
+/// So the headline figure above is a floor across shapes rather than a typical
+/// cost, which the self-checks below assert rather than leave implied.
+struct ShapeRow {
+    shape: &'static str,
+    record_chars: usize,
+    owned_selector: usize,
+    /// Capacity the selector holds beyond its length. A selector sized by
+    /// `format!` rather than reserved keeps this, for the life of the entry.
+    selector_slack: usize,
+    keys: usize,
+    per_entry: f64,
+    amplification: f64,
+}
+
+const SHAPE_VALUE_BYTES: usize = 64;
+
+fn selector_bytes(key: &CacheKey) -> (usize, usize) {
+    match &key.selector {
+        std::borrow::Cow::Borrowed(_) => (0, 0),
+        std::borrow::Cow::Owned(owned) => (owned.len(), owned.capacity() - owned.len()),
+    }
+}
+
+fn measure_shape(shape: &'static str, build: &dyn Fn(usize) -> CacheKey) -> ShapeRow {
+    let capacity = ENTRIES * SHAPE_VALUE_BYTES * HEADROOM;
+    let cache = MultiLayerCache::with_options(CacheOptions::new(capacity, 0, 0));
+    let value = vec![0u8; SHAPE_VALUE_BYTES];
+    for index in 0..ENTRIES {
+        cache
+            .put(build(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+
+    let footprint = cache.footprint();
+    assert_eq!(
+        footprint.memory_entries, ENTRIES,
+        "nothing may evict during the fill, or the denominator is wrong"
+    );
+    assert_eq!(
+        footprint.payload_bytes,
+        ENTRIES * SHAPE_VALUE_BYTES,
+        "every entry of this shape has to be a distinct key, or the fill is smaller than it looks"
+    );
+
+    let sample = build(0);
+    let (owned_selector, selector_slack) = selector_bytes(&sample);
+    let per_entry_terms = footprint.key_bytes
+        + footprint.metadata_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes;
+
+    ShapeRow {
+        shape,
+        record_chars: sample.record_key.len(),
+        owned_selector,
+        selector_slack,
+        keys: footprint.key_bytes,
+        per_entry: per_entry_terms as f64 / ENTRIES as f64,
+        amplification: footprint.amplification(),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let json_output = args
@@ -312,6 +387,43 @@ fn main() {
     }
     println!();
 
+    println!("  what the key shape costs, {ENTRIES} entries of {SHAPE_VALUE_BYTES}-byte values");
+    println!();
+    println!(
+        "  {:>9}  {:>7}  {:>10}  {:>6}  {:>9}  {:>8}  {:>7}",
+        "shape", "record", "owned sel", "slack", "keys", "B/entry", "ampl."
+    );
+    let shapes: Vec<ShapeRow> = vec![
+        measure_shape("string", &|index| CacheKey::string(0, &record(index))),
+        measure_shape("set", &|index| CacheKey::set_members(0, &record(index))),
+        measure_shape("hash", &|index| {
+            CacheKey::hash(0, &record(index), "field-00000123")
+        }),
+        measure_shape("page", &|index| CacheKey::page(0, index as u64, 4096, 512)),
+        measure_shape("feature", &|index| {
+            CacheKey::feature_query(
+                0,
+                &record(index),
+                1_700_000_000_000,
+                1_700_000_600_000,
+                Some(5_000),
+            )
+        }),
+    ];
+    for row in &shapes {
+        println!(
+            "  {:>9}  {:>7}  {:>10}  {:>6}  {:>9}  {:>8.1}  {:>6.2}x",
+            row.shape,
+            row.record_chars,
+            row.owned_selector,
+            row.selector_slack,
+            row.keys,
+            row.per_entry,
+            row.amplification
+        );
+    }
+    println!();
+
     // ---- Self-checks ------------------------------------------------------
     let mut failures: Vec<String> = Vec::new();
 
@@ -385,6 +497,46 @@ fn main() {
                  {expected} was expected; the filter needs its estimator sized from capacity"
             ));
         }
+    }
+
+    // A selector the cache keeps is held for the life of the entry and once
+    // per key allocation, so slack in it is resident waste. `format!` sizes a
+    // string from nothing and grows it: the feature query's selector came out
+    // of it holding fifty-two bytes for thirty-two characters.
+    for row in &shapes {
+        if row.selector_slack > 0 {
+            failures.push(format!(
+                "the {} shape keeps {} bytes of slack in its selector, which is resident for \
+                 the life of the entry; reserve the allocation instead of letting it grow",
+                row.shape, row.selector_slack
+            ));
+        }
+    }
+
+    // A positive control. If no shape here computes a selector, the check
+    // above passes by measuring nothing at all.
+    if !shapes.iter().any(|row| row.owned_selector > 0) {
+        failures.push(
+            "no shape in this arm computes a selector, so the slack check above is vacuous"
+                .to_string(),
+        );
+    }
+
+    // The headline table uses the cheapest shape, which makes its figure a
+    // floor rather than a typical cost. Worth stating as a check, because the
+    // number gets quoted on its own.
+    if let Some(string_row) = shapes.iter().find(|row| row.shape == "string") {
+        for row in &shapes {
+            if row.per_entry < string_row.per_entry - 0.05 {
+                failures.push(format!(
+                    "the {} shape costs {:.1} bytes an entry against the string shape's {:.1}, \
+                     so the headline figure is not the floor it is presented as",
+                    row.shape, row.per_entry, string_row.per_entry
+                ));
+            }
+        }
+    } else {
+        failures.push("the shape arm lost the string shape it compares against".to_string());
     }
 
     if failures.is_empty() {
