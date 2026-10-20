@@ -5100,11 +5100,25 @@ impl MultiLayerCache {
     /// before the stop has to be releasable after it, or shutting down while
     /// handles are outstanding would leave them pinned forever.
     pub fn pin(&self, key: CacheKey) {
+        self.pin_ref(&key);
+    }
+
+    /// Pin an entry, without being handed the key.
+    ///
+    /// [`Self::pin`] takes a `CacheKey` by value and never consumes it -- the
+    /// only thing it does is `increment_pin(&key)` -- so a caller that still
+    /// wants its key had to clone a seventy-two byte struct, plus a string
+    /// allocation for each of its two `Cow` fields that is computed rather
+    /// than a literal.
+    ///
+    /// `pin` keeps its signature and forwards here, so nothing published
+    /// changes; this is the form the cache's own callers use.
+    pub fn pin_ref(&self, key: &CacheKey) {
         let inner = self.inner.read().expect("cache lock poisoned");
         if !inner.started {
             return;
         }
-        inner.increment_pin(&key);
+        inner.increment_pin(key);
     }
 
     /// Give back a handle.
@@ -7710,6 +7724,14 @@ impl ShardedMultiLayerCache {
 
     pub fn pin(&self, key: CacheKey) {
         self.shard_for_key(&key).pin(key);
+    }
+
+    /// Pin an entry, without being handed the key.
+    ///
+    /// Routed to the one shard that owns it, as `pin` is. See
+    /// [`MultiLayerCache::pin_ref`].
+    pub fn pin_ref(&self, key: &CacheKey) {
+        self.shard_for_key(key).pin_ref(key);
     }
 
     pub fn pin_batch(&self, keys: Vec<CacheKey>) -> usize {
@@ -10647,11 +10669,11 @@ impl MultiLayerCache {
         let hot_keys = (0..4)
             .map(|idx| CacheKey::page_with_slot(7, 1, idx * 8, 8, Some(3)))
             .collect::<Vec<_>>();
-        let pinned_key = hot_keys[0].clone();
+        let pinned_key = &hot_keys[0];
         for (idx, key) in hot_keys.iter().enumerate() {
             let _ = self.put(key.clone(), vec![b'h' + idx as u8; 8]);
         }
-        self.pin(pinned_key.clone());
+        self.pin_ref(pinned_key);
 
         let mut cold_keys = Vec::new();
         for idx in 0..iterations {
@@ -10761,7 +10783,7 @@ impl MultiLayerCache {
             pmem_tier_configured,
             hot_memory_survivors,
             cold_memory_survivors,
-            pinned_memory_survived: self.get_memory(&pinned_key).is_some(),
+            pinned_memory_survived: self.get_memory(pinned_key).is_some(),
             restart_disk_refill_ready,
             observed_evictions: stats.memory_evictions,
             observed_pinned_skips: stats.eviction_pinned_skips,

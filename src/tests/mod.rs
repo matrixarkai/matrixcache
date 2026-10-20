@@ -11353,6 +11353,64 @@ mod tests {
     }
 
     #[test]
+    fn pinning_does_not_require_giving_up_the_key() {
+        // `pin` took a `CacheKey` by value and never consumed it -- the only
+        // thing it did was `increment_pin(&key)` -- so a caller that still
+        // wanted its key had to clone a seventy-two byte struct plus a string
+        // allocation for each of its two `Cow` fields that is computed rather
+        // than a literal.
+        //
+        // `pin_ref` is the same pin without that. `pin` keeps its signature
+        // and forwards, so this is additive.
+        //
+        // A compile-level contract, like the tier writes: the key is used
+        // again after the pin, which only builds while the signature borrows.
+        // Paired with a behavioural check that the pin actually took, because
+        // a method that silently did nothing would also compile.
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        // A computed selector, so a copy would really have allocated.
+        let key = CacheKey::page(7, 2, 4096, 512);
+        cache.put(key.clone(), vec![0u8; 256]).unwrap();
+
+        let before = cache.stats().pinned_entries;
+        cache.pin_ref(&key);
+        assert_eq!(
+            cache.stats().pinned_entries,
+            before + 1,
+            "the borrowing pin has to take the same pin the owning one did"
+        );
+
+        // Still ours, which is the point.
+        assert!(cache.get_memory(&key).is_some());
+        cache.unpin(&key);
+        assert_eq!(cache.stats().pinned_entries, before);
+    }
+
+    #[test]
+    fn a_sharded_cache_can_pin_without_being_handed_the_key() {
+        // Forwarded for the same reason every other borrowing counterpart is:
+        // a method on the single-shard type is unreachable on the type most
+        // likely to be holding a large cache otherwise.
+        let dir = unique_temp_path("sharded-pin-ref");
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths(vec![dir]),
+            4,
+        );
+        let key = CacheKey::page(7, 5, 8192, 256);
+        cache.put(key.clone(), vec![0u8; 128]).unwrap();
+
+        let before = cache.stats().pinned_entries;
+        cache.pin_ref(&key);
+        assert_eq!(
+            cache.stats().pinned_entries,
+            before + 1,
+            "the pin has to reach the shard that owns the key"
+        );
+        cache.unpin(&key);
+        assert_eq!(cache.stats().pinned_entries, before);
+    }
+
+    #[test]
     fn no_pin_count_clones_the_key_it_is_about_to_drop() {
         // Each acquire path cloned the key for its pin count and then once
         // more per position for the handle. The count is pushed after the
