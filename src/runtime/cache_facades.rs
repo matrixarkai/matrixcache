@@ -3346,11 +3346,6 @@ struct CacheOrderNode {
     next: u32,
     access_prev: u32,
     access_next: u32,
-    /// Whether this node sits strictly between the eviction end and the
-    /// insertion point. Carried here because the alternative -- walking to find
-    /// out -- is `len() >> spec` steps, and `touch_access` would pay it on
-    /// every hit.
-    access_cold: bool,
 }
 
 /// Recency ordering over cache keys, from least recently used at the front to
@@ -3381,6 +3376,19 @@ pub struct CacheKeyOrder {
     /// ones that would be evicted before a newly inserted entry. CacheLib
     /// calls this the tail size; the orientation here is reversed.
     access_cold: usize,
+    /// Which nodes sit strictly between the eviction end and the insertion
+    /// point, one bit per node of the arena.
+    ///
+    /// This was a `bool` on the node, which is where it belongs by rights --
+    /// but a node is an eight-byte key handle and four `u32` indices, which is
+    /// twenty-four bytes exactly, and one more byte took the struct to
+    /// **thirty-two** for its eight-byte alignment. So the flag cost eight
+    /// bytes a node rather than one. A bit a node costs an eight-thousandth of
+    /// that, and the answer is still one indexed load away.
+    ///
+    /// A node past the end of this is not cold, so the vector only has to grow
+    /// when a bit is actually set.
+    access_cold_bits: Vec<u64>,
     /// New entries are placed with `len() >> spec` entries closer to eviction
     /// than themselves. Zero puts them at the most-recently-used end.
     insertion_spec: u8,
@@ -3412,6 +3420,7 @@ impl CacheKeyOrder {
             access_tail: CACHE_ORDER_NIL,
             access_insert: CACHE_ORDER_NIL,
             access_cold: 0,
+            access_cold_bits: Vec::new(),
             insertion_spec: 0,
             empty_key: Arc::new(CacheKey::empty()),
         }
@@ -3672,6 +3681,7 @@ impl CacheKeyOrder {
         self.access_tail = CACHE_ORDER_NIL;
         self.access_insert = CACHE_ORDER_NIL;
         self.access_cold = 0;
+        self.access_cold_bits.clear();
     }
 
     /// Iterate from most to least recently used.
@@ -3698,6 +3708,35 @@ impl CacheKeyOrder {
         }
     }
 
+    /// Whether `node` sits strictly between the eviction end and the insertion
+    /// point.
+    fn node_is_cold(&self, node: u32) -> bool {
+        let index = node as usize;
+        self.access_cold_bits
+            .get(index / 64)
+            .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+    }
+
+    fn set_node_cold(&mut self, node: u32, cold: bool) {
+        let index = node as usize;
+        let word = index / 64;
+        if word >= self.access_cold_bits.len() {
+            // Absent is not cold, so clearing a bit that was never set has
+            // nothing to do and the vector stays as short as the set bits
+            // require.
+            if !cold {
+                return;
+            }
+            self.access_cold_bits.resize(word + 1, 0);
+        }
+        let mask = 1u64 << (index % 64);
+        if cold {
+            self.access_cold_bits[word] |= mask;
+        } else {
+            self.access_cold_bits[word] &= !mask;
+        }
+    }
+
     fn alloc(&mut self, key: Arc<CacheKey>) -> u32 {
         if let Some(index) = self.free.pop() {
             let node = &mut self.nodes[index as usize];
@@ -3706,7 +3745,7 @@ impl CacheKeyOrder {
             node.next = CACHE_ORDER_NIL;
             node.access_prev = CACHE_ORDER_NIL;
             node.access_next = CACHE_ORDER_NIL;
-            node.access_cold = false;
+            self.set_node_cold(index, false);
             return index;
         }
         self.nodes.push(CacheOrderNode {
@@ -3715,9 +3754,10 @@ impl CacheKeyOrder {
             next: CACHE_ORDER_NIL,
             access_prev: CACHE_ORDER_NIL,
             access_next: CACHE_ORDER_NIL,
-            access_cold: false,
         });
-        (self.nodes.len() - 1) as u32
+        let node = (self.nodes.len() - 1) as u32;
+        self.set_node_cold(node, false);
+        node
     }
 
     fn release(&mut self, node: u32) {
@@ -3780,6 +3820,7 @@ impl CacheKeyOrder {
 
         let structural = (self.nodes.capacity() * std::mem::size_of::<CacheOrderNode>())
             .saturating_add(self.free.capacity() * std::mem::size_of::<u32>())
+            .saturating_add(self.access_cold_bits.capacity() * std::mem::size_of::<u64>())
             .saturating_add(map_table_bytes(&self.index));
 
         (key_bytes, structural)
@@ -3910,7 +3951,7 @@ impl CacheKeyOrder {
         }
         // The new node lands strictly on the eviction side of the point, so it
         // is cold and the point is now one step further from the eviction end.
-        self.nodes[node as usize].access_cold = true;
+        self.set_node_cold(node, true);
         self.access_cold += 1;
         self.rebalance_insertion_point();
     }
@@ -3944,7 +3985,7 @@ impl CacheKeyOrder {
             if next == CACHE_ORDER_NIL {
                 break;
             }
-            self.nodes[self.access_insert as usize].access_cold = true;
+            self.set_node_cold(self.access_insert, true);
             self.access_insert = next;
             self.access_cold += 1;
         }
@@ -3956,10 +3997,10 @@ impl CacheKeyOrder {
                 break;
             }
             self.access_insert = prev;
-            self.nodes[prev as usize].access_cold = false;
+            self.set_node_cold(prev, false);
             self.access_cold -= 1;
         }
-        self.nodes[self.access_insert as usize].access_cold = false;
+        self.set_node_cold(self.access_insert, false);
     }
 
     fn link_access_back(&mut self, node: u32) {
@@ -3997,22 +4038,22 @@ impl CacheKeyOrder {
                 let next = self.nodes[node as usize].access_next;
                 if next != CACHE_ORDER_NIL {
                     self.access_insert = next;
-                    self.nodes[next as usize].access_cold = false;
+                    self.set_node_cold(next, false);
                 } else {
                     let prev = self.nodes[node as usize].access_prev;
                     self.access_insert = prev;
                     if prev != CACHE_ORDER_NIL {
-                        self.nodes[prev as usize].access_cold = false;
+                        self.set_node_cold(prev, false);
                         self.access_cold = self.access_cold.saturating_sub(1);
                     } else {
                         self.access_cold = 0;
                     }
                 }
-            } else if self.nodes[node as usize].access_cold {
+            } else if self.node_is_cold(node) {
                 self.access_cold = self.access_cold.saturating_sub(1);
             }
         }
-        self.nodes[node as usize].access_cold = false;
+        self.set_node_cold(node, false);
         self.unlink_access_inner(node)
     }
 

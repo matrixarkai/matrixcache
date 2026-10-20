@@ -16881,13 +16881,69 @@ mod tests {
 
     #[test]
     fn an_order_node_does_not_carry_a_key_inline() {
-        // Thirty-two bytes: a pointer to the shared key, four link indices and
-        // a flag. Putting a `CacheKey` back inline would make it a hundred and
-        // four, which is the regression this number exists to catch.
+        // Twenty-four bytes: a pointer to the shared key and four link
+        // indices, and nothing else. Putting a `CacheKey` back inline would
+        // make it a hundred and four, which is the regression this number
+        // exists to catch.
+        //
+        // It was thirty-two while the cold flag was a `bool` on the node. Four
+        // `u32` indices beside an eight-byte pointer fill twenty-four bytes
+        // exactly, so that one byte took the struct to the next multiple of
+        // its alignment and cost eight. The flag is a bitset beside the arena
+        // now, and anything added back here will cost eight again rather than
+        // one -- which is the other reason for pinning this exactly.
         assert_eq!(
             std::mem::size_of::<CacheOrderNode>(),
-            32,
-            "a node must reference its key rather than contain it"
+            24,
+            "a node must reference its key rather than contain it, and must not carry a field \
+             that pushes it past its alignment"
+        );
+    }
+
+    #[test]
+    fn the_cold_flag_costs_a_bit_a_node_rather_than_eight_bytes() {
+        // The flag has to still work, and has to still be cheap. Both halves
+        // matter: a bitset that reported every node cold, or one that grew a
+        // word per node, would pass a size assertion on its own.
+        //
+        // `push_back_if_absent` rather than `push_back`, because only the
+        // former routes a new entry through the access-order insertion point
+        // -- which is what sets the flag at all. My first attempt used
+        // `push_back` and found nothing cold, and the two existing
+        // insertion-spec tests passing is what told me the flag was fine and
+        // the setup was not.
+        const NODES: usize = 1000;
+        let mut order = CacheKeyOrder::new();
+        order.set_insertion_spec(1);
+        for index in 0..NODES {
+            order.push_back_if_absent(order_key(index));
+        }
+        order
+            .check_access_invariants()
+            .expect("the access order has to be consistent before anything is read off it");
+
+        let (_, structural) = order.footprint_bytes();
+        let nodes = order.nodes.capacity() * std::mem::size_of::<CacheOrderNode>();
+        let bits = order.access_cold_bits.capacity() * std::mem::size_of::<u64>();
+        assert!(
+            bits * 64 <= nodes,
+            "the bitset holds {bits} bytes against {nodes} of nodes; a bit a node would be \
+             about a sixty-fourth of the arena once the node is twenty-four bytes"
+        );
+        assert!(
+            structural > nodes,
+            "the structural total has to include the bitset, or it is going uncounted"
+        );
+
+        // And the flag itself: with a spec of one, half the entries sit on the
+        // cold side of the insertion point, so some node must be cold and some
+        // must not.
+        let cold = (0..order.nodes.len() as u32)
+            .filter(|node| order.node_is_cold(*node))
+            .count();
+        assert!(
+            cold > 0 && cold < NODES,
+            "{cold} of {NODES} nodes are cold, which is not a flag doing any work"
         );
     }
 
