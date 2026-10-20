@@ -17845,6 +17845,81 @@ mod tests {
     }
 
     #[test]
+    fn the_pinning_reads_deliver_an_expiry_they_reclaim() {
+        // Reclaiming an expired entry on a read queues a record for a
+        // registered handler. `get_shared`, `get_with_tier`, `get_batch` and
+        // `get_shared_batch_into` hand it over before returning; these four
+        // did not -- so whether the handler heard about an expiry, and when,
+        // came down to which read happened to notice it.
+        //
+        // Found by asking the same question of every read that `purge_expired`
+        // failed, rather than by reading the four in isolation.
+        type Read = Box<dyn Fn(&MultiLayerCache, &CacheKey)>;
+        let readers: Vec<(&str, Read)> = vec![
+            (
+                "get_memory_shared",
+                Box::new(|cache: &MultiLayerCache, key: &CacheKey| {
+                    cache.get_memory_shared(key);
+                }),
+            ),
+            (
+                "acquire",
+                Box::new(|cache: &MultiLayerCache, key: &CacheKey| {
+                    cache.acquire(key).expect("acquire");
+                }),
+            ),
+            (
+                "acquire_no_promotion",
+                Box::new(|cache: &MultiLayerCache, key: &CacheKey| {
+                    cache.acquire_no_promotion(key).expect("acquire");
+                }),
+            ),
+            (
+                "acquire_batch_no_promotion",
+                Box::new(|cache: &MultiLayerCache, key: &CacheKey| {
+                    cache
+                        .acquire_batch_no_promotion(std::slice::from_ref(key))
+                        .expect("acquire batch");
+                }),
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 16, dir.path());
+        cache.start().unwrap();
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&delivered);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record.key);
+        });
+
+        for (name, read) in readers {
+            // One key each: the first read to notice an expiry is the one that
+            // reclaims it, so a shared key would measure only the first.
+            let key = CacheKey::string(0, &format!("pinned-expiry-{name}"));
+            cache
+                .put_with_ttl(key.clone(), vec![b'x'; 128], Duration::from_millis(30))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+
+            let before = delivered.lock().unwrap().len();
+            read(&cache, &key);
+            let after = delivered.lock().unwrap().clone();
+            assert_eq!(
+                after.len(),
+                before + 1,
+                "{name} reclaimed the expired entry without telling the handler"
+            );
+            assert_eq!(after.last(), Some(&key), "{name} delivered the wrong key");
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert!(
+                inner.pending_eviction_records.is_empty(),
+                "{name} left a copy of the expired value queued"
+            );
+        }
+    }
+
+    #[test]
     fn an_expiry_sweep_delivers_its_evictions_before_returning() {
         // Every other eviction path drains the queue before returning.
         // `purge_expired` did not, so the handler heard about a quiet expiry

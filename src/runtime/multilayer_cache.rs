@@ -3854,6 +3854,12 @@ impl MultiLayerCache {
             inner.remove_expired_entry(key);
             inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
             inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            drop(inner);
+            // Reclaiming on a read queues a record for a registered handler,
+            // and the four copying reads hand it over before returning. The
+            // pinning reads did not, so whether the handler heard about an
+            // expiry -- and when -- came down to which read noticed it.
+            self.drain_eviction_records();
             return None;
         }
         let value = inner.memory.get(key).cloned();
@@ -3918,12 +3924,20 @@ impl MultiLayerCache {
         // bytes, and holding them pins the entry against the eviction that
         // would otherwise have removed it.
         if expired {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
-            if inner.entry_expired(key, now_millis) {
-                inner.remove_expired_entry(key);
-                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            // Reclaiming on a read queues a record for a registered
+            // handler, and the four copying reads hand it over before
+            // returning. The pinning reads did not, so whether the handler
+            // heard about an expiry -- and when -- came down to which read
+            // noticed it.
+            self.drain_eviction_records();
             return Ok(None);
         }
 
@@ -4073,12 +4087,20 @@ impl MultiLayerCache {
         }
 
         if expired {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
-            if inner.entry_expired(key, now_millis) {
-                inner.remove_expired_entry(key);
-                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            // Reclaiming on a read queues a record for a registered
+            // handler, and the four copying reads hand it over before
+            // returning. The pinning reads did not, so whether the handler
+            // heard about an expiry -- and when -- came down to which read
+            // noticed it.
+            self.drain_eviction_records();
             return Ok(None);
         }
 
@@ -4162,14 +4184,22 @@ impl MultiLayerCache {
         }
 
         if !expired_keys.is_empty() {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
-            for key in expired_keys {
-                if inner.entry_expired(key, now_millis) {
-                    inner.remove_expired_entry(key);
-                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                for key in expired_keys {
+                    if inner.entry_expired(key, now_millis) {
+                        inner.remove_expired_entry(key);
+                        inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                        inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
+            // Reclaiming on a read queues a record for a registered
+            // handler, and the four copying reads hand it over before
+            // returning. The pinning reads did not, so whether the handler
+            // heard about an expiry -- and when -- came down to which read
+            // noticed it.
+            self.drain_eviction_records();
         }
 
         if ssd_candidates.is_empty() {
