@@ -2450,6 +2450,7 @@ impl CacheInner {
                 if key_pinned && removed_pinned_bytes > 0 {
                     // Still held, so remember what the handle is worth now the
                     // tier no longer has it.
+                    self.pinned_removals_seen.store(true, Ordering::Relaxed);
                     pins.entries
                         .entry(self.shared_key(key))
                         .or_default()
@@ -2739,6 +2740,13 @@ impl CacheInner {
     }
 
     fn pinned_removed_bytes_total(&self) -> usize {
+        // Nothing has ever been removed from a tier while pinned, so every
+        // entry's `removed_bytes` is `None` and the sum is zero. Answered
+        // without locking a single stripe, which is what `size()` was doing
+        // on every call -- and on a sharded cache, once per shard.
+        if !self.pinned_removals_seen.load(Ordering::Relaxed) {
+            return 0;
+        }
         self.all_pins()
             .iter()
             .flat_map(|pins| pins.entries.values().filter_map(|entry| entry.removed_bytes))

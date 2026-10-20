@@ -11353,6 +11353,49 @@ mod tests {
     }
 
     #[test]
+    fn every_pinned_removal_raises_the_flag_that_lets_size_skip_the_walk() {
+        // `size()` adds back the bytes of entries removed from their tier
+        // while still pinned, and it found them by locking every pin stripe
+        // and walking every pinned entry -- on a sharded cache, once per
+        // shard. A sticky flag lets it answer zero without a lock for any
+        // cache where that has never happened.
+        //
+        // The flag is safe because it is never cleared: the worst it can do is
+        // stay true and cost the walk that used to be unconditional. What it
+        // cannot survive is a *fifth* write site added without raising it,
+        // because then `size()` would answer zero when the real total is not.
+        // That is what this checks, by reading the source.
+        const RUNTIME: [&str; 2] = [
+            include_str!("../runtime/multilayer_cache.rs"),
+            include_str!("../runtime/builder_and_gc.rs"),
+        ];
+
+        let writes: usize = RUNTIME
+            .iter()
+            .map(|source| source.matches("removed_bytes = Some").count())
+            .sum();
+        let raises: usize = RUNTIME
+            .iter()
+            .map(|source| {
+                source
+                    .matches("pinned_removals_seen.store(true")
+                    .count()
+            })
+            .sum();
+
+        // The parser has to be shown to work, or a rename turns this into a
+        // test that counts nothing twice and passes.
+        assert!(
+            writes >= 4,
+            "only {writes} writes of `removed_bytes` found, so this test is not reading the              source properly and would pass whatever the code did"
+        );
+        assert_eq!(
+            raises, writes,
+            "{writes} places record bytes for a pinned entry removed from its tier but only              {raises} raise the flag `size()` trusts; a write without the flag makes `size()`              answer zero when it should not"
+        );
+    }
+
+    #[test]
     fn the_pin_figures_add_up_across_every_stripe() {
         // `pinned_bytes` used to be computed in a second pass over the pin
         // stripes, after the other four figures had been folded and the guards
