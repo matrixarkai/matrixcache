@@ -7725,6 +7725,97 @@ mod tests {
     }
 
     #[test]
+    fn the_disk_manifest_stays_bounded_against_what_it_describes() {
+        // The manifest is append-only: one line per block written, and the
+        // same bytes every time the same key is rewritten. Measured before
+        // this: two thousand writes of ONE key left two thousand identical
+        // lines and 142,000 bytes of durable metadata for a single live entry.
+        // Recovery reads that file, so its cost grew with the write history
+        // rather than with the live set, and nothing bounded it -- the
+        // whole-manifest rewrite existed but only three bulk invalidations
+        // called it.
+        const LIVE: usize = 8;
+        const WRITES: usize = 600;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let key = |index: usize| CacheKey::string(3, &format!("manifest-bound-{index:04}"));
+        let value = |index: usize| vec![(index % 251) as u8; 32];
+
+        for round in 0..WRITES {
+            let index = round % LIVE;
+            cache.put(key(index), value(index)).unwrap();
+        }
+
+        // Then keep writing until a rewrite has just happened, so the file is
+        // exactly the live set when the assertions below look at it.
+        //
+        // Without this the test was masked: a rewrite that dropped an entry
+        // was followed by more appends, which put the dropped key's line back
+        // before anything checked -- planting the rewrite to skip an entry
+        // passed. The manifest only describes the live set at the instant it
+        // has been written whole.
+        let manifest = dir.path().join("cache_manifest.jsonl");
+        let lines_now = || {
+            std::fs::read_to_string(&manifest)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        if !cfg!(feature = "rocksdb-ssd") {
+            let mut round = WRITES;
+            while lines_now() > LIVE {
+                let index = round % LIVE;
+                cache.put(key(index), value(index)).unwrap();
+                round += 1;
+                assert!(
+                    round < WRITES + 10_000,
+                    "no rewrite happened in ten thousand writes, so nothing is bounding the \
+                     manifest"
+                );
+            }
+        }
+
+        // The manifest only exists on the non-RocksDB backend: with RocksDB
+        // the store keeps its own index and nothing replays these lines.
+        if !cfg!(feature = "rocksdb-ssd") {
+            let text = std::fs::read_to_string(&manifest)
+                .expect("the manifest has to exist on this backend");
+            let lines = text.lines().count();
+            assert!(
+                lines < WRITES / 4,
+                "the manifest holds {lines} lines for {LIVE} live entries, so nothing is \
+                 bounding it"
+            );
+            // One line per live entry, and every line distinct: this is the
+            // assertion a rewrite that dropped an entry fails, and the reason
+            // the loop above waits for a rewrite before looking.
+            let distinct: std::collections::HashSet<&str> = text.lines().collect();
+            assert_eq!(
+                distinct.len(),
+                LIVE,
+                "the manifest describes {} entries where {LIVE} are live",
+                distinct.len()
+            );
+        }
+
+        // And everything it describes is still recoverable. This is the
+        // assertion a compaction that dropped a live entry fails, and it is
+        // the reason the rewrite is driven from the disk index rather than
+        // from anything the writes accumulate.
+        let restarted = MultiLayerCache::new(8, dir.path());
+        restarted
+            .recover_disk_index()
+            .expect("the manifest has to be readable after being rewritten");
+        for index in 0..LIVE {
+            assert_eq!(
+                restarted.get(&key(index)).unwrap(),
+                Some(value(index)),
+                "entry {index} did not survive the manifest being rewritten"
+            );
+        }
+    }
+
+    #[test]
     fn recover_disk_index_skips_stale_manifest_entries() {
         let dir = tempfile::tempdir().unwrap();
         let key = CacheKey::string(12, "stale");

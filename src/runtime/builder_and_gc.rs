@@ -660,6 +660,10 @@ impl CacheInner {
                 file.sync_all()?;
             }
             fs::rename(temp_path, manifest_path)?;
+            // Whoever called this has just made the file one line per live
+            // entry, so the length counter describes it again.
+            self.manifest_appends
+                .store(self.disk_index.len() as u64, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -674,7 +678,38 @@ impl CacheInner {
                 .open(self.manifest_path())
                 .map_err(CacheError::Io)?;
             writeln!(file, "{line}").map_err(CacheError::Io)
-        })
+        })?;
+        self.compact_disk_manifest_if_long()
+    }
+
+    /// Write the manifest whole once it has grown past a multiple of what it
+    /// describes.
+    ///
+    /// The file is append-only, so rewriting the same key appends the same
+    /// line again: two thousand writes of one key left two thousand identical
+    /// lines, 142,000 bytes, for one live entry -- and recovery reads the
+    /// file, so its cost grew with the write history rather than with the live
+    /// set. Nothing bounded it: the whole-manifest rewrite existed but only
+    /// three bulk invalidations called it.
+    ///
+    /// Four times the live set, above a floor, so a cache whose disk index is
+    /// genuinely large is not rewritten for every write, and a rewrite cannot
+    /// repeat until the file has grown fourfold again -- the rewrite leaves
+    /// exactly one line per live entry, which is where the counter is reset
+    /// to. Three live-set-sized runs of writes between rewrites, so the work
+    /// is a third of a line per write amortised.
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn compact_disk_manifest_if_long(&self) -> Result<(), CacheError> {
+        const MANIFEST_COMPACT_FLOOR: u64 = 64;
+        let appended = self.manifest_appends.fetch_add(1, Ordering::Relaxed) + 1;
+        let live = self.disk_index.len() as u64;
+        if appended <= MANIFEST_COMPACT_FLOOR.max(live.saturating_mul(4)) {
+            return Ok(());
+        }
+        self.rewrite_disk_manifest()?;
+        // What the rewrite just wrote: one line per live entry.
+        self.manifest_appends.store(live, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Record a block's arrival in the disk manifest.
