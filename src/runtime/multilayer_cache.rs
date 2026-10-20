@@ -459,8 +459,15 @@ pub struct CacheFootprint {
     /// its bytes are in. Counted by walking the three tiers and deduplicating,
     /// since an entry resident in two of them is one entry.
     pub tracked_entries: usize,
-    /// Entry payloads across the memory and persistent-memory tiers. This is
-    /// the term, and the only term, the capacity bound counts.
+    /// Entry payloads across the memory and persistent-memory tiers, counted
+    /// **once per allocation**.
+    ///
+    /// A write admitted to both resident tiers gives them handles to the same
+    /// bytes, so an entry in both is one payload here. The per-tier capacity
+    /// counters take the other view and charge it to both, because each tier's
+    /// bound is about that tier's budget rather than about what the process
+    /// holds. This is the term, and the only term, in `total_bytes` that is
+    /// payload rather than bookkeeping.
     pub payload_bytes: usize,
     /// Every resident copy of every key: the struct wherever it is stored
     /// inline, plus the strings it owns, plus a header for each key held
@@ -8719,8 +8726,18 @@ impl CacheInner {
         }
         let tracked_entries = tracked.len();
 
-        let memory_payload: usize = self.memory.values().map(|value| value.len()).sum();
-        let pmem_payload: usize = self.pmem.values().map(|value| value.len()).sum();
+        // Charged once per allocation, not once per tier holding it. A write
+        // admitted to both resident tiers gives them handles to the same bytes,
+        // so adding the two maps' lengths would report those bytes twice --
+        // and would have gone on reporting the same total after the copy
+        // between them was removed, hiding the change it exists to measure.
+        let mut counted_payloads = std::collections::HashSet::new();
+        let mut payload_bytes = 0usize;
+        for value in self.memory.values().chain(self.pmem.values()) {
+            if counted_payloads.insert(value.as_ptr()) {
+                payload_bytes = payload_bytes.saturating_add(value.len());
+            }
+        }
 
         let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
 
@@ -8806,7 +8823,7 @@ impl CacheInner {
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
             tracked_entries,
-            payload_bytes: memory_payload + pmem_payload,
+            payload_bytes,
             key_bytes: shared_character_bytes
                 + shared_key_bytes
                 + memory_order_keys
@@ -8868,6 +8885,16 @@ impl CacheInner {
         value: Vec<u8>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
+        // One allocation for the bytes, shared by every tier that takes them.
+        //
+        // This used to hand each tier `value.clone()`, and each tier then
+        // copied that clone into an `Arc` of its own -- two payload-sized
+        // copies for a write the memory tier accepted, four when the PMEM tier
+        // took it as well, and in that case the two tiers held two separate
+        // allocations of identical bytes. Nothing after the tier writes needs
+        // an owned `Vec`: the SSD path only reads the bytes to encode a block
+        // from them.
+        let value = Arc::<[u8]>::from(value);
         // Reclaim a few lapsed entries before this write is placed. Done here
         // rather than inside the memory tier's admission: a cache with no
         // memory tier configured never reaches that, and its entries need
@@ -8897,7 +8924,7 @@ impl CacheInner {
                 request.hotness,
                 decision.reason,
             );
-            if !self.put_memory(key.clone(), value.clone())
+            if !self.put_memory_shared(key.clone(), Arc::clone(&value))
                 && matches!(
                     self.tiering_policy.data_placement,
                     CacheDataPlacement::Tiered
@@ -8912,7 +8939,7 @@ impl CacheInner {
                     request.hotness,
                     CacheAdmissionReason::PersistentMemory,
                 );
-                pmem_admitted_via_memory_fallback = self.put_pmem(key.clone(), value.clone());
+                pmem_admitted_via_memory_fallback = self.put_pmem_shared(key.clone(), Arc::clone(&value));
             }
         } else if !self.ssd_instance_only {
             self.stats.memory_admission_rejected += 1;
@@ -8937,7 +8964,7 @@ impl CacheInner {
                 request.hotness,
                 decision.reason,
             );
-            let _ = self.put_pmem(key.clone(), value.clone());
+            let _ = self.put_pmem_shared(key.clone(), Arc::clone(&value));
         } else if !self.ssd_instance_only {
             self.stats.pmem_admission_rejected =
                 self.stats.pmem_admission_rejected.saturating_add(1);
@@ -9053,6 +9080,8 @@ impl CacheInner {
         let mut inserted = 0usize;
 
         for (key, value, logical_size) in entries {
+            // Shared across the tiers, exactly as the single-entry path above.
+            let value = Arc::<[u8]>::from(value);
             if !self.is_pinned(&key) {
                 self.pins_for(&key).entries.remove(&key);
             }
@@ -9076,7 +9105,7 @@ impl CacheInner {
                     request.hotness,
                     decision.reason,
                 );
-                if !self.put_memory(key.clone(), value.clone())
+                if !self.put_memory_shared(key.clone(), Arc::clone(&value))
                     && matches!(
                         self.tiering_policy.data_placement,
                         CacheDataPlacement::Tiered
@@ -9091,7 +9120,7 @@ impl CacheInner {
                         request.hotness,
                         CacheAdmissionReason::PersistentMemory,
                     );
-                    pmem_admitted_via_memory_fallback = self.put_pmem(key.clone(), value.clone());
+                    pmem_admitted_via_memory_fallback = self.put_pmem_shared(key.clone(), Arc::clone(&value));
                 }
             } else if !self.ssd_instance_only {
                 self.stats.memory_admission_rejected =
@@ -9107,7 +9136,7 @@ impl CacheInner {
                     request.hotness,
                     decision.reason,
                 );
-                let _ = self.put_pmem(key.clone(), value.clone());
+                let _ = self.put_pmem_shared(key.clone(), Arc::clone(&value));
             } else if !self.ssd_instance_only {
                 self.stats.pmem_admission_rejected =
                     self.stats.pmem_admission_rejected.saturating_add(1);
