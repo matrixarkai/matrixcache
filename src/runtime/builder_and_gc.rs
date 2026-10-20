@@ -2263,11 +2263,12 @@ impl CacheInner {
                 };
             }
         }
-        let windowed = self.select_eviction_victim(order.iter_access().take(candidates), segmented);
+        let windowed =
+            self.select_eviction_victim(order.iter_access().take(candidates), segmented, candidates);
         if windowed.victim.is_some() || order.len() <= candidates {
             return windowed;
         }
-        let full = self.select_eviction_victim(order.iter_access(), segmented);
+        let full = self.select_eviction_victim(order.iter_access(), segmented, order.len());
         PickedEvictionVictim {
             victim: full.victim,
             groups_weighed: windowed
@@ -2289,12 +2290,23 @@ impl CacheInner {
     /// Borrows the keys rather than taking them by value: the caller passes the
     /// tier's own map keys straight in, so a selection no longer starts by
     /// cloning every key in the tier.
-    fn select_eviction_victim<'a, I>(&self, keys: I, segmented: bool) -> PickedEvictionVictim
+    fn select_eviction_victim<'a, I>(
+        &self,
+        keys: I,
+        segmented: bool,
+        candidates: usize,
+    ) -> PickedEvictionVictim
     where
         I: IntoIterator<Item = &'a CacheKey>,
     {
         let mut pinned_skips = 0u64;
-        let mut groups: HashMap<EvictionGroupKey<'a>, SlotEvictionGroup<'a>> = HashMap::new();
+        // Sized for the window up front. The candidate walk is a linked list,
+        // so the iterator cannot say how many are coming and the table grew
+        // from empty on every eviction: measured at 11.48 allocations and
+        // 44,140 bytes for one evicting write, most of it this table doubling
+        // and copying itself four or five times on the way up.
+        let mut groups: HashMap<EvictionGroupKey<'a>, SlotEvictionGroup<'a>> =
+            HashMap::with_capacity(candidates.min(EVICTION_CANDIDATE_WINDOW));
         for key in keys {
             if self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
@@ -2364,7 +2376,7 @@ impl CacheInner {
             .routing_slot
             .or_else(|| extract_routing_slot(key))
             .map(EvictionGroupKey::Slot)
-            .unwrap_or(EvictionGroupKey::Object(&key.namespace, &key.record_key));
+            .unwrap_or(EvictionGroupKey::Object(key));
         self.disk_order
             .iter()
             .take(EVICTION_CANDIDATE_WINDOW)
@@ -2995,7 +3007,7 @@ fn eviction_group_key_of<'a>(
     meta.and_then(|meta| meta.routing_slot)
         .or_else(|| extract_routing_slot(key))
         .map(EvictionGroupKey::Slot)
-        .unwrap_or(EvictionGroupKey::Object(&key.namespace, &key.record_key))
+        .unwrap_or(EvictionGroupKey::Object(key))
 }
 
 fn observe_latency_bucket(

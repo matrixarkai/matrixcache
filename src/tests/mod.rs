@@ -18047,6 +18047,84 @@ mod tests {
     }
 
     #[test]
+    fn the_eviction_group_key_groups_by_the_object_it_names() {
+        // The variant holds the key now rather than its namespace and record
+        // key: two fat pointers are thirty-two bytes against eight for one
+        // thin one, and this sits in a table sized for the whole candidate
+        // window on every eviction. The comparison and the hash are written by
+        // hand as a result, so what they read is what this pins.
+        //
+        // Only one direction of the hash contract is testable here, and it is
+        // worth saying which: equal keys must hash equally, so a hash that
+        // read a field the equality ignores would split a group -- planted,
+        // and it fails below. A hash that reads FEWER fields than the equality
+        // only collides, which is slower and not wrong, so no assertion here
+        // can catch it and none claims to.
+        fn hash_of(group: &EvictionGroupKey<'_>) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            group.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // Same object, different part of it: one group.
+        let first_page = CacheKey::page(0, 7, 4096, 512);
+        let second_page = CacheKey::page(0, 7, 8192, 512);
+        assert_ne!(first_page, second_page, "precondition: these are two keys");
+        let first = eviction_group_key_of(None, &first_page);
+        let second = eviction_group_key_of(None, &second_page);
+        assert_eq!(first, second, "two parts of one object have to group together");
+        assert_eq!(
+            hash_of(&first),
+            hash_of(&second),
+            "equal group keys that hash apart would put them in different groups anyway"
+        );
+
+        // A different record, same namespace: a different group.
+        let other_object = CacheKey::page(0, 8, 4096, 512);
+        let other = eviction_group_key_of(None, &other_object);
+        assert_ne!(first, other, "different objects must not share a group");
+
+        // A different namespace, same record key: also a different group,
+        // which is the half of the comparison a key-identity shortcut would
+        // have lost.
+        let same_record_other_namespace = CacheKey::string(0, first_page.record_key.as_ref());
+        let renamespaced = eviction_group_key_of(None, &same_record_other_namespace);
+        assert_eq!(
+            same_record_other_namespace.record_key, first_page.record_key,
+            "precondition: the record key has to be the same for this to test the namespace"
+        );
+        assert_ne!(
+            first, renamespaced,
+            "the namespace is part of the group, so these must not group together"
+        );
+
+        // And a routing slot wins over the object, with two different objects
+        // in one slot grouping together.
+        let mut slotted = CacheKey::page_with_slot(0, 11, 4096, 512, Some(3));
+        let slotted_other = CacheKey::page_with_slot(0, 12, 4096, 512, Some(3));
+        let slot_group = eviction_group_key_of(None, &slotted);
+        assert_eq!(
+            slot_group,
+            eviction_group_key_of(None, &slotted_other),
+            "one slot is one group whatever objects are in it"
+        );
+        assert_eq!(hash_of(&slot_group), hash_of(&eviction_group_key_of(None, &slotted_other)));
+        assert_ne!(slot_group, first, "a slot group is not an object group");
+        // The selector is what carries the slot, so changing it back drops to
+        // the object grouping -- stated because it is the one way these two
+        // variants meet.
+        slotted.selector = std::borrow::Cow::Borrowed("value");
+        assert!(
+            matches!(
+                eviction_group_key_of(None, &slotted),
+                EvictionGroupKey::Object(_)
+            ),
+            "without a slot in the key the grouping is by object"
+        );
+    }
+
+    #[test]
     fn a_cache_that_shrank_gives_its_table_space_back() {
         // A `HashMap` never shrinks on its own. Measured before this: a cache
         // filled to twenty thousand entries and emptied down to a thousand
