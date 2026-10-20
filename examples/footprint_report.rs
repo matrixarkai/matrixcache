@@ -286,9 +286,11 @@ fn measure_shape(shape: &'static str, build: &dyn Fn(usize) -> CacheKey) -> Shap
 /// added: a cache taken from 20,000 entries down to 1,000 held 3,762 bytes an
 /// entry where a cache that never grew held 320.
 ///
-/// The recency order's node arena is the part that stays: a node's index is
-/// its identity and the free list holds every released one for reuse, so
-/// neither can shrink without compacting the arena and remapping every id.
+/// The recency order's arena is compacted rather than left at its high water
+/// mark -- a node's index is its identity, so that means rebuilding the arena
+/// in eviction order and rewriting every name in both lists, the index and the
+/// cold bits. What is left is the rounding: the arena is rebuilt at the live
+/// count and grows by doubling after that.
 struct ShrunkenRow {
     label: &'static str,
     entries: usize,
@@ -603,14 +605,14 @@ fn main() {
                     after.tables, filled.tables
                 ));
             }
-            // And the part that cannot come down, so that a future reader does
-            // not take the row above as a claim that everything does.
-            if after.orders <= small.orders {
+            // The orders come down too, now that the arena is compacted. Not
+            // all the way: the rebuilt arena grows by doubling, so a thousand
+            // live nodes sit in one sized for two thousand.
+            if after.orders > small.orders * 2 {
                 failures.push(format!(
-                    "the orders came down to {} against {} for a cache that never grew, which \
-                     means the node arena shrank -- it cannot, so this arm is measuring \
-                     something other than what it says",
-                    after.orders, small.orders
+                    "a cache shrunk to {} entries holds {} bytes of recency order where one \
+                     that never grew holds {}; the arena is not being compacted",
+                    after.entries, after.orders, small.orders
                 ));
             }
         }
