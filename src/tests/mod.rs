@@ -17779,6 +17779,148 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_eviction_holds_a_payload_the_footprint_counts() {
+        // `record_eviction` copies the whole evicted value into the queue when
+        // a handler is registered. The footprint counted the array of record
+        // structs as a fixed cost and the copies hanging off it not at all --
+        // so a cache with a handler could hold a payload per queued eviction
+        // that no figure reported.
+        const VALUE_BYTES: usize = 4096;
+        const EVICTIONS: usize = 8;
+
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let queue_records = |cache: &MultiLayerCache| {
+            let mut inner = cache.inner.write().expect("cache lock poisoned");
+            for index in 0..EVICTIONS {
+                let key = CacheKey::string(0, &format!("queued-eviction-{index:03}"));
+                inner.record_eviction(
+                    CacheTier::Memory,
+                    &key,
+                    &vec![9u8; VALUE_BYTES],
+                    CacheRemovalCause::Expired,
+                );
+            }
+        };
+
+        // The gate first: no handler, no copies, and so nothing to report.
+        queue_records(&cache);
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert_eq!(
+                inner.pending_eviction_records.len(),
+                0,
+                "precondition: without a handler the copy is not made at all"
+            );
+        }
+        assert_eq!(cache.footprint().eviction_queue_bytes, 0);
+
+        cache.register_eviction_callback(|_record| {});
+        queue_records(&cache);
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert_eq!(
+                inner.pending_eviction_records.len(),
+                EVICTIONS,
+                "precondition: the records have to be queued for this to measure anything"
+            );
+        }
+
+        let footprint = cache.footprint();
+        assert!(
+            footprint.eviction_queue_bytes >= EVICTIONS * VALUE_BYTES,
+            "the queue holds {EVICTIONS} copies of {VALUE_BYTES} bytes and reports {}",
+            footprint.eviction_queue_bytes
+        );
+        assert!(
+            footprint.total_bytes >= EVICTIONS * VALUE_BYTES,
+            "and the total has to carry it: {}",
+            footprint.total_bytes
+        );
+        // The characters of a key only the queue holds are counted too: the
+        // entries were never put, so nothing else reaches these keys.
+        assert!(
+            footprint.key_bytes > 0,
+            "a key held only by the eviction queue is still resident"
+        );
+    }
+
+    #[test]
+    fn an_expiry_sweep_delivers_its_evictions_before_returning() {
+        // Every other eviction path drains the queue before returning.
+        // `purge_expired` did not, so the handler heard about a quiet expiry
+        // only when some unrelated call came along -- and until then the queue
+        // held an owned copy of every expired value, with nothing bounding it.
+        const ENTRIES: usize = 12;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 16, dir.path());
+        cache.start().unwrap();
+
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&delivered);
+        cache.register_eviction_callback(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+
+        for index in 0..ENTRIES {
+            cache
+                .put_with_ttl(
+                    CacheKey::string(0, &format!("swept-delivery-{index:03}")),
+                    vec![b'z'; 256],
+                    Duration::from_millis(40),
+                )
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(150));
+
+        // The writes above can expire each other as they go, so what the sweep
+        // finds is not fixed -- but nothing may be left queued once it returns.
+        let before = delivered.lock().unwrap().len();
+        let purged = cache.purge_expired();
+        let after = delivered.lock().unwrap().len();
+        assert_eq!(
+            cache.stats().expired_removals as usize,
+            ENTRIES,
+            "precondition: every entry has to have been reclaimed between the writes and the sweep"
+        );
+        assert_eq!(
+            after - before,
+            purged,
+            "the sweep reclaimed {purged} entries and delivered {} of them",
+            after - before
+        );
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert_eq!(
+                inner.pending_eviction_records.len(),
+                0,
+                "the sweep must not leave a copy of an expired value queued"
+            );
+        }
+        // Not zero: a drained `VecDeque` keeps the array it grew, and the
+        // footprint counts that array at capacity on purpose. What must be
+        // gone is the payload hanging off it.
+        let queue_array = {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            inner.pending_eviction_records.capacity()
+                * std::mem::size_of::<CacheEvictionRecord>()
+        };
+        assert_eq!(
+            cache.footprint().eviction_queue_bytes, queue_array,
+            "once drained, only the queue's own array is left"
+        );
+        assert!(
+            cache.footprint().eviction_queue_bytes < ENTRIES * 256,
+            "no copy of an expired value may still be held: {} bytes",
+            cache.footprint().eviction_queue_bytes
+        );
+        assert_eq!(
+            delivered.lock().unwrap().len(),
+            ENTRIES,
+            "between the writes and the sweep the handler has to hear about every one"
+        );
+    }
+
+    #[test]
     fn an_empty_cache_reports_no_entries_and_no_payload() {
         let dir = std::env::temp_dir().join("matrixcache-footprint-empty");
         let _ = std::fs::remove_dir_all(&dir);

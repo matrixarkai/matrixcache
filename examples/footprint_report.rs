@@ -103,7 +103,10 @@ fn measure(value_bytes: usize) -> Row {
         orders: footprint.order_bytes,
         tables: footprint.table_bytes,
         sketch: footprint.sketch_bytes,
-        other: footprint.writeback_bytes + footprint.pin_bytes + footprint.fixed_bytes,
+        other: footprint.writeback_bytes
+            + footprint.pin_bytes
+            + footprint.fixed_bytes
+            + footprint.eviction_queue_bytes,
         total: footprint.total_bytes,
         per_entry: per_entry_terms as f64 / ENTRIES as f64,
         amplification: footprint.amplification(),
