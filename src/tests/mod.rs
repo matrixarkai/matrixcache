@@ -7782,7 +7782,7 @@ mod tests {
 
         let admitted = {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
-            inner.put_ssd_bypass_if_absent(key.clone(), b"value-that-cannot-be-recorded")
+            inner.put_ssd_bypass_if_absent(&key, b"value-that-cannot-be-recorded")
         };
 
         assert!(
@@ -7834,7 +7834,7 @@ mod tests {
         fs::create_dir_all(&manifest_path).unwrap();
         {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
-            inner.put_ssd_bypass_if_absent(key.clone(), b"orphan-payload");
+            inner.put_ssd_bypass_if_absent(&key, b"orphan-payload");
         }
         drop(cache);
 
@@ -15906,6 +15906,55 @@ mod tests {
     }
 
     #[test]
+    fn the_tier_writes_borrow_the_key_they_are_given() {
+        // Every tier write took the key by value and only ever read it, so
+        // every caller cloned a whole `CacheKey`: a struct copy, plus a string
+        // allocation for each of the two `Cow` fields that is computed rather
+        // than a literal -- a page's offset and length, a hash field, a
+        // feature query's window.
+        //
+        // This is a compile-level contract rather than a measurement. It hands
+        // each write a borrow and goes on using the key afterwards, which only
+        // builds while the signatures borrow. The crate forbids unsafe code and
+        // so cannot install a counting allocator, so an absent allocation
+        // cannot be observed at runtime -- what can be pinned is that the
+        // caller is not required to give up its key.
+        let cache = two_resident_tiers_cache("tier-writes-borrow-the-key");
+        // A computed selector, which is the case where cloning the key was an
+        // allocation rather than two pointer copies.
+        let key = CacheKey::page(7, 3, 4096, 512);
+        assert!(
+            matches!(key.selector, std::borrow::Cow::Owned(_)),
+            "precondition: this key has to own its selector, or the clone being removed was              free anyway and the test is describing nothing"
+        );
+        let value: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![1u8; 256]);
+
+        let mut inner = cache.inner.write().expect("cache lock poisoned");
+        assert!(
+            inner.put_memory_shared(&key, std::sync::Arc::clone(&value)),
+            "the memory tier must accept the write"
+        );
+        assert!(
+            inner.put_pmem_shared(&key, std::sync::Arc::clone(&value)),
+            "the PMEM tier must accept the write"
+        );
+        assert!(
+            inner.refill_from_ssd_shared(&key, std::sync::Arc::clone(&value)),
+            "a refill must be accepted too"
+        );
+
+        // Still ours after three writes, which is the whole point: each of
+        // those lines used to consume a copy.
+        assert!(inner.memory.contains_key(&key));
+        assert!(inner.pmem.contains_key(&key));
+        assert_eq!(
+            key.selector.as_ref(),
+            CacheKey::page(7, 3, 4096, 512).selector.as_ref(),
+            "the key the caller still holds has to be the key it started with"
+        );
+    }
+
+    #[test]
     fn a_put_gives_both_tiers_the_same_allocation() {
         // The admission decision for an ordinary write to a cache with both
         // resident tiers configured is `admit_memory: true, admit_pmem: true`
@@ -16240,11 +16289,11 @@ mod tests {
         {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
             assert!(
-                inner.put_ssd_bypass_if_absent(ssd_key.clone(), b"ssd-payload"),
+                inner.put_ssd_bypass_if_absent(&ssd_key, b"ssd-payload"),
                 "the SSD tier has room and must take the key, or nothing below is being tested"
             );
             assert!(
-                inner.put_pmem(pmem_key.clone(), b"pmem-payload".to_vec()),
+                inner.put_pmem(&pmem_key, b"pmem-payload".to_vec()),
                 "the persistent tier has room and must take the key"
             );
         }
@@ -16354,7 +16403,7 @@ mod tests {
         {
             let mut inner = cache.inner.write().expect("cache lock poisoned");
             assert!(
-                inner.put_pmem(key.clone(), vec![0u8; 128]),
+                inner.put_pmem(&key, vec![0u8; 128]),
                 "the persistent tier has room and must take the key"
             );
         }

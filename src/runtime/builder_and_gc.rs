@@ -911,7 +911,7 @@ impl CacheInner {
                 report.skipped_files = report.skipped_files.saturating_add(1);
                 continue;
             }
-            if self.put_pmem_with_persistence(key, value, false) {
+            if self.put_pmem_with_persistence(&key, value, false) {
                 report.recovered_files = report.recovered_files.saturating_add(1);
                 report.recovered_bytes = report.recovered_bytes.saturating_add(expected_len);
             } else {
@@ -1634,11 +1634,11 @@ impl CacheInner {
         }
     }
 
-    fn put_memory(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+    fn put_memory(&mut self, key: &CacheKey, value: Vec<u8>) -> bool {
         self.put_memory_shared(key, Arc::<[u8]>::from(value))
     }
 
-    fn put_memory_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
+    fn put_memory_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
         let eviction_started = Instant::now();
         let value_len = value.len();
         if self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes {
@@ -1649,8 +1649,8 @@ impl CacheInner {
         // Recorded whether or not it is admitted: a key rejected once has to be
         // able to earn its way in, or the filter is a permanent ban rather than
         // a comparison.
-        self.access_frequency.record(&key);
-        if !self.candidate_beats_the_victim(&key, value_len) {
+        self.access_frequency.record(key);
+        if !self.candidate_beats_the_victim(key, value_len) {
             self.stats.memory_admission_rejected += 1;
             return false;
         }
@@ -1659,15 +1659,15 @@ impl CacheInner {
         // One handle for the entry map and the recency order both, taken from
         // whatever already holds this key -- the metadata map, if the write
         // path reached it first.
-        let shared = self.shared_key(&key);
+        let shared = self.shared_key(key);
         if let Some(old) = self.memory.insert(Arc::clone(&shared), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
             // An overwrite is an access. The access order alone does not settle
             // it -- the eviction score weighs hotness before recency, so a
             // rewritten key with the lowest hotness is given up whatever
             // position it holds -- so raise both.
-            self.memory_order.touch_access(&key);
-            if let Some(meta) = self.metadata.get(&key) {
+            self.memory_order.touch_access(key);
+            if let Some(meta) = self.metadata.get(key) {
                 let threshold = self.tiering_policy.memory_hotness_threshold;
                 let before = meta.hotness.fetch_add(1, Ordering::Relaxed);
                 // Counted the same way a read counts it. Raising hotness
@@ -1688,26 +1688,26 @@ impl CacheInner {
         true
     }
 
-    fn put_pmem(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+    fn put_pmem(&mut self, key: &CacheKey, value: Vec<u8>) -> bool {
         self.put_pmem_shared_with_persistence(key, Arc::<[u8]>::from(value), true)
     }
 
     fn put_pmem_with_persistence(
         &mut self,
-        key: CacheKey,
+        key: &CacheKey,
         value: Vec<u8>,
         persist: bool,
     ) -> bool {
         self.put_pmem_shared_with_persistence(key, Arc::<[u8]>::from(value), persist)
     }
 
-    fn put_pmem_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
+    fn put_pmem_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
         self.put_pmem_shared_with_persistence(key, value, true)
     }
 
     fn put_pmem_shared_with_persistence(
         &mut self,
-        key: CacheKey,
+        key: &CacheKey,
         value: Arc<[u8]>,
         persist: bool,
     ) -> bool {
@@ -1717,14 +1717,14 @@ impl CacheInner {
                 self.stats.pmem_admission_rejected.saturating_add(1);
             return false;
         }
-        if persist && self.persist_pmem_put(&key, &value).is_err() {
+        if persist && self.persist_pmem_put(key, &value).is_err() {
             self.stats.pmem_admission_rejected =
                 self.stats.pmem_admission_rejected.saturating_add(1);
             return false;
         }
         self.stats.pmem_admission_accepted = self.stats.pmem_admission_accepted.saturating_add(1);
         self.stats.pmem_fills = self.stats.pmem_fills.saturating_add(1);
-        let shared = self.shared_key(&key);
+        let shared = self.shared_key(key);
         if let Some(old) = self.pmem.insert(Arc::clone(&shared), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
@@ -1735,11 +1735,11 @@ impl CacheInner {
         true
     }
 
-    fn put_ssd_bypass_if_absent(&mut self, key: CacheKey, value: &[u8]) -> bool {
-        if self.disk_index.contains_key(&key) || self.ssd_capacity_bytes == 0 {
+    fn put_ssd_bypass_if_absent(&mut self, key: &CacheKey, value: &[u8]) -> bool {
+        if self.disk_index.contains_key(key) || self.ssd_capacity_bytes == 0 {
             return false;
         }
-        if !self.ssd_write_budget_admits(&key) {
+        if !self.ssd_write_budget_admits(key) {
             return false;
         }
         if value.len() > self.tiering_policy.max_ssd_block_bytes
@@ -1768,7 +1768,7 @@ impl CacheInner {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
-        if self.write_ssd_block(&key, &block).is_err() {
+        if self.write_ssd_block(key, &block).is_err() {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
@@ -1776,12 +1776,12 @@ impl CacheInner {
         // so a block it never records is unreachable after a restart: never
         // served, never counted, and never reclaimed by any eviction path. Undo
         // the write and reject, exactly as a failed block write is rejected.
-        if self.append_disk_manifest_put(&key, block_len as u64).is_err() {
+        if self.append_disk_manifest_put(key, block_len as u64).is_err() {
             let _ = self.delete_ssd_blocks(std::slice::from_ref(&key));
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             return false;
         }
-        let shared = self.shared_key(&key);
+        let shared = self.shared_key(key);
         self.disk_index
             .insert(Arc::clone(&shared), block_len as u64);
         self.disk_order.push_back_if_absent_shared(shared);
@@ -1831,10 +1831,10 @@ impl CacheInner {
             // The same allocation the memory tier was holding, handed down
             // rather than copied: it is leaving one map for another, and both
             // of them hold the bytes behind a handle.
-            return self.put_pmem_shared(key.clone(), Arc::clone(value));
+            return self.put_pmem_shared(key, Arc::clone(value));
         }
         if self.ssd_capacity_bytes > 0 {
-            return self.put_ssd_bypass_if_absent(key.clone(), value);
+            return self.put_ssd_bypass_if_absent(key, value);
         }
         false
     }
@@ -1846,14 +1846,14 @@ impl CacheInner {
         {
             return false;
         }
-        self.put_ssd_bypass_if_absent(key.clone(), value)
+        self.put_ssd_bypass_if_absent(key, value)
     }
 
-    fn refill_from_ssd(&mut self, key: CacheKey, value: Vec<u8>) -> bool {
+    fn refill_from_ssd(&mut self, key: &CacheKey, value: Vec<u8>) -> bool {
         self.refill_from_ssd_shared(key, Arc::<[u8]>::from(value))
     }
 
-    fn refill_from_ssd_shared(&mut self, key: CacheKey, value: Arc<[u8]>) -> bool {
+    fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
         if matches!(
             self.tiering_policy.data_placement,
             CacheDataPlacement::SideBySide

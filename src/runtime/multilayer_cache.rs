@@ -2715,7 +2715,7 @@ impl MultiLayerCache {
                     if inner.pmem.contains_key(key) {
                         inner.record_hit(key, length);
                     }
-                    if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
+                    if !inner.put_memory_shared(key, Arc::clone(&value)) {
                         inner.stats.refill_failures =
                             inner.stats.refill_failures.saturating_add(1);
                     }
@@ -2755,7 +2755,7 @@ impl MultiLayerCache {
                 }
                 inner.record_hit(key, value.len());
                 if !inner.ssd_instance_only
-                    && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&value))
+                    && !inner.refill_from_ssd_shared(key, Arc::clone(&value))
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
@@ -2907,7 +2907,7 @@ impl MultiLayerCache {
                 if inner.pmem.contains_key(&key) {
                     inner.record_hit(&key, value.len());
                 }
-                if !inner.put_memory(key, value.to_vec()) {
+                if !inner.put_memory(&key, value.to_vec()) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.record_get_latency(started);
@@ -2959,7 +2959,7 @@ impl MultiLayerCache {
                         // `Arc` -- two copies of the bytes to store what was
                         // in hand.
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd_shared(key, Arc::clone(&value))
+                            && !inner.refill_from_ssd_shared(&key, Arc::clone(&value))
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
@@ -3389,7 +3389,7 @@ impl MultiLayerCache {
             if inner.pmem.contains_key(key) {
                 inner.record_hit(key, decoded.len());
             }
-            if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
+            if !inner.put_memory_shared(key, Arc::clone(&value)) {
                 inner.stats.refill_failures += 1;
             }
             inner.record_get_latency(started);
@@ -3417,7 +3417,7 @@ impl MultiLayerCache {
                     inner.stats.compressed_hits += 1;
                 }
                 inner.record_hit(key, decoded.len());
-                if !inner.ssd_instance_only && !inner.refill_from_ssd(key.clone(), decoded.clone())
+                if !inner.ssd_instance_only && !inner.refill_from_ssd(key, decoded.clone())
                 {
                     inner.stats.refill_failures += 1;
                 }
@@ -3592,7 +3592,7 @@ impl MultiLayerCache {
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit_metadata(&key, value.len());
                         let decoded = value.to_vec();
-                        if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
+                        if !inner.put_memory_shared(&key, Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
@@ -3649,7 +3649,7 @@ impl MultiLayerCache {
                 match decoded {
                     Some((value, compressed)) => {
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd(key.clone(), value.clone())
+                            && !inner.refill_from_ssd(&key, value.clone())
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
@@ -3825,7 +3825,7 @@ impl MultiLayerCache {
             }
             if let Some(value) = inner.pmem.get(key).cloned() {
                 inner.increment_pin_for_handle(key, value.len());
-                if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
+                if !inner.put_memory_shared(key, Arc::clone(&value)) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
@@ -3851,7 +3851,7 @@ impl MultiLayerCache {
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.increment_pin_for_handle(key, decoded.len());
                 if !inner.ssd_instance_only
-                    && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&decoded))
+                    && !inner.refill_from_ssd_shared(key, Arc::clone(&decoded))
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
@@ -4212,7 +4212,7 @@ impl MultiLayerCache {
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
                         let occurrences = positions.len();
-                        if !inner.put_memory_shared(key.clone(), Arc::clone(&value)) {
+                        if !inner.put_memory_shared(&key, Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
@@ -4273,7 +4273,7 @@ impl MultiLayerCache {
                     Some((value, compressed)) => {
                         let occurrences = positions.len();
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd_shared(key.clone(), Arc::clone(&value))
+                            && !inner.refill_from_ssd_shared(&key, Arc::clone(&value))
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
@@ -4581,7 +4581,7 @@ impl MultiLayerCache {
             0,
             CacheAdmissionReason::MemoryOnly,
         );
-        if !inner.put_memory(key.clone(), value) {
+        if !inner.put_memory(&key, value) {
             inner.stats.refill_failures += 1;
         }
         inner.record_put_latency(started);
@@ -8971,7 +8971,7 @@ impl CacheInner {
                 request.hotness,
                 decision.reason,
             );
-            if !self.put_memory_shared(key.clone(), Arc::clone(&value))
+            if !self.put_memory_shared(&key, Arc::clone(&value))
                 && matches!(
                     self.tiering_policy.data_placement,
                     CacheDataPlacement::Tiered
@@ -8986,7 +8986,7 @@ impl CacheInner {
                     request.hotness,
                     CacheAdmissionReason::PersistentMemory,
                 );
-                pmem_admitted_via_memory_fallback = self.put_pmem_shared(key.clone(), Arc::clone(&value));
+                pmem_admitted_via_memory_fallback = self.put_pmem_shared(&key, Arc::clone(&value));
             }
         } else if !self.ssd_instance_only {
             self.stats.memory_admission_rejected += 1;
@@ -9011,7 +9011,7 @@ impl CacheInner {
                 request.hotness,
                 decision.reason,
             );
-            let _ = self.put_pmem_shared(key.clone(), Arc::clone(&value));
+            let _ = self.put_pmem_shared(&key, Arc::clone(&value));
         } else if !self.ssd_instance_only {
             self.stats.pmem_admission_rejected =
                 self.stats.pmem_admission_rejected.saturating_add(1);
@@ -9152,7 +9152,7 @@ impl CacheInner {
                     request.hotness,
                     decision.reason,
                 );
-                if !self.put_memory_shared(key.clone(), Arc::clone(&value))
+                if !self.put_memory_shared(&key, Arc::clone(&value))
                     && matches!(
                         self.tiering_policy.data_placement,
                         CacheDataPlacement::Tiered
@@ -9167,7 +9167,7 @@ impl CacheInner {
                         request.hotness,
                         CacheAdmissionReason::PersistentMemory,
                     );
-                    pmem_admitted_via_memory_fallback = self.put_pmem_shared(key.clone(), Arc::clone(&value));
+                    pmem_admitted_via_memory_fallback = self.put_pmem_shared(&key, Arc::clone(&value));
                 }
             } else if !self.ssd_instance_only {
                 self.stats.memory_admission_rejected =
@@ -9183,7 +9183,7 @@ impl CacheInner {
                     request.hotness,
                     decision.reason,
                 );
-                let _ = self.put_pmem_shared(key.clone(), Arc::clone(&value));
+                let _ = self.put_pmem_shared(&key, Arc::clone(&value));
             } else if !self.ssd_instance_only {
                 self.stats.pmem_admission_rejected =
                     self.stats.pmem_admission_rejected.saturating_add(1);
@@ -9372,7 +9372,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_memory(key, value) {
+                if !self.put_memory(&key, value) {
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -9385,7 +9385,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_pmem(key, value) {
+                if !self.put_pmem(&key, value) {
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -9449,7 +9449,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_memory(key, value) {
+                if !self.put_memory(&key, value) {
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -9462,7 +9462,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_pmem(key, value) {
+                if !self.put_pmem(&key, value) {
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
