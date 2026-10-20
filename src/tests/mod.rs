@@ -11418,6 +11418,124 @@ mod tests {
     }
 
     #[test]
+    fn the_promoting_batch_reads_without_copying_the_grouped_keys() {
+        // Third of the five readers, and the one that defers the most: four
+        // vectors of state across three lock phases -- the keys still to
+        // serve, the hits needing exclusive work, the SSD candidates and the
+        // decoded blocks -- and each of them held a key the grouping had
+        // copied for it.
+        //
+        // The per-position clone in each handle stays: `CachePinnedHandle.key`
+        // is a public owned `CacheKey`, so that copy is the type's contract.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+        let body = {
+            let start = SOURCE
+                .find("pub fn acquire_batch(\n        &self,\n        keys: &[CacheKey],")
+                .expect("acquire_batch must be in this file");
+            let rest = &SOURCE[start..];
+            let end = rest
+                .find("\n    pub fn update_cached_value_if_current(")
+                .expect("the next method must follow it");
+            &rest[..end]
+        };
+        assert!(
+            !body.contains("pub fn acquire_batch_no_promotion"),
+            "the slice caught the wrong reader"
+        );
+        assert!(
+            body.contains("coalesce_batch_positions_borrowed(keys)"),
+            "this reader should be on the borrowing grouping"
+        );
+        assert!(
+            !body.contains("coalesce_batch_positions(keys)"),
+            "this reader has gone back to the copying grouping"
+        );
+
+        // Behavioural for the deferred state. A borrowed grouping that loses
+        // track of which positions belong to which key answers wrongly rather
+        // than counting wrongly, so this checks the bytes at every position --
+        // over two tiers, because the memory arm and the PMEM arm are reached
+        // through different deferred vectors.
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("promoting-batch-borrowed-grouping"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 1 << 20,
+                pmem_capacity_bytes: 1 << 20,
+                ssd_capacity_bytes: 0,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 0,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1 << 16,
+                max_pmem_block_bytes: 1 << 16,
+                max_ssd_block_bytes: 0,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions::default(),
+        );
+        let in_memory = CacheKey::string(7, "promoting-batch-memory");
+        let in_pmem = CacheKey::string(7, "promoting-batch-pmem");
+        cache.put(in_pmem.clone(), vec![2u8; 1024]).unwrap();
+        // Squeeze the memory tier until it lets the first key go, give the room
+        // back, then put the second one in: the two keys of this batch have to
+        // sit in different tiers for the two arms to both be exercised.
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        cache.set_capacity_for_tier(CacheTier::Memory, 1 << 20);
+        cache.put(in_memory.clone(), vec![1u8; 1024]).unwrap();
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert!(
+                inner.memory.contains_key(&in_memory),
+                "precondition: one key has to be memory-resident"
+            );
+            assert!(
+                !inner.memory.contains_key(&in_pmem),
+                "precondition: the other has to have left the memory tier"
+            );
+            assert!(
+                inner.pmem.contains_key(&in_pmem),
+                "precondition: and the PMEM tier has to be the one holding it"
+            );
+        }
+
+        let handles = cache
+            .acquire_batch(&[
+                in_pmem.clone(),
+                in_memory.clone(),
+                in_pmem.clone(),
+                in_memory.clone(),
+            ])
+            .expect("acquire_batch");
+        assert_eq!(handles.len(), 4);
+        for (position, byte, tier) in [
+            (0usize, 2u8, CacheReadTier::Pmem),
+            (1, 1, CacheReadTier::Memory),
+            (2, 2, CacheReadTier::Pmem),
+            (3, 1, CacheReadTier::Memory),
+        ] {
+            let handle = handles[position]
+                .as_ref()
+                .unwrap_or_else(|| panic!("position {position} was not answered"));
+            assert_eq!(
+                handle.value(),
+                &vec![byte; 1024][..],
+                "position {position} got the wrong bytes"
+            );
+            assert_eq!(
+                handle.tier(),
+                tier,
+                "position {position} was served from the wrong tier"
+            );
+        }
+        // Two distinct keys over four handles: the grouping has to hold the
+        // duplicates together without merging the positions they answer.
+        assert_eq!(cache.stats().pinned_entries, 2);
+        cache.release_batch(handles.into_iter().flatten().collect());
+        assert_eq!(cache.stats().pinned_entries, 0);
+    }
+
+    #[test]
     fn grouping_batch_positions_can_borrow_its_keys() {
         // Five batch readers group requested positions by key, and the
         // grouping copied the keys: once per distinct key on the small path,

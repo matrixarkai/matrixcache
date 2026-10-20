@@ -2612,7 +2612,7 @@ impl CacheInner {
         }
     }
 
-    fn increment_pin_handle_counts(&self, counts: &[(CacheKey, usize, usize, usize)]) {
+    fn increment_pin_handle_counts(&self, counts: &[(&CacheKey, usize, usize, usize)]) {
         if counts.is_empty() {
             return;
         }
