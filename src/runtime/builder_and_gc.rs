@@ -1248,6 +1248,24 @@ impl CacheInner {
     /// at a fixed ten thousand entries across thirty thousand writes: the
     /// predicate asks for **no** shrink at all, so a cache sitting at its
     /// capacity pays nothing for this.
+    /// Give a pin stripe's table back when the pins it held are gone.
+    ///
+    /// The pin maps are deliberately not in [`Self::shrink_tables_if_sparse`]:
+    /// reaching them means locking **every** stripe, and `all_pins` is not
+    /// reentrant, so a shrink from the removal paths would take locks they do
+    /// not need. Each stripe shrinks instead on the release that empties it,
+    /// under the lock that release already holds.
+    ///
+    /// Same threshold as the tier maps, and against the bucket count for the
+    /// same reason -- see `estimated_buckets`.
+    fn shrink_pin_stripe_if_sparse(pins: &mut CachePinState) {
+        const SHRINK_FLOOR: usize = 64;
+        let buckets = estimated_buckets(pins.entries.capacity());
+        if buckets > SHRINK_FLOOR && pins.entries.len().saturating_mul(4) <= buckets {
+            pins.entries.shrink_to_fit();
+        }
+    }
+
     fn shrink_tables_if_sparse(&mut self) {
         const SHRINK_FLOOR: usize = 64;
 
@@ -1275,6 +1293,13 @@ impl CacheInner {
         }
         if sparse(&self.expiries) {
             self.expiries.shrink_to_fit();
+        }
+        // Bounded by `max_async_writeback_queue` rather than by the entry
+        // count, so this one is tens of kilobytes rather than megabytes -- but
+        // it is the same table keeping the same high water mark, and a reader
+        // of this list would otherwise wonder why it is absent.
+        if sparse(&self.async_writeback_positions) {
+            self.async_writeback_positions.shrink_to_fit();
         }
         for order in [
             &mut self.memory_order,
@@ -2511,6 +2536,7 @@ impl CacheInner {
                         .removed_bytes = Some(removed_pinned_bytes);
                 } else {
                     pins.entries.remove(key);
+                    Self::shrink_pin_stripe_if_sparse(&mut pins);
                 }
             }
             self.stats.invalidations += 1;
@@ -2750,6 +2776,7 @@ impl CacheInner {
             // The last handle takes everything known about the key with it, in
             // one removal.
             pins.entries.remove(key);
+            Self::shrink_pin_stripe_if_sparse(&mut pins);
         }
         pins.unpin_operations = pins.unpin_operations.saturating_add(count);
     }
@@ -2786,6 +2813,7 @@ impl CacheInner {
                     entry.handles -= count;
                 } else {
                     pins.entries.remove(key);
+                    Self::shrink_pin_stripe_if_sparse(&mut pins);
                 }
                 pins.unpin_operations = pins.unpin_operations.saturating_add(count);
                 cursor += 1;

@@ -18255,6 +18255,84 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_stripe_gives_its_table_back_when_the_handles_do() {
+        // The pin maps were the one family of tables #165 left out, because
+        // reaching them from the removal paths means locking every stripe.
+        // Measured before this: 20,000 handles taken and all but a hundred
+        // given back left **1,344,768 bytes** of pin bookkeeping, where a cache
+        // that never pinned more than a hundred holds 7,348.
+        const PINNED: usize = 4_000;
+        const KEPT: usize = 20;
+
+        let key = |index: usize| CacheKey::string(0, &format!("pin-stripe-{index:08}"));
+        let build = || MultiLayerCache::with_options(CacheOptions::new(1 << 30, 0, 0));
+        let value = vec![5u8; 64];
+
+        let cache = build();
+        for index in 0..PINNED {
+            cache.put(key(index), value.clone()).unwrap();
+        }
+        let mut handles = Vec::with_capacity(PINNED);
+        for index in 0..PINNED {
+            handles.push(
+                cache
+                    .acquire(&key(index))
+                    .expect("acquire")
+                    .expect("the entry was just written"),
+            );
+        }
+        let held = cache.footprint();
+        assert_eq!(cache.stats().pinned_entries, PINNED as u64);
+
+        let release = handles.split_off(KEPT);
+        cache.release_batch(release);
+        let after = cache.footprint();
+        assert_eq!(cache.stats().pinned_entries, KEPT as u64);
+
+        // Against a cache that never held more, which is the only scale that
+        // means anything.
+        let fresh = build();
+        for index in 0..PINNED {
+            fresh.put(key(index), value.clone()).unwrap();
+        }
+        let mut few = Vec::with_capacity(KEPT);
+        for index in 0..KEPT {
+            few.push(
+                fresh
+                    .acquire(&key(index))
+                    .expect("acquire")
+                    .expect("the entry was just written"),
+            );
+        }
+        let never = fresh.footprint();
+
+        assert!(
+            after.pin_bytes * 4 <= held.pin_bytes,
+            "the pin tables did not come down: {} against {} while every handle was out",
+            after.pin_bytes,
+            held.pin_bytes
+        );
+        // Not all the way down, and the reason is the floor rather than a
+        // missed stripe: twenty handles spread over the stripes leave most of
+        // them below the size worth rehashing, and each keeps its floor.
+        assert!(
+            after.pin_bytes <= never.pin_bytes * 16,
+            "and has to land near what a cache that never pinned more holds: {} against {}",
+            after.pin_bytes,
+            never.pin_bytes
+        );
+        assert!(
+            after.pin_bytes >= never.pin_bytes,
+            "precondition: a shrunk stripe cannot hold less than one that never grew, so this \
+             comparison is the right way round"
+        );
+
+        for handle in handles.into_iter().chain(few) {
+            cache.release(handle);
+        }
+    }
+
+    #[test]
     fn a_cache_held_at_one_size_never_rehashes_for_the_shrink() {
         // The threshold is a quarter of the buckets, so a cache sitting at its
         // own size cannot reach it. Measured on a plain map held at ten
