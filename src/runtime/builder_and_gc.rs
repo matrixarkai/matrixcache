@@ -2745,23 +2745,6 @@ impl CacheInner {
             .fold(0usize, usize::saturating_add)
     }
 
-    fn pinned_memory_bytes(&self) -> u64 {
-        self.all_pins()
-            .iter()
-            .flat_map(|pins| {
-                pins.entries.iter().map(|(key, entry)| {
-                    let memory_bytes =
-                        self.memory.get(key).map(|value| value.len()).unwrap_or(0);
-                    let pmem_bytes = self.pmem.get(key).map(|value| value.len()).unwrap_or(0);
-                    let removed_bytes = entry.removed_bytes.unwrap_or(0);
-                    memory_bytes
-                        .max(pmem_bytes)
-                        .max(entry.handle_bytes)
-                        .max(removed_bytes) as u64
-                })
-            })
-            .sum::<u64>()
-    }
 
     fn record_get_latency(&self, started: Instant) {
         let micros = elapsed_micros(started);
