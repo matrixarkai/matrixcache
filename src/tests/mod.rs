@@ -11018,6 +11018,139 @@ mod tests {
         assert_eq!(cache.stats().pinned_entries, before.pinned_entries);
     }
 
+    /// A cache whose memory tier is too small to hold what it is given, so a
+    /// put lands on SSD and a read has to come back off it.
+    fn ssd_only_then_refilling_cache(name: &str) -> MultiLayerCache {
+        MultiLayerCache::with_tiering_policy(
+            unique_temp_path(name),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 64,
+                pmem_capacity_bytes: 0,
+                ssd_capacity_bytes: 4096,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 1024,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: u32::MAX,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 64,
+                max_pmem_block_bytes: 0,
+                max_ssd_block_bytes: 4096,
+                ssd_write_through: true,
+            },
+            CacheBlockOptions::default(),
+        )
+    }
+
+    /// Puts `key`, then squeezes the memory tier until nothing is resident, so
+    /// the next read is served from SSD and refills.
+    fn park_on_ssd(cache: &MultiLayerCache, key: &CacheKey, value: &[u8]) {
+        cache.put(key.clone(), value.to_vec()).unwrap();
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        assert_eq!(
+            cache.size_for_tier(CacheTier::Memory),
+            0,
+            "the setup has to leave the memory tier empty or the read under test never reaches SSD"
+        );
+        cache.set_capacity_for_tier(CacheTier::Memory, 64);
+        assert!(
+            !cache
+                .inner
+                .read()
+                .expect("cache lock poisoned")
+                .memory
+                .contains_key(key),
+            "precondition: the key must not be memory-resident before the read"
+        );
+    }
+
+    #[test]
+    fn a_shared_read_from_disk_hands_back_the_allocation_it_cached() {
+        // The whole promise of a shared read is that the caller and the cache
+        // hold one copy of the bytes. On an SSD hit they held two: the read
+        // decoded into a `Vec`, cloned it, built an `Arc` from the clone, and
+        // handed the `Vec` to a refill that built a second `Arc`. Four
+        // payload-sized allocations, and the caller's copy was not the cache's.
+        //
+        // Pointer identity is the only thing that can see this. The bytes were
+        // equal before the fix too.
+        let cache = ssd_only_then_refilling_cache("shared-read-ssd-handle");
+        let key = CacheKey::string(7, "shared-read-ssd-handle");
+        park_on_ssd(&cache, &key, b"payload");
+
+        let before = cache.stats();
+        let value = cache
+            .get_shared(&key)
+            .expect("get_shared")
+            .expect("the key is on SSD");
+        let after = cache.stats();
+
+        assert_eq!(
+            after.disk_hits.saturating_sub(before.disk_hits),
+            1,
+            "precondition: the read has to have been served from SSD"
+        );
+        assert_eq!(&value[..], b"payload");
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let resident = inner
+            .memory
+            .get(&key)
+            .expect("the read refills the memory tier, or there is nothing to share with");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, resident),
+            "the caller and the memory tier should hold one allocation; two equal copies means              the refill built its own"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&value),
+            2,
+            "one handle for the caller and one for the tier it was refilled into"
+        );
+    }
+
+    #[test]
+    fn a_shared_batch_read_from_disk_hands_back_the_allocation_it_cached() {
+        // Same claim for the batch, where it was worse: the batch already had
+        // the `Arc` in hand -- it is what it returns -- and copied it with
+        // `to_vec` so that the refill could copy it again into an `Arc` of its
+        // own. Two payload copies to store bytes it was holding.
+        let cache = ssd_only_then_refilling_cache("shared-batch-ssd-handle");
+        let key = CacheKey::string(7, "shared-batch-ssd-handle");
+        park_on_ssd(&cache, &key, b"payload");
+
+        let before = cache.stats();
+        let values = cache
+            .get_shared_batch(std::slice::from_ref(&key))
+            .expect("get_shared_batch");
+        let after = cache.stats();
+
+        assert_eq!(
+            after.disk_hits.saturating_sub(before.disk_hits),
+            1,
+            "precondition: the read has to have been served from SSD"
+        );
+        let value = values
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the key is on SSD");
+        assert_eq!(&value[..], b"payload");
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let resident = inner
+            .memory
+            .get(&key)
+            .expect("the read refills the memory tier, or there is nothing to share with");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, resident),
+            "the batch should refill with the handle it is about to return"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&value),
+            2,
+            "one handle for the caller and one for the tier it was refilled into"
+        );
+    }
+
     #[test]
     fn get_shared_batch_coalesces_duplicates_and_refills_once() {
         let cache = MultiLayerCache::with_tiering_policy(
