@@ -11353,6 +11353,41 @@ mod tests {
     }
 
     #[test]
+    fn no_pin_count_clones_the_key_it_is_about_to_drop() {
+        // Each acquire path cloned the key for its pin count and then once
+        // more per position for the handle. The count is pushed after the
+        // handles now and takes the key by move, because nothing below reads
+        // it -- one fewer key copy per key acquired, and a key copy allocates
+        // for each of its two `Cow` fields that is computed rather than a
+        // literal.
+        //
+        // The per-position clones stay: `CachePinnedHandle.key` is a public
+        // owned `CacheKey`, so those are the handle's contract rather than an
+        // oversight. That is also what stops the pin counts from borrowing
+        // instead, which would have removed the copies rather than moving one.
+        //
+        // Read off the source, because the copy that was removed was transient
+        // -- created, handed to the counter, dropped -- and an absent
+        // allocation cannot be observed at runtime in a crate that forbids
+        // unsafe code and so cannot install a counting allocator.
+        const SOURCE: &str = include_str!("../runtime/multilayer_cache.rs");
+
+        let moved = SOURCE.matches("pin_counts.push((key,").count();
+        let cloned = SOURCE.matches("pin_counts.push((key.clone()").count();
+
+        // The parser has to be shown to work, or a rename turns this into a
+        // test that finds nothing and passes.
+        assert!(
+            moved >= 4,
+            "only {moved} pin counts take the key by move, so this test is not reading the              source properly and would pass whatever the code did"
+        );
+        assert_eq!(
+            cloned, 0,
+            "{cloned} pin count(s) still clone a key they are about to drop; push the count              after the handles and move it"
+        );
+    }
+
+    #[test]
     fn every_pinned_removal_raises_the_flag_that_lets_size_skip_the_walk() {
         // `size()` adds back the bytes of entries removed from their tier
         // while still pinned, and it found them by locking every pin stripe

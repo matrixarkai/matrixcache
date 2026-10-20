@@ -4040,7 +4040,7 @@ impl MultiLayerCache {
                 }
                 if !inner.ssd_instance_only {
                     if let Some(value) = inner.memory.get(&key).cloned() {
-                        pin_counts.push((key.clone(), value.len(), positions.len()));
+                        let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
@@ -4048,10 +4048,12 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Memory,
                             });
                         }
+                        // Takes the key by move: nothing below reads it.
+                        pin_counts.push((key, value.len(), occurrences));
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
-                        pin_counts.push((key.clone(), value.len(), positions.len()));
+                        let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
@@ -4059,6 +4061,7 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Pmem,
                             });
                         }
+                        pin_counts.push((key, value.len(), occurrences));
                         continue;
                     }
                 }
@@ -4205,7 +4208,7 @@ impl MultiLayerCache {
                 let micros = elapsed_micros(started);
                 inner.record_get_latency_micros_many(micros, occurrences);
                 inner.record_read_through_latency_micros_many(micros, occurrences);
-                pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                let pinned_occurrences = positions.len();
                 for position in positions {
                     results[position] = Some(CachePinnedHandle {
                         key: key.clone(),
@@ -4213,6 +4216,8 @@ impl MultiLayerCache {
                         tier: CacheReadTier::Memory,
                     });
                 }
+                // Takes the key by move: nothing below this reads it.
+                pin_counts.push((key, value.len(), pinned_occurrences, 1));
             }
             inner.increment_pin_handle_counts(&pin_counts);
         }
@@ -4265,7 +4270,7 @@ impl MultiLayerCache {
                         inner.record_hit(&key, value.len());
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
-                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        let pinned_occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
@@ -4273,6 +4278,8 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Memory,
                             });
                         }
+                        // Takes the key by move: nothing below this reads it.
+                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(&key).cloned() {
@@ -4290,7 +4297,7 @@ impl MultiLayerCache {
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
-                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        let pinned_occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
@@ -4298,6 +4305,8 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Pmem,
                             });
                         }
+                        // Takes the key by move: nothing below this reads it.
+                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
                         needs_eviction_drain = true;
                         continue;
                     }
@@ -4356,7 +4365,7 @@ impl MultiLayerCache {
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
-                        pin_counts.push((key.clone(), value.len(), positions.len(), 1));
+                        let pinned_occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
                                 key: key.clone(),
@@ -4364,6 +4373,8 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Ssd,
                             });
                         }
+                        // Takes the key by move: nothing below this reads it.
+                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
                         needs_eviction_drain = true;
                     }
                     None => {
