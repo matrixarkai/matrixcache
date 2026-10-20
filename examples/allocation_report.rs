@@ -120,6 +120,24 @@ fn main() {
             .expect("acquire_batch_no_promotion");
         cache.release_batch(handles.into_iter().flatten().collect());
     }));
+    rows.push(measure("acquire_batch", BATCH, || {
+        let handles = cache.acquire_batch(&batch).expect("acquire_batch");
+        cache.release_batch(handles.into_iter().flatten().collect());
+    }));
+    // A key asked for twice is what the grouping exists for, and the one case
+    // where its position list has to hold more than one position.
+    let with_duplicates: Vec<CacheKey> =
+        batch.iter().chain(batch.iter().take(2)).cloned().collect();
+    rows.push(measure(
+        "acquire_batch, 2 duplicated",
+        with_duplicates.len(),
+        || {
+            let handles = cache
+                .acquire_batch(&with_duplicates)
+                .expect("acquire_batch");
+            cache.release_batch(handles.into_iter().flatten().collect());
+        },
+    ));
     rows.push(measure("put, overwriting", 1, || {
         cache
             .put(probe.clone(), value.clone())
@@ -194,6 +212,8 @@ fn main() {
         "get_batch, copying",
         "get_shared_batch",
         "acquire_batch_no_promotion",
+        "acquire_batch",
+        "acquire_batch, 2 duplicated",
     ] {
         if let Some(row) = find(path) {
             if row.per_key > 4.0 {
@@ -203,6 +223,26 @@ fn main() {
                     row.per_key
                 ));
             }
+        }
+    }
+
+    // A batch over distinct keys asks for exactly one position per key, and a
+    // list holding one position does not need an allocation of its own. This is
+    // the figure that moves if it goes back to a vector a key: measured at one
+    // allocation and eight bytes a key, which was over half of what a pinned
+    // batch read allocated.
+    if let (Some(pinned), Some(single)) = (
+        find("acquire_batch_no_promotion"),
+        find("acquire and release"),
+    ) {
+        let bookkeeping = pinned.allocations - single.allocations * pinned.keys_asked as f64;
+        if bookkeeping > pinned.keys_asked as f64 {
+            failures.push(format!(
+                "a pinned batch over {} distinct keys allocates {:.2} times beyond what the \
+                 single read does, which is more than one a key -- a position list is being \
+                 given its own allocation again",
+                pinned.keys_asked, bookkeeping
+            ));
         }
     }
 
