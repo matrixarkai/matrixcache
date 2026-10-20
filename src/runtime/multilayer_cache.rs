@@ -2838,10 +2838,15 @@ impl MultiLayerCache {
         }
 
         let mut unique_values = empty_batch_results(unique_keys.len());
-        let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
-        let mut pmem_refills = Vec::<(usize, CacheKey, Arc<[u8]>, Instant)>::new();
-        let mut ssd_candidates = Vec::<(usize, CacheKey, Instant)>::new();
-        let mut expired_keys = Vec::<(CacheKey, Instant)>::new();
+        // These carry the position of the distinct key rather than a copy of
+        // it. The distinct keys are borrowed from the caller's slice, which
+        // outlives the whole read, so there is nothing for a copy to protect
+        // against -- and a key copy allocates for each of its two `Cow` fields
+        // that is computed rather than a literal.
+        let mut needs_exclusive = Vec::<(usize, HitOutcome, usize)>::new();
+        let mut pmem_refills = Vec::<(usize, Arc<[u8]>, Instant)>::new();
+        let mut ssd_candidates = Vec::<(usize, Instant)>::new();
+        let mut expired_keys = Vec::<(usize, Instant)>::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -2854,7 +2859,7 @@ impl MultiLayerCache {
                 let key: &CacheKey = key;
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
-                    expired_keys.push((key.clone(), started));
+                    expired_keys.push((unique_position, started));
                     continue;
                 }
                 if !inner.ssd_instance_only {
@@ -2869,7 +2874,7 @@ impl MultiLayerCache {
                             HitOutcome::Accounted
                         };
                         if !matches!(outcome, HitOutcome::Accounted) {
-                            needs_exclusive.push((key.clone(), outcome, value.len()));
+                            needs_exclusive.push((unique_position, outcome, value.len()));
                         }
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros(micros);
@@ -2878,23 +2883,24 @@ impl MultiLayerCache {
                         continue;
                     }
                     if let Some(value) = inner.pmem.get(key).cloned() {
-                        pmem_refills.push((unique_position, key.clone(), value, started));
+                        pmem_refills.push((unique_position, value, started));
                         continue;
                     }
                 }
-                ssd_candidates.push((unique_position, key.clone(), started));
+                ssd_candidates.push((unique_position, started));
             }
         }
 
         if !needs_exclusive.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
-            for (key, outcome, len) in needs_exclusive {
+            for (unique_position, outcome, len) in needs_exclusive {
+                let key = unique_keys[unique_position];
                 match outcome {
                     HitOutcome::Accounted => {}
-                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
                     HitOutcome::NeedsMetadata => {
-                        if inner.memory.contains_key(&key) {
-                            inner.record_hit(&key, len);
+                        if inner.memory.contains_key(key) {
+                            inner.record_hit(key, len);
                         }
                     }
                 }
@@ -2907,21 +2913,29 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (key, started) in expired_keys {
-                if inner.entry_expired(&key, now_millis) {
-                    inner.remove_expired_entry(&key);
+            for (unique_position, started) in expired_keys {
+                let key = unique_keys[unique_position];
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
                     inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
                     inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                 }
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
             }
-            for (unique_position, key, value, started) in pmem_refills {
+            for (unique_position, value, started) in pmem_refills {
+                let key = unique_keys[unique_position];
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                if inner.pmem.contains_key(&key) {
-                    inner.record_hit(&key, value.len());
+                if inner.pmem.contains_key(key) {
+                    inner.record_hit(key, value.len());
                 }
-                if !inner.put_memory(&key, value.to_vec()) {
+                // `value` is already the `Arc<[u8]>` this batch returns, so the
+                // memory tier takes a handle to it. The `to_vec` that used to
+                // be here copied the payload so that `put_memory` could copy it
+                // again into an `Arc` -- two copies to store what was in hand,
+                // and the caller was then left holding a different allocation
+                // from the one the tier kept.
+                if !inner.put_memory_shared(key, Arc::clone(&value)) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.record_get_latency(started);
@@ -2933,9 +2947,11 @@ impl MultiLayerCache {
         }
 
         if !ssd_candidates.is_empty() {
+            // Already a slice of references, which is what `read_ssd_blocks`
+            // takes, so the positions resolve straight into it.
             let candidate_keys = ssd_candidates
                 .iter()
-                .map(|(_, key, _)| key)
+                .map(|(unique_position, _)| unique_keys[*unique_position])
                 .collect::<Vec<_>>();
             let refill_started = Instant::now();
             let blocks = {
@@ -2943,7 +2959,7 @@ impl MultiLayerCache {
                 inner.read_ssd_blocks(&candidate_keys)?
             };
             let mut decoded = Vec::with_capacity(ssd_candidates.len());
-            for ((unique_position, key, started), block) in ssd_candidates.into_iter().zip(blocks) {
+            for ((unique_position, started), block) in ssd_candidates.into_iter().zip(blocks) {
                 let decoded_block = match block {
                     Some(block) => Some((
                         Arc::<[u8]>::from(decode_cache_block(&block)?),
@@ -2951,13 +2967,14 @@ impl MultiLayerCache {
                     )),
                     None => None,
                 };
-                decoded.push((unique_position, key, started, decoded_block));
+                decoded.push((unique_position, started, decoded_block));
             }
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (unique_position, key, started, decoded_block) in decoded {
+            for (unique_position, started, decoded_block) in decoded {
+                let key = unique_keys[unique_position];
                 match decoded_block {
                     Some((value, compressed)) => {
                         inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
@@ -2965,7 +2982,7 @@ impl MultiLayerCache {
                             inner.stats.compressed_hits =
                                 inner.stats.compressed_hits.saturating_add(1);
                         }
-                        inner.record_hit(&key, value.len());
+                        inner.record_hit(key, value.len());
                         // `value` is already the `Arc<[u8]>` this batch
                         // returns, so the tier takes a handle to it. The
                         // `to_vec` that used to be here copied the payload so
@@ -2973,7 +2990,7 @@ impl MultiLayerCache {
                         // `Arc` -- two copies of the bytes to store what was
                         // in hand.
                         if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd_shared(&key, Arc::clone(&value))
+                            && !inner.refill_from_ssd_shared(key, Arc::clone(&value))
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
