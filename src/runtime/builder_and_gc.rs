@@ -962,7 +962,6 @@ impl CacheInner {
                     hits: AtomicU64::new(0),
                     last_access_epoch: AtomicU64::new(0),
                     admission_reason: CacheAdmissionReason::MemoryOnly,
-                    expires_at_millis: AtomicU64::new(0),
                 });
             }
             self.disk_index = recovered_index;
@@ -1039,7 +1038,6 @@ impl CacheInner {
                     hits: AtomicU64::new(0),
                     last_access_epoch: AtomicU64::new(0),
                     admission_reason: CacheAdmissionReason::MemoryOnly,
-                    expires_at_millis: AtomicU64::new(0),
                 });
             }
 
@@ -1154,6 +1152,7 @@ impl CacheInner {
                 self.stats.expired_delete_failures.saturating_add(1);
         }
         self.metadata.remove(key);
+        self.forget_expiry(key);
         self.stats.expired_removals = self.stats.expired_removals.saturating_add(1);
         if let Some((tier, value)) = departing {
             self.record_eviction(tier, key, &value, CacheRemovalCause::Expired);
@@ -1205,14 +1204,14 @@ impl CacheInner {
         }
     }
 
-    /// Whether the entry under `key` has passed its time to live.
-    /// Drops an entry's metadata, but only if no tier still holds the key.
+    /// Drops an entry's metadata and any expiry held for it, but only if no
+    /// tier still holds the key.
     ///
     /// The metadata map is keyed independently of the tiers and outlives any
     /// one of them, so every removal has to ask all three. An entry that loses
     /// its metadata while a tier can still serve it is not merely cheaper to
-    /// keep: [`Self::entry_expired`] reads the expiry out of the metadata and
-    /// answers `false` when there is none, so the entry stops expiring; and
+    /// keep: [`Self::entry_expired`] answers `false` for an entry with no
+    /// expiry recorded, so a stripped entry stops expiring; and
     /// `eviction_score_of` scores a key with no metadata as zero hotness, zero
     /// hits and epoch zero, which is the coldest thing in the cache. Removing
     /// it early therefore makes an entry both immortal against its time to live
@@ -1226,13 +1225,44 @@ impl CacheInner {
             && !self.disk_index.contains_key(key)
         {
             self.metadata.remove(key);
+            self.forget_expiry(key);
         }
     }
 
+    /// Whether the entry under `key` has passed its time to live.
+    ///
+    /// Costs nothing at all when no time to live has ever been set, which is
+    /// the default: the flag is checked before the map is touched, so the read
+    /// path does not hash a key to learn that nothing expires.
     fn entry_expired(&self, key: &CacheKey, now_millis: u64) -> bool {
-        self.metadata
-            .get(key)
-            .is_some_and(|meta| meta.is_expired(now_millis))
+        self.ttl_in_use
+            && self
+                .expiries
+                .get(key)
+                .is_some_and(|expires_at| now_millis >= *expires_at)
+    }
+
+    /// Stamp an expiry `ttl_millis` from now, or clear it when zero.
+    ///
+    /// An absent key is what no expiry looks like, so clearing removes rather
+    /// than storing a zero.
+    fn set_entry_expiry(&mut self, key: &CacheKey, ttl_millis: u64, now_millis: u64) {
+        if ttl_millis == 0 {
+            self.forget_expiry(key);
+            return;
+        }
+        // Saturating, so a caller asking for a century does not wrap into an
+        // entry that is already expired.
+        let expires_at = now_millis.saturating_add(ttl_millis).max(1);
+        let shared = self.shared_key(key);
+        self.expiries.insert(shared, expires_at);
+    }
+
+    /// Drop any expiry held for `key`.
+    fn forget_expiry(&mut self, key: &CacheKey) {
+        if self.ttl_in_use {
+            self.expiries.remove(key);
+        }
     }
 
     fn record_metadata(
@@ -1249,14 +1279,21 @@ impl CacheInner {
         // tier, a write-through -- is the common case, and it needs neither the
         // second lookup nor the key clone. Hotness and hits carry across, which
         // is what rebuilding the entry did; the rest is replaced either way.
+        let mut rewriting = false;
         if let Some(meta) = self.metadata.get_mut(key) {
             meta.block_kind = block_kind;
             meta.routing_slot = routing_slot;
             meta.last_access_epoch.store(epoch, Ordering::Relaxed);
             meta.admission_reason = admission_reason;
+            rewriting = true;
+        }
+        if rewriting {
             // Rewriting an entry restarts its life, which is what a caller
-            // means by putting the key again.
-            meta.set_ttl(self.default_ttl_millis, epoch);
+            // means by putting the key again. Stamped outside the borrow
+            // above, because the expiry is no longer a field of the struct
+            // that borrow holds.
+            let default_ttl_millis = self.default_ttl_millis;
+            self.set_entry_expiry(key, default_ttl_millis, epoch);
             return;
         }
         let shared = self.shared_key(key);
@@ -1271,7 +1308,6 @@ impl CacheInner {
                 hits: AtomicU64::new(0),
                 last_access_epoch: AtomicU64::new(epoch),
                 admission_reason,
-                expires_at_millis: AtomicU64::new(0),
             },
         );
     }
@@ -1314,7 +1350,6 @@ impl CacheInner {
                     hits: AtomicU64::new(1),
                     last_access_epoch: AtomicU64::new(epoch),
                     admission_reason: CacheAdmissionReason::MemoryOnly,
-                    expires_at_millis: AtomicU64::new(0),
                 },
             );
             before < threshold && hotness >= threshold
@@ -2461,6 +2496,7 @@ impl CacheInner {
             }
         }
         self.metadata.clear();
+        self.expiries.clear();
         self.async_writeback_queue.clear();
         self.async_writeback_positions.clear();
         self.async_writeback_head = 0;

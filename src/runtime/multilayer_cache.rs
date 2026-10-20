@@ -714,6 +714,19 @@ struct CacheInner {
     /// use expiry, and this is what keeps it costing nothing: one bool test on
     /// the write path, and the sweep is never entered.
     ttl_in_use: bool,
+    /// Coarse-clock millisecond at which an entry stops being servable, for
+    /// the entries that have one.
+    ///
+    /// Held apart from `CacheEntryMeta` because almost no entry has an expiry.
+    /// It was a `u64` on that struct, which cost eight bytes an entry to carry
+    /// a constant zero for every cache that never sets a time to live -- and
+    /// the struct is held for every entry the cache tracks, so those eight
+    /// bytes were eight more in every bucket of the metadata table as well.
+    ///
+    /// An absent key is what no expiry looks like, so a value in here is
+    /// always non-zero. Nothing is persisted: a restart loses expiries exactly
+    /// as it did when they lived on the metadata struct.
+    expiries: HashMap<Arc<CacheKey>, u64>,
     tiering_policy: CacheTieringPolicy,
     block_options: CacheBlockOptions,
     /// Keyed on a shared handle, not on the key itself.
@@ -1136,32 +1149,6 @@ struct CacheEntryMeta {
     hits: AtomicU64,
     last_access_epoch: AtomicU64,
     admission_reason: CacheAdmissionReason,
-    /// Coarse-clock millisecond at which this entry stops being servable.
-    ///
-    /// Zero means it never does, which is what an entry gets unless a time to
-    /// live was asked for. Stored rather than a `Duration` so the check on the
-    /// read path is one relaxed load and one comparison.
-    expires_at_millis: AtomicU64,
-}
-
-impl CacheEntryMeta {
-    /// Whether this entry has passed its time to live as of `now_millis`.
-    fn is_expired(&self, now_millis: u64) -> bool {
-        let expires_at = self.expires_at_millis.load(Ordering::Relaxed);
-        expires_at != 0 && now_millis >= expires_at
-    }
-
-    /// Stamp an expiry `ttl_millis` from now, or clear it when zero.
-    fn set_ttl(&self, ttl_millis: u64, now_millis: u64) {
-        let expires_at = if ttl_millis == 0 {
-            0
-        } else {
-            // Saturating, so a caller asking for a century does not wrap into
-            // an entry that is already expired.
-            now_millis.saturating_add(ttl_millis).max(1)
-        };
-        self.expires_at_millis.store(expires_at, Ordering::Relaxed);
-    }
 }
 struct StagedSsdBatchWrite {
     key: CacheKey,
@@ -1661,6 +1648,7 @@ impl MultiLayerCache {
                 ssd_write_budget: SsdWriteBudget::unlimited(),
                 default_ttl_millis: 0,
                 ttl_in_use: false,
+                expiries: HashMap::new(),
                 tiering_policy,
                 block_options,
                 memory: HashMap::new(),
@@ -1814,12 +1802,17 @@ impl MultiLayerCache {
     ) -> Result<(), CacheError> {
         self.put(key.clone(), value)?;
         let ttl_millis = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        // One write lock, where this used to take a write lock to raise the
+        // flag and then a read lock to stamp the expiry atomically. The expiry
+        // no longer lives behind a shared handle, so there is nothing left for
+        // the second lock to do.
+        let mut inner = self.inner.write().expect("cache lock poisoned");
         if ttl_millis > 0 {
-            self.inner.write().expect("cache lock poisoned").ttl_in_use = true;
+            inner.ttl_in_use = true;
         }
-        let inner = self.inner.read().expect("cache lock poisoned");
-        if let Some(meta) = inner.metadata.get(&key) {
-            meta.set_ttl(ttl_millis, CoarseClock::now_millis());
+        if inner.metadata.contains_key(&key) {
+            let now_millis = CoarseClock::now_millis();
+            inner.set_entry_expiry(&key, ttl_millis, now_millis);
         }
         Ok(())
     }
@@ -1855,10 +1848,13 @@ impl MultiLayerCache {
     pub fn purge_expired(&self) -> usize {
         let now_millis = CoarseClock::now_millis();
         let mut inner = self.inner.write().expect("cache lock poisoned");
+        // Walks the entries that have an expiry rather than every entry the
+        // cache holds. For a cache with a handful of timed entries among
+        // millions that is the difference between a sweep and a scan.
         let expired: Vec<CacheKey> = inner
-            .metadata
+            .expiries
             .iter()
-            .filter(|(_, meta)| meta.is_expired(now_millis))
+            .filter(|(_, expires_at)| now_millis >= **expires_at)
             .map(|(key, _)| CacheKey::clone(key))
             .collect();
         for key in &expired {
@@ -8802,7 +8798,10 @@ impl CacheInner {
         let table_bytes = map_table_bytes(&self.memory)
             + map_table_bytes(&self.pmem)
             + map_table_bytes(&self.disk_index)
-            + map_table_bytes(&self.metadata);
+            + map_table_bytes(&self.metadata)
+            // `expiries` is empty, and so free, for a cache that never sets a
+            // time to live.
+            + map_table_bytes(&self.expiries);
 
         let mut footprint = CacheFootprint {
             memory_entries: self.memory.len(),
@@ -8858,6 +8857,7 @@ impl CacheInner {
             && !self.disk_index.contains_key(&key)
         {
             self.metadata.remove(&key);
+            self.forget_expiry(&key);
         }
         outcome
     }

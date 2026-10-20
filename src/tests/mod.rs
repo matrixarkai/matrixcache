@@ -1018,14 +1018,15 @@ mod tests {
         //
         // The time to live has to outlast the churn below, which takes most of
         // a second, or the entry expires on its own before the condition under
-        // test is reached. That is asserted rather than assumed.
-        const TTL: Duration = Duration::from_millis(3000);
+        // test is reached. That is asserted rather than assumed -- by reading
+        // the recorded expiry rather than by timing the churn, which is what
+        // the first version of this did and which flaked once under load.
+        const TTL: Duration = Duration::from_millis(5000);
         let cache = pmem_outliving_ssd_cache("expiry-survives-an-ssd-eviction");
         let watched = CacheKey::string(7, "expiry-survives-00000");
         cache
             .put_with_ttl(watched.clone(), vec![0u8; 256], TTL)
             .unwrap();
-        let written = std::time::Instant::now();
         churn_the_disk_tier(&cache, "expiry-survives", 200);
 
         {
@@ -1038,21 +1039,21 @@ mod tests {
                 !inner.disk_index.contains_key(&watched),
                 "precondition: the watched key's SSD copy has to have been evicted, or its                  metadata was never at risk"
             );
-            assert!(
-                written.elapsed() < TTL,
-                "precondition: the churn outlasted the time to live, so the entry expired                  before the SSD eviction could strip it"
-            );
             // The crisp form of the claim, before the behavioural one: the
-            // expiry is still recorded. With the bug this map has no entry for
-            // the key at all.
-            let meta = inner
-                .metadata
+            // expiry is still recorded, and still in the future. With the bug
+            // the map has no entry for the key at all.
+            assert!(
+                inner.metadata.contains_key(&watched),
+                "an entry the PMEM tier is serving keeps its metadata"
+            );
+            let expires_at = inner
+                .expiries
                 .get(&watched)
-                .expect("an entry the PMEM tier is serving keeps its metadata");
-            assert_ne!(
-                meta.expires_at_millis.load(Ordering::Relaxed),
-                0,
-                "the entry still has metadata but its expiry has been cleared, which makes it                  immortal just as losing the metadata did"
+                .copied()
+                .expect("an entry the PMEM tier is serving keeps its expiry");
+            assert!(
+                expires_at > CoarseClock::now_millis(),
+                "precondition: the churn outlasted the time to live, so the entry expired on                  its own before the SSD eviction could strip it"
             );
         }
 
@@ -15538,6 +15539,258 @@ mod tests {
         assert!(
             honest < stale,
             "the accounting must not charge for a key struct the map does not hold"
+        );
+    }
+
+    #[test]
+    fn an_entry_carries_no_room_for_an_expiry_it_does_not_have() {
+        // The expiry used to be a `u64` on the metadata struct, set to zero
+        // for every entry unless a time to live was asked for. The struct is
+        // held for every entry the cache tracks, so that was eight bytes an
+        // entry of constant zero -- and eight more in every bucket of the
+        // metadata table, which is the larger half.
+        //
+        // Pinned exactly, because the whole change is a number: alignment
+        // decides whether removing a field removes anything at all, and
+        // removing the `routing_slot` option instead would have left this at
+        // forty.
+        assert_eq!(
+            std::mem::size_of::<CacheEntryMeta>(),
+            32,
+            "the metadata struct was 40 bytes with the expiry on it and is 32 without; a field              added back here costs eight bytes a bucket as well as its own size"
+        );
+
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        for i in 0..100 {
+            cache
+                .put(CacheKey::string(0, &format!("no-expiry-{i:04}")), vec![0u8; 64])
+                .unwrap();
+        }
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        assert_eq!(inner.metadata.len(), 100);
+        assert!(
+            inner.expiries.is_empty(),
+            "a cache that was never given a time to live holds {} expiries",
+            inner.expiries.len()
+        );
+        assert_eq!(
+            map_table_bytes(&inner.expiries),
+            0,
+            "an empty expiry map must cost nothing, or this moved the bytes rather than              removing them"
+        );
+    }
+
+    #[test]
+    fn the_expiry_map_holds_only_the_entries_that_asked_for_one() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        for i in 0..100 {
+            cache
+                .put(CacheKey::string(0, &format!("some-expiry-{i:04}")), vec![0u8; 64])
+                .unwrap();
+        }
+        for i in 0..3 {
+            cache
+                .put_with_ttl(
+                    CacheKey::string(0, &format!("timed-{i:04}")),
+                    vec![0u8; 64],
+                    Duration::from_secs(600),
+                )
+                .unwrap();
+        }
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        assert_eq!(inner.metadata.len(), 103);
+        assert_eq!(
+            inner.expiries.len(),
+            3,
+            "the expiry map should hold the three timed entries and nothing else"
+        );
+    }
+
+    /// A cache with room on both tiers, so what leaves does so because it was
+    /// told to rather than because something filled up.
+    fn expiry_exit_cache(dir: &std::path::Path) -> MultiLayerCache {
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 1 << 20,
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.start().unwrap();
+        cache
+    }
+
+    fn expiries_held(cache: &MultiLayerCache) -> usize {
+        cache
+            .inner
+            .read()
+            .expect("cache lock poisoned")
+            .expiries
+            .len()
+    }
+
+    fn tracked_by_any_tier(cache: &MultiLayerCache, key: &CacheKey) -> bool {
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        inner.memory.contains_key(key)
+            || inner.pmem.contains_key(key)
+            || inner.disk_index.contains_key(key)
+    }
+
+    #[test]
+    fn an_invalidated_entry_takes_its_expiry_with_it() {
+        // A side map is a leak waiting to happen: several places remove an
+        // entry's metadata and every one has to remove its expiry too.
+        //
+        // The life here is ten minutes, so nothing expires on its own. An
+        // earlier version of this test used a short life and then swept, which
+        // made it pass with the eviction path's removal deleted -- the sweep
+        // cleaned up what the eviction had left behind, and the test could not
+        // see the difference. Each exit is now checked at the moment it
+        // happens.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = expiry_exit_cache(dir.path());
+        let key = CacheKey::string(0, "expiry-exit-invalidated");
+        cache
+            .put_with_ttl(key.clone(), vec![0u8; 64], Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(
+            expiries_held(&cache),
+            1,
+            "precondition: the entry has to have an expiry to lose"
+        );
+
+        cache.invalidate(&key).expect("invalidating a resident key must succeed");
+
+        assert!(
+            !tracked_by_any_tier(&cache, &key),
+            "precondition: invalidation has to have taken the entry out of every tier"
+        );
+        assert_eq!(
+            expiries_held(&cache),
+            0,
+            "the entry is gone from every tier and its expiry is still held"
+        );
+    }
+
+    #[test]
+    fn an_entry_evicted_from_every_tier_takes_its_expiry_with_it() {
+        // The path the invalidation above does not reach on its own: the
+        // eviction rule that decides whether an entry's bookkeeping is still
+        // needed. Both tiers are squeezed, because shrinking memory alone
+        // demotes the entry to SSD, where it is still servable and still
+        // entitled to its expiry.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = expiry_exit_cache(dir.path());
+        let key = CacheKey::string(0, "expiry-exit-evicted");
+        cache
+            .put_with_ttl(key.clone(), vec![0u8; 64], Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(
+            expiries_held(&cache),
+            1,
+            "precondition: the entry has to have an expiry to lose"
+        );
+
+        cache.set_capacity_for_tier(CacheTier::Ssd, 1);
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+
+        assert!(
+            !tracked_by_any_tier(&cache, &key),
+            "precondition: the squeeze has to have taken the entry out of every tier"
+        );
+        assert_eq!(
+            expiries_held(&cache),
+            0,
+            "the entry was evicted from every tier and its expiry is still held"
+        );
+    }
+
+    #[test]
+    fn a_swept_entry_takes_its_expiry_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = expiry_exit_cache(dir.path());
+        let key = CacheKey::string(0, "expiry-exit-swept");
+        cache
+            .put_with_ttl(key.clone(), vec![0u8; 64], Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(
+            expiries_held(&cache),
+            1,
+            "precondition: the entry has to have an expiry to lose"
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(cache.purge_expired(), 1, "the sweep should have found it");
+
+        assert_eq!(
+            expiries_held(&cache),
+            0,
+            "the sweep removed the entry and left its expiry behind"
+        );
+    }
+
+    #[test]
+    fn a_cache_where_every_entry_is_timed_pays_for_the_side_map() {
+        // The other side of the trade, asserted so that the saving is never
+        // quoted unconditionally. Moving the expiry off the metadata struct
+        // takes eight bytes an entry and eight more from every bucket of the
+        // metadata table -- but a cache whose entries all carry a time to live
+        // then holds a second table, and that costs more than the two savings
+        // together.
+        //
+        // The win is for caches that do not set a time to live on everything,
+        // which is the default: `default_ttl` is zero and `put_with_ttl` is
+        // opt-in per entry.
+        const ENTRIES: usize = 20_000;
+
+        let bookkeeping = |timed: bool| {
+            let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 24, 0, 0));
+            for i in 0..ENTRIES {
+                let key = CacheKey::string(0, &format!("timed-cost-{i:08}-kkkkkkkkkkkkkkkkk"));
+                if timed {
+                    cache
+                        .put_with_ttl(key, vec![0u8; 64], Duration::from_secs(600))
+                        .unwrap();
+                } else {
+                    cache.put(key, vec![0u8; 64]).unwrap();
+                }
+            }
+            let footprint = cache.footprint();
+            assert_eq!(
+                footprint.tracked_entries, ENTRIES,
+                "nothing may evict during the fill or the denominator is wrong"
+            );
+            let held = cache
+                .inner
+                .read()
+                .expect("cache lock poisoned")
+                .expiries
+                .len();
+            assert_eq!(
+                held,
+                if timed { ENTRIES } else { 0 },
+                "the expiry map should hold one entry per timed key and nothing otherwise"
+            );
+            (footprint.key_bytes
+                + footprint.metadata_bytes
+                + footprint.order_bytes
+                + footprint.table_bytes) as f64
+                / ENTRIES as f64
+        };
+
+        let untimed = bookkeeping(false);
+        let timed = bookkeeping(true);
+
+        assert!(
+            timed > untimed,
+            "an all-timed cache holds a second table, so it cannot be cheaper: {timed:.1}              against {untimed:.1} bytes an entry"
+        );
+        // Eight bytes an entry and eight a bucket is what the struct gave up;
+        // if the side map ever cost less than that, the expiry would be free
+        // and this test would be describing something that is no longer true.
+        assert!(
+            timed - untimed > 8.0,
+            "the side map costs {:.1} bytes an entry, which is less than the struct field it              replaced -- the trade described here no longer holds",
+            timed - untimed
         );
     }
 
