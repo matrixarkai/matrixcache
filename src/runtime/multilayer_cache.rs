@@ -4815,6 +4815,31 @@ impl MultiLayerCache {
         true
     }
 
+    /// How many write-backs are queued.
+    ///
+    /// Reads the queue itself. There was no way to ask a single shard for this
+    /// without building a whole `CacheStats` -- all 147 counters -- and
+    /// throwing 146 of them away, which is what the sharded forwarder did once
+    /// per shard.
+    pub fn async_writeback_queue_depth(&self) -> u64 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .async_writeback_queue
+            .len() as u64
+    }
+
+    /// How many bytes are queued for write-back.
+    ///
+    /// Reads the counter itself, for the same reason as
+    /// [`Self::async_writeback_queue_depth`].
+    pub fn async_writeback_queue_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .async_writeback_queue_bytes
+    }
+
     pub fn async_writeback_worker_running(&self) -> bool {
         self.async_writeback_worker
             .lock()
@@ -6411,17 +6436,23 @@ impl ShardedMultiLayerCache {
         self.flush_async_writeback()
     }
 
+    /// How many write-backs are queued across every shard.
+    ///
+    /// Each shard is asked for the number rather than for a statistics
+    /// snapshot. This used to build a `CacheStats` per shard -- 147 counters --
+    /// and keep one field of it.
     pub fn async_writeback_queue_depth(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.stats().async_writeback_queue_depth)
+            .map(MultiLayerCache::async_writeback_queue_depth)
             .sum()
     }
 
+    /// How many bytes are queued for write-back across every shard.
     pub fn async_writeback_queue_bytes(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.stats().async_writeback_queue_bytes)
+            .map(MultiLayerCache::async_writeback_queue_bytes)
             .sum()
     }
 
