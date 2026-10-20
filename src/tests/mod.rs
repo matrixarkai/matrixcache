@@ -11278,6 +11278,81 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_batch_refilling_from_pmem_hands_back_the_allocation_it_cached() {
+        // The last payload copy in the shared batch read, and the one place
+        // #134 did not reach: a key served from the PMEM tier was refilled
+        // into memory with `put_memory(&key, value.to_vec())`, and
+        // `put_memory` then copied that `Vec` into an `Arc` of its own. Two
+        // copies of bytes the batch was already holding -- and the caller was
+        // left with a different allocation from the one the memory tier kept.
+        let cache = MultiLayerCache::with_tiering_policy(
+            unique_temp_path("shared-batch-pmem-handle"),
+            CacheTieringPolicy {
+                memory_capacity_bytes: 256,
+                pmem_capacity_bytes: 1 << 20,
+                ssd_capacity_bytes: 0,
+                data_placement: CacheDataPlacement::Tiered,
+                data_placement_threshold_bytes: 0,
+                memory_hotness_threshold: 0,
+                pmem_admit_hotness_threshold: 0,
+                ssd_admit_hotness_threshold: 0,
+                max_memory_block_bytes: 1 << 16,
+                max_pmem_block_bytes: 1 << 16,
+                max_ssd_block_bytes: 0,
+                ssd_write_through: false,
+            },
+            CacheBlockOptions::default(),
+        );
+        let key = CacheKey::string(7, "shared-batch-pmem-handle");
+        cache.put(key.clone(), vec![4u8; 1024]).unwrap();
+
+        // Squeeze the memory tier until it lets go, leaving the PMEM tier as
+        // the only resident holder, then give the memory tier its room back so
+        // the refill below can land.
+        cache.set_capacity_for_tier(CacheTier::Memory, 1);
+        cache.set_capacity_for_tier(CacheTier::Memory, 1 << 20);
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            assert!(
+                !inner.memory.contains_key(&key),
+                "precondition: the memory tier has to have let the key go"
+            );
+            assert!(
+                inner.pmem.contains_key(&key),
+                "precondition: the PMEM tier has to be the one holding it"
+            );
+        }
+
+        let before = cache.stats();
+        let values = cache
+            .get_shared_batch(std::slice::from_ref(&key))
+            .expect("get_shared_batch");
+        let after = cache.stats();
+        assert_eq!(
+            after.pmem_hits.saturating_sub(before.pmem_hits),
+            1,
+            "precondition: the read has to have been served from the PMEM tier"
+        );
+
+        let value = values
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the key is resident in PMEM");
+        assert_eq!(value.len(), 1024);
+
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        let resident = inner
+            .memory
+            .get(&key)
+            .expect("the read refills the memory tier, or there is nothing to share with");
+        assert!(
+            std::sync::Arc::ptr_eq(&value, resident),
+            "the batch returned one allocation and refilled the memory tier with another"
+        );
+    }
+
+    #[test]
     fn a_shared_read_from_disk_hands_back_the_allocation_it_cached() {
         // The whole promise of a shared read is that the caller and the cache
         // hold one copy of the bytes. On an SSD hit they held two: the read
