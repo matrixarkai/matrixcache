@@ -318,6 +318,46 @@ fn main() {
         }
     }
 
+    // The ratchet.
+    //
+    // The checks above and below are relational -- zero where a copy would
+    // show, bounded per key asked for -- and a path that went from two
+    // allocations to five would pass every one of them. These are the figures
+    // as measured, each with a little room, so that giving back what the copy
+    // elisions won fails here instead of being noticed much later.
+    //
+    // Identical across three runs of the same binary and across both feature
+    // arms (only the SSD row differs between arms, and it is bounded
+    // separately below), so there is nothing to tolerate but a change.
+    //
+    //   pinned batch of 8        15 -> 7 allocations
+    //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
+    //   a batch of 8 shared      2 allocations for 8 keys
+    //
+    // Raising one is a deliberate act, and the number that replaced it goes
+    // in the table beside it.
+    for (path, max_allocations, max_bytes) in [
+        ("get, copying", 1.5, 1_100.0),
+        ("get_batch, copying", 11.5, 9_400.0),
+        ("get_shared_batch", 2.5, 500.0),
+        ("acquire_batch_no_promotion", 7.5, 3_000.0),
+        ("acquire_batch", 7.5, 3_100.0),
+        ("acquire_batch, 2 duplicated", 9.5, 4_300.0),
+        ("put, overwriting", 2.5, 2_200.0),
+        ("put, evicting", 6.5, 20_500.0),
+    ] {
+        match find(path) {
+            Some(row) if row.allocations <= max_allocations && row.bytes <= max_bytes => {}
+            Some(row) => failures.push(format!(
+                "{path} allocates {:.2} times and {:.1} bytes, against the {max_allocations:.1} \
+                 and {max_bytes:.0} it has been held to -- raise the ceiling on purpose or do \
+                 not give the allocations back",
+                row.allocations, row.bytes
+            )),
+            None => failures.push(format!("{path} is missing, so its ceiling checks nothing")),
+        }
+    }
+
     // A write that reaches the SSD tier compresses, frames a block, builds a
     // manifest line and writes it, so it is never going to be cheap. What it
     // must not be paying for is copies of the payload that nothing reads. The
