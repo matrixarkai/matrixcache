@@ -729,6 +729,59 @@ impl CacheTableBytes {
     }
 }
 
+/// The per-entry metadata, reached through accessors rather than as a map.
+///
+/// Every reader goes through these, so that **where** an entry's metadata is
+/// kept can change without touching any of them. It is one map today, and
+/// that map is the largest table in the cache: its bucket is a key handle,
+/// the struct inline and a control byte, against a key handle and a
+/// sixteen-byte handle in the tier map beside it.
+///
+/// The field itself stays visible to the sizing and shrinking code, which is
+/// about the map as storage rather than about an entry's metadata.
+impl CacheInner {
+    fn metadata_of(&self, key: &CacheKey) -> Option<&CacheEntryMeta> {
+        self.metadata.get(key)
+    }
+
+    fn metadata_of_mut(&mut self, key: &CacheKey) -> Option<&mut CacheEntryMeta> {
+        self.metadata.get_mut(key)
+    }
+
+    fn set_metadata(&mut self, key: Arc<CacheKey>, meta: CacheEntryMeta) {
+        self.metadata.insert(key, meta);
+    }
+
+    /// Record metadata for a key that may already have some, keeping what is
+    /// there: recovery replays entries it may have seen already.
+    fn set_metadata_if_absent(&mut self, key: Arc<CacheKey>, meta: CacheEntryMeta) {
+        self.metadata.entry(key).or_insert(meta);
+    }
+
+    fn forget_metadata_of(&mut self, key: &CacheKey) {
+        self.metadata.remove(key);
+    }
+
+    fn metadata_len(&self) -> usize {
+        self.metadata.len()
+    }
+
+    /// Every key that has metadata, as the handles the maps hold.
+    fn metadata_keys(&self) -> impl Iterator<Item = &Arc<CacheKey>> + '_ {
+        self.metadata.keys()
+    }
+
+    /// The handle this cache holds for a key that has metadata, which is the
+    /// one allocation several structures share.
+    fn shared_metadata_key(&self, key: &CacheKey) -> Option<&Arc<CacheKey>> {
+        self.metadata.get_key_value(key).map(|(held, _)| held)
+    }
+
+    fn clear_metadata(&mut self) {
+        self.metadata.clear();
+    }
+}
+
 impl CacheFootprint {
     /// Everything that is not payload.
     pub fn overhead_bytes(&self) -> usize {
@@ -9269,7 +9322,7 @@ impl CacheInner {
         if let Some((held, _)) = self.memory.get_key_value(key) {
             return Arc::clone(held);
         }
-        if let Some((held, _)) = self.metadata.get_key_value(key) {
+        if let Some(held) = self.shared_metadata_key(key) {
             return Arc::clone(held);
         }
         if let Some((held, _)) = self.pmem.get_key_value(key) {
@@ -9315,7 +9368,7 @@ impl CacheInner {
             .map(|key| key.as_ref())
             .chain(self.pmem.keys().map(|key| key.as_ref()))
             .chain(self.disk_index.keys().map(|key| key.as_ref()))
-            .chain(self.metadata.keys().map(|key| key.as_ref()))
+            .chain(self.metadata_keys().map(|key| key.as_ref()))
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
             .chain(self.disk_order.iter())
@@ -9349,7 +9402,7 @@ impl CacheInner {
         for held in self
             .memory
             .keys()
-            .chain(self.metadata.keys())
+            .chain(self.metadata_keys())
             .chain(self.pmem.keys())
             .chain(self.disk_index.keys())
             .chain(self.async_writeback_positions.keys())
@@ -9395,7 +9448,7 @@ impl CacheInner {
             }
         }
 
-        let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
+        let metadata_bytes = self.metadata_len() * std::mem::size_of::<CacheEntryMeta>();
 
         // The three orders, each reporting its keys apart from its structure.
         let (memory_order_keys, memory_order_structure) = self.memory_order.footprint_bytes();
@@ -9572,7 +9625,7 @@ impl CacheInner {
             && !self.pmem.contains_key(key)
             && !self.disk_index.contains_key(key)
         {
-            self.metadata.remove(key);
+            self.forget_metadata_of(key);
             self.forget_expiry(key);
         }
         outcome

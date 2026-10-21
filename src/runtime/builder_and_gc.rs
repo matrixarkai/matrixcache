@@ -1001,7 +1001,7 @@ impl CacheInner {
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
                 let shared = self.shared_key(&key);
-                self.metadata.entry(shared).or_insert(CacheEntryMeta::new(
+                self.set_metadata_if_absent(shared, CacheEntryMeta::new(
                     block_kind,
                     routing_slot,
                     0,
@@ -1077,7 +1077,7 @@ impl CacheInner {
                 let block_kind = infer_block_kind(&key);
                 let routing_slot = extract_routing_slot(&key);
                 let shared = self.shared_key(&key);
-                self.metadata.entry(shared).or_insert(CacheEntryMeta::new(
+                self.set_metadata_if_absent(shared, CacheEntryMeta::new(
                     block_kind,
                     routing_slot,
                     0,
@@ -1096,7 +1096,7 @@ impl CacheInner {
 
     fn default_request(&self, key: &CacheKey, block_bytes: usize) -> CacheAdmissionRequest {
         // A reference is enough: this reads four fields and drops the rest.
-        let existing = self.metadata.get(key);
+        let existing = self.metadata_of(key);
         CacheAdmissionRequest {
             block_kind: existing
                 .map(|meta| meta.block_kind)
@@ -1197,7 +1197,7 @@ impl CacheInner {
             self.stats.expired_delete_failures =
                 self.stats.expired_delete_failures.saturating_add(1);
         }
-        self.metadata.remove(key);
+        self.forget_metadata_of(key);
         self.forget_expiry(key);
         self.stats.expired_removals = self.stats.expired_removals.saturating_add(1);
         if let Some((tier, value)) = departing {
@@ -1270,7 +1270,7 @@ impl CacheInner {
             && !self.pmem.contains_key(key)
             && !self.disk_index.contains_key(key)
         {
-            self.metadata.remove(key);
+            self.forget_metadata_of(key);
             self.forget_expiry(key);
         }
     }
@@ -1405,7 +1405,7 @@ impl CacheInner {
         // second lookup nor the key clone. Hotness and hits carry across, which
         // is what rebuilding the entry did; the rest is replaced either way.
         let mut rewriting = false;
-        if let Some(meta) = self.metadata.get_mut(key) {
+        if let Some(meta) = self.metadata_of_mut(key) {
             meta.block_kind = block_kind;
             meta.set_routing_slot(routing_slot);
             meta.last_access_epoch.store(epoch, Ordering::Relaxed);
@@ -1422,7 +1422,7 @@ impl CacheInner {
             return;
         }
         let shared = self.shared_key(key);
-        self.metadata.insert(
+        self.set_metadata(
             shared,
             CacheEntryMeta::new(
                 block_kind,
@@ -1447,7 +1447,7 @@ impl CacheInner {
         // actually needs them; going through `entry()` did all of that on
         // every hit and then discarded it.
         let mut seen_at = None;
-        let crossed_threshold = if let Some(entry) = self.metadata.get(key) {
+        let crossed_threshold = if let Some(entry) = self.metadata_of(key) {
             entry.record_hits(1);
             let before = entry.hotness.fetch_add(1, Ordering::Relaxed);
             // Read, do not swap. This stamp records when the entry was
@@ -1464,7 +1464,7 @@ impl CacheInner {
             let before = initial_hotness(block_kind, block_bytes);
             let hotness = before.saturating_add(1);
             let shared = self.shared_key(key);
-            self.metadata.insert(
+            self.set_metadata(
                 shared,
                 CacheEntryMeta::new(
                     block_kind,
@@ -1513,7 +1513,7 @@ impl CacheInner {
         occurrences: usize,
         epoch: u64,
     ) -> HitOutcome {
-        let Some(entry) = self.metadata.get(key) else {
+        let Some(entry) = self.metadata_of(key) else {
             return HitOutcome::NeedsMetadata;
         };
         let threshold = self.tiering_policy.memory_hotness_threshold;
@@ -1587,7 +1587,7 @@ impl CacheInner {
         // Advance the stamp with the move it describes. The extra lookup is on
         // the branch that promotes, which the refresh window exists to make
         // rare; the alternative is stamping on every read, which is the bug.
-        if let Some(meta) = self.metadata.get(key) {
+        if let Some(meta) = self.metadata_of(key) {
             meta.last_access_epoch
                 .store(CoarseClock::now_millis(), Ordering::Relaxed);
         }
@@ -1659,7 +1659,7 @@ impl CacheInner {
             .memory_order
             .iter_access()
             .next()
-            .and_then(|key| self.metadata.get(key))
+            .and_then(|key| self.metadata_of(key))
             .map(|meta| now.saturating_sub(meta.last_access_epoch.load(Ordering::Relaxed)))
             .unwrap_or(0);
 
@@ -1790,7 +1790,7 @@ impl CacheInner {
             // rewritten key with the lowest hotness is given up whatever
             // position it holds -- so raise both.
             self.memory_order.touch_access(key);
-            if let Some(meta) = self.metadata.get(key) {
+            if let Some(meta) = self.metadata_of(key) {
                 let threshold = self.tiering_policy.memory_hotness_threshold;
                 let before = meta.hotness.fetch_add(1, Ordering::Relaxed);
                 // Counted the same way a read counts it. Raising hotness
@@ -2281,8 +2281,7 @@ impl CacheInner {
                     first_unpinned = Some(key.clone());
                 }
                 let twice_read = self
-                    .metadata
-                    .get(key)
+                    .metadata_of(key)
                     .is_some_and(|meta| meta.hits() >= SLRU_PROTECTED_HITS);
                 if twice_read {
                     promote.push(key.clone());
@@ -2360,7 +2359,7 @@ impl CacheInner {
             // map about the same key, and hashing a CacheKey hashes three
             // Strings -- doing it twice per candidate, up to 128 candidates
             // per eviction, is the bulk of choosing a victim.
-            let meta = self.metadata.get(key);
+            let meta = self.metadata_of(key);
             let score = eviction_score_of(meta, segmented);
             let group_key = eviction_group_key_of(meta, key);
             groups
@@ -2401,7 +2400,7 @@ impl CacheInner {
     /// weighing it. Segments decide which resident entry gives way, and that is
     /// [`select_eviction_victim`](Self::select_eviction_victim).
     fn eviction_score(&self, key: &CacheKey) -> EvictionScore {
-        eviction_score_of(self.metadata.get(key), false)
+        eviction_score_of(self.metadata_of(key), false)
     }
 
     fn incoming_ssd_block_is_colder_than_existing_groups(
@@ -2432,7 +2431,7 @@ impl CacheInner {
     }
 
     fn eviction_group_key<'a>(&self, key: &'a CacheKey) -> EvictionGroupKey<'a> {
-        eviction_group_key_of(self.metadata.get(key), key)
+        eviction_group_key_of(self.metadata_of(key), key)
     }
 
     fn record_expired_eviction(&mut self) {
@@ -2632,7 +2631,7 @@ impl CacheInner {
                 pins.zero_copy_handle_hits = 0;
             }
         }
-        self.metadata.clear();
+        self.clear_metadata();
         self.expiries.clear();
         self.async_writeback_queue.clear();
         self.async_writeback_positions.clear();

@@ -990,7 +990,7 @@ mod tests {
         let stripped = inner
             .pmem
             .keys()
-            .filter(|key| !inner.metadata.contains_key(key.as_ref()))
+            .filter(|key| inner.metadata_of(key.as_ref()).is_none())
             .count();
         assert_eq!(
             stripped,
@@ -1051,7 +1051,7 @@ mod tests {
             // expiry is still recorded, and still in the future. With the bug
             // the map has no entry for the key at all.
             assert!(
-                inner.metadata.contains_key(&watched),
+                inner.metadata_of(&watched).is_some(),
                 "an entry the PMEM tier is serving keeps its metadata"
             );
             let expires_at = inner
@@ -1110,8 +1110,7 @@ mod tests {
         let hits_before = {
             let inner = cache.inner.read().expect("cache lock poisoned");
             inner
-                .metadata
-                .get(&watched)
+                .metadata_of(&watched)
                 .expect("the entry has metadata before anything evicts")
                 .hits()
         };
@@ -1164,8 +1163,7 @@ mod tests {
             "precondition: the PMEM tier still has to be serving it"
         );
         let meta = inner
-            .metadata
-            .get(&watched)
+            .metadata_of(&watched)
             .expect("an entry the PMEM tier is serving keeps its metadata");
         assert!(
             meta.hits() >= hits_before,
@@ -3361,7 +3359,7 @@ mod tests {
                 .unwrap();
         }
 
-        let described = cache.inner.read().expect("cache lock poisoned").metadata.len();
+        let described = cache.inner.read().expect("cache lock poisoned").metadata_len();
         assert_eq!(
             described, 16,
             "entries stored on the SSD tier lost their description"
@@ -3408,7 +3406,7 @@ mod tests {
         assert!(stats.eviction_oversize > 0, "the writes were not actually refused");
         assert_eq!(stats.memory_bytes, 0, "something was stored after all");
 
-        let described = cache.inner.read().expect("cache lock poisoned").metadata.len();
+        let described = cache.inner.read().expect("cache lock poisoned").metadata_len();
         assert_eq!(
             described, 0,
             "{described} entries are described by the cache without being stored anywhere"
@@ -16915,7 +16913,7 @@ mod tests {
                 .unwrap();
         }
         let inner = cache.inner.read().expect("cache lock poisoned");
-        assert_eq!(inner.metadata.len(), 100);
+        assert_eq!(inner.metadata_len(), 100);
         assert!(
             inner.expiries.is_empty(),
             "a cache that was never given a time to live holds {} expiries",
@@ -16946,7 +16944,7 @@ mod tests {
                 .unwrap();
         }
         let inner = cache.inner.read().expect("cache lock poisoned");
-        assert_eq!(inner.metadata.len(), 103);
+        assert_eq!(inner.metadata_len(), 103);
         assert_eq!(
             inner.expiries.len(),
             3,
@@ -17637,8 +17635,7 @@ mod tests {
             .find(|held| held.as_ref() == &key)
             .expect("the entry map must hold the key");
         let in_metadata = inner
-            .metadata
-            .keys()
+            .metadata_keys()
             .find(|held| held.as_ref() == &key)
             .expect("the metadata map must hold the key");
         let in_order = inner
@@ -17820,8 +17817,7 @@ mod tests {
             .find(|held| held.as_ref() == &key)
             .expect("the entry map must hold the key");
         let in_metadata = inner
-            .metadata
-            .keys()
+            .metadata_keys()
             .find(|held| held.as_ref() == &key)
             .expect("the metadata map must hold the key");
         // The precondition: a second tier map really does hold it, or the
