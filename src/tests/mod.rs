@@ -23905,6 +23905,10 @@ fn the_footprint_total_is_every_byte_term_added_up() {
         // these bytes are already inside `table_bytes`. Adding them counted 32
         // bytes an entry twice, which is the bug that produced this exclusion.
         metadata_bytes: _,
+        // Also not in the sum, and for a sharper reason: it **is**
+        // `table_bytes`, split by which map holds it. Asserted below rather
+        // than ignored.
+        table_bytes_by_map,
         payload_bytes,
         key_bytes,
         order_bytes,
@@ -23931,6 +23935,20 @@ fn the_footprint_total_is_every_byte_term_added_up() {
             + fixed_bytes
             + eviction_queue_bytes,
         "the total is not the sum of the terms, so some term is weighed by nothing"
+    );
+
+    // The decomposition has to be the thing it decomposes. A map added to the
+    // cache and left out of the breakdown fails here; a map added to the
+    // breakdown and not to `table_bytes` fails here too.
+    assert_eq!(
+        table_bytes_by_map.total(),
+        table_bytes,
+        "the per-map breakdown is not the table bytes it splits: {table_bytes_by_map:?}"
+    );
+    assert!(
+        table_bytes_by_map.metadata > 0 && table_bytes_by_map.pmem > 0,
+        "the fixture did not populate the maps the breakdown is being checked on: \
+         {table_bytes_by_map:?}"
     );
 
     // An identity over terms that are all zero holds for the wrong reason, so
