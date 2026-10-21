@@ -754,6 +754,17 @@ impl CacheTableBytes {
 /// The field itself stays visible to the sizing and shrinking code, which is
 /// about the map as storage rather than about an entry's metadata.
 impl CacheInner {
+    /// An entry's metadata, from whichever of its two homes holds it.
+    ///
+    /// The tier first, then the map beside it -- and that order is a trade
+    /// worth stating. For a memory-resident entry this is one hash lookup,
+    /// exactly as the single map was. For an entry the tier does not hold it
+    /// is **two**: a miss in the tier and then the map. A tiered cache reads
+    /// mostly non-resident entries, so those reads pay one extra probe on a
+    /// path that was already going to a lower tier for the bytes. Measured in
+    /// bytes rather than in time here, and the bytes are the reason for it:
+    /// the alternative is a second bucket, a second key handle and a second
+    /// table's slack for every entry, resident or not.
     fn metadata_of(&self, key: &CacheKey) -> Option<&CacheEntryMeta> {
         match self.memory.get(key) {
             Some(resident) => resident.meta.as_ref(),
