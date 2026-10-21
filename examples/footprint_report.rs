@@ -575,7 +575,64 @@ fn main() {
     println!();
 
     // ---- Self-checks ------------------------------------------------------
+
     let mut failures: Vec<String> = Vec::new();
+
+    // The ratchet.
+    //
+    // Every check below this block is relational -- flat in the value size,
+    // non-zero, one shape no cheaper than another -- and not one of them
+    // would notice the figures going back up. A change that gave away
+    // everything this work has won would have passed every gate in this file.
+    //
+    // So the figures are pinned, each a little above what is measured today,
+    // with the ladder that got there. They are ceilings and not predictions:
+    // raising one is a deliberate act, and the number that replaced it goes
+    // in the ladder beside it.
+    //
+    //   memory-only, per entry      377.5 -> 311.3 -> 298.2 -> 283.5
+    //   its amplification at 64 B    6.90x -> 5.87x -> 5.66x -> 5.43x
+    //   tiered, per tracked entry   426.4 -> 409.6 -> 411.0
+    //   shrunken to 1,000 of 20,000  3,762.5 -> 1,223.8 -> 363.6 -> 347.2 -> 328.9
+    //   a cache that never grew      330.8 -> 314.4 -> 296.1
+    //   the dearest key shape        343.3 -> 330.2 -> 315.5
+    //
+    // Deterministic, all of it: these are struct sizes and table sizes at a
+    // fixed entry count, and three runs of the same binary gave the same
+    // figures to the tenth of a byte. Nothing here is a timing.
+    const MEMORY_ONLY_CEILING: f64 = 290.0;
+    const MEMORY_ONLY_AMPLIFICATION_CEILING: f64 = 5.6;
+    const TIERED_CEILING: f64 = 420.0;
+    const SHRUNKEN_CEILING: f64 = 340.0;
+    const NEVER_GREW_CEILING: f64 = 305.0;
+    const DEAREST_SHAPE_CEILING: f64 = 325.0;
+
+    for row in &rows {
+        if row.per_entry > MEMORY_ONLY_CEILING {
+            failures.push(format!(
+                "the memory-only overhead is {:.1} bytes an entry at {} byte values, above the \
+                 {MEMORY_ONLY_CEILING:.0} this has been held to -- raise the ceiling on purpose \
+                 or do not give the bytes back",
+                row.per_entry, row.value_bytes
+            ));
+        }
+        if row.value_bytes == 64 && row.amplification > MEMORY_ONLY_AMPLIFICATION_CEILING {
+            failures.push(format!(
+                "the memory-only amplification at 64-byte values is {:.2}x, above the \
+                 {MEMORY_ONLY_AMPLIFICATION_CEILING:.2}x this has been held to",
+                row.amplification
+            ));
+        }
+    }
+    for row in &tiered {
+        if row.per_tracked_entry > TIERED_CEILING {
+            failures.push(format!(
+                "the tiered overhead is {:.1} bytes a tracked entry at {} byte values, above \
+                 the {TIERED_CEILING:.0} this has been held to",
+                row.per_tracked_entry, row.value_bytes
+            ));
+        }
+    }
 
     // The per-entry terms must not move with the value size. If they do,
     // something in them is charged per byte and this table is describing it
@@ -707,6 +764,22 @@ fn main() {
         }
         _ => failures.push("the shrunken arm lost one of its three rows".to_string()),
     }
+    for row in &shrunken {
+        let ceiling = match row.label {
+            "after shrinking" => SHRUNKEN_CEILING,
+            "never grew" => NEVER_GREW_CEILING,
+            // The filled row is the memory-only arm measured again, and it is
+            // ratcheted there.
+            _ => continue,
+        };
+        if row.per_entry > ceiling {
+            failures.push(format!(
+                "the \"{}\" row holds {:.1} bytes an entry, above the {ceiling:.0} it has been \
+                 held to",
+                row.label, row.per_entry
+            ));
+        }
+    }
 
     // A selector the cache keeps is held for the life of the entry and once
     // per key allocation, so slack in it is resident waste. `format!` sizes a
@@ -734,6 +807,18 @@ fn main() {
     // The headline table uses the cheapest shape, which makes its figure a
     // floor rather than a typical cost. Worth stating as a check, because the
     // number gets quoted on its own.
+    // The dearest shape is ratcheted too, since the headline figure is the
+    // cheapest one and a regression could hide in the others.
+    for row in &shapes {
+        if row.per_entry > DEAREST_SHAPE_CEILING {
+            failures.push(format!(
+                "the {} shape costs {:.1} bytes an entry, above the \
+                 {DEAREST_SHAPE_CEILING:.0} the dearest shape has been held to",
+                row.shape, row.per_entry
+            ));
+        }
+    }
+
     if let Some(string_row) = shapes.iter().find(|row| row.shape == "string") {
         for row in &shapes {
             if row.per_entry < string_row.per_entry - 0.05 {
