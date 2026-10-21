@@ -1147,7 +1147,7 @@ impl CacheInner {
         // one departure rather than one per copy.
         let notifying = self.eviction_handler_enabled && self.eviction_callback.is_some();
         let mut departing: Option<(CacheTier, Vec<u8>)> = None;
-        if let Some(value) = self.memory.remove(key) {
+        if let Some(value) = self.take_resident(key) {
             self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
             self.stats.memory_bytes = self.memory_bytes as u64;
             if notifying {
@@ -1736,7 +1736,7 @@ impl CacheInner {
     fn drop_stale_tier_copy(&mut self, key: &CacheKey, tier: CacheTier) {
         match tier {
             CacheTier::Memory => {
-                if let Some(stale) = self.memory.remove(key) {
+                if let Some(stale) = self.take_resident(key) {
                     self.memory_bytes = self.memory_bytes.saturating_sub(stale.len());
                     self.stats.memory_bytes = self.memory_bytes as u64;
                     self.stats.stale_tier_copies_dropped =
@@ -1783,7 +1783,7 @@ impl CacheInner {
         // whatever already holds this key -- the metadata map, if the write
         // path reached it first.
         let shared = self.shared_key(key);
-        if let Some(old) = self.memory.insert(Arc::clone(&shared), Arc::clone(&value)) {
+        if let Some(old) = self.make_resident(Arc::clone(&shared), Arc::clone(&value)) {
             self.memory_bytes = self.memory_bytes.saturating_sub(old.len());
             // An overwrite is an access. The access order alone does not settle
             // it -- the eviction score weighs hotness before recency, so a
@@ -2012,7 +2012,7 @@ impl CacheInner {
             // that order, so leaving it until after the loop lets the next
             // round pick the same key, whose bytes are already gone.
             self.memory_order.remove(&victim);
-            let Some(old_value) = self.memory.remove(&victim) else {
+            let Some(old_value) = self.take_resident(&victim) else {
                 // A key the order still listed but the tier no longer holds.
                 // It is gone from the order now, so the next round makes
                 // progress rather than picking it again.
@@ -2543,7 +2543,7 @@ impl CacheInner {
         for key in keys {
             let key_pinned = self.is_pinned(key);
             let mut removed_pinned_bytes = 0usize;
-            if let Some(value) = self.memory.remove(key) {
+            if let Some(value) = self.take_resident(key) {
                 removed_pinned_bytes = removed_pinned_bytes.max(value.len());
                 self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
             }
@@ -2698,8 +2698,7 @@ impl CacheInner {
 
     fn increment_pin(&self, key: &CacheKey) {
         let bytes = self
-            .memory
-            .get(key)
+            .resident_value(key)
             .map(|value| value.len())
             .or_else(|| self.pmem.get(key).map(|value| value.len()))
             .or_else(|| {
@@ -3181,7 +3180,8 @@ impl CacheInner {
             if bytes >= budget && count >= 1 {
                 break;
             }
-            bytes = bytes.saturating_add(self.memory.get(key).map_or(0, |value| value.len()));
+            bytes =
+                bytes.saturating_add(self.resident_value(key).map_or(0, |value| value.len()));
             count += 1;
         }
         count.max(1)

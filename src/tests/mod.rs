@@ -11525,8 +11525,7 @@ mod tests {
 
         let inner = cache.inner.read().expect("cache lock poisoned");
         let resident = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("the read refills the memory tier, or there is nothing to share with");
         assert!(
             std::sync::Arc::ptr_eq(&value, resident),
@@ -12120,8 +12119,7 @@ mod tests {
         {
             let inner = cache.inner.read().expect("cache lock poisoned");
             let resident = inner
-                .memory
-                .get(&key)
+                .resident_value(&key)
                 .expect("precondition: the memory tier has to hold the entry");
             assert!(
                 std::sync::Arc::ptr_eq(&handle.value, resident),
@@ -12557,8 +12555,7 @@ mod tests {
         {
             let inner = cache.inner.read().expect("cache lock poisoned");
             let resident = inner
-                .memory
-                .get(&key)
+                .resident_value(&key)
                 .expect("precondition: the memory tier has to hold the key");
             assert!(
                 std::sync::Arc::ptr_eq(&value, resident),
@@ -12607,8 +12604,7 @@ mod tests {
         let shard = cache.shard_for_key(&key);
         let inner = shard.inner.read().expect("cache lock poisoned");
         let resident = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("precondition: the owning shard has to hold the key");
         assert!(
             std::sync::Arc::ptr_eq(&shared, resident),
@@ -12646,8 +12642,7 @@ mod tests {
 
         let inner = cache.inner.read().expect("cache lock poisoned");
         let resident = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("the read refills the memory tier, or there is nothing to share with");
         assert!(
             std::sync::Arc::ptr_eq(&value, resident),
@@ -12690,8 +12685,7 @@ mod tests {
 
         let inner = cache.inner.read().expect("cache lock poisoned");
         let resident = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("the read refills the memory tier, or there is nothing to share with");
         assert!(
             std::sync::Arc::ptr_eq(&value, resident),
@@ -16900,6 +16894,16 @@ mod tests {
         // alignment to round the struct back up to 32. This assertion is what
         // caught that change, and it is the reason the figure is pinned rather
         // than bounded.
+        // And `Option<CacheEntryMeta>` has to be 24 as well, because the
+        // memory tier holds one per entry: the struct has a `bool` in it, so
+        // the discriminant goes in that field's unused bit patterns rather
+        // than in eight bytes of its own. The whole saving from folding the
+        // metadata into the tier depends on this being free.
+        assert_eq!(
+            std::mem::size_of::<Option<CacheEntryMeta>>(),
+            std::mem::size_of::<CacheEntryMeta>(),
+            "an absent metadata costs nothing only while the discriminant fits in a niche"
+        );
         assert_eq!(
             std::mem::size_of::<CacheEntryMeta>(),
             24,
@@ -17179,8 +17183,7 @@ mod tests {
 
         let inner = cache.inner.read().expect("cache lock poisoned");
         let in_memory = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("precondition: the memory tier has to have taken the write");
         assert!(
             std::sync::Arc::ptr_eq(&value, in_memory),
@@ -17242,8 +17245,7 @@ mod tests {
 
         let inner = second.inner.read().expect("cache lock poisoned");
         let stored = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("precondition: the second cache has to have taken the write");
         assert!(
             std::sync::Arc::ptr_eq(&read, stored),
@@ -17374,8 +17376,7 @@ mod tests {
 
         let inner = cache.inner.read().expect("cache lock poisoned");
         let in_memory = inner
-            .memory
-            .get(&key)
+            .resident_value(&key)
             .expect("precondition: the memory tier has to have taken the write");
         let in_pmem = inner
             .pmem
@@ -17427,8 +17428,7 @@ mod tests {
         let inner = cache.inner.read().expect("cache lock poisoned");
         for key in &keys {
             let in_memory = inner
-                .memory
-                .get(key)
+                .resident_value(key)
                 .expect("precondition: the memory tier has to have taken the write");
             let in_pmem = inner
                 .pmem
@@ -17628,43 +17628,74 @@ mod tests {
             .put(key.clone(), vec![0u8; 64])
             .expect("a cache with room must accept a put");
 
+        {
+            let inner = cache.inner.read().expect("cache lock poisoned");
+            let in_memory = inner
+                .memory
+                .keys()
+                .find(|held| held.as_ref() == &key)
+                .expect("the entry map must hold the key");
+            let in_metadata = inner
+                .metadata_keys()
+                .find(|held| held.as_ref() == &key)
+                .expect("the metadata must be reachable for the key");
+            let in_order = inner
+                .memory_order
+                .shared_handle(&key)
+                .expect("the recency order must hold the key");
+
+            // The same handle, not two handles over the same characters: one
+            // `CacheKey` exists for this entry, and every structure points at
+            // it. `ptr_eq` is the whole claim -- equal keys would prove
+            // nothing, and equal character addresses would still allow copies
+            // of the struct around them.
+            assert!(
+                std::sync::Arc::ptr_eq(in_memory, in_metadata),
+                "the entry map and the metadata hold different keys, so each is paying for its \
+                 own copy of the struct"
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(in_memory, &in_order),
+                "the entry map and the recency order hold different keys, so each is paying for \
+                 its own copy of the struct"
+            );
+
+            // Four owners, where this used to say five. The metadata of a
+            // memory-resident entry is held beside its bytes now, so the
+            // metadata map holds no second handle for it -- one fewer owner,
+            // and one fewer bucket, which is the point of folding it in.
+            assert_eq!(
+                std::sync::Arc::strong_count(in_memory),
+                4,
+                "four owners and no more: the entry map, the order's node, the order's index, \
+                 and the handle this test is itself holding"
+            );
+        }
+
+        // And the other home for the same metadata. Emptying the memory tier
+        // leaves the entry's metadata behind -- it may still be in a lower
+        // tier, and its expiry and hit history are the entry's rather than the
+        // tier's -- so the handle moves into the map that holds what the tier
+        // does not, and it has to be the same allocation.
+        cache.clear_memory_for_test();
         let inner = cache.inner.read().expect("cache lock poisoned");
-        let in_memory = inner
-            .memory
-            .keys()
-            .find(|held| held.as_ref() == &key)
-            .expect("the entry map must hold the key");
-        let in_metadata = inner
+        let in_overflow = inner
             .metadata_keys()
             .find(|held| held.as_ref() == &key)
-            .expect("the metadata map must hold the key");
+            .expect("clearing the memory tier must not forget the entry's metadata");
         let in_order = inner
             .memory_order
             .shared_handle(&key)
-            .expect("the recency order must hold the key");
-
-        // The same handle, not two handles over the same characters: one
-        // `CacheKey` exists for this entry, and all three structures point at
-        // it. `ptr_eq` is the whole claim -- equal keys would prove nothing,
-        // and equal character addresses would still allow three copies of the
-        // struct around them.
+            .expect("the recency order still holds the key");
         assert!(
-            std::sync::Arc::ptr_eq(in_memory, in_metadata),
-            "the entry map and the metadata map hold different keys, so each is paying for its \
-             own copy of the struct"
+            std::sync::Arc::ptr_eq(in_overflow, &in_order),
+            "the metadata moved out of the tier into a different key allocation"
         );
-        assert!(
-            std::sync::Arc::ptr_eq(in_memory, &in_order),
-            "the entry map and the recency order hold different keys, so each is paying for its \
-             own copy of the struct"
-        );
-
-        // Three holders, one allocation: the strong count says so.
         assert_eq!(
-            std::sync::Arc::strong_count(in_memory),
-            5,
-            "five owners and no more: the entry map, the metadata map, the order's node, the \
-             order's index, and the handle this test is itself holding"
+            std::sync::Arc::strong_count(in_overflow),
+            4,
+            "the handle moved rather than being copied: the metadata map, the order's node, the \
+             order's index, and this test's own handle"
         );
     }
 
@@ -17764,8 +17795,7 @@ mod tests {
 
         let held = Arc::clone(
             inner
-                .memory
-                .get(&key)
+                .resident_value(&key)
                 .expect("the memory tier must hold the value"),
         );
         assert!(
@@ -24042,4 +24072,91 @@ fn the_narrowed_metadata_fields_read_back_as_what_they_replaced() {
         3 + (1 << 20),
         "a single call adds at most the per-call cap"
     );
+}
+
+/// An entry's metadata lives in exactly one of its two homes.
+///
+/// The memory tier holds the metadata of the entries it holds; the map beside
+/// it holds the metadata of the entries it does not. Both holding it would
+/// double-count the footprint and let two copies drift apart; neither holding
+/// it is the loss that an SSD eviction once caused.
+///
+/// The churn here moves entries both ways: a fill that demotes most of them,
+/// then reads that bring some back.
+#[test]
+fn an_entrys_metadata_lives_in_exactly_one_place() {
+    const ENTRIES: usize = 400;
+    const VALUE_BYTES: usize = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path().to_path_buf(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 26,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+
+    let keys: Vec<CacheKey> = (0..ENTRIES)
+        .map(|index| CacheKey::string(0, &format!("exclusive-{index:04}")))
+        .collect();
+    for key in &keys {
+        cache
+            .put(key.clone(), vec![b'v'; VALUE_BYTES])
+            .expect("a cache with room must accept a put");
+    }
+    // Reads bring entries back up, so the transition is exercised in both
+    // directions before the invariant is checked.
+    for key in keys.iter().take(40) {
+        let _ = cache.get(key);
+    }
+
+    let inner = cache.inner.read().expect("cache lock poisoned");
+    let both: Vec<&CacheKey> = inner
+        .memory
+        .keys()
+        .filter(|held| inner.metadata.contains_key(held.as_ref()))
+        .map(|held| held.as_ref())
+        .collect();
+    assert!(
+        both.is_empty(),
+        "{} entries have metadata in the tier and in the map beside it",
+        both.len()
+    );
+
+    let missing = keys
+        .iter()
+        .filter(|key| inner.metadata_of(key).is_none())
+        .count();
+    assert_eq!(
+        missing, 0,
+        "{missing} of {ENTRIES} entries lost their metadata somewhere in the churn"
+    );
+
+    // And the count has to agree with the walk, or the footprint is reporting
+    // a number nothing can reach.
+    let counted = inner
+        .memory
+        .values()
+        .filter(|resident| resident.meta.is_some())
+        .count()
+        + inner.metadata.len();
+    assert_eq!(
+        inner.metadata_len(),
+        counted,
+        "the reported metadata count is not the number of entries that have any"
+    );
+    drop(inner);
+    assert!(cache.stop(), "the cache did not stop cleanly");
 }

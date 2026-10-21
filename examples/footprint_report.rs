@@ -502,15 +502,10 @@ fn main() {
         );
     }
     println!();
-    println!(
-        "  The per-entry metadata map is the largest table in a tiered cache, larger than \
-         either"
-    );
-    println!(
-        "  tier map whose entries it describes: its value is held inline in the bucket rather \
-         than"
-    );
-    println!("  behind a handle, so the bucket is 8 + 24 + 1 bytes against 8 + 16 + 1.");
+    println!("  The metadata column holds the entries this tier is not holding: a memory-resident");
+    println!("  entry keeps its metadata inline in the memory tier's own bucket, which is why the");
+    println!("  memory-only arm above reports no metadata table at all and this arm, where almost");
+    println!("  every entry has been demoted, reports the largest table in the cache.");
     println!();
     // Named, because this table reads off the memory-only rows measured near
     // the top of this arm, not off the tiered rows printed just above it. It
