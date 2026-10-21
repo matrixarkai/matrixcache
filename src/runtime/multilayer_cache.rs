@@ -661,6 +661,10 @@ pub struct CacheFootprint {
     /// per-entry metadata map is the largest table in the cache, larger than
     /// either tier map whose entries it describes, because its value is
     /// stored inline in the bucket rather than behind a handle.
+    ///
+    /// That reading is what sent the metadata of memory-resident entries into
+    /// the memory tier's own buckets, so in a memory-only cache the metadata
+    /// line here is zero and the memory line carries it.
     pub table_bytes_by_map: CacheTableBytes,
     /// What the SSD tier's store holds in **memory**.
     ///
@@ -699,14 +703,24 @@ pub struct CacheFootprint {
 /// holds it inline.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheTableBytes {
-    /// The memory tier's map: a key handle and an `Arc<[u8]>` to a bucket.
+    /// The memory tier's map: a key handle, an `Arc<[u8]>` and **the entry's
+    /// metadata inline** to a bucket.
+    ///
+    /// The metadata is in here rather than in `metadata` below for every
+    /// entry this tier holds, which is why a memory-only cache reports
+    /// nothing for that one.
     pub memory: usize,
     /// The PMEM tier's map, the same shape as the memory tier's.
     pub pmem: usize,
     /// The SSD tier's index: a key handle and a block length to a bucket.
     pub disk_index: usize,
-    /// The per-entry metadata, held **inline** in its buckets, so this is the
-    /// one table here that holds its values rather than handles to them.
+    /// The metadata of entries the memory tier is **not** holding, held
+    /// inline in its buckets -- so this is the one table here that holds its
+    /// values rather than handles to them.
+    ///
+    /// Empty for a memory-only cache: a resident entry's metadata is in
+    /// `memory` above. In a tiered cache this is the largest table there is,
+    /// because most entries are not memory-resident.
     pub metadata: usize,
     /// The expiries, which are empty -- and so free -- for a cache that was
     /// never given a time to live.
@@ -726,6 +740,164 @@ impl CacheTableBytes {
         self.disk_index += other.disk_index;
         self.metadata += other.metadata;
         self.expiries += other.expiries;
+    }
+}
+
+/// The per-entry metadata, reached through accessors rather than as a map.
+///
+/// Every reader goes through these, so that **where** an entry's metadata is
+/// kept can change without touching any of them. It is one map today, and
+/// that map is the largest table in the cache: its bucket is a key handle,
+/// the struct inline and a control byte, against a key handle and a
+/// sixteen-byte handle in the tier map beside it.
+///
+/// The field itself stays visible to the sizing and shrinking code, which is
+/// about the map as storage rather than about an entry's metadata.
+impl CacheInner {
+    fn metadata_of(&self, key: &CacheKey) -> Option<&CacheEntryMeta> {
+        match self.memory.get(key) {
+            Some(resident) => resident.meta.as_ref(),
+            None => self.metadata.get(key),
+        }
+    }
+
+    fn metadata_of_mut(&mut self, key: &CacheKey) -> Option<&mut CacheEntryMeta> {
+        match self.memory.get_mut(key) {
+            Some(resident) => resident.meta.as_mut(),
+            None => self.metadata.get_mut(key),
+        }
+    }
+
+    fn set_metadata(&mut self, key: Arc<CacheKey>, meta: CacheEntryMeta) {
+        if let Some(resident) = self.memory.get_mut(key.as_ref()) {
+            resident.meta = Some(meta);
+            return;
+        }
+        self.metadata.insert(key, meta);
+    }
+
+    /// Record metadata for a key that may already have some, keeping what is
+    /// there: recovery replays entries it may have seen already.
+    fn set_metadata_if_absent(&mut self, key: Arc<CacheKey>, meta: CacheEntryMeta) {
+        if let Some(resident) = self.memory.get_mut(key.as_ref()) {
+            resident.meta.get_or_insert(meta);
+            return;
+        }
+        self.metadata.entry(key).or_insert(meta);
+    }
+
+    fn forget_metadata_of(&mut self, key: &CacheKey) {
+        if let Some(resident) = self.memory.get_mut(key) {
+            resident.meta = None;
+        }
+        self.metadata.remove(key);
+    }
+
+    /// How many entries have metadata, across both places it can be.
+    ///
+    /// A walk rather than two lengths, because a memory-resident entry may
+    /// have none recorded yet. The footprint is the only caller and it already
+    /// walks everything.
+    fn metadata_len(&self) -> usize {
+        self.memory
+            .values()
+            .filter(|resident| resident.meta.is_some())
+            .count()
+            + self.metadata.len()
+    }
+
+    /// Every key that has metadata, as the handles the maps hold.
+    fn metadata_keys(&self) -> impl Iterator<Item = &Arc<CacheKey>> + '_ {
+        self.memory
+            .iter()
+            .filter(|(_, resident)| resident.meta.is_some())
+            .map(|(key, _)| key)
+            .chain(self.metadata.keys())
+    }
+
+    /// The handle this cache holds for a key that has metadata, which is the
+    /// one allocation several structures share.
+    fn shared_metadata_key(&self, key: &CacheKey) -> Option<&Arc<CacheKey>> {
+        if let Some((held, resident)) = self.memory.get_key_value(key) {
+            if resident.meta.is_some() {
+                return Some(held);
+            }
+        }
+        self.metadata.get_key_value(key).map(|(held, _)| held)
+    }
+
+    /// The bytes the memory tier holds for a key.
+    fn resident_value(&self, key: &CacheKey) -> Option<&Arc<[u8]>> {
+        self.memory.get(key).map(|resident| &resident.value)
+    }
+
+    fn resident_value_mut(&mut self, key: &CacheKey) -> Option<&mut Arc<[u8]>> {
+        self.memory.get_mut(key).map(|resident| &mut resident.value)
+    }
+
+    /// Every value the memory tier holds.
+    fn resident_values(&self) -> impl Iterator<Item = &Arc<[u8]>> + '_ {
+        self.memory.values().map(|resident| &resident.value)
+    }
+
+    /// Every key and value the memory tier holds.
+    fn resident_entries(&self) -> impl Iterator<Item = (&Arc<CacheKey>, &Arc<[u8]>)> + '_ {
+        self.memory
+            .iter()
+            .map(|(key, resident)| (key, &resident.value))
+    }
+
+    fn clear_metadata(&mut self) {
+        for resident in self.memory.values_mut() {
+            resident.meta = None;
+        }
+        self.metadata.clear();
+    }
+
+    /// Put an entry in the memory tier, bringing its metadata with it.
+    ///
+    /// Returns the bytes this replaced, if the entry was already resident --
+    /// in which case its metadata stays exactly as it was, because an
+    /// overwrite is not a new entry and its hit history carries across.
+    fn make_resident(&mut self, key: Arc<CacheKey>, value: Arc<[u8]>) -> Option<Arc<[u8]>> {
+        if let Some(resident) = self.memory.get_mut(key.as_ref()) {
+            return Some(std::mem::replace(&mut resident.value, value));
+        }
+        let meta = self.metadata.remove(key.as_ref());
+        self.memory.insert(key, MemoryResident { value, meta });
+        None
+    }
+
+    /// Empty the memory tier, leaving every entry metadata behind.
+    ///
+    /// A tier clear is not a forget: the entries may still be in a lower tier,
+    /// and an entry expiry and hit history belong to the entry rather than to
+    /// the tier holding its bytes. Dropping the map wholesale threw that away
+    /// -- which is the bug this fold could most easily have shipped, and the
+    /// one the suite caught: twelve expiry tests and a hotness test, all
+    /// through a test helper that clears this tier.
+    fn clear_resident(&mut self) {
+        let drained: Vec<(Arc<CacheKey>, MemoryResident)> = self.memory.drain().collect();
+        for (held, resident) in drained {
+            if let Some(meta) = resident.meta {
+                self.metadata.insert(held, meta);
+            }
+        }
+    }
+
+    /// Take an entry out of the memory tier, leaving its metadata behind in
+    /// the map that holds what this tier does not.
+    ///
+    /// The metadata has to survive the move: an entry demoted to another tier
+    /// is the same entry, with the same expiry and the same hit history. An
+    /// SSD eviction throwing that away was a real bug, and this is the same
+    /// moment one tier up.
+    fn take_resident(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
+        let (held, resident) = self.memory.remove_entry(key)?;
+        if let Some(meta) = resident.meta {
+            self.metadata.insert(held, meta);
+        }
+        Some(resident.value)
     }
 }
 
@@ -966,6 +1138,24 @@ struct CacheAsyncWritebackWorker {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// What the memory tier holds for one entry: the bytes, and the entry own
+/// metadata **inline beside them**.
+///
+/// The metadata used to live in a second map keyed by the same key, which is
+/// a second bucket, a second key handle, a second control byte and a second
+/// table worth of slack for every entry -- and it was the largest table in
+/// the cache. Here it costs the 24 bytes of the struct and nothing else.
+///
+/// `None` means this entry has no metadata recorded, which is what an absent
+/// map entry used to mean. `Option<CacheEntryMeta>` is **also** 24 bytes: the
+/// struct has a `bool` in it, so the discriminant goes in that field unused
+/// bit patterns. A test asserts that, because the whole saving depends on it.
+#[derive(Debug)]
+struct MemoryResident {
+    value: Arc<[u8]>,
+    meta: Option<CacheEntryMeta>,
+}
+
 #[derive(Debug)]
 struct CacheInner {
     started: bool,
@@ -1050,7 +1240,10 @@ struct CacheInner {
     /// They now hold one `Arc<CacheKey>` between them, so a slot carries a
     /// pointer. Lookups are unaffected: `Arc<CacheKey>` borrows as a
     /// `CacheKey`, so `get`, `remove` and `contains_key` still take `&CacheKey`.
-    memory: HashMap<Arc<CacheKey>, Arc<[u8]>>,
+    /// The memory tier, holding each entry metadata beside its bytes --
+    /// see [`MemoryResident`]. The map below holds the metadata of entries
+    /// this tier is **not** holding.
+    memory: HashMap<Arc<CacheKey>, MemoryResident>,
     pmem: HashMap<Arc<CacheKey>, Arc<[u8]>>,
     disk_index: HashMap<Arc<CacheKey>, u64>,
     disk_order: CacheKeyOrder,
@@ -1116,6 +1309,13 @@ struct CacheInner {
     memory_replacement_policy: CacheReplacementPolicy,
     pmem_replacement_policy: CacheReplacementPolicy,
     ssd_replacement_policy: CacheReplacementPolicy,
+    /// The metadata of entries the memory tier is not holding.
+    ///
+    /// A memory-resident entry metadata lives in [`MemoryResident`], and
+    /// this map must not also hold it: the two places are exclusive, the
+    /// transitions between them are [`CacheInner::make_resident`] and
+    /// [`CacheInner::take_resident`], and a test asserts the exclusion after
+    /// a churn that moves entries both ways.
     metadata: HashMap<Arc<CacheKey>, CacheEntryMeta>,
     /// How often keys have been asked for recently, including keys that are
     /// not resident. Consulted at admission; see `admission_filter_enabled`.
@@ -2229,7 +2429,7 @@ impl MultiLayerCache {
             if ttl_millis > 0 {
                 inner.ttl_in_use = true;
             }
-            if inner.metadata.contains_key(&key) {
+            if inner.metadata_of(&key).is_some() {
                 let now_millis = CoarseClock::now_millis();
                 inner.set_entry_expiry(&key, ttl_millis, now_millis);
             }
@@ -2442,8 +2642,7 @@ impl MultiLayerCache {
         let inner = self.inner.read().expect("cache lock poisoned");
         match tier {
             CacheTier::Memory => inner
-                .memory
-                .iter()
+                .resident_entries()
                 .map(|(key, value)| key.logical_size().saturating_add(value.len()))
                 .sum(),
             CacheTier::Pmem => inner
@@ -3065,8 +3264,7 @@ impl MultiLayerCache {
                 None
             } else {
                 inner
-                    .memory
-                    .get(key)
+                    .resident_value(key)
                     .cloned()
                     .map(|value| (value, CacheReadTier::Memory))
                     .or_else(|| {
@@ -3283,7 +3481,7 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.resident_value(key).cloned() {
                         inner
                             .read_counters
                             .memory_hits
@@ -3477,7 +3675,7 @@ impl MultiLayerCache {
             if inner.entry_expired(key, CoarseClock::now_millis()) {
                 return Ok(None);
             }
-            if let Some(value) = inner.memory.get(key).cloned() {
+            if let Some(value) = inner.resident_value(key).cloned() {
                 return Ok(Some(CacheReadResult {
                     value: value.to_vec(),
                     tier: CacheReadTier::Memory,
@@ -3525,7 +3723,7 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.resident_value(key).cloned() {
                         results[index] = Some(CacheReadResult {
                             value: value.to_vec(),
                             tier: CacheReadTier::Memory,
@@ -3630,7 +3828,7 @@ impl MultiLayerCache {
                 if inner.entry_expired(key, now_millis) {
                     return Ok(None);
                 }
-                let Some(value) = inner.memory.get(key).cloned() else {
+                let Some(value) = inner.resident_value(key).cloned() else {
                     return Ok(None);
                 };
                 memory_hits.push((key, value, started));
@@ -3697,7 +3895,7 @@ impl MultiLayerCache {
                 if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
-                let Some(value) = inner.memory.get(key).cloned() else {
+                let Some(value) = inner.resident_value(key).cloned() else {
                     return Ok(false);
                 };
                 memory_hits.push((key, value, started));
@@ -3761,8 +3959,7 @@ impl MultiLayerCache {
                 None
             } else {
                 inner
-                    .memory
-                    .get(key)
+                    .resident_value(key)
                     .cloned()
                     .map(|value| (value, CacheReadTier::Memory))
                     .or_else(|| {
@@ -3959,7 +4156,7 @@ impl MultiLayerCache {
                     deferred.push((key, positions, started));
                     continue;
                 }
-                match inner.memory.get(key).cloned() {
+                match inner.resident_value(key).cloned() {
                     Some(value) => {
                         inner.read_counters.memory_hits.fetch_add(
                             positions.len() as u64,
@@ -4033,7 +4230,7 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.resident_value(key).cloned() {
                         let occurrences = positions.len();
                         inner
                             .read_counters
@@ -4189,7 +4386,7 @@ impl MultiLayerCache {
             self.drain_eviction_records();
             return None;
         }
-        let value = inner.memory.get(key).cloned();
+        let value = inner.resident_value(key).cloned();
         if value.is_some() {
             inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
             inner.record_hit(
@@ -4242,7 +4439,7 @@ impl MultiLayerCache {
             if expired {
                 None
             } else {
-                inner.memory.get(key).cloned()
+                inner.resident_value(key).cloned()
             }
         };
 
@@ -4394,7 +4591,7 @@ impl MultiLayerCache {
                 // Preserve the single-key acquire behavior below: expired
                 // entries are cleaned up under the exclusive lock.
             } else {
-                if let Some(value) = inner.memory.get(key).cloned() {
+                if let Some(value) = inner.resident_value(key).cloned() {
                     inner.increment_pin_with_size(key, value.len());
                     return Ok(Some(CachePinnedHandle {
                         key: key.clone(),
@@ -4479,7 +4676,7 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.resident_value(key).cloned() {
                         let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -4634,7 +4831,7 @@ impl MultiLayerCache {
                     remaining.push((key, positions));
                     continue;
                 }
-                let Some(value) = inner.memory.get(key).cloned() else {
+                let Some(value) = inner.resident_value(key).cloned() else {
                     remaining.push((key, positions));
                     continue;
                 };
@@ -4708,7 +4905,7 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.memory.get(key).cloned() {
+                    if let Some(value) = inner.resident_value(key).cloned() {
                         let occurrences = positions.len();
                         inner
                             .read_counters
@@ -4945,7 +5142,7 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         let handle_value = if !inner.ssd_instance_only {
-            if let Some(memory_value) = inner.memory.get(&key).cloned() {
+            if let Some(memory_value) = inner.resident_value(&key).cloned() {
                 Some((memory_value, CacheReadTier::Memory))
             } else if let Some(pmem_value) = inner.pmem.get(&key).cloned() {
                 Some((pmem_value, CacheReadTier::Pmem))
@@ -5182,7 +5379,7 @@ impl MultiLayerCache {
         }
         match tier {
             CacheTier::Memory => {
-                let Some(value) = inner.memory.get(key).cloned() else {
+                let Some(value) = inner.resident_value(key).cloned() else {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
@@ -5978,7 +6175,7 @@ impl MultiLayerCache {
         }
         let key_pinned = inner.is_pinned(key);
         let mut removed_pinned_bytes = 0usize;
-        if let Some(value) = inner.memory.remove(key) {
+        if let Some(value) = inner.take_resident(key) {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
         }
@@ -6053,7 +6250,7 @@ impl MultiLayerCache {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.ssd_instance_only = enabled;
         if enabled {
-            inner.memory.clear();
+            inner.clear_resident();
             inner.pmem.clear();
             inner.memory_order.clear();
             inner.pmem_order.clear();
@@ -9269,7 +9466,7 @@ impl CacheInner {
         if let Some((held, _)) = self.memory.get_key_value(key) {
             return Arc::clone(held);
         }
-        if let Some((held, _)) = self.metadata.get_key_value(key) {
+        if let Some(held) = self.shared_metadata_key(key) {
             return Arc::clone(held);
         }
         if let Some((held, _)) = self.pmem.get_key_value(key) {
@@ -9315,7 +9512,7 @@ impl CacheInner {
             .map(|key| key.as_ref())
             .chain(self.pmem.keys().map(|key| key.as_ref()))
             .chain(self.disk_index.keys().map(|key| key.as_ref()))
-            .chain(self.metadata.keys().map(|key| key.as_ref()))
+            .chain(self.metadata_keys().map(|key| key.as_ref()))
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
             .chain(self.disk_order.iter())
@@ -9349,7 +9546,7 @@ impl CacheInner {
         for held in self
             .memory
             .keys()
-            .chain(self.metadata.keys())
+            .chain(self.metadata_keys())
             .chain(self.pmem.keys())
             .chain(self.disk_index.keys())
             .chain(self.async_writeback_positions.keys())
@@ -9389,13 +9586,13 @@ impl CacheInner {
         // between them was removed, hiding the change it exists to measure.
         let mut counted_payloads = std::collections::HashSet::new();
         let mut payload_bytes = 0usize;
-        for value in self.memory.values().chain(self.pmem.values()) {
+        for value in self.resident_values().chain(self.pmem.values()) {
             if counted_payloads.insert(value.as_ptr()) {
                 payload_bytes = payload_bytes.saturating_add(value.len());
             }
         }
 
-        let metadata_bytes = self.metadata.len() * std::mem::size_of::<CacheEntryMeta>();
+        let metadata_bytes = self.metadata_len() * std::mem::size_of::<CacheEntryMeta>();
 
         // The three orders, each reporting its keys apart from its structure.
         let (memory_order_keys, memory_order_structure) = self.memory_order.footprint_bytes();
@@ -9572,7 +9769,7 @@ impl CacheInner {
             && !self.pmem.contains_key(key)
             && !self.disk_index.contains_key(key)
         {
-            self.metadata.remove(key);
+            self.forget_metadata_of(key);
             self.forget_expiry(key);
         }
         outcome
@@ -10149,7 +10346,7 @@ impl CacheInner {
     fn test_remove_for_tier(&mut self, tier: CacheTier, key: &CacheKey) -> Result<(), CacheError> {
         match tier {
             CacheTier::Memory => {
-                if let Some(value) = self.memory.remove(key) {
+                if let Some(value) = self.take_resident(key) {
                     self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
                     if self.is_pinned(key) {
                         self.pinned_removals_seen.store(true, Ordering::Relaxed);
@@ -10227,17 +10424,21 @@ impl CacheInner {
         let new_value = Arc::<[u8]>::from(new_value);
         match tier {
             CacheTier::Memory => {
-                let Some(current) = self.memory.get_mut(key) else {
-                    return Err(CacheError::NotFound);
+                let replaced = {
+                    let Some(current) = self.resident_value_mut(key) else {
+                        return Err(CacheError::NotFound);
+                    };
+                    if !Arc::ptr_eq(current, &old_handle.value) {
+                        return Err(CacheError::ReplaceMismatch);
+                    }
+                    let replaced = current.len();
+                    *current = Arc::clone(&new_value);
+                    replaced
                 };
-                if !Arc::ptr_eq(current, &old_handle.value) {
-                    return Err(CacheError::ReplaceMismatch);
-                }
                 self.memory_bytes = self
                     .memory_bytes
-                    .saturating_sub(current.len())
+                    .saturating_sub(replaced)
                     .saturating_add(new_value.len());
-                *current = Arc::clone(&new_value);
                 Ok(())
             }
             CacheTier::Pmem => {
@@ -10352,7 +10553,7 @@ impl MultiLayerCache {
             .collect::<Vec<_>>();
         let memory_entries_removed = memory_keys.len();
         for key in &memory_keys {
-            if let Some(value) = inner.memory.remove(key) {
+            if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
             if let Some(value) = inner.pmem.remove(key) {
@@ -10417,7 +10618,7 @@ impl MultiLayerCache {
         let mut disk_bytes_removed = 0u64;
         let mut disk_delete_keys = Vec::new();
         for key in &slot_keys {
-            if let Some(value) = inner.memory.remove(key) {
+            if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
             if let Some(value) = inner.pmem.remove(key) {
@@ -10430,7 +10631,7 @@ impl MultiLayerCache {
             {
                 inner.pins_for(key).entries.remove(key);
             }
-            inner.metadata.remove(key);
+            inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
         inner
@@ -10481,7 +10682,7 @@ impl MultiLayerCache {
         let mut disk_bytes_removed = 0u64;
         let mut disk_delete_keys = Vec::new();
         for key in &segment_keys {
-            if let Some(value) = inner.memory.remove(key) {
+            if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
             if let Some(value) = inner.pmem.remove(key) {
@@ -10494,7 +10695,7 @@ impl MultiLayerCache {
             {
                 inner.pins_for(key).entries.remove(key);
             }
-            inner.metadata.remove(key);
+            inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
         inner.memory_order.retain(|key| {
@@ -10534,8 +10735,7 @@ impl MultiLayerCache {
             .map(|key| {
                 let pinned = inner.is_pinned(&key);
                 let memory_bytes = inner
-                    .memory
-                    .get(&key)
+                    .resident_value(&key)
                     .map(|value| value.len() as u64)
                     .unwrap_or_default();
                 let pmem_bytes = inner
@@ -10550,7 +10750,7 @@ impl MultiLayerCache {
                         .map(|metadata| metadata.len())
                         .unwrap_or_default()
                 });
-                let meta = inner.metadata.get(&key);
+                let meta = inner.metadata_of(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace.to_string(),
@@ -10596,8 +10796,7 @@ impl MultiLayerCache {
             .map(|key| {
                 let pinned = inner.is_pinned(&key);
                 let memory_bytes = inner
-                    .memory
-                    .get(&key)
+                    .resident_value(&key)
                     .map(|value| value.len() as u64)
                     .unwrap_or_default();
                 let pmem_bytes = inner
@@ -10612,7 +10811,7 @@ impl MultiLayerCache {
                         .map(|metadata| metadata.len())
                         .unwrap_or_default()
                 });
-                let meta = inner.metadata.get(&key);
+                let meta = inner.metadata_of(&key);
                 CacheEntryInfo {
                     shard_id: key.shard_id,
                     namespace: key.namespace.to_string(),
@@ -10679,7 +10878,7 @@ impl MultiLayerCache {
                     .iter()
                     .map(|(key, entry)| {
                         let memory_bytes =
-                            inner.memory.get(key).map(|value| value.len()).unwrap_or(0);
+                            inner.resident_value(key).map(|value| value.len()).unwrap_or(0);
                         let pmem_bytes =
                             inner.pmem.get(key).map(|value| value.len()).unwrap_or(0);
                         memory_bytes
@@ -11164,7 +11363,7 @@ impl MultiLayerCache {
     #[doc(hidden)]
     pub fn clear_memory_for_test(&self) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
-        inner.memory.clear();
+        inner.clear_resident();
         inner.pmem.clear();
         inner.memory_bytes = 0;
         inner.pmem_bytes = 0;
