@@ -1966,7 +1966,11 @@ pub type StorageEnginePmem = StorageEngineSimple;
 pub struct StorageEngineRocksDb {
     db_path: String,
     initialized: bool,
-    records: HashMap<String, Vec<u8>>,
+    /// Keyed by a `Box<str>` rather than a `String`: the key is the
+    /// entry's `v1` manifest line, built exactly sized, so boxing it is a
+    /// free shrink -- and it takes eight bytes out of every bucket of this
+    /// map, which is one bucket per block the tier holds.
+    records: HashMap<Box<str>, Vec<u8>>,
     /// Bytes appended to the journal since the last snapshot, so compaction
     /// can be triggered by how much has accumulated rather than by a count of
     /// operations, which says nothing about the size of them.
@@ -2064,13 +2068,12 @@ impl StorageEngineRocksDb {
                 .iter()
                 .map(|(key, value)| key.len() + value.len())
                 .sum();
-            let table = if self.records.capacity() == 0 {
-                0
-            } else {
-                (self.records.capacity() * 8 / 7).next_power_of_two()
-                    * (std::mem::size_of::<(String, Vec<u8>)>() + 1)
-            };
-            contents + table
+            // Read off the map rather than written out by hand. This used
+            // to name `(String, Vec<u8>)` in a literal, so boxing the key
+            // took eight bytes out of every bucket and this term went on
+            // reporting the old number -- a representation change is not done
+            // until the leg that weighs it moves.
+            contents + map_table_bytes(&self.records)
         }
     }
 
@@ -2347,7 +2350,10 @@ impl StorageEngineRocksDb {
             };
             if tag == Self::JOURNAL_PUT {
                 self.records
-                    .insert(key.to_string(), raw[key_end..value_end].to_vec());
+                    .insert(
+                        key.to_string().into_boxed_str(),
+                        raw[key_end..value_end].to_vec(),
+                    );
             } else {
                 self.records.remove(key);
             }
@@ -2411,7 +2417,7 @@ impl StorageEngineRocksDb {
                 .ok_or_else(|| CacheError::CorruptBlock("rocksdb value out of bounds".into()))?
                 .to_vec();
             offset = value_end;
-            records.insert(key, value);
+            records.insert(key.into_boxed_str(), value);
         }
         if offset != raw.len() {
             return Err(CacheError::CorruptBlock(
@@ -2480,7 +2486,7 @@ impl StorageEngineRocksDb {
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
-            self.records.insert(key.to_string(), value);
+            self.records.insert(key.to_string().into_boxed_str(), value);
             // The record must be in the map before it is journaled: an append
             // can trigger a snapshot, and the snapshot is written from the
             // map, so journaling first could write a record into a file that
@@ -2560,14 +2566,15 @@ impl StorageEngineRocksDb {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             for (key, value) in coalesced {
-                self.records.insert(key.clone(), value);
+                self.records
+                    .insert(key.clone().into_boxed_str(), value);
                 // Encoded from the map, for the reason given in `put_view`:
                 // once per entry, this was a full payload copy per entry.
                 let record = Self::encode_journal_change(
                     &key,
                     Some(
                         self.records
-                            .get(&key)
+                            .get(key.as_str())
                             .expect("the record just inserted must be present")
                             .as_slice(),
                     ),
@@ -2610,7 +2617,7 @@ impl StorageEngineRocksDb {
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
             for key in &unique_keys {
-                if self.records.remove(key).is_some() {
+                if self.records.remove(key.as_str()).is_some() {
                     deleted = deleted.saturating_add(1);
                     self.journal_change(key, None)?;
                 }
@@ -2649,7 +2656,7 @@ impl StorageEngineRocksDb {
             for key in keys {
                 let size = self.records.get(&key).map_or(0, Vec::len);
                 let mut view = StringViewBuffer::new(size);
-                view.SetKey(&key);
+                view.SetKey(key.as_ref());
                 callback(&key, view);
             }
         }
@@ -2899,7 +2906,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
             for key in keys {
                 let value = self.records.get(&key).ok_or(CacheError::NotFound)?;
                 let mut buffer = CacheBuffer::new(value.clone());
-                buffer.set_key(&key);
+                buffer.set_key(key.as_ref());
                 callback.on_recover_data(&key, buffer);
             }
         }
