@@ -249,6 +249,63 @@ fn measure_sketch() -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
+/// The headline figure is a **sawtooth** in the entry count, and this arm is
+/// what says so.
+///
+/// Every per-entry figure here divides hash tables by the entries in them,
+/// and a `HashMap` holds a power of two of buckets: it doubles when the
+/// entries pass seven eighths of what it has. So the per-entry cost falls as
+/// a table fills and jumps back the moment it grows, and a figure quoted at
+/// one entry count is a figure quoted at one phase of that cycle.
+///
+/// The same key shape as the headline arm, so the 20,000-entry row here is
+/// the headline figure measured a second way -- which the self-checks compare.
+struct PhaseRow {
+    entries: usize,
+    /// The buckets a map of this many entries holds, derived the way the cache
+    /// derives them.
+    buckets: usize,
+    /// Entries over buckets as a percentage: where in the growth cycle this
+    /// count sits.
+    load: f64,
+    per_entry: f64,
+}
+
+const PHASE_VALUE_BYTES: usize = 64;
+
+fn measure_phase(entries: usize) -> PhaseRow {
+    let capacity = entries * PHASE_VALUE_BYTES * HEADROOM;
+    let cache = MultiLayerCache::with_options(CacheOptions::new(capacity, 0, 0));
+    let value = vec![0u8; PHASE_VALUE_BYTES];
+    for index in 0..entries {
+        cache
+            .put(key(index), value.clone())
+            .expect("a cache with room must accept a put");
+    }
+    let footprint = cache.footprint();
+    assert_eq!(
+        footprint.memory_entries, entries,
+        "nothing may evict during the fill, or the denominator is wrong"
+    );
+    let per_entry_terms = footprint.key_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes
+        + footprint.payload_header_bytes;
+    PhaseRow {
+        entries,
+        buckets: estimated_buckets_for(entries),
+        load: entries as f64 / estimated_buckets_for(entries) as f64 * 100.0,
+        per_entry: per_entry_terms as f64 / entries as f64,
+    }
+}
+
+/// The buckets a `HashMap` holds for this many entries: the next power of two
+/// above eight sevenths of them, which is the rule the cache's own table
+/// accounting uses.
+fn estimated_buckets_for(entries: usize) -> usize {
+    (entries * 8 / 7).next_power_of_two()
+}
+
 /// What the *shape* of a key costs, which none of the tables above show.
 ///
 /// Every row above uses `CacheKey::string`, whose namespace and selector are
@@ -570,6 +627,46 @@ fn main() {
     }
     println!();
 
+    println!(
+        "  the same figure across the growth cycle of the tables it divides, \
+         {PHASE_VALUE_BYTES}-byte values"
+    );
+    println!();
+    println!(
+        "  {:>8}  {:>9}  {:>7}  {:>9}",
+        "entries", "buckets", "load", "B/entry"
+    );
+    let phases: Vec<PhaseRow> = [
+        14_000usize,
+        16_000,
+        ENTRIES,
+        24_000,
+        28_000,
+        28_700,
+        30_000,
+        32_000,
+    ]
+    .into_iter()
+    .map(measure_phase)
+    .collect();
+    for row in &phases {
+        println!(
+            "  {:>8}  {:>9}  {:>6.1}%  {:>9.1}",
+            row.entries, row.buckets, row.load, row.per_entry
+        );
+    }
+    println!();
+    println!(
+        "  A table holds a power of two of buckets and doubles at seven eighths full, so this"
+    );
+    println!(
+        "  figure falls as the tables fill and jumps back when they grow. The headline above is"
+    );
+    println!(
+        "  measured at {ENTRIES} entries, which is one phase of that cycle rather than the best"
+    );
+    println!("  or the worst of it.");
+    println!();
     println!("  what the key shape costs, {ENTRIES} entries of {SHAPE_VALUE_BYTES}-byte values");
     println!();
     println!(
@@ -847,6 +944,86 @@ fn main() {
     // The headline table uses the cheapest shape, which makes its figure a
     // floor rather than a typical cost. Worth stating as a check, because the
     // number gets quoted on its own.
+    // The sweep across the growth cycle, which is what keeps the headline
+    // figure honest rather than lucky.
+    //
+    // Measured: 257.3 bytes an entry at 85.4% load and 330.1 at 43.8%, so the
+    // published figure swings by 1.28x with nothing changing but the entry
+    // count -- 28,000 entries reports 257.3 and 28,700 reports 330.1, a 28%
+    // jump for 2.5% more entries. A per-entry figure over a hash table is a
+    // sawtooth, and these checks pin the envelope rather than one tooth.
+    const PHASE_WORST_CEILING: f64 = 340.0;
+    match (
+        phases
+            .iter()
+            .map(|row| row.per_entry)
+            .fold(f64::INFINITY, f64::min),
+        phases
+            .iter()
+            .map(|row| row.per_entry)
+            .fold(f64::NEG_INFINITY, f64::max),
+        phases.iter().find(|row| row.entries == ENTRIES),
+        rows.iter().find(|row| row.value_bytes == PHASE_VALUE_BYTES),
+    ) {
+        (best, worst, Some(headline_phase), Some(headline_row)) => {
+            // The same quantity measured twice, in two arms, with the same
+            // key shape and the same value size. A difference means one of
+            // the two fixtures has drifted from what it claims to measure.
+            if (headline_phase.per_entry - headline_row.per_entry).abs() > 0.05 {
+                failures.push(format!(
+                    "the sweep reports {:.1} bytes an entry at {ENTRIES} entries and the \
+                     headline arm reports {:.1}, so the two arms are not measuring the same \
+                     cache",
+                    headline_phase.per_entry, headline_row.per_entry
+                ));
+            }
+            // The ceiling that does not depend on where the fixture sits in
+            // the cycle: whatever phase a deployment lands in, this is the
+            // figure it is held to.
+            if worst > PHASE_WORST_CEILING {
+                failures.push(format!(
+                    "the worst phase in the sweep holds {worst:.1} bytes an entry, above the \
+                     {PHASE_WORST_CEILING:.0} the envelope has been held to"
+                ));
+            }
+            // And the headline has to be an ordinary phase, not the flattering
+            // end of the cycle. If a change moved the fixture to the fullest
+            // table it could find, this is what would say so.
+            if headline_row.per_entry <= best + 0.05 {
+                failures.push(format!(
+                    "the headline entry count reports {:.1} bytes an entry, which is the best \
+                     phase in the sweep -- the fixture is sitting at the fullest table rather \
+                     than a representative one",
+                    headline_row.per_entry
+                ));
+            }
+            if headline_row.per_entry >= worst - 0.05 {
+                failures.push(format!(
+                    "the headline entry count reports {:.1} bytes an entry, which is the worst \
+                     phase in the sweep",
+                    headline_row.per_entry
+                ));
+            }
+            // The phenomenon itself. If the tables stopped growing by powers
+            // of two this would hold flat, and the prose beside the table
+            // would be describing something that no longer happens.
+            if worst / best < 1.15 {
+                failures.push(format!(
+                    "the sweep reports {best:.1} to {worst:.1} bytes an entry, a swing of \
+                     {:.2}x -- the tables are no longer growing the way the text beside this \
+                     table says they do",
+                    worst / best
+                ));
+            }
+        }
+        (_, _, headline_phase, headline_row) => failures.push(format!(
+            "the sweep is missing a row at {ENTRIES} entries ({}) or the headline arm is \
+             missing its {PHASE_VALUE_BYTES}-byte row ({})",
+            headline_phase.is_some(),
+            headline_row.is_some()
+        )),
+    }
+
     // The dearest shape is ratcheted too, since the headline figure is the
     // cheapest one and a regression could hide in the others.
     for row in &shapes {
