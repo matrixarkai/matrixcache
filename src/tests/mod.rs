@@ -24215,3 +24215,151 @@ fn a_payload_carries_a_header_the_payload_figure_does_not_count() {
 
     assert!(cache.stop(), "the cache did not stop cleanly");
 }
+
+/// The admission sketch is sized for the entries the cache turns out to hold,
+/// not for the entries a default guess assumed it would.
+///
+/// The sketch is sized when the filter is switched on, from the memory
+/// capacity divided by what an entry is expected to cost -- sixty-four bytes
+/// unless the caller says otherwise, and the caller usually switches the
+/// filter on at startup, when there is nothing to measure. Measured before
+/// this: a one-mebibyte cache of four-kibibyte values sized its sketch for
+/// 16,384 entries, held 256, and kept 524,288 bytes of counters for keys that
+/// could not exist -- about seven times every other piece of bookkeeping those
+/// 256 entries carried between them.
+#[test]
+fn the_sketch_is_sized_for_the_entries_the_cache_turned_out_to_hold() {
+    const CAPACITY: usize = 1 << 20;
+    const VALUE_BYTES: usize = 4096;
+    const GUESSED_BYTES: usize = 524_288;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(CAPACITY, 0, 0));
+    cache.set_admission_filter_enabled(true);
+    assert_eq!(
+        cache.footprint().sketch_bytes,
+        GUESSED_BYTES,
+        "precondition: switched on while empty, the sketch is sized from the default guess"
+    );
+
+    // Past capacity, so the entry count stops being a guess.
+    for index in 0..1_000 {
+        let _ = cache.put(
+            CacheKey::string(0, &format!("sketch-sizing-{index:06}")),
+            vec![7u8; VALUE_BYTES],
+        );
+    }
+
+    let footprint = cache.footprint();
+    let entries = footprint.memory_entries;
+    assert!(
+        entries > 0 && entries < 1_000,
+        "precondition: the fill has to have filled the tier, leaving {entries} of 1,000"
+    );
+    assert_eq!(
+        footprint.sketch_bytes,
+        (entries * 32).next_power_of_two(),
+        "the sketch has to be sized for the {entries} entries the cache holds"
+    );
+    assert!(
+        footprint.sketch_bytes * 16 <= GUESSED_BYTES,
+        "the correction has to be worth making: {} against the {GUESSED_BYTES} it was",
+        footprint.sketch_bytes
+    );
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// A cache that never fills keeps the size it was given, because its entry
+/// count is still a guess.
+///
+/// The correction is not "measure at some point"; it is "measure when the
+/// answer is a fact". A tier with room to spare has not told anyone how many
+/// entries it will hold.
+#[test]
+fn a_cache_that_never_fills_keeps_the_sketch_it_was_given() {
+    const CAPACITY: usize = 1 << 20;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(CAPACITY, 0, 0));
+    cache.set_admission_filter_enabled(true);
+    let when_enabled = cache.footprint().sketch_bytes;
+
+    // Sixty-four byte values and a mebibyte of room: nothing is ever evicted.
+    for index in 0..1_000 {
+        cache
+            .put(
+                CacheKey::string(0, &format!("never-full-{index:06}")),
+                vec![7u8; 64],
+            )
+            .expect("a cache with room must accept a put");
+    }
+    assert_eq!(
+        cache.stats().memory_evictions, 0,
+        "precondition: the tier must not have evicted anything"
+    );
+    assert_eq!(
+        cache.footprint().sketch_bytes,
+        when_enabled,
+        "a tier that never filled has no measured entry count to be re-sized for"
+    );
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// Re-sizing the sketch does not throw away what it knew.
+///
+/// The counts cannot be carried across -- the table is a different width, so
+/// every key hashes somewhere else -- so they are re-seeded from the hit
+/// history the resident entries carry. Nothing has been evicted at that
+/// moment, so every key the sketch could know anything about is still there to
+/// be asked.
+///
+/// What is pinned here is the property the re-seed exists for: an entry the
+/// cache has been serving outranks a key nothing has ever seen. Not the shape
+/// of the distribution, which the re-seed deliberately bounds.
+#[test]
+fn re_sizing_the_sketch_keeps_what_the_resident_entries_know() {
+    const CAPACITY: usize = 1 << 20;
+    const VALUE_BYTES: usize = 4096;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(CAPACITY, 0, 0));
+    cache.set_admission_filter_enabled(true);
+
+    let watched = CacheKey::string(0, "sketch-reseed-watched");
+    cache
+        .put(watched.clone(), vec![7u8; VALUE_BYTES])
+        .expect("a cache with room must accept a put");
+    for _ in 0..200 {
+        let _ = cache.get(&watched);
+    }
+
+    // Fill past capacity, which is when the re-size happens.
+    for index in 0..1_000 {
+        let _ = cache.put(
+            CacheKey::string(0, &format!("sketch-reseed-{index:06}")),
+            vec![7u8; VALUE_BYTES],
+        );
+    }
+
+    let inner = cache.inner.read().expect("cache lock poisoned");
+    let unseen = CacheKey::string(0, "sketch-reseed-never-seen-by-anyone");
+    assert_eq!(
+        inner.access_frequency.estimate(&unseen),
+        0,
+        "precondition: a key nothing has seen has to estimate zero, or this proves nothing"
+    );
+    let resident: Vec<&Arc<CacheKey>> = inner.memory.keys().collect();
+    assert!(
+        !resident.is_empty(),
+        "precondition: the tier has to be holding something"
+    );
+    let known = resident
+        .iter()
+        .filter(|held| inner.access_frequency.estimate(held.as_ref()) > 0)
+        .count();
+    assert_eq!(
+        known,
+        resident.len(),
+        "{} of {} resident entries estimate zero after the re-size, so the sketch came back \
+         empty for them",
+        resident.len() - known,
+        resident.len()
+    );
+}

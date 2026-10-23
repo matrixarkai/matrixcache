@@ -1671,6 +1671,58 @@ impl CacheInner {
             .store(effective, Ordering::Relaxed);
     }
 
+    /// Size the admission sketch for the entries the cache turned out to
+    /// hold.
+    ///
+    /// The sketch is sized when the filter is switched on, from the memory
+    /// capacity divided by what an entry is **expected** to cost -- and that
+    /// expectation is a guess whenever the filter is switched on at startup,
+    /// which [`MultiLayerCache::set_expected_entry_bytes`] says is the usual
+    /// case. Measured: a one-mebibyte cache of four-kibibyte values, told
+    /// nothing, sizes the sketch for 16,384 entries and then holds 256. That
+    /// is 524,288 bytes of counters for keys that cannot exist, against 8,192
+    /// for the keys that can -- and against about 72,000 bytes of every other
+    /// piece of bookkeeping those 256 entries carry between them. The sketch
+    /// was seven times the rest of the cache.
+    ///
+    /// So the first time the tier is full -- the first moment the entry count
+    /// is a fact rather than a guess -- the sketch is rebuilt for that count.
+    /// It corrects in both directions: a cache told to expect large entries
+    /// and handed small ones gets a **bigger** sketch, which is the accuracy
+    /// the sizing is there for.
+    ///
+    /// Re-seeded from the hit history the resident entries carry, on the same
+    /// sampled scale the sketch records on, because nothing has been evicted
+    /// yet at this moment: every key the sketch could know anything about is
+    /// still here to be asked. Bounded by
+    /// `SKETCH_RESEED_RECORDS_PER_ENTRY`.
+    fn size_the_sketch_for_what_is_resident(&mut self) {
+        if !self.admission_filter_enabled || self.sketch_sized_from_what_is_resident {
+            return;
+        }
+        // Before the tier is full the entry count is still a guess, and a
+        // guess is what this is correcting.
+        if self.memory.is_empty() || self.memory_bytes < self.memory_capacity_bytes {
+            return;
+        }
+        self.sketch_sized_from_what_is_resident = true;
+        let entries = self.memory.len();
+        if FrequencySketch::bytes_for(entries) == self.access_frequency.footprint_bytes() {
+            return;
+        }
+        let sized = FrequencySketch::with_capacity(entries);
+        for (key, resident) in &self.memory {
+            let hits = resident.meta.as_ref().map_or(0, CacheEntryMeta::hits);
+            let records = sampled_hit_count(0, hits).min(SKETCH_RESEED_RECORDS_PER_ENTRY);
+            // Every resident key gets at least one, so a key the cache is
+            // holding outranks a key nothing has ever seen.
+            for _ in 0..records.max(1) {
+                sized.record(key.as_ref());
+            }
+        }
+        self.access_frequency = sized;
+    }
+
     /// Whether a newcomer is worth what admitting it would cost.
     ///
     /// The replacement policy has already decided which resident entry is
@@ -1769,6 +1821,9 @@ impl CacheInner {
             self.stats.eviction_oversize += 1;
             return false;
         }
+        // The sketch was sized from a guess about what an entry costs. This is
+        // the path that reads it, so this is where the guess gets corrected.
+        self.size_the_sketch_for_what_is_resident();
         // Recorded whether or not it is admitted: a key rejected once has to be
         // able to earn its way in, or the filter is a permanent ban rather than
         // a comparison.
@@ -3198,6 +3253,17 @@ fn initial_hotness(block_kind: CacheBlockKind, block_bytes: usize) -> u32 {
         CacheBlockKind::Other => 0,
     }
 }
+
+/// Most records a single resident entry contributes when the sketch is
+/// re-sized.
+///
+/// The re-seed exists to restore each resident entry's rank above a key
+/// nothing has seen, which is the comparison admission makes. Restoring the
+/// full distribution would mean replaying every entry's sampled history, which
+/// on a cache of a million entries is tens of millions of counter updates
+/// under the cache lock -- so it is bounded here instead, and the ordering
+/// among the hot keys re-establishes itself from the hits that follow.
+const SKETCH_RESEED_RECORDS_PER_ENTRY: u64 = 8;
 
 fn sampled_hit_count(hits_before: u64, occurrences: u64) -> u64 {
     if occurrences == 0 {

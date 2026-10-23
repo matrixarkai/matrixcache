@@ -249,6 +249,47 @@ fn measure_sketch() -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
+/// What the admission sketch is sized for, before and after the cache knows
+/// how many entries it holds.
+///
+/// The sketch is sized when the filter is switched on, from the memory
+/// capacity divided by what an entry is **expected** to cost -- sixty-four
+/// bytes unless the caller says otherwise, and the caller normally switches
+/// the filter on at startup, when there is nothing to measure. So a cache of
+/// larger values sizes a sketch for keys that cannot exist, and this table is
+/// what that costs and what correcting it recovers.
+struct SketchSizingRow {
+    value_bytes: usize,
+    entries: usize,
+    when_enabled: usize,
+    after_the_fill: usize,
+}
+
+const SKETCH_SIZING_CAPACITY: usize = 1 << 20;
+
+fn measure_sketch_sizing(value_bytes: usize) -> SketchSizingRow {
+    let cache = MultiLayerCache::with_options(CacheOptions::new(SKETCH_SIZING_CAPACITY, 0, 0));
+    cache.set_admission_filter_enabled(true);
+    let when_enabled = cache.footprint().sketch_bytes;
+    // Four times the capacity, so the tier fills and the entry count stops
+    // being a guess.
+    let fill = (SKETCH_SIZING_CAPACITY / value_bytes) * 4;
+    let value = vec![0u8; value_bytes];
+    for index in 0..fill {
+        let _ = cache.put(
+            CacheKey::string(0, &format!("sketch-sizing-{index:08}")),
+            value.clone(),
+        );
+    }
+    let footprint = cache.footprint();
+    SketchSizingRow {
+        value_bytes,
+        entries: footprint.memory_entries,
+        when_enabled,
+        after_the_fill: footprint.sketch_bytes,
+    }
+}
+
 /// The headline figure is a **sawtooth** in the entry count, and this arm is
 /// what says so.
 ///
@@ -627,6 +668,28 @@ fn main() {
     }
     println!();
 
+    println!("  and what that sketch is sized for, against what the cache turned out to hold");
+    println!("  (a capacity of {SKETCH_SIZING_CAPACITY} bytes)");
+    println!();
+    println!(
+        "  {:>6}  {:>8}  {:>14}  {:>16}",
+        "value", "entries", "when enabled", "after the fill"
+    );
+    let sketch_sizing: Vec<SketchSizingRow> = [64usize, 1024, 4096]
+        .into_iter()
+        .map(measure_sketch_sizing)
+        .collect();
+    for row in &sketch_sizing {
+        println!(
+            "  {:>6}  {:>8}  {:>14}  {:>16}",
+            row.value_bytes, row.entries, row.when_enabled, row.after_the_fill
+        );
+    }
+    println!();
+    println!("  The third column is a guess: the capacity over sixty-four bytes an entry.");
+    println!("  The fourth is what the cache measured once it was full. At 64-byte values");
+    println!("  the guess happens to be right, so the correction has nothing to do.");
+    println!();
     println!(
         "  the same figure across the growth cycle of the tables it divides, \
          {PHASE_VALUE_BYTES}-byte values"
@@ -944,6 +1007,44 @@ fn main() {
     // The headline table uses the cheapest shape, which makes its figure a
     // floor rather than a typical cost. Worth stating as a check, because the
     // number gets quoted on its own.
+    // The sketch sizing. A tier that filled has to end up sized for the
+    // entries it holds, whatever the guess was -- including the 64-byte row,
+    // where the guess happens to be right and the correction is therefore a
+    // no-op. A tier that never filled has to keep the size it was given,
+    // because its entry count is still a guess.
+    //
+    // And the arm has to be showing something: at least one row where the
+    // guess was wrong by a factor, or this table is three identical columns.
+    let mut corrected = 0;
+    for row in &sketch_sizing {
+        let for_what_it_holds = (row.entries.max(1) * 32).next_power_of_two();
+        let filled = row.entries * row.value_bytes >= SKETCH_SIZING_CAPACITY / 2;
+        if filled && row.after_the_fill != for_what_it_holds {
+            failures.push(format!(
+                "at {} byte values the tier filled with {} entries, so the sketch has to be \
+                 sized at {for_what_it_holds} and it is {}",
+                row.value_bytes, row.entries, row.after_the_fill
+            ));
+        }
+        if !filled && row.after_the_fill != row.when_enabled {
+            failures.push(format!(
+                "at {} byte values the tier never filled, so there is no measured entry count \
+                 -- but the sketch moved from {} to {}",
+                row.value_bytes, row.when_enabled, row.after_the_fill
+            ));
+        }
+        if row.after_the_fill * 4 <= row.when_enabled {
+            corrected += 1;
+        }
+    }
+    if corrected == 0 {
+        failures.push(
+            "no row in the sketch sizing arm was corrected by a factor of four, so the table \
+             demonstrates nothing"
+                .to_string(),
+        );
+    }
+
     // The sweep across the growth cycle, which is what keeps the headline
     // figure honest rather than lucky.
     //
@@ -1054,11 +1155,12 @@ fn main() {
         println!("self-checks: passed");
         println!();
         println!(
-            "With the admission filter off, which is the default, the sketch holds {} bytes",
-            off_largest
+            "With the admission filter off, which is the default, the sketch holds 32 bytes
+whatever the capacity. Switched on it is sized from the capacity and a guess
+about what an entry costs -- half a gibibyte for a gibibyte of capacity, which
+is why it waits to be asked for -- and then corrected to what the cache turned
+out to hold, the first time the tier is full."
         );
-        println!("whatever the capacity. Switched on, it is sized from capacity: half a");
-        println!("gibibyte for a gibibyte, which is why it waits to be asked for.");
     } else {
         println!("self-checks: FAILED");
         for failure in &failures {
