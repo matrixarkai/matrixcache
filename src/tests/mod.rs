@@ -24363,3 +24363,96 @@ fn re_sizing_the_sketch_keeps_what_the_resident_entries_know() {
         resident.len()
     );
 }
+
+/// The emulated SSD store keys its blocks by `Box<str>`, which is eight bytes
+/// a bucket less than a `String`.
+///
+/// The key is the entry's `v1` manifest line and the store holds one bucket
+/// per block, so those eight bytes are eight bytes per block the tier holds.
+/// Measured on the report's tiered arm, 2,000 blocks: 478,704 bytes of
+/// resident store against 445,936.
+///
+/// Free, because the line is built exactly sized -- `String::into_boxed_str`
+/// shrinks, and there is nothing to shrink. The allocation report measures
+/// the write that puts it there and did not move: 28.11 allocations before
+/// and after.
+///
+/// Pinned as a size rather than described, because nothing else would notice
+/// the key going back to a `String`: the map would still work, the figures
+/// would still be published, and every bucket would be eight bytes bigger.
+#[test]
+fn the_store_keys_its_blocks_by_a_boxed_str() {
+    assert_eq!(
+        std::mem::size_of::<(Box<str>, Vec<u8>)>(),
+        40,
+        "a boxed key and an owned value, with no capacity word on the key"
+    );
+    assert_eq!(
+        std::mem::size_of::<(String, Vec<u8>)>()
+            - std::mem::size_of::<(Box<str>, Vec<u8>)>(),
+        8,
+        "the saving is the capacity word a String carries and a Box<str> does not"
+    );
+
+    // And the store reports what it holds, including that bucket. A literal
+    // bucket size here is what made the figure stale the last time this
+    // changed, so the term reads the map instead -- which this asserts by
+    // holding the store to the same arithmetic.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path().to_path_buf(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 16 * 256,
+            pmem_capacity_bytes: 1 << 20,
+            ssd_capacity_bytes: 1 << 26,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    for index in 0..400 {
+        cache
+            .put(
+                CacheKey::string(0, &format!("boxed-store-{index:04}")),
+                vec![b'v'; 256],
+            )
+            .expect("a cache with room must accept a put");
+    }
+
+    let footprint = cache.footprint();
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    {
+        let demoted = footprint
+            .tracked_entries
+            .saturating_sub(footprint.memory_entries);
+        assert!(
+            demoted > 100,
+            "the fixture did not demote: {demoted} of {} left memory",
+            footprint.tracked_entries
+        );
+        // One bucket per block, and the buckets are 41 bytes now rather than
+        // 49: the store cannot be reporting less than its keys and its table.
+        let buckets = (demoted * 8 / 7).next_power_of_two();
+        assert!(
+            footprint.ssd_store_bytes >= buckets * 41,
+            "the store reports {} bytes for {demoted} blocks, which is less than the {} its \
+             table alone occupies",
+            footprint.ssd_store_bytes,
+            buckets * 41
+        );
+    }
+    #[cfg(feature = "rocksdb-ssd")]
+    assert_eq!(
+        footprint.ssd_store_bytes, 0,
+        "with RocksDB the store's bytes are allocated outside Rust and counted as zero"
+    );
+
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
