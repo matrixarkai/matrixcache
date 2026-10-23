@@ -58,6 +58,10 @@ fn key(index: usize) -> CacheKey {
 }
 
 struct Row {
+    /// The sixteen bytes in front of each payload: a strong count and a
+    /// weak count, resident for as long as the entry is, and counted by
+    /// nothing until today.
+    handles: usize,
     value_bytes: usize,
     capacity: usize,
     payload: usize,
@@ -92,9 +96,17 @@ fn measure(value_bytes: usize) -> Row {
         "nothing may evict during the fill, or the denominator is wrong"
     );
 
-    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes
+        // The sixteen bytes in front of each payload. Per entry, and
+        // overhead rather than payload, so it belongs in this sum: a
+        // figure built from the keys, the orders and the tables alone was
+        // missing the one term paid for every value in the cache.
+        + footprint.payload_header_bytes;
 
     Row {
+        handles: footprint.payload_header_bytes,
         value_bytes,
         capacity,
         payload: footprint.payload_bytes,
@@ -180,7 +192,14 @@ fn measure_tiered(value_bytes: usize) -> TieredRow {
     }
 
     let footprint = cache.footprint();
-    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes
+        // The sixteen bytes in front of each payload. Per entry, and
+        // overhead rather than payload, so it belongs in this sum: a
+        // figure built from the keys, the orders and the tables alone was
+        // missing the one term paid for every value in the cache.
+        + footprint.payload_header_bytes;
 
     TieredRow {
         value_bytes,
@@ -285,7 +304,14 @@ fn measure_shape(shape: &'static str, build: &dyn Fn(usize) -> CacheKey) -> Shap
 
     let sample = build(0);
     let (owned_selector, selector_slack) = selector_bytes(&sample);
-    let per_entry_terms = footprint.key_bytes + footprint.order_bytes + footprint.table_bytes;
+    let per_entry_terms = footprint.key_bytes
+        + footprint.order_bytes
+        + footprint.table_bytes
+        // The sixteen bytes in front of each payload. Per entry, and
+        // overhead rather than payload, so it belongs in this sum: a
+        // figure built from the keys, the orders and the tables alone was
+        // missing the one term paid for every value in the cache.
+        + footprint.payload_header_bytes;
 
     ShapeRow {
         shape,
@@ -334,7 +360,10 @@ fn measure_shrunken() -> Vec<ShrunkenRow> {
             keys: footprint.key_bytes,
             orders: footprint.order_bytes,
             tables: footprint.table_bytes,
-            per_entry: (footprint.key_bytes + footprint.order_bytes + footprint.table_bytes) as f64
+            per_entry: (footprint.key_bytes
+                + footprint.order_bytes
+                + footprint.table_bytes
+                + footprint.payload_header_bytes) as f64
                 / entries as f64,
         }
     };
@@ -375,8 +404,8 @@ fn main() {
     println!("Capacity is {HEADROOM}x what the fill needs, so nothing evicts.");
     println!();
     println!(
-        "  {:>6}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}",
-        "value", "payload", "keys", "metadata", "orders", "tables", "sketch", "other"
+        "  {:>6}  {:>10}  {:>9}  {:>9}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}",
+        "value", "payload", "handles", "keys", "metadata", "orders", "tables", "sketch", "other"
     );
 
     let rows: Vec<Row> = [64usize, 256, 1024, 4096]
@@ -385,9 +414,10 @@ fn main() {
         .collect();
     for row in &rows {
         println!(
-            "  {:>6}  {:>10}  {:>9}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}",
+            "  {:>6}  {:>10}  {:>9}  {:>9}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}",
             row.value_bytes,
             row.payload,
+            row.handles,
             row.keys,
             row.metadata,
             row.orders,
@@ -398,7 +428,10 @@ fn main() {
     }
 
     println!();
-    println!("  the per-entry overhead -- keys, orders, tables");
+    println!(
+        "  the per-entry overhead -- keys, orders, tables, and the handle in front of each \
+         payload"
+    );
     println!("  (the metadata column above is inside tables, not beside it)");
     println!();
     println!(
@@ -590,22 +623,29 @@ fn main() {
     // raising one is a deliberate act, and the number that replaced it goes
     // in the ladder beside it.
     //
-    //   memory-only, per entry      377.5 -> 311.3 -> 298.2 -> 283.5
-    //   its amplification at 64 B    6.90x -> 5.87x -> 5.66x -> 5.43x
-    //   tiered, per tracked entry   426.4 -> 409.6 -> 411.0
-    //   shrunken to 1,000 of 20,000  3,762.5 -> 1,223.8 -> 363.6 -> 347.2 -> 328.9
-    //   a cache that never grew      330.8 -> 314.4 -> 296.1
-    //   the dearest key shape        343.3 -> 330.2 -> 315.5
+    //   memory-only, per entry      377.5 -> 311.3 -> 298.2 -> 283.5 -> 299.5
+    //   its amplification at 64 B    6.90x -> 5.87x -> 5.66x -> 5.43x -> 5.68x
+    //   tiered, per tracked entry   426.4 -> 409.6 -> 411.0 -> 427.0
+    //   shrunken to 1,000 of 20,000  3,762.5 -> 1,223.8 -> 363.6 -> 347.2 -> 328.9 -> 344.9
+    //   a cache that never grew      330.8 -> 314.4 -> 296.1 -> 312.1
+    //   the dearest key shape        343.3 -> 330.2 -> 315.5 -> 331.5
+    //
+    // The last step on every line is **upward by sixteen bytes an entry, and
+    // it is not a regression**: it is the handle in front of each payload --
+    // a strong count and a weak count on the `Arc<[u8]>` the tier holds --
+    // which was resident all along and counted by nothing. The cache did not
+    // get worse; these figures got honest. Every ceiling below was raised for
+    // that reason and no other, which is what this comment is for.
     //
     // Deterministic, all of it: these are struct sizes and table sizes at a
     // fixed entry count, and three runs of the same binary gave the same
     // figures to the tenth of a byte. Nothing here is a timing.
-    const MEMORY_ONLY_CEILING: f64 = 290.0;
-    const MEMORY_ONLY_AMPLIFICATION_CEILING: f64 = 5.6;
-    const TIERED_CEILING: f64 = 420.0;
-    const SHRUNKEN_CEILING: f64 = 340.0;
-    const NEVER_GREW_CEILING: f64 = 305.0;
-    const DEAREST_SHAPE_CEILING: f64 = 325.0;
+    const MEMORY_ONLY_CEILING: f64 = 306.0;
+    const MEMORY_ONLY_AMPLIFICATION_CEILING: f64 = 5.8;
+    const TIERED_CEILING: f64 = 435.0;
+    const SHRUNKEN_CEILING: f64 = 352.0;
+    const NEVER_GREW_CEILING: f64 = 320.0;
+    const DEAREST_SHAPE_CEILING: f64 = 340.0;
 
     for row in &rows {
         if row.per_entry > MEMORY_ONLY_CEILING {
@@ -856,13 +896,14 @@ fn main() {
         json.push_str("  \"rows\": [\n");
         for (index, row) in rows.iter().enumerate() {
             json.push_str(&format!(
-                "    {{\"value_bytes\": {}, \"capacity\": {}, \"payload\": {}, \"keys\": {}, \
+                "    {{\"value_bytes\": {}, \"capacity\": {}, \"payload\": {}, \"handles\": {}, \"keys\": {}, \
                  \"metadata\": {}, \"orders\": {}, \"tables\": {}, \"sketch\": {}, \
                  \"other\": {}, \"total\": {}, \"per_entry_overhead\": {:.1}, \
                  \"amplification\": {:.3}}}{}\n",
                 row.value_bytes,
                 row.capacity,
                 row.payload,
+                row.handles,
                 row.keys,
                 row.metadata,
                 row.orders,

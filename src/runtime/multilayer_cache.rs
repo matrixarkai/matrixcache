@@ -623,6 +623,25 @@ pub struct CacheFootprint {
     /// holds. This is the term, and the only term, in `total_bytes` that is
     /// payload rather than bookkeeping.
     pub payload_bytes: usize,
+    /// The per-allocation header in front of each payload, which nothing
+    /// counted until today.
+    ///
+    /// A payload is held behind an `Arc<[u8]>`: the bytes the caller asked
+    /// for, with a strong count and a weak count in front of them. Sixteen
+    /// bytes per distinct payload allocation, resident for exactly as long as
+    /// the entry is -- and absent from every figure this type published,
+    /// because [`Self::payload_bytes`] is the caller's bytes and nothing else.
+    ///
+    /// The size is not a guess. The allocation report measures a 1,024-byte
+    /// overwrite at 2,064 bytes: the caller's vector, and 1,040 for the handle
+    /// the tier keeps.
+    ///
+    /// **Not** folded into `payload_bytes`, deliberately. That term is the
+    /// denominator of the amplification ratio, and the denominator has to stay
+    /// the bytes the caller asked for; adding sixteen bytes to both halves of
+    /// a ratio makes it look better. This is bookkeeping, so it is counted as
+    /// bookkeeping -- in `total_bytes`, beside the keys and the tables.
+    pub payload_header_bytes: usize,
     /// Every resident copy of every key: the struct wherever it is stored
     /// inline, plus the strings it owns, plus a header for each key held
     /// behind a shared handle.
@@ -693,6 +712,13 @@ pub struct CacheFootprint {
     /// it.
     pub total_bytes: usize,
 }
+
+/// A strong count and a weak count, in front of every payload allocation.
+///
+/// The same shape as the two counts the key accounting already charges per
+/// `Arc<CacheKey>`: `Arc<[u8]>` puts them in front of the bytes, so a 64-byte
+/// value occupies 80.
+const PAYLOAD_HEADER_BYTES: usize = 2 * std::mem::size_of::<usize>();
 
 /// Which map holds a cache's table bytes.
 ///
@@ -951,6 +977,7 @@ impl CacheFootprint {
         // and the sum is a count of distinct keys.
         self.tracked_entries += other.tracked_entries;
         self.payload_bytes += other.payload_bytes;
+        self.payload_header_bytes += other.payload_header_bytes;
         self.key_bytes += other.key_bytes;
         self.metadata_bytes += other.metadata_bytes;
         self.order_bytes += other.order_bytes;
@@ -9597,9 +9624,13 @@ impl CacheInner {
         // between them was removed, hiding the change it exists to measure.
         let mut counted_payloads = std::collections::HashSet::new();
         let mut payload_bytes = 0usize;
+        let mut payload_header_bytes = 0usize;
         for value in self.resident_values().chain(self.pmem.values()) {
             if counted_payloads.insert(value.as_ptr()) {
                 payload_bytes = payload_bytes.saturating_add(value.len());
+                // Once per allocation, exactly as the bytes are: an entry in
+                // both resident tiers is one payload behind one header.
+                payload_header_bytes = payload_header_bytes.saturating_add(PAYLOAD_HEADER_BYTES);
             }
         }
 
@@ -9714,6 +9745,7 @@ impl CacheInner {
             memory_entries: self.memory.len(),
             tracked_entries,
             payload_bytes,
+            payload_header_bytes,
             key_bytes: shared_character_bytes
                 + shared_key_bytes
                 + memory_order_keys
@@ -9736,6 +9768,7 @@ impl CacheInner {
         // holds it. It was added here as well, which counted 32 bytes an entry
         // twice and inflated every per-entry figure this type has reported.
         footprint.total_bytes = footprint.payload_bytes
+            + footprint.payload_header_bytes
             + footprint.key_bytes
             + footprint.order_bytes
             + footprint.table_bytes
