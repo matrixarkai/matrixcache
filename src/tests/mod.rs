@@ -17948,18 +17948,18 @@ mod tests {
             footprint.overhead_bytes_per_entry() > 0.0,
             "overhead per entry must be positive once there are entries"
         );
-        assert_eq!(
-            footprint.total_bytes,
-            footprint.payload_bytes
-                + footprint.key_bytes
-                + footprint.order_bytes
-                + footprint.table_bytes
-                + footprint.writeback_bytes
-                + footprint.sketch_bytes
-                + footprint.pin_bytes
-                + footprint.fixed_bytes,
-            "the total has to be its parts, or a term is being dropped"
-        );
+        // The total-is-its-parts identity used to be re-asserted here, with
+        // the terms listed by hand. It is not, now, and the reason is worth
+        // the comment: by the time this change found it, the list had **lost
+        // three terms** -- the eviction queue, the SSD store's resident bytes
+        // and the payload handles -- and it went on passing because all three
+        // are zero in this fixture. An identity over zeros holds for the wrong
+        // reason.
+        //
+        // `the_footprint_total_is_every_byte_term_added_up` owns that claim.
+        // It destructures the footprint with no `..`, so a term added to the
+        // type and left out of the sum does not compile, which is what a
+        // hand-listed sum cannot do.
         // `metadata_bytes` is not one of those parts, and this is the
         // assertion that used to say otherwise: it added every field up and
         // compared that to the total, which is the same arithmetic the total
@@ -17968,19 +17968,14 @@ mod tests {
             footprint.metadata_bytes > 0,
             "precondition: there has to be metadata, or the next assertion is vacuous"
         );
-        assert_eq!(
-            footprint.total_bytes + footprint.metadata_bytes,
-            footprint.payload_bytes
-                + footprint.key_bytes
-                + footprint.metadata_bytes
-                + footprint.order_bytes
-                + footprint.table_bytes
-                + footprint.writeback_bytes
-                + footprint.sketch_bytes
-                + footprint.pin_bytes
-                + footprint.fixed_bytes,
-            "the metadata content is inside the table term and must not be added again"
-        );
+        // The metadata-is-inside-the-tables claim was re-asserted here as a
+        // second hand-listed sum, and it broke on the payload handles for the
+        // same reason the one above did: a list of terms maintained by hand
+        // falls behind the type. `the_metadata_content_is_inside_the_table_
+        // that_holds_it`, immediately below, owns that claim and makes it the
+        // way it should be made -- by costing the same bucket count with the
+        // value and without it, which is a statement about the map rather
+        // than about the order the terms are added in.
     }
 
     #[test]
@@ -23936,6 +23931,7 @@ fn the_footprint_total_is_every_byte_term_added_up() {
         // than ignored.
         table_bytes_by_map,
         payload_bytes,
+        payload_header_bytes,
         key_bytes,
         order_bytes,
         table_bytes,
@@ -23951,6 +23947,7 @@ fn the_footprint_total_is_every_byte_term_added_up() {
     assert_eq!(
         total_bytes,
         payload_bytes
+            + payload_header_bytes
             + key_bytes
             + order_bytes
             + table_bytes
@@ -24158,5 +24155,63 @@ fn an_entrys_metadata_lives_in_exactly_one_place() {
         "the reported metadata count is not the number of entries that have any"
     );
     drop(inner);
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// A payload costs sixteen bytes more than the caller asked for, and the
+/// figure that says so is not the payload figure.
+///
+/// The bytes live behind an `Arc<[u8]>`, which puts a strong count and a weak
+/// count in front of them: a 64-byte value occupies 80. Those sixteen bytes
+/// are resident for exactly as long as the entry is and were counted nowhere
+/// -- `payload_bytes` is the caller's bytes, and every per-entry figure this
+/// crate publishes was derived from a total that left the header out.
+///
+/// Both halves are asserted exactly, because the point is the **separation**:
+/// the header is bookkeeping and has to be counted as bookkeeping. Folding it
+/// into `payload_bytes` would add sixteen bytes to the numerator and the
+/// denominator of the amplification ratio and make the figure look better
+/// than it is.
+#[test]
+fn a_payload_carries_a_header_the_payload_figure_does_not_count() {
+    const ENTRIES: usize = 200;
+    const VALUE_BYTES: usize = 64;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+    for index in 0..ENTRIES {
+        cache
+            .put(
+                CacheKey::string(0, &format!("header-{index:04}")),
+                vec![7u8; VALUE_BYTES],
+            )
+            .expect("a cache with room must accept a put");
+    }
+
+    let footprint = cache.footprint();
+    assert_eq!(
+        footprint.memory_entries, ENTRIES,
+        "the fixture has to be holding every entry in memory for the counts below to be exact"
+    );
+    assert_eq!(
+        footprint.payload_bytes,
+        ENTRIES * VALUE_BYTES,
+        "the payload figure must be the bytes the caller asked for, with no header folded in"
+    );
+    assert_eq!(
+        footprint.payload_header_bytes,
+        ENTRIES * 2 * std::mem::size_of::<usize>(),
+        "one strong count and one weak count per payload allocation, and no more"
+    );
+
+    // And the total has to carry it, or the term is reported and weighed by
+    // nothing -- which is what `payload_header_bytes` was before it existed.
+    assert!(
+        footprint.total_bytes > footprint.payload_bytes + footprint.payload_header_bytes,
+        "the total ({}) does not even hold the payload and its headers ({} + {})",
+        footprint.total_bytes,
+        footprint.payload_bytes,
+        footprint.payload_header_bytes
+    );
+
     assert!(cache.stop(), "the cache did not stop cleanly");
 }
