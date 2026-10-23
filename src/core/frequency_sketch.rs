@@ -108,6 +108,16 @@ impl FrequencySketch {
         Self::with_capacity(0)
     }
 
+    /// What a sketch for this many entries would occupy, without building
+            /// one.
+    ///
+    /// So a caller deciding whether to re-size can tell first whether
+    /// re-sizing would change anything.
+    pub(crate) fn bytes_for(entries: usize) -> usize {
+        (entries.max(1) * COUNTERS_PER_ENTRY).next_power_of_two()
+            * std::mem::size_of::<AtomicU8>()
+    }
+
     pub fn with_capacity(entries: usize) -> Self {
         let width = (entries.max(1) * COUNTERS_PER_ENTRY).next_power_of_two();
         Self {

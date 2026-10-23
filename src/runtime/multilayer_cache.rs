@@ -1361,6 +1361,13 @@ struct CacheInner {
     /// Whether a candidate colder than the entry it would evict is declined.
     /// Off by default: it changes what the cache keeps.
     admission_filter_enabled: bool,
+    /// Whether the admission sketch has been sized from what the cache was
+    /// measured to hold, rather than from what an entry was expected to cost.
+    ///
+    /// One shot: the correction happens the first time the memory tier is
+    /// full, which is the first moment the entry count is a fact. See
+    /// `CacheInner::size_the_sketch_for_what_is_resident`.
+    sketch_sized_from_what_is_resident: bool,
     /// What a caller expects one entry to cost, in bytes, used to turn a byte
     /// capacity into the entry count the admission sketch is sized for.
     ///
@@ -2333,6 +2340,7 @@ impl MultiLayerCache {
                 // held and none of them read it.
                 access_frequency: FrequencySketch::unsized_until_enabled(),
                 admission_filter_enabled: false,
+                sketch_sized_from_what_is_resident: false,
                 expected_entry_bytes: DEFAULT_EXPECTED_ENTRY_BYTES,
                 read_counters: ReadPathCounters::default(),
                 stats: CacheStats::default(),
@@ -9702,6 +9710,7 @@ impl CacheInner {
         //   `next_reconfigure_millis`, `eviction_handler_enabled`,
         //   `ssd_instance_only`, `cold_eviction_share_pct`,
         //   `admission_filter_enabled`, `expected_entry_bytes`,
+        //   `sketch_sized_from_what_is_resident`,
         //   `memory_replacement_policy`,
         //   `pmem_replacement_policy`, `ssd_replacement_policy`,
         //   `block_options`, `tiering_policy`, `read_counters`, `stats`.
