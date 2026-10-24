@@ -2866,6 +2866,23 @@ impl CacheInner {
         pins.pin_operations = pins.pin_operations.saturating_add(1);
     }
 
+    /// Whether a resident tier is holding more than its capacity allows.
+    ///
+    /// Only a pin can leave a tier here. Every write path evicts to capacity
+    /// before it returns, an oversize value is refused rather than admitted,
+    /// and eviction **skips** a pinned entry rather than taking it -- so a
+    /// tier above its bound is a tier holding something it could not
+    /// displace. Shrinking the capacity under a pin is the way to get there:
+    /// the eviction that follows takes what it can and leaves the rest.
+    ///
+    /// Cheap on purpose. This is read on every release, under a lock the
+    /// release already holds, and it is three integer comparisons.
+    fn over_a_capacity(&self) -> bool {
+        self.memory_bytes > self.memory_capacity_bytes
+            || self.pmem_bytes > self.pmem_capacity_bytes
+            || self.ssd_bytes > self.ssd_capacity_bytes as u64
+    }
+
     fn decrement_pin(&self, key: &CacheKey) {
         self.decrement_pin_count(key, 1);
     }

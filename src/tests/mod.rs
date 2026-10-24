@@ -24456,3 +24456,178 @@ fn the_store_keys_its_blocks_by_a_boxed_str() {
 
     assert!(cache.stop(), "the cache did not stop cleanly");
 }
+
+/// A release brings a tier back under its capacity.
+///
+/// A tier can only be above its bound because something in it was pinned:
+/// every write path evicts to capacity before returning, an oversize value is
+/// refused, and eviction skips a pinned entry rather than taking it. Shrinking
+/// the capacity under a pin is how a caller gets there.
+///
+/// Measured before this held: a memory tier shrunk from 256 bytes to 64 while
+/// two entries were pinned held 128 bytes -- and still held 128 after **every**
+/// handle had been released, because nothing reclaimed on the way out. A cache
+/// never written to again stayed at twice its configured size for good.
+#[test]
+fn a_release_brings_a_tier_back_under_its_capacity() {
+    const VALUE_BYTES: usize = 64;
+    const PINNED: usize = 2;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(4 * VALUE_BYTES, 0, 0));
+    let keys: Vec<CacheKey> = (0..4)
+        .map(|index| CacheKey::string(0, &format!("release-bound-{index}")))
+        .collect();
+    for key in &keys {
+        cache
+            .put(key.clone(), vec![7u8; VALUE_BYTES])
+            .expect("a cache with room must accept a put");
+    }
+    let mut handles = Vec::new();
+    for key in keys.iter().take(PINNED) {
+        handles.push(
+            cache
+                .acquire(key)
+                .expect("acquire must not error")
+                .expect("the entry is resident, so it must pin"),
+        );
+    }
+
+    // Room for one, two of them pinned.
+    cache.set_capacity_for_tier(CacheTier::Memory, VALUE_BYTES);
+    let shrunk = cache.footprint();
+    assert_eq!(
+        shrunk.payload_bytes,
+        PINNED * VALUE_BYTES,
+        "precondition: the pinned entries have to be the only thing left, holding the tier \
+         above its bound"
+    );
+    assert!(
+        shrunk.payload_bytes > VALUE_BYTES,
+        "precondition: the tier has to be over its bound, or there is nothing to reclaim"
+    );
+
+    let evictions_before = cache.stats().memory_evictions;
+    cache.release(handles.remove(0));
+
+    let after = cache.footprint();
+    assert!(
+        after.payload_bytes <= VALUE_BYTES,
+        "the release left the tier holding {} bytes against a capacity of {VALUE_BYTES}",
+        after.payload_bytes
+    );
+    assert!(
+        cache.stats().memory_evictions > evictions_before,
+        "the tier came back under its bound without evicting anything, which cannot be"
+    );
+
+    for handle in handles {
+        cache.release(handle);
+    }
+    assert!(
+        cache.footprint().payload_bytes <= VALUE_BYTES,
+        "the tier went back over its bound once the rest of the handles went"
+    );
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// The same guarantee through the batch release, which counts its pins in one
+/// pass and so takes a different path to the same question.
+#[test]
+fn releasing_a_batch_brings_a_tier_back_under_its_capacity() {
+    const VALUE_BYTES: usize = 64;
+    const PINNED: usize = 3;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(4 * VALUE_BYTES, 0, 0));
+    let keys: Vec<CacheKey> = (0..4)
+        .map(|index| CacheKey::string(0, &format!("batch-bound-{index}")))
+        .collect();
+    for key in &keys {
+        cache
+            .put(key.clone(), vec![7u8; VALUE_BYTES])
+            .expect("a cache with room must accept a put");
+    }
+    let handles: Vec<CachePinnedHandle> = keys
+        .iter()
+        .take(PINNED)
+        .map(|key| {
+            cache
+                .acquire(key)
+                .expect("acquire must not error")
+                .expect("the entry is resident, so it must pin")
+        })
+        .collect();
+
+    cache.set_capacity_for_tier(CacheTier::Memory, VALUE_BYTES);
+    assert!(
+        cache.footprint().payload_bytes > VALUE_BYTES,
+        "precondition: the pins have to be holding the tier above its bound"
+    );
+
+    let released = cache.release_batch(handles);
+    assert_eq!(released, PINNED, "every handle has to be released");
+    assert!(
+        cache.footprint().payload_bytes <= VALUE_BYTES,
+        "the batch release left the tier holding {} bytes against a capacity of {VALUE_BYTES}",
+        cache.footprint().payload_bytes
+    );
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
+
+/// A pinned insert refuses rather than growing the tier past its bound.
+///
+/// This is a choice, and the other one is defensible: a cache can let a pinned
+/// insert through and carry the overshoot until the handles go, which makes
+/// `insert_pinned` an operation that cannot fail for want of room. This cache
+/// keeps the bound instead and hands back no handle, so a caller that pins a
+/// working set larger than the capacity finds out at the pin rather than
+/// through a tier quietly twice its configured size.
+///
+/// Pinned as a test because it is the kind of thing that gets changed by
+/// accident: the admission path returning `Ok(None)` rather than an error is
+/// easy to read as success.
+#[test]
+fn a_pinned_insert_refuses_rather_than_growing_past_the_bound() {
+    const VALUE_BYTES: usize = 64;
+
+    let cache = MultiLayerCache::with_options(CacheOptions::new(2 * VALUE_BYTES, 0, 0));
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let key = CacheKey::string(0, &format!("pinned-bound-{index}"));
+        cache
+            .put(key.clone(), vec![7u8; VALUE_BYTES])
+            .expect("a cache with room must accept a put");
+        handles.push(
+            cache
+                .acquire(&key)
+                .expect("acquire must not error")
+                .expect("the entry is resident, so it must pin"),
+        );
+    }
+    assert_eq!(
+        cache.footprint().payload_bytes,
+        2 * VALUE_BYTES,
+        "precondition: the tier has to be full and every entry pinned"
+    );
+
+    let refused = cache
+        .insert_pinned_sized(
+            CacheKey::string(0, "pinned-bound-newcomer"),
+            vec![9u8; VALUE_BYTES],
+            VALUE_BYTES,
+        )
+        .expect("a refusal is not an error");
+    assert!(
+        refused.is_none(),
+        "a pinned insert into a full tier of pinned entries has to hand back no handle"
+    );
+    assert_eq!(
+        cache.footprint().payload_bytes,
+        2 * VALUE_BYTES,
+        "the refused insert must not have grown the tier"
+    );
+
+    for handle in handles {
+        cache.release(handle);
+    }
+    assert!(cache.stop(), "the cache did not stop cleanly");
+}
