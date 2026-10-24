@@ -4820,6 +4820,31 @@ impl MultiLayerCache {
         self.unpin(&handle.key);
     }
 
+    /// Bring the tiers back under their capacities, after a release that may
+    /// have freed what was holding one above its bound.
+    ///
+    /// A tier can only be over its capacity because something in it was
+    /// pinned: eviction skips a pinned entry rather than taking it. So the
+    /// handle that has just gone may be the one that was in the way, and this
+    /// is the moment the bound can be restored -- otherwise the tier stays
+    /// over it until the next write, and a cache that is never written to
+    /// again stays over it for good. Measured before this existed: a tier
+    /// shrunk from 256 bytes to 64 under two pins held 128 bytes, and still
+    /// held 128 after **every** handle was released.
+    ///
+    /// Which entry goes is the replacement policy's business, not this
+    /// function's. The guarantee is the bound.
+    fn reclaim_after_release(&self) {
+        {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            inner.evict_memory_to_capacity();
+            inner.evict_pmem_to_capacity();
+            inner.evict_ssd_to_capacity();
+        }
+        // An eviction here reaches a handler exactly as one from a write does.
+        self.drain_eviction_records();
+    }
+
     pub fn release_batch(&self, handles: Vec<CachePinnedHandle>) -> usize {
         self.release_batch_iter(handles)
     }
@@ -4832,8 +4857,14 @@ impl MultiLayerCache {
         if released == 0 {
             return 0;
         }
-        let inner = self.inner.read().expect("cache lock poisoned");
-        inner.decrement_pin_counts(&counts);
+        let over = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.decrement_pin_counts(&counts);
+            inner.over_a_capacity()
+        };
+        if over {
+            self.reclaim_after_release();
+        }
         released
     }
 
@@ -5835,8 +5866,14 @@ impl MultiLayerCache {
     /// which has its own lock, so one reader releasing a handle no longer
     /// stops every other reader from taking one.
     pub fn unpin(&self, key: &CacheKey) {
-        let inner = self.inner.read().expect("cache lock poisoned");
-        inner.decrement_pin(key);
+        let over = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            inner.decrement_pin(key);
+            inner.over_a_capacity()
+        };
+        if over {
+            self.reclaim_after_release();
+        }
     }
 
     pub fn invalidate(&self, key: &CacheKey) -> Result<(), CacheError> {
