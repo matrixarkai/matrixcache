@@ -280,6 +280,40 @@ fn main() {
     // assumed from the fixture. Checked below.
     let promote_disk_hits = promoting.stats().disk_hits;
 
+    // The same read asked for eight keys at once. The batch path reads the
+    // blocks together, decodes each one once, and hands the bytes to every
+    // position that asked for that key -- so what it must not do is a copy per
+    // position on top of the one each position gets.
+    //
+    // The groups are built outside the measured closure, as the resident batch
+    // row builds its key list outside: a batch row that formats eight keys a
+    // call measures `format!`.
+    let promote_groups: Vec<Vec<CacheKey>> = (0..PROMOTE_KEYS / BATCH)
+        .map(|group| {
+            ((group * BATCH)..(group * BATCH + BATCH))
+                .map(key)
+                .collect()
+        })
+        .collect();
+    let mut promote_group_cursor = 0usize;
+    let batch_promotion_hits_before = promoting.stats().disk_hits;
+    rows.push(measure(
+        "get_batch, promoting from a lower tier",
+        BATCH,
+        || {
+            promote_group_cursor += 1;
+            let group = &promote_groups[promote_group_cursor % promote_groups.len()];
+            let found = promoting
+                .get_batch(group)
+                .expect("a batch read of keys the fixture wrote must succeed");
+            assert!(
+                found.iter().all(|slot| slot.is_some()),
+                "the fixture has to still hold every key of the group"
+            );
+        },
+    ));
+    let batch_promotion_hits = promoting.stats().disk_hits - batch_promotion_hits_before;
+
     let mut reaching_ssd = 2_000_000usize;
     rows.push(measure("put, reaching the SSD tier", 1, || {
         reaching_ssd += 1;
@@ -385,6 +419,7 @@ fn main() {
     //   pinned batch of 8        15 -> 7 allocations
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
+    //   a promoting read         13.00 -> 12.00 allocations, 25,334.0 -> 24,310.0 bytes
     //
     // Raising one is a deliberate act, and the number that replaced it goes
     // in the table beside it.
@@ -397,7 +432,7 @@ fn main() {
         ("acquire_batch, 2 duplicated", 9.5, 4_300.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
-        ("get, promoting from a lower tier", 15.0, 27_500.0),
+        ("get, promoting from a lower tier", 13.0, 25_500.0),
     ] {
         match find(path) {
             Some(row) if row.allocations <= max_allocations && row.bytes <= max_bytes => {}
@@ -424,18 +459,39 @@ fn main() {
     //   RocksDB before         16.11    58,193.6
     //    RocksDB after         12.11    55,951.6
     //
+    // And again when framing a block stopped copying the payload into a buffer
+    // of its own first:
+    //
+    //         backend   allocations       bytes
+    //       Rust after         27.11    58,223.8
+    //    RocksDB after         11.11    54,914.2
+    //
     // Per arm, because the two are not comparable: this allocator sees Rust
     // only, and with RocksDB the store's own bytes are allocated elsewhere.
     // Three runs of the same binary moved the figures by 0.01 allocations and
     // 8 bytes, so the margin here is wide rather than lucky.
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_ALLOCATIONS: f64 = 30.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 65.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 80.0;
+    match find("get_batch, promoting from a lower tier") {
+        Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 190_000.0 => {}
+        Some(row) => failures.push(format!(
+            "a batch of {BATCH} promoting reads allocates {:.2} times and {:.1} bytes, against \
+             {BATCH_PROMOTION_ALLOCATIONS:.0} and 190,000",
+            row.allocations, row.bytes
+        )),
+        None => failures.push("the promoting batch read is missing from the table".to_string()),
+    }
+
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_BYTES: f64 = 60_500.0;
+    const SSD_WRITE_ALLOCATIONS: f64 = 28.5;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const SSD_WRITE_BYTES: f64 = 59_000.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_ALLOCATIONS: f64 = 14.0;
+    const SSD_WRITE_ALLOCATIONS: f64 = 12.5;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_BYTES: f64 = 57_000.0;
+    const SSD_WRITE_BYTES: f64 = 55_700.0;
     match find("put, reaching the SSD tier") {
         Some(row) if row.allocations <= SSD_WRITE_ALLOCATIONS && row.bytes <= SSD_WRITE_BYTES => {}
         Some(row) => failures.push(format!(
@@ -475,9 +531,19 @@ fn main() {
     // a larger memory capacity, a placement change -- and the row would go on
     // reporting the cost of a memory hit under the promotion label.
     let promote_reads = REPEATS as u64 + 1;
-    if promote_disk_hits + 16 < promote_reads {
+    if promote_disk_hits * 10 < promote_reads * 9 {
         failures.push(format!(
-            "the promoting row made {promote_reads} reads and only {promote_disk_hits} of them              reached a lower tier, so it is not measuring a promotion"
+            "the promoting row made {promote_reads} reads and only {promote_disk_hits} of them reached a lower tier, so it is not measuring a promotion"
+        ));
+    }
+
+    // The same check for the batch row, over its own reads: eight keys asked
+    // for on each of two hundred and one calls, all but a handful of which
+    // have to come off the SSD tier.
+    let batch_promotion_reads = (REPEATS as u64 + 1) * BATCH as u64;
+    if batch_promotion_hits * 10 < batch_promotion_reads * 9 {
+        failures.push(format!(
+            "the promoting batch row asked for {batch_promotion_reads} keys and only {batch_promotion_hits} came off a lower tier"
         ));
     }
 

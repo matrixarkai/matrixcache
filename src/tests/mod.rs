@@ -24749,3 +24749,192 @@ fn a_restart_into_less_room_stays_inside_the_new_bound() {
     );
     assert!(restarted.stop(), "the cache did not stop cleanly");
 }
+
+/// The shared block decode agrees with the owning one, block for block.
+///
+/// `decode_cache_block_shared` skips the `Vec` for an uncompressed block by
+/// reading the header itself, which means the header checks exist twice. Two
+/// copies of a validation drift: one gains a case, or loses one, and the
+/// cache either rejects a block it used to serve or serves one it used to
+/// reject -- quietly, on whichever of the two paths was not updated.
+///
+/// So this asserts the only thing that matters about the duplicate: for every
+/// block either shape of it can be handed, the two answer the same. Accepted
+/// with the same bytes, or rejected -- and a rejection is checked by its
+/// message, because `CorruptBlock` carries the reason and a decode that
+/// rejects for the wrong reason has still diverged.
+#[test]
+fn the_shared_block_decode_answers_exactly_what_the_owning_one_does() {
+    let raw_options = CacheBlockOptions {
+        compression: CacheCompression::None,
+        min_compress_bytes: 128,
+    };
+    let zstd_options = CacheBlockOptions {
+        compression: CacheCompression::Zstd { level: 1 },
+        min_compress_bytes: 128,
+    };
+
+    let compressible = vec![7u8; 4096];
+    let mut fill = 0x2545_f491_4f6c_dd1du64;
+    let incompressible: Vec<u8> = (0..4096)
+        .map(|_| {
+            fill ^= fill << 13;
+            fill ^= fill >> 7;
+            fill ^= fill << 17;
+            (fill & 0xff) as u8
+        })
+        .collect();
+
+    let compressed_block =
+        encode_cache_block(&compressible, zstd_options).expect("a compressible value must encode");
+    assert!(
+        is_encoded_compressed_block(&compressed_block),
+        "the fixture has to produce a compressed block for the compressed case to be covered"
+    );
+    let raw_block =
+        encode_cache_block(&incompressible, zstd_options).expect("a value must encode");
+    assert!(
+        !is_encoded_compressed_block(&raw_block),
+        "an incompressible value has to come back raw, or the raw case is not covered"
+    );
+    let empty_block = encode_cache_block(&[], raw_options).expect("an empty value must encode");
+    let short_value_block =
+        encode_cache_block(&[1, 2, 3], raw_options).expect("a short value must encode");
+
+    let mut truncated_payload = raw_block.clone();
+    truncated_payload.truncate(truncated_payload.len() - 1);
+    let mut bad_version = raw_block.clone();
+    bad_version[8] = CACHE_BLOCK_VERSION.wrapping_add(1);
+    let mut unsupported_codec = raw_block.clone();
+    unsupported_codec[9] = 99;
+    let mut lying_original_len = raw_block.clone();
+    lying_original_len[10..18].copy_from_slice(&7u64.to_le_bytes());
+    let mut lying_payload_len = raw_block.clone();
+    lying_payload_len[18..26].copy_from_slice(&7u64.to_le_bytes());
+
+    let blocks: Vec<(&str, Vec<u8>)> = vec![
+        ("a raw block", raw_block.clone()),
+        ("a compressed block", compressed_block),
+        ("an empty value", empty_block),
+        ("a value shorter than the header", short_value_block),
+        ("bytes with no magic at all", b"not a cache block".to_vec()),
+        ("no bytes at all", Vec::new()),
+        ("a header cut short", raw_block[..12].to_vec()),
+        ("a payload cut short", truncated_payload),
+        ("an unknown version", bad_version),
+        ("an unknown codec", unsupported_codec),
+        ("a lying original length", lying_original_len),
+        ("a lying payload length", lying_payload_len),
+    ];
+
+    for (what, block) in blocks {
+        let owning = decode_cache_block(&block);
+        let shared = decode_cache_block_shared(&block);
+        match (owning, shared) {
+            (Ok(owning), Ok(shared)) => assert_eq!(
+                owning.as_slice(),
+                shared.as_ref(),
+                "{what}: the two decodes accepted it with different bytes"
+            ),
+            (Err(owning), Err(shared)) => assert_eq!(
+                owning.to_string(),
+                shared.to_string(),
+                "{what}: the two decodes rejected it for different reasons"
+            ),
+            (Ok(owning), Err(shared)) => panic!(
+                "{what}: the owning decode accepted {} bytes and the shared one rejected it:                  {shared}",
+                owning.len()
+            ),
+            (Err(owning), Ok(shared)) => panic!(
+                "{what}: the shared decode accepted {} bytes and the owning one rejected it:                  {owning}",
+                shared.len()
+            ),
+        }
+    }
+}
+
+/// A raw block is framed with one copy of the payload, not two.
+///
+/// Every arm of `encode_cache_block` used to own its payload before the block
+/// was built, so a raw block cost two payload-sized allocations and two
+/// copies. The copy is not observable from outside, but the block is: this
+/// asserts the framing is byte for byte what it was, which is what makes the
+/// copy removable at all. A block on a device outlives the process that wrote
+/// it, so this is a durable format.
+#[test]
+fn a_raw_block_is_framed_exactly_as_it_always_was() {
+    let options = CacheBlockOptions {
+        compression: CacheCompression::None,
+        min_compress_bytes: 128,
+    };
+    let value: Vec<u8> = (0..300u32).map(|byte| (byte & 0xff) as u8).collect();
+    let block = encode_cache_block(&value, options).expect("a value must encode");
+
+    assert_eq!(&block[..8], CACHE_BLOCK_MAGIC, "the magic moved");
+    assert_eq!(block[8], CACHE_BLOCK_VERSION, "the version moved");
+    assert_eq!(block[9], CACHE_CODEC_RAW, "the codec byte moved");
+    assert_eq!(
+        u64::from_le_bytes(block[10..18].try_into().unwrap()),
+        value.len() as u64,
+        "the original length moved"
+    );
+    assert_eq!(
+        u64::from_le_bytes(block[18..26].try_into().unwrap()),
+        value.len() as u64,
+        "the payload length moved"
+    );
+    assert_eq!(&block[26..], value.as_slice(), "the payload moved");
+    assert_eq!(
+        block.len(),
+        CACHE_HEADER_LEN + value.len(),
+        "the block grew"
+    );
+    assert_eq!(
+        decode_cache_block(&block).expect("the block must decode"),
+        value,
+        "the block does not decode to what was written"
+    );
+
+    // And a compressed block, where the two lengths are **different**.
+    //
+    // Planted the two length fields written the other way round: every
+    // assertion above still passed, because a raw block stores the value as
+    // it is and its two lengths are equal by construction. A reader handed a
+    // compressed block with those fields swapped would size the decompression
+    // by the compressed length and reject the block. So the field that tells
+    // the two apart has to be checked on a block where they differ.
+    let compressible = vec![7u8; 4096];
+    let compressed = encode_cache_block(
+        &compressible,
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 128,
+        },
+    )
+    .expect("a compressible value must encode");
+    assert!(
+        is_encoded_compressed_block(&compressed),
+        "the fixture has to produce a compressed block for the two lengths to differ"
+    );
+    let original_len = u64::from_le_bytes(compressed[10..18].try_into().unwrap()) as usize;
+    let payload_len = u64::from_le_bytes(compressed[18..26].try_into().unwrap()) as usize;
+    assert_eq!(
+        original_len,
+        compressible.len(),
+        "the first length is the value's, before compression"
+    );
+    assert_eq!(
+        payload_len,
+        compressed.len() - CACHE_HEADER_LEN,
+        "the second length is the stored payload's"
+    );
+    assert!(
+        payload_len < original_len,
+        "a compressed block that did not get smaller is not a compressed block"
+    );
+    assert_eq!(
+        decode_cache_block(&compressed).expect("the block must decode"),
+        compressible,
+        "the compressed block does not decode to what was written"
+    );
+}
