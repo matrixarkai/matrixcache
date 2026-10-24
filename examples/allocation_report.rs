@@ -288,6 +288,82 @@ fn main() {
     // The groups are built outside the measured closure, as the resident batch
     // row builds its key list outside: a batch row that formats eight keys a
     // call measures `format!`.
+    // The same two paths with a value that compresses, which is what puts the
+    // codec on them: every row above stores its value raw, so the compressor
+    // runs and its output is discarded, and the decompressor never runs at
+    // all.
+    //
+    // A constant fill is maximally compressible -- the block comes out at
+    // forty-four bytes. That is deliberate here, and it is why these rows say
+    // nothing about tier bytes: they are about what the codec costs per call.
+    let compressible = vec![7u8; VALUE_BYTES];
+    let compressing_dir = std::env::temp_dir().join("matrixcache-allocation-report-compressing");
+    let _ = std::fs::remove_dir_all(&compressing_dir);
+    let compressing = MultiLayerCache::with_tiering_policy(
+        compressing_dir,
+        CacheTieringPolicy {
+            memory_capacity_bytes: 64 * VALUE_BYTES,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    let mut compressing_cursor = 3_000_000usize;
+    rows.push(measure("put, compressing a block", 1, || {
+        compressing_cursor += 1;
+        let _ = compressing.put(key(compressing_cursor), compressible.clone());
+    }));
+
+    let decompressing_dir =
+        std::env::temp_dir().join("matrixcache-allocation-report-decompressing");
+    let _ = std::fs::remove_dir_all(&decompressing_dir);
+    let decompressing = MultiLayerCache::with_tiering_policy(
+        decompressing_dir,
+        CacheTieringPolicy {
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    for index in 0..PROMOTE_KEYS {
+        decompressing
+            .put(key(index), compressible.clone())
+            .expect("a cache with room must accept a put");
+    }
+    let mut decompressing_cursor = 0usize;
+    let decompressing_hits_before = decompressing.stats().disk_hits;
+    rows.push(measure("get, promoting a compressed block", 1, || {
+        decompressing_cursor += 1;
+        let found = decompressing
+            .get(&key(decompressing_cursor % PROMOTE_KEYS))
+            .expect("a read of a key the fixture wrote must succeed");
+        assert!(
+            found.is_some(),
+            "the fixture has to still hold the key for this row to be measuring a promotion"
+        );
+    }));
+    let decompressing_hits = decompressing.stats().disk_hits - decompressing_hits_before;
+    let compressed_hits = decompressing.stats().compressed_hits;
+
     let promote_groups: Vec<Vec<CacheKey>> = (0..PROMOTE_KEYS / BATCH)
         .map(|group| {
             ((group * BATCH)..(group * BATCH + BATCH))
@@ -470,6 +546,51 @@ fn main() {
     // only, and with RocksDB the store's own bytes are allocated elsewhere.
     // Three runs of the same binary moved the figures by 0.01 allocations and
     // 8 bytes, so the margin here is wide rather than lucky.
+    // A read of a **compressed** block allocates 153,389 bytes for a value of
+    // 1,024 -- six times what the same read costs when the block is stored
+    // raw (24,310), and the figure is identical on both feature arms, so none
+    // of it is the store. It is the decompressor: `zstd::stream::decode_all`
+    // builds a context and its window on every call.
+    //
+    // A write that keeps its compressed form costs 49,498 bytes on the
+    // pure-Rust store and 48,342 through the other. A write whose value does
+    // NOT compress pays nearly the same -- the compressor still runs, and its
+    // output is discarded -- which is why the raw write row above is only
+    // ~9,000 bytes cheaper than this one.
+    //
+    // These bounds are where the codec is today. They are not an endorsement:
+    // a reused context would move both, and the bounds come down with it.
+    match find("get, promoting a compressed block") {
+        Some(row) if row.allocations <= 15.0 && row.bytes <= 156_000.0 => {}
+        Some(row) => failures.push(format!(
+            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 15 \
+             and 156,000",
+            row.allocations, row.bytes
+        )),
+        None => failures.push("the compressed read is missing from the table".to_string()),
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 27.5;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    const COMPRESSING_WRITE_BYTES: f64 = 51_000.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 12.0;
+    #[cfg(feature = "rocksdb-ssd")]
+    const COMPRESSING_WRITE_BYTES: f64 = 50_000.0;
+    match find("put, compressing a block") {
+        Some(row)
+            if row.allocations <= COMPRESSING_WRITE_ALLOCATIONS
+                && row.bytes <= COMPRESSING_WRITE_BYTES => {}
+        Some(row) => failures.push(format!(
+            "a write that compresses its block allocates {:.2} times and {:.1} bytes, against \
+             {COMPRESSING_WRITE_ALLOCATIONS:.1} and {COMPRESSING_WRITE_BYTES:.0}",
+            row.allocations, row.bytes
+        )),
+        None => failures
+            .push("the write that compresses its block is missing from the table".to_string()),
+    }
+
     #[cfg(not(feature = "rocksdb-ssd"))]
     const BATCH_PROMOTION_ALLOCATIONS: f64 = 65.0;
     #[cfg(feature = "rocksdb-ssd")]
@@ -534,6 +655,23 @@ fn main() {
     if promote_disk_hits * 10 < promote_reads * 9 {
         failures.push(format!(
             "the promoting row made {promote_reads} reads and only {promote_disk_hits} of them reached a lower tier, so it is not measuring a promotion"
+        ));
+    }
+
+    // The compressed read is only about the codec if the blocks it read were
+    // compressed. `compressed_hits` counts reads served from a block with the
+    // compressed codec byte set, so this says the decompressor ran -- and if
+    // the fixture's value ever stopped compressing, the row would quietly
+    // become a second copy of the raw one.
+    if decompressing_hits * 10 < (REPEATS as u64 + 1) * 9 {
+        failures.push(format!(
+            "the compressed read row made {} reads and only {decompressing_hits} reached a lower tier",
+            REPEATS + 1
+        ));
+    }
+    if compressed_hits * 10 < decompressing_hits * 9 {
+        failures.push(format!(
+            "the compressed read row had {decompressing_hits} lower-tier hits and only {compressed_hits} of them were compressed blocks, so it is not measuring a decompression"
         ));
     }
 
