@@ -1996,20 +1996,42 @@ mod tests {
         });
         cache.start().unwrap();
 
-        for index in 0..64 {
+        // The life has to outlast the writing. At forty milliseconds it did
+        // not on a loaded machine: the loop itself took longer than that, the
+        // first keys lapsed and were reclaimed while the rest were still
+        // being written, and `peak` was recorded at a fraction of what the
+        // round actually held -- 832 bytes of 4,096. The second round then
+        // read as growth and the test failed for a reason that had nothing to
+        // do with what it is about.
+        const LAPSING: usize = 64;
+        const LIFE: Duration = Duration::from_millis(500);
+        for index in 0..LAPSING {
             cache
                 .put_with_ttl(
                     CacheKey::string(0, &format!("lapses-{index:03}")),
                     vec![b'x'; 64],
-                    Duration::from_millis(40),
+                    LIFE,
                 )
                 .unwrap();
         }
         let peak = cache.stats().memory_bytes;
         assert!(peak > 0);
         assert_eq!(cache.stats().memory_evictions, 0, "the cache was under pressure");
+        // And the precondition, asserted rather than assumed: `peak` has to be
+        // the whole first round. If the machine is slow enough that entries
+        // lapse while the round is still being written, this says so instead
+        // of leaving a low `peak` to fail the comparison at the end.
+        let settled = cache.stats();
+        assert_eq!(
+            settled.expired_removals, 0,
+            "entries lapsed while the first round was still being written, so the peak is not a peak"
+        );
+        assert_eq!(
+            peak as u64, (LAPSING * 64) as u64,
+            "the first round is not all resident, so the peak is not a peak"
+        );
 
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(LIFE + Duration::from_millis(100));
 
         // Keep writing. Nothing reads the lapsed keys and nothing evicts, so
         // only the incremental sweep can reclaim them.
