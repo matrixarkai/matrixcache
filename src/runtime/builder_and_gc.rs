@@ -906,6 +906,18 @@ impl CacheInner {
     fn recover_persistent_tiers_locked(&mut self) -> Result<CacheRecoverReport, CacheError> {
         let pmem = self.recover_pmem_index_locked()?;
         let ssd = self.recover_disk_index_locked()?;
+        // A restart into less room than the data on the device is an ordinary
+        // event: the device shrank, or the configuration did. Recovery indexes
+        // what is there, and the bound has to hold once it has -- so the tiers
+        // come down to their capacities here rather than at the next write,
+        // which on a cache nobody writes to again never comes.
+        //
+        // Measured before this: 256 incompressible kibibyte blocks written
+        // with a mebibyte of room, re-opened with 64 kibibytes, recovered all
+        // 256 and held 268,800 bytes -- four times the configured capacity,
+        // reported as resident, and nothing on the way to removing it.
+        self.evict_pmem_to_capacity();
+        self.evict_ssd_to_capacity();
         Ok(CacheRecoverReport {
             scanned_files: pmem.scanned_files.saturating_add(ssd.scanned_files),
             recovered_files: pmem.recovered_files.saturating_add(ssd.recovered_files),
