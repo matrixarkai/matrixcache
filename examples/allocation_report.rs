@@ -228,6 +228,58 @@ fn main() {
             (fill & 0xff) as u8
         })
         .collect();
+    // A read that misses memory and finds the entry on the SSD tier.
+    //
+    // Every read row above this one is a memory hit. A lower-tier hit also
+    // promotes the entry back into memory before it returns, which is an
+    // admission -- and an admission into a full tier evicts. That work is on
+    // the reader, and this row is what it costs.
+    let promote_dir = std::env::temp_dir().join("matrixcache-allocation-report-promote");
+    let _ = std::fs::remove_dir_all(&promote_dir);
+    let promoting = MultiLayerCache::with_tiering_policy(
+        promote_dir.clone(),
+        CacheTieringPolicy {
+            // Room for sixteen in memory, so a read of anything else has to
+            // promote into a full tier.
+            memory_capacity_bytes: 16 * VALUE_BYTES,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 1 << 28,
+            data_placement: CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 0,
+            pmem_admit_hotness_threshold: 0,
+            ssd_admit_hotness_threshold: 0,
+            max_memory_block_bytes: 1 << 20,
+            max_pmem_block_bytes: 1 << 20,
+            max_ssd_block_bytes: 1 << 20,
+            ssd_write_through: true,
+        },
+        CacheBlockOptions::default(),
+    );
+    const PROMOTE_KEYS: usize = 512;
+    for index in 0..PROMOTE_KEYS {
+        promoting
+            .put(key(index), incompressible.clone())
+            .expect("a cache with room must accept a put");
+    }
+    // Keys drawn from the demoted range, so each read is a lower-tier hit that
+    // promotes. Round-robin rather than one key, or the second read is a
+    // memory hit.
+    let mut promote_cursor = 0usize;
+    rows.push(measure("get, promoting from a lower tier", 1, || {
+        promote_cursor += 1;
+        let found = promoting
+            .get(&key(promote_cursor % PROMOTE_KEYS))
+            .expect("a read of a key the fixture wrote must succeed");
+        assert!(
+            found.is_some(),
+            "the fixture has to still hold the key for this row to be measuring a promotion"
+        );
+    }));
+    // What the reads above actually did, asked of the cache rather than
+    // assumed from the fixture. Checked below.
+    let promote_disk_hits = promoting.stats().disk_hits;
+
     let mut reaching_ssd = 2_000_000usize;
     rows.push(measure("put, reaching the SSD tier", 1, || {
         reaching_ssd += 1;
@@ -345,6 +397,7 @@ fn main() {
         ("acquire_batch, 2 duplicated", 9.5, 4_300.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
+        ("get, promoting from a lower tier", 15.0, 27_500.0),
     ] {
         match find(path) {
             Some(row) if row.allocations <= max_allocations && row.bytes <= max_bytes => {}
@@ -413,6 +466,19 @@ fn main() {
                 pinned.keys_asked, bookkeeping
             ));
         }
+    }
+
+    // The promoting row is a row about a lower-tier hit only if the reads went
+    // to a lower tier. Memory holds sixteen of the five hundred and twelve
+    // keys and the reads walk the whole range, so all but a handful have to
+    // come off the SSD tier. Without this the fixture could stop demoting --
+    // a larger memory capacity, a placement change -- and the row would go on
+    // reporting the cost of a memory hit under the promotion label.
+    let promote_reads = REPEATS as u64 + 1;
+    if promote_disk_hits + 16 < promote_reads {
+        failures.push(format!(
+            "the promoting row made {promote_reads} reads and only {promote_disk_hits} of them              reached a lower tier, so it is not measuring a promotion"
+        ));
     }
 
     // The zero-copy write exists so that a caller holding an `Arc` can hand
