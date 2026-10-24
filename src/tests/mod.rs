@@ -24631,3 +24631,121 @@ fn a_pinned_insert_refuses_rather_than_growing_past_the_bound() {
     }
     assert!(cache.stop(), "the cache did not stop cleanly");
 }
+
+/// A restart into less room than the data on the device stays inside the new
+/// bound.
+///
+/// Re-opening a cache with a smaller capacity than the one that wrote the data
+/// is an ordinary event: the device shrank, or the configuration did. Recovery
+/// indexes what is on the device, and until this held it stopped there --
+/// measured, 256 incompressible kibibyte blocks written with a mebibyte of
+/// room came back under a 64-kibibyte capacity as all 256 blocks and 268,800
+/// bytes, four times the bound, with nothing on the way to removing them. The
+/// next write would have started evicting; a cache nobody writes to again
+/// would have stayed there.
+///
+/// The surviving index is checked as well as the figure. An eviction that
+/// drops a block but keeps its index entry leaves a key the cache claims to
+/// hold and cannot serve, which is the failure this would most likely cause.
+#[test]
+fn a_restart_into_less_room_stays_inside_the_new_bound() {
+    const BLOCKS: usize = 256;
+    const VALUE_BYTES: usize = 1024;
+    const ROOMY: usize = 1 << 20;
+    const CRAMPED: usize = 1 << 16;
+
+    // Incompressible, or the blocks shrink to forty-four bytes each, the
+    // smaller capacity is never reached, and this measures nothing. The same
+    // trap has cost this work two measurements already.
+    let mut fill = 0x2545_f491_4f6c_dd1du64;
+    let value: Vec<u8> = (0..VALUE_BYTES)
+        .map(|_| {
+            fill ^= fill << 13;
+            fill ^= fill >> 7;
+            fill ^= fill << 17;
+            (fill & 0xff) as u8
+        })
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let roomy = CacheOptions {
+        dram_capacity: 1 << 13,
+        ssd_capacity: ROOMY,
+        ssd_paths: vec![dir.path().to_path_buf()],
+        ..CacheOptions::default()
+    };
+    let cache = MultiLayerCache::with_options(roomy);
+    cache.start().unwrap();
+    for index in 0..BLOCKS {
+        let _ = cache.put(
+            CacheKey::string(0, &format!("restart-into-less-{index:04}")),
+            value.clone(),
+        );
+    }
+    let written = {
+        let inner = cache.inner.read().expect("cache lock poisoned");
+        assert!(
+            inner.ssd_bytes > CRAMPED as u64,
+            "precondition: the device has to hold more than the smaller capacity will allow, \
+             and it holds {}",
+            inner.ssd_bytes
+        );
+        inner.disk_index.len()
+    };
+    cache.stop();
+
+    let cramped = CacheOptions {
+        dram_capacity: 1 << 13,
+        ssd_capacity: CRAMPED,
+        ssd_paths: vec![dir.path().to_path_buf()],
+        ..CacheOptions::default()
+    };
+    let restarted = MultiLayerCache::with_options(cramped);
+    restarted.start().unwrap();
+    let report = restarted
+        .recover_persistent_tiers()
+        .expect("recovery must succeed");
+    assert!(
+        report.recovered_files > 0,
+        "precondition: recovery has to have found the blocks to be holding too many of them"
+    );
+
+    let surviving: Vec<CacheKey> = {
+        let inner = restarted.inner.read().expect("cache lock poisoned");
+        assert!(
+            inner.ssd_bytes <= CRAMPED as u64,
+            "recovery left the tier holding {} bytes against a capacity of {CRAMPED}",
+            inner.ssd_bytes
+        );
+        assert!(
+            inner.disk_index.len() < written,
+            "recovery kept every one of the {written} blocks, so nothing came down to the bound"
+        );
+        assert!(
+            !inner.disk_index.is_empty(),
+            "recovery dropped everything, which is not a bound but an erasure"
+        );
+        inner
+            .disk_index
+            .keys()
+            .map(|held| CacheKey::clone(held))
+            .collect()
+    };
+
+    // Every key the index still claims has to be servable.
+    let mut missing = Vec::new();
+    for key in &surviving {
+        match restarted.get(key) {
+            Ok(Some(_)) => {}
+            _ => missing.push(key.record_key.to_string()),
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {} surviving entries are indexed and cannot be served: {:?}",
+        missing.len(),
+        surviving.len(),
+        &missing[..missing.len().min(4)]
+    );
+    assert!(restarted.stop(), "the cache did not stop cleanly");
+}
