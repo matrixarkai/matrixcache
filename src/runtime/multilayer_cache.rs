@@ -3417,7 +3417,7 @@ impl MultiLayerCache {
                 // four payload-sized allocations, and a caller holding a
                 // different copy from the one the cache kept. The whole point
                 // of a shared read is that there is one.
-                let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
+                let value = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 inner
@@ -3626,7 +3626,7 @@ impl MultiLayerCache {
             for ((unique_position, started), block) in ssd_candidates.into_iter().zip(blocks) {
                 let decoded_block = match block {
                     Some(block) => Some((
-                        Arc::<[u8]>::from(decode_cache_block(&block)?),
+                        decode_cache_block_shared(&block)?,
                         is_encoded_compressed_block(&block),
                     )),
                     None => None,
@@ -4112,22 +4112,26 @@ impl MultiLayerCache {
         }
 
         let refill_started = Instant::now();
-        let block = {
+        // The flag is read here rather than after the decode because it
+        // decides which decode is the cheap one, and this lock is already
+        // being taken.
+        let (block, refill_wanted) = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_block(key)?
+            (inner.read_ssd_block(key)?, !inner.ssd_instance_only)
         };
         match block {
             Some(block) => {
-                let decoded = decode_cache_block(&block)?;
+                let decoded = CacheDecodedBlock::decode(&block, refill_wanted)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 if is_encoded_compressed_block(&block) {
                     inner.stats.compressed_hits += 1;
                 }
                 inner.record_hit(key, decoded.len());
-                if !inner.ssd_instance_only && !inner.refill_from_ssd(key, decoded.clone())
-                {
-                    inner.stats.refill_failures += 1;
+                if let Some(refill) = decoded.to_refill() {
+                    if !inner.refill_from_ssd_shared(key, refill) {
+                        inner.stats.refill_failures += 1;
+                    }
                 }
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
@@ -4135,7 +4139,7 @@ impl MultiLayerCache {
                 drop(inner);
                 self.drain_eviction_records();
                 Ok(Some(CacheReadResult {
-                    value: decoded,
+                    value: decoded.into_vec(),
                     tier: CacheReadTier::Ssd,
                 }))
             }
@@ -4332,15 +4336,21 @@ impl MultiLayerCache {
             .map(|(key, _, _)| *key)
             .collect::<Vec<_>>();
         let refill_started = Instant::now();
-        let blocks = {
+        // The flag is read with the blocks rather than later because it
+        // decides which decode is the cheap one, and this lock is already
+        // being taken.
+        let (blocks, refill_wanted) = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_blocks(&candidate_keys)?
+            (
+                inner.read_ssd_blocks(&candidate_keys)?,
+                !inner.ssd_instance_only,
+            )
         };
         let mut ssd_reads = Vec::with_capacity(ssd_candidates.len());
         for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
             let decoded = match block {
                 Some(block) => Some((
-                    decode_cache_block(&block)?,
+                    CacheDecodedBlock::decode(&block, refill_wanted)?,
                     is_encoded_compressed_block(&block),
                 )),
                 None => None,
@@ -4356,11 +4366,11 @@ impl MultiLayerCache {
             for (key, positions, started, refill_started, decoded) in ssd_reads {
                 match decoded {
                     Some((value, compressed)) => {
-                        if !inner.ssd_instance_only
-                            && !inner.refill_from_ssd(key, value.clone())
-                        {
-                            inner.stats.refill_failures =
-                                inner.stats.refill_failures.saturating_add(1);
+                        if let Some(refill) = value.to_refill() {
+                            if !inner.refill_from_ssd_shared(key, refill) {
+                                inner.stats.refill_failures =
+                                    inner.stats.refill_failures.saturating_add(1);
+                            }
                         }
                         let occurrences = positions.len();
                         inner
@@ -4377,7 +4387,7 @@ impl MultiLayerCache {
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(refill_started);
                         for index in positions {
-                            results[index] = Some(value.clone());
+                            results[index] = Some(value.to_vec());
                         }
                         needs_eviction_drain = true;
                     }
@@ -4587,7 +4597,7 @@ impl MultiLayerCache {
         };
         match block {
             Some(block) => {
-                let decoded = Arc::<[u8]>::from(decode_cache_block(&block)?);
+                let decoded = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.increment_pin_for_handle(key, decoded.len());
                 if !inner.ssd_instance_only
@@ -4681,7 +4691,7 @@ impl MultiLayerCache {
         let Some(block) = block else {
             return Ok(None);
         };
-        let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
+        let value = decode_cache_block_shared(&block)?;
         // Shared: taking the pin changes only the pin state, which has its own
         // lock.
         let inner = self.inner.read().expect("cache lock poisoned");
@@ -4789,7 +4799,7 @@ impl MultiLayerCache {
             let Some(block) = block else {
                 continue;
             };
-            decoded_hits.push((key, positions, Arc::<[u8]>::from(decode_cache_block(&block)?)));
+            decoded_hits.push((key, positions, decode_cache_block_shared(&block)?));
         }
         if decoded_hits.is_empty() {
             return Ok(results);
@@ -5048,7 +5058,7 @@ impl MultiLayerCache {
             for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
                 let value = match block {
                     Some(block) => Some((
-                        Arc::<[u8]>::from(decode_cache_block(&block)?),
+                        decode_cache_block_shared(&block)?,
                         is_encoded_compressed_block(&block),
                     )),
                     None => None,
@@ -5479,7 +5489,7 @@ impl MultiLayerCache {
             }
             CacheTier::Ssd => match inner.read_ssd_block(key)? {
                 Some(block) => {
-                    let value = Arc::<[u8]>::from(decode_cache_block(&block)?);
+                    let value = decode_cache_block_shared(&block)?;
                     inner.increment_pin_with_size(key, value.len());
                     Ok(Some(CachePinnedHandle {
                         key: key.clone(),

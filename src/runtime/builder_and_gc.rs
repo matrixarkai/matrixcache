@@ -287,21 +287,34 @@ const CACHE_CODEC_RAW: u8 = 0;
 const CACHE_CODEC_ZSTD: u8 = 1;
 const CACHE_HEADER_LEN: usize = 8 + 1 + 1 + 8 + 8;
 
+/// Frame a value as a block, with one copy of the payload.
+///
+/// Every arm of this used to `value.to_vec()` the payload into an owned buffer
+/// and then copy that buffer into the block -- two payload-sized allocations
+/// and two copies per block written, where the block itself is the only buffer
+/// anyone keeps. Three of the four arms store the value raw, so three of the
+/// four were paying for a copy that existed only to be copied again.
+///
+/// The compressed payload still needs a buffer of its own, because whether it
+/// is used at all is decided by how big it turns out to be. The raw payload
+/// does not: it is already in the caller's slice.
 fn encode_cache_block(value: &[u8], options: CacheBlockOptions) -> Result<Vec<u8>, CacheError> {
-    let (codec, payload) = match options.compression {
-        CacheCompression::None if value.len() >= options.min_compress_bytes => {
-            (CACHE_CODEC_RAW, value.to_vec())
-        }
-        CacheCompression::None => (CACHE_CODEC_RAW, value.to_vec()),
+    let compressed = match options.compression {
         CacheCompression::Zstd { level } if value.len() >= options.min_compress_bytes => {
             let compressed = zstd::stream::encode_all(value, level)?;
+            // Kept only if framing it is smaller than storing the value as it
+            // is, which is the same comparison as before.
             if CACHE_HEADER_LEN + compressed.len() < value.len() {
-                (CACHE_CODEC_ZSTD, compressed)
+                Some(compressed)
             } else {
-                (CACHE_CODEC_RAW, value.to_vec())
+                None
             }
         }
-        CacheCompression::Zstd { .. } => (CACHE_CODEC_RAW, value.to_vec()),
+        CacheCompression::Zstd { .. } | CacheCompression::None => None,
+    };
+    let (codec, payload): (u8, &[u8]) = match compressed.as_deref() {
+        Some(compressed) => (CACHE_CODEC_ZSTD, compressed),
+        None => (CACHE_CODEC_RAW, value),
     };
     let mut block = Vec::with_capacity(CACHE_HEADER_LEN + payload.len());
     block.extend_from_slice(CACHE_BLOCK_MAGIC);
@@ -309,7 +322,7 @@ fn encode_cache_block(value: &[u8], options: CacheBlockOptions) -> Result<Vec<u8
     block.push(codec);
     block.extend_from_slice(&(value.len() as u64).to_le_bytes());
     block.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    block.extend_from_slice(&payload);
+    block.extend_from_slice(payload);
     Ok(block)
 }
 
@@ -360,6 +373,136 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decoded block bytes, in the form the read that asked for them needs.
+///
+/// A read that refills hands the bytes to **two** holders: the tier it refills
+/// and the caller. Decoding into the handle the tier wants costs one
+/// allocation for the tier and one copy for the caller.
+///
+/// A read that cannot refill -- an SSD-only instance, which never puts
+/// anything back into memory -- has one holder, and a handle would have to be
+/// copied again to hand back an owned value. That read decodes into the value
+/// it is going to return.
+///
+/// Both of those used to be the same thing: decode into a `Vec`, clone the
+/// `Vec` for the tier, and let the tier build an `Arc` from the clone. Three
+/// payload-sized allocations to serve two holders, and the extra one grew with
+/// the payload.
+enum CacheDecodedBlock {
+    /// Shared with the tier this read refills.
+    Shared(Arc<[u8]>),
+    /// Owned by the read, because nothing else wants these bytes.
+    Owned(Vec<u8>),
+}
+
+impl CacheDecodedBlock {
+    fn decode(block: &[u8], refilling: bool) -> Result<Self, CacheError> {
+        if refilling {
+            Ok(Self::Shared(decode_cache_block_shared(block)?))
+        } else {
+            Ok(Self::Owned(decode_cache_block(block)?))
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Shared(bytes) => bytes.len(),
+            Self::Owned(bytes) => bytes.len(),
+        }
+    }
+
+    /// A handle to refill a tier with, or `None` from the form that has none.
+    ///
+    /// A read that asked for the owning form is a read that said it would not
+    /// refill, so there is nothing to hand over.
+    fn to_refill(&self) -> Option<Arc<[u8]>> {
+        match self {
+            Self::Shared(bytes) => Some(Arc::clone(bytes)),
+            Self::Owned(_) => None,
+        }
+    }
+
+    /// One owned copy, for a read that needs several.
+    fn to_vec(&self) -> Vec<u8> {
+        match self {
+            Self::Shared(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes.clone(),
+        }
+    }
+
+    /// The owned copy, for a read that needs one.
+    ///
+    /// The owning form moves rather than copies here, which is why the two
+    /// forms are worth telling apart at all.
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Shared(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// Decode a block into a handle the tiers and the caller share.
+///
+/// Seven read paths wrote `Arc::<[u8]>::from(decode_cache_block(..)?)`, which
+/// for an uncompressed block is two payload-sized allocations and two copies:
+/// one into the `Vec` the decode owns, one into the `Arc` that `Vec` is thrown
+/// away for. An uncompressed payload is already a slice of the block, so the
+/// handle can be built straight from it.
+///
+/// A compressed payload still decompresses into a `Vec` first -- building the
+/// handle in place without one would need the unsafe this crate forbids.
+fn decode_cache_block_shared(block: &[u8]) -> Result<Arc<[u8]>, CacheError> {
+    if let Some(payload) = uncompressed_block_payload(block)? {
+        return Ok(Arc::<[u8]>::from(payload));
+    }
+    Ok(Arc::<[u8]>::from(decode_cache_block(block)?))
+}
+
+/// The payload of a block that needs no decompressing, or `None` when it does.
+///
+/// The header checks are the ones [`decode_cache_block`] makes, in the same
+/// order, so a block either passes both or fails both.
+fn uncompressed_block_payload(block: &[u8]) -> Result<Option<&[u8]>, CacheError> {
+    if !block.starts_with(CACHE_BLOCK_MAGIC) {
+        return Ok(Some(block));
+    }
+    if block.len() < CACHE_HEADER_LEN {
+        return Err(CacheError::CorruptBlock("short header".to_string()));
+    }
+    let version = block[8];
+    if version != CACHE_BLOCK_VERSION {
+        return Err(CacheError::CorruptBlock(format!(
+            "unsupported version {version}"
+        )));
+    }
+    if block[9] != CACHE_CODEC_RAW {
+        return Ok(None);
+    }
+    let original_len = u64::from_le_bytes(
+        block[10..18]
+            .try_into()
+            .expect("cache block original length slice"),
+    ) as usize;
+    let payload_len = u64::from_le_bytes(
+        block[18..26]
+            .try_into()
+            .expect("cache block payload length slice"),
+    ) as usize;
+    if block.len() != CACHE_HEADER_LEN + payload_len {
+        return Err(CacheError::CorruptBlock(
+            "payload length mismatch".to_string(),
+        ));
+    }
+    let payload = &block[CACHE_HEADER_LEN..];
+    if payload.len() != original_len {
+        return Err(CacheError::CorruptBlock(
+            "original length mismatch".to_string(),
+        ));
+    }
+    Ok(Some(payload))
 }
 
 fn decode_cache_block(block: &[u8]) -> Result<Vec<u8>, CacheError> {
@@ -2037,10 +2180,6 @@ impl CacheInner {
             return false;
         }
         self.put_ssd_bypass_if_absent(key, value)
-    }
-
-    fn refill_from_ssd(&mut self, key: &CacheKey, value: Vec<u8>) -> bool {
-        self.refill_from_ssd_shared(key, Arc::<[u8]>::from(value))
     }
 
     fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
