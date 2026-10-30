@@ -10039,7 +10039,7 @@ impl CacheInner {
             self.stats.puts += 1;
             return Ok(false);
         }
-        if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64
+        if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64) > self.ssd_capacity_bytes as u64
             && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len())
         {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
@@ -10048,8 +10048,7 @@ impl CacheInner {
             self.stats.puts += 1;
             return Ok(false);
         }
-        self.evict_ssd_for(block_len as u64);
-        if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64 {
+        if !self.make_room_for_ssd_install(&[], 0, key, block_len as u64) {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
@@ -10095,7 +10094,7 @@ impl CacheInner {
         let mut staged_ssd = Vec::<StagedSsdBatchWrite>::new();
         let mut staged_ssd_positions = HashMap::<CacheKey, usize>::new();
         let mut ssd_rewrites = HashMap::<CacheKey, Arc<[u8]>>::new();
-        let mut staged_ssd_bytes = self.ssd_bytes;
+        let mut staged_ssd_bytes = 0u64;
         let mut inserted = 0usize;
 
         for (key, value, logical_size) in entries {
@@ -10219,14 +10218,7 @@ impl CacheInner {
                 inserted = inserted.saturating_add(1);
                 continue;
             }
-            let staged_existing_len = staged_ssd_positions
-                .get(&key)
-                .and_then(|index| staged_ssd.get(*index))
-                .map(|entry| entry.block_len)
-                .unwrap_or_default();
-            if staged_ssd_bytes
-                .saturating_sub(staged_existing_len)
-                .saturating_add(block_len as u64)
+            if self.projected_ssd_install_bytes(&staged_ssd, staged_ssd_bytes, &key, block_len as u64)
                 > self.ssd_capacity_bytes as u64
                 && self.incoming_ssd_block_is_colder_than_existing_groups(
                     &key,
@@ -10242,17 +10234,7 @@ impl CacheInner {
                 inserted = inserted.saturating_add(1);
                 continue;
             }
-            self.evict_ssd_for((block_len as u64).saturating_sub(staged_existing_len));
-            staged_ssd_bytes = self.ssd_bytes;
-            let existing_len = if staged_existing_len > 0 {
-                staged_existing_len
-            } else {
-                self.disk_index.get(&key).copied().unwrap_or_default()
-            };
-            let projected_bytes = staged_ssd_bytes
-                .saturating_sub(existing_len)
-                .saturating_add(block_len as u64);
-            if projected_bytes > self.ssd_capacity_bytes as u64 {
+            if !self.make_room_for_ssd_install(&staged_ssd, staged_ssd_bytes, &key, block_len as u64) {
                 self.stats.ssd_admission_rejected =
                     self.stats.ssd_admission_rejected.saturating_add(1);
                 self.stats.writeback_backpressure_events =
@@ -10268,7 +10250,7 @@ impl CacheInner {
                     .compression_bytes_saved
                     .saturating_add(value.len().saturating_sub(block.len()) as u64);
             }
-            staged_ssd_bytes = projected_bytes;
+            staged_ssd_bytes = staged_ssd_bytes.saturating_add(block_len as u64);
             let entry = StagedSsdBatchWrite {
                 key: key.clone(),
                 block,
