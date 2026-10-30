@@ -1855,7 +1855,14 @@ impl CacheInner {
         // every hit and then discarded it.
         let mut seen_at = None;
         let crossed_threshold = if let Some(entry) = self.metadata_of(key) {
-            entry.record_hits(1);
+            let hits_before = entry.record_hits(1);
+            if let Some(sketch) = &self.ssd_access_frequency {
+                if self.disk_index.contains_key(key) {
+                    for _ in 0..sampled_hit_count(hits_before, 1) {
+                        sketch.record(key);
+                    }
+                }
+            }
             let before = entry.hotness.fetch_add(1, Ordering::Relaxed);
             // Read, do not swap. This stamp records when the entry was
             // last MOVED in the access order; swapping here would make the
@@ -1926,6 +1933,13 @@ impl CacheInner {
         let threshold = self.tiering_policy.memory_hotness_threshold;
         let occurrences = occurrences.max(1) as u64;
         let hits_before = entry.record_hits(occurrences);
+        if let Some(sketch) = &self.ssd_access_frequency {
+            if self.disk_index.contains_key(key) {
+                for _ in 0..sampled_hit_count(hits_before, occurrences) {
+                    sketch.record(key);
+                }
+            }
+        }
         // A sampled hit signal for the admission sketch, and only when the
         // filter that consumes it is on -- a bool already in this cache line,
         // against ~1.6ns of sketch work nothing would read.
@@ -2777,7 +2791,7 @@ impl CacheInner {
             CacheReplacementPolicy::Slru => {
                 let candidates = self.memory_cold_candidate_count();
                 let picked =
-                    self.select_windowed_eviction_victim(&self.memory_order, true, candidates);
+                    self.select_windowed_eviction_victim(&self.memory_order, true, candidates, false);
                 self.record_sampled_groups(picked.groups_weighed);
                 self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
@@ -2785,7 +2799,7 @@ impl CacheInner {
             CacheReplacementPolicy::WeightedHotnessLru => {
                 let candidates = self.memory_cold_candidate_count();
                 let picked =
-                    self.select_windowed_eviction_victim(&self.memory_order, false, candidates);
+                    self.select_windowed_eviction_victim(&self.memory_order, false, candidates, false);
                 self.record_sampled_groups(picked.groups_weighed);
                 self.apply_cold_tail_promotions(&picked.promote);
                 picked.victim
@@ -2803,6 +2817,7 @@ impl CacheInner {
                     &self.pmem_order,
                     true,
                     EVICTION_CANDIDATE_WINDOW,
+                    false,
                 );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
@@ -2812,6 +2827,7 @@ impl CacheInner {
                     &self.pmem_order,
                     false,
                     EVICTION_CANDIDATE_WINDOW,
+                    false,
                 );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
@@ -2829,6 +2845,7 @@ impl CacheInner {
                     &self.disk_order,
                     true,
                     EVICTION_CANDIDATE_WINDOW,
+                    self.ssd_access_frequency.is_some(),
                 );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
@@ -2838,6 +2855,7 @@ impl CacheInner {
                     &self.disk_order,
                     false,
                     EVICTION_CANDIDATE_WINDOW,
+                    self.ssd_access_frequency.is_some(),
                 );
                 self.record_sampled_groups(picked.groups_weighed);
                 picked.victim
@@ -2872,6 +2890,7 @@ impl CacheInner {
         order: &CacheKeyOrder,
         segmented: bool,
         candidates: usize,
+        frequency: bool,
     ) -> PickedEvictionVictim {
         // An entry past its time to live could not have been served again, so
         // dropping it costs no future hit. Take one the moment the window turns
@@ -2903,7 +2922,7 @@ impl CacheInner {
         // Bounded by the scan, and gives up the coldest anyway when every
         // candidate has earned a second chance: a full cache must be able to
         // release something, and a rule that can refuse to is a stall.
-        if self.cold_eviction_share_pct < 100 {
+        if !frequency && self.cold_eviction_share_pct < 100 {
             let mut promote = Vec::new();
             let mut first_unpinned = None;
             for key in order.iter_access().take(candidates) {
@@ -2940,11 +2959,11 @@ impl CacheInner {
             }
         }
         let windowed =
-            self.select_eviction_victim(order.iter_access().take(candidates), segmented, candidates);
+            self.select_eviction_victim(order.iter_access().take(candidates), segmented, candidates, frequency);
         if windowed.victim.is_some() || order.len() <= candidates {
             return windowed;
         }
-        let full = self.select_eviction_victim(order.iter_access(), segmented, order.len());
+        let full = self.select_eviction_victim(order.iter_access(), segmented, order.len(), frequency);
         PickedEvictionVictim {
             victim: full.victim,
             groups_weighed: windowed
@@ -2971,6 +2990,7 @@ impl CacheInner {
         keys: I,
         segmented: bool,
         candidates: usize,
+        frequency: bool,
     ) -> PickedEvictionVictim
     where
         I: IntoIterator<Item = &'a CacheKey>,
@@ -2993,7 +3013,13 @@ impl CacheInner {
             // Strings -- doing it twice per candidate, up to 128 candidates
             // per eviction, is the bulk of choosing a victim.
             let meta = self.metadata_of(key);
-            let score = eviction_score_of(meta, segmented);
+            let mut score = eviction_score_of(meta, segmented);
+            if frequency {
+                let recent = self.ssd_access_frequency.as_ref().expect("SSD frequency mode enabled").estimate(key);
+                score.hotness = recent as u32;
+                score.hits = 0;
+                score.segment = u8::from(segmented && recent as u64 >= SLRU_PROTECTED_HITS);
+            }
             let group_key = eviction_group_key_of(meta, key);
             groups
                 .entry(group_key)
@@ -3035,6 +3061,10 @@ impl CacheInner {
         if self.ssd_replacement_policy == CacheReplacementPolicy::Fifo {
             return false;
         }
+        let frequency = self.ssd_access_frequency.as_ref().map(|sketch| {
+            sketch.record(key);
+            sketch.estimate(key)
+        });
         let incoming_score = EvictionScore {
             segment: 0,
             hotness: initial_hotness(request.block_kind, block_bytes).max(request.hotness),
@@ -3057,7 +3087,11 @@ impl CacheInner {
             }
             // Admission compares popularity, not resident protection segments.
             // One eligible colder entry suffices; no minimum needs materializing.
-            if eviction_score_of(meta, false) <= incoming_score {
+            let can_replace = match frequency {
+                Some(incoming) => self.ssd_access_frequency.as_ref().expect("SSD frequency mode enabled").estimate(candidate) <= incoming,
+                None => eviction_score_of(meta, false) <= incoming_score,
+            };
+            if can_replace {
                 return false;
             }
             weighed += 1;

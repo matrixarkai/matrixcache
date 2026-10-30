@@ -1369,6 +1369,7 @@ struct CacheInner {
     /// How often keys have been asked for recently, including keys that are
     /// not resident. Consulted at admission; see `admission_filter_enabled`.
     access_frequency: FrequencySketch,
+    ssd_access_frequency: Option<FrequencySketch>,
     /// Whether a candidate colder than the entry it would evict is declined.
     /// Off by default: it changes what the cache keeps.
     admission_filter_enabled: bool,
@@ -2345,6 +2346,7 @@ impl MultiLayerCache {
                 // by default, so this used to be the largest thing many caches
                 // held and none of them read it.
                 access_frequency: FrequencySketch::unsized_until_enabled(),
+                ssd_access_frequency: None,
                 admission_filter_enabled: false,
                 sketch_sized_from_what_is_resident: false,
                 expected_entry_bytes: DEFAULT_EXPECTED_ENTRY_BYTES,
@@ -2933,6 +2935,40 @@ impl MultiLayerCache {
         // filter keeps whatever the sketch has learned, which is what it did
         // before this was built lazily.
         inner.admission_filter_enabled = enabled;
+    }
+
+    /// Use recent request frequency instead of lifetime popularity for SSD admission and eviction.
+    ///
+    /// Off by default. Records rejected candidates so repeated demand can earn
+    /// admission. Hit signals are sampled, and counters age as requests arrive.
+    /// Uses at most 64 KiB of counters per cache; large populations may collide.
+    /// FIFO bypasses popularity admission regardless of this setting. Pins,
+    /// capacity, block-size and write-budget limits still apply.
+    /// Victim selection uses the same scores, while preserving expiry and slot grouping.
+    pub fn set_ssd_admission_filter_enabled(&self, enabled: bool) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        if enabled && inner.ssd_access_frequency.is_none() {
+            let entries = if inner.disk_index.is_empty() {
+                inner.ssd_capacity_bytes / inner.expected_entry_bytes.max(1)
+            } else {
+                inner.disk_index.len()
+            }.clamp(1, 2048);
+            let sketch = FrequencySketch::with_capacity(entries);
+            for key in inner.disk_index.keys() {
+                let hits = inner.metadata_of(key).map_or(0, CacheEntryMeta::hits);
+                for _ in 0..sampled_hit_count(0, hits).clamp(1, 16) {
+                    sketch.record(key);
+                }
+            }
+            inner.ssd_access_frequency = Some(sketch);
+        }
+        if !enabled {
+            inner.ssd_access_frequency = None;
+        }
+    }
+
+    pub fn ssd_admission_filter_enabled(&self) -> bool {
+        self.inner.read().expect("cache lock poisoned").ssd_access_frequency.is_some()
     }
 
     /// Tells the cache what one entry is expected to cost, which is how the
@@ -9146,6 +9182,17 @@ impl ShardedMultiLayerCache {
         }
     }
 
+    /// Configure recent-frequency SSD admission independently on every shard.
+    pub fn set_ssd_admission_filter_enabled(&self, enabled: bool) {
+        for shard in self.shards.iter() {
+            shard.set_ssd_admission_filter_enabled(enabled);
+        }
+    }
+
+    pub fn ssd_admission_filter_enabled(&self) -> bool {
+        self.shards.first().map(MultiLayerCache::ssd_admission_filter_enabled).unwrap_or(false)
+    }
+
     /// Whether the admission filter is on.
     ///
     /// Reads shard zero; the setter writes all of them and nothing else can
@@ -9719,7 +9766,8 @@ impl CacheInner {
 
         // `access_frequency`: sized when the admission filter is turned on,
         // and a few dozen bytes until then.
-        let sketch_bytes = self.access_frequency.footprint_bytes();
+        let sketch_bytes = self.access_frequency.footprint_bytes()
+            .saturating_add(self.ssd_access_frequency.as_ref().map_or(0, FrequencySketch::footprint_bytes));
 
         // Per-cache rather than per-entry: `disk_dir`, `pmem_paths`, and the
         // two queues that carry eviction records out to a callback.
