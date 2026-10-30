@@ -1929,11 +1929,11 @@ impl SsdTierStore {
         !matches!(self, Self::Disabled { .. })
     }
 
-    fn get(&self, key: &str) -> Result<CacheBuffer, CacheError> {
+    fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
         match self {
             Self::Disabled { .. } => Err(CacheError::NotFound),
-            Self::Single(storage) => storage.get(key),
-            Self::Multi(storage) => storage.get(key),
+            Self::Single(storage) => storage.get_owned(key),
+            Self::Multi(storage) => storage.get_owned(key),
         }
     }
 
@@ -1941,14 +1941,7 @@ impl SsdTierStore {
         match self {
             Self::Disabled { .. } => Ok(vec![None; keys.len()]),
             Self::Single(storage) => storage.get_batch(keys),
-            Self::Multi(storage) => keys
-                .iter()
-                .map(|key| match storage.get(key) {
-                    Ok(buffer) => Ok(Some(buffer.to_vec())),
-                    Err(CacheError::NotFound) => Ok(None),
-                    Err(err) => Err(err),
-                })
-                .collect(),
+            Self::Multi(storage) => storage.get_batch(keys),
         }
     }
 

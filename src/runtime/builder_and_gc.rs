@@ -789,8 +789,8 @@ impl CacheInner {
     }
 
     fn read_ssd_block(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
-        match self.ssd_store.get(&Self::ssd_store_key(key)) {
-            Ok(buffer) => Ok(Some(buffer.to_vec())),
+        match self.ssd_store.get_owned(&Self::ssd_store_key(key)) {
+            Ok(block) => Ok(Some(block)),
             Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
                 Ok(block) => Ok(Some(block)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
