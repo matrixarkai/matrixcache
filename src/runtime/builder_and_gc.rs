@@ -1191,6 +1191,25 @@ impl CacheInner {
         Ok(())
     }
 
+    fn open_matching_pmem_block(path: &Path, value: &[u8]) -> Result<Option<File>, CacheError> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(CacheError::Io(err)),
+        };
+        if file.metadata()?.len() != value.len() as u64 {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; 8192];
+        for chunk in value.chunks(buffer.len()) {
+            std::io::Read::read_exact(&mut file, &mut buffer[..chunk.len()])?;
+            if &buffer[..chunk.len()] != chunk {
+                return Ok(None);
+            }
+        }
+        Ok(Some(file))
+    }
+
     fn persist_pmem_put(&self, key: &CacheKey, value: &[u8]) -> Result<(), CacheError> {
         let Some(path) = self.pmem_block_path_for_key(key) else {
             return Ok(());
@@ -1198,6 +1217,17 @@ impl CacheInner {
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let tmp = path.with_extension("tmp");
         let durable = self.pmem_block_durability;
+        if self.pmem.get(key).is_some_and(|old| old.as_ref() == value) {
+            if let Some(file) = Self::open_matching_pmem_block(&path, value)? {
+                // Keep the durability operations and manifest append: the file
+                // may have been written under a different policy or recovered.
+                if durable {
+                    file.sync_all()?;
+                    sync_parent_dir(&path)?;
+                }
+                return self.append_pmem_manifest_line(manifest_line_for_key(key, value.len() as u64));
+            }
+        }
         creating_the_directory_if_missing(&parent, || {
             if durable {
                 let mut file = File::create(&tmp).map_err(CacheError::Io)?;
