@@ -5,6 +5,32 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn conditional_ssd_update_validates_stale_handles_and_corrupt_blocks() {
+        for compression in [CacheCompression::None, CacheCompression::Zstd { level: 1 }] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = CacheOptions::new(0, 0, 1024 * 1024).with_ssd_paths([dir.path().join("ssd")]);
+            options.block_options.compression = compression;
+            options.block_options.min_compress_bytes = 0;
+            let cache = MultiLayerCache::with_options(options);
+            cache.start().unwrap();
+            let key = CacheKey::string(0, "conditional-ssd");
+            cache.put(key.clone(), vec![7; 65536]).unwrap();
+            let old = cache.acquire(&key).unwrap().unwrap();
+            cache.update_cached_value_if_current_for_tier(CacheTier::Ssd, &key, &old, vec![9; 65536]).unwrap();
+            assert_eq!(old.as_slice(), &[7; 65536]);
+            assert!(matches!(cache.update_cached_value_if_current_for_tier(CacheTier::Ssd, &key, &old, vec![3; 65536]), Err(CacheError::ReplaceMismatch)));
+            assert_eq!(cache.get(&key).unwrap().unwrap(), vec![9; 65536]);
+            let corrupt = CACHE_BLOCK_MAGIC.to_vec();
+            cache.inner.write().unwrap().write_ssd_block(&key, corrupt.clone()).unwrap();
+            assert!(cache.update_cached_value_if_current_for_tier(CacheTier::Ssd, &key, &old, vec![3; 65536]).is_err());
+            assert_eq!(cache.inner.read().unwrap().read_ssd_block(&key).unwrap(), Some(corrupt));
+            cache.release(old);
+            assert!(cache.stop());
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn conditional_pmem_update_preserves_pins_and_rejects_stale_handles() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_options(

@@ -10657,8 +10657,7 @@ impl CacheInner {
                     return Err(CacheError::ReplaceMismatch);
                 }
                 let existing_block = self.read_ssd_block(key)?.ok_or(CacheError::NotFound)?;
-                let existing_value = decode_cache_block(&existing_block)?;
-                if existing_value.as_slice() != old_handle.value.as_ref() {
+                if !cache_block_matches_value(&existing_block, old_handle.value.as_ref())? {
                     return Err(CacheError::ReplaceMismatch);
                 }
 
