@@ -611,6 +611,74 @@ fn coalesce_storage_batch_key_refs<'a>(keys: &[&'a str]) -> (Vec<&'a str>, Vec<u
     (unique_keys, output_positions)
 }
 
+// Positions come from coalescing in first-seen order. Move each original on its
+// final occurrence so only the additional owned outputs need payload copies.
+fn expand_storage_batch_values(
+    mut values: Vec<Option<Vec<u8>>>,
+    positions: Vec<usize>,
+) -> Vec<Option<Vec<u8>>> {
+    if values.len() == positions.len() {
+        return values;
+    }
+    let mut remaining = vec![0usize; values.len()];
+    for &position in &positions {
+        remaining[position] += 1;
+    }
+    positions
+        .into_iter()
+        .map(|position| {
+            remaining[position] -= 1;
+            if remaining[position] == 0 {
+                values[position].take()
+            } else {
+                values[position].clone()
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod storage_batch_expansion_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_batch_moves_original_buffers_on_last_occurrence() {
+        let first = vec![7; 4096];
+        let second = vec![9; 8192];
+        let first_ptr = first.as_ptr();
+        let second_ptr = second.as_ptr();
+        let mut result = expand_storage_batch_values(
+            vec![Some(first), None, Some(second)],
+            vec![0, 1, 2, 0, 2, 1, 0],
+        );
+        assert_eq!(result.len(), 7);
+        assert_eq!(result[6].as_ref().unwrap().as_ptr(), first_ptr);
+        assert_eq!(result[4].as_ref().unwrap().as_ptr(), second_ptr);
+        assert_ne!(result[0].as_ref().unwrap().as_ptr(), first_ptr);
+        assert_ne!(result[2].as_ref().unwrap().as_ptr(), second_ptr);
+        assert_eq!(result[0], result[3]);
+        assert_eq!(result[0], result[6]);
+        assert_eq!(result[2], result[4]);
+        assert!(result[1].is_none() && result[5].is_none());
+        result[0].as_mut().unwrap()[0] = 42;
+        assert_eq!(result[3].as_ref().unwrap()[0], 7);
+        assert_eq!(result[6].as_ref().unwrap()[0], 7);
+    }
+
+    #[test]
+    fn unique_batch_keeps_outer_and_payload_allocations() {
+        let values = vec![Some(vec![3; 4096]), None, Some(Vec::new())];
+        let outer_ptr = values.as_ptr();
+        let payload_ptr = values[0].as_ref().unwrap().as_ptr();
+        let result = expand_storage_batch_values(values, vec![0, 1, 2]);
+        assert_eq!(result.as_ptr(), outer_ptr);
+        assert_eq!(result[0].as_ref().unwrap().as_ptr(), payload_ptr);
+        assert!(result[1].is_none());
+        assert_eq!(result[2], Some(Vec::new()));
+        assert!(expand_storage_batch_values(Vec::new(), Vec::new()).is_empty());
+    }
+}
+
 fn coalesce_storage_delete_keys(keys: &[String]) -> Vec<String> {
     if keys.len() <= STORAGE_BATCH_LINEAR_SCAN_MAX_KEYS {
         let mut unique_keys = Vec::<String>::with_capacity(keys.len());
@@ -2546,13 +2614,7 @@ impl StorageEngineRocksDb {
             .iter()
             .map(|key| self.records.get(*key).cloned())
             .collect::<Vec<_>>();
-        if unique_values.len() == output_positions.len() {
-            return Ok(unique_values);
-        }
-        Ok(output_positions
-            .into_iter()
-            .map(|position| unique_values[position].clone())
-            .collect())
+        Ok(expand_storage_batch_values(unique_values, output_positions))
     }
 
     pub fn put_batch(&mut self, entries: Vec<(String, Vec<u8>)>) -> Result<usize, CacheError> {
@@ -3226,13 +3288,7 @@ impl StorageEngineMultiSsd {
             }
         }
 
-        if unique_values.len() == output_positions.len() {
-            return Ok(unique_values);
-        }
-        Ok(output_positions
-            .into_iter()
-            .map(|position| unique_values[position].clone())
-            .collect())
+        Ok(expand_storage_batch_values(unique_values, output_positions))
     }
 
     /// Write without building a `CacheBuffer` around the value.
