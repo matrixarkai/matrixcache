@@ -2376,6 +2376,23 @@ impl CacheInner {
         self.put_ssd_bypass_if_absent(key, value)
     }
 
+    fn promote_pmem_probe_if_current(&mut self, key: &CacheKey, value: &Arc<[u8]>) {
+        // A read can return its captured value, but must not restore it after
+        // another operation replaced, invalidated, or expired the entry.
+        if !self.started
+            || self.ssd_instance_only
+            || self.memory.contains_key(key)
+            || self.entry_expired(key, CoarseClock::now_millis())
+            || !self.pmem.get(key).is_some_and(|current| Arc::ptr_eq(current, value))
+        {
+            return;
+        }
+        self.record_hit(key, value.len());
+        if !self.put_memory_shared(key, Arc::clone(value)) {
+            self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
+        }
+    }
+
     fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
         if matches!(
             self.tiering_policy.data_placement,
