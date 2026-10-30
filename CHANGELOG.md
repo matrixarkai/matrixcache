@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Unix PMEM manifest appends reuse one descriptor per cache and verify file
+  identity before writing. Lifecycle changes and write failures release it.
+
 - PMEM and compatibility SSD manifest appends write each complete record as one
   buffer, reducing write calls while preserving the on-disk format.
 

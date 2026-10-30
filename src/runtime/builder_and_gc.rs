@@ -1150,12 +1150,23 @@ impl CacheInner {
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         line.push('\n');
         creating_the_directory_if_missing(&parent, || {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(CacheError::Io)?;
-            std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
+            #[cfg(unix)]
+            {
+                let mut writer = self
+                    .pmem_manifest_writer
+                    .lock()
+                    .expect("manifest writer poisoned");
+                PmemManifestWriter::append(&mut writer, &path, line.as_bytes())
+            }
+            #[cfg(not(unix))]
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(CacheError::Io)?;
+                std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
+            }
         })
     }
 
@@ -1207,6 +1218,7 @@ impl CacheInner {
     }
 
     fn clear_pmem_persistence(&self) -> Result<(), CacheError> {
+        self.reset_pmem_manifest_writer();
         let Some(root) = self.pmem_root_dir() else {
             return Ok(());
         };
