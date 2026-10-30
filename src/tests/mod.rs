@@ -3,6 +3,53 @@
 
 #[cfg(test)]
 mod tests {
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn identical_pmem_rewrites_reuse_valid_blocks_and_repair_persistence() {
+        for (size, durable) in [(1024, false), (65536, false), (1024, true), (65536, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = || {
+                let mut options = CacheOptions::new(0, 1024 * 1024, 0)
+                .with_pmem_paths([dir.path().join("pmem")])
+                .with_auto_recover_on_start(true);
+                options.pmem_block_durability = durable;
+                options
+            };
+            let cache = MultiLayerCache::with_options(options());
+            cache.start().unwrap();
+            let mut policy = cache.production_tiering_policy();
+            policy.data_placement = CacheDataPlacement::SideBySide;
+            policy.data_placement_threshold_bytes = 0;
+            cache.update_production_tiering_policy(policy);
+            let key = CacheKey::string(0, "identical-pmem");
+            let value = vec![7; size];
+            cache.put(key.clone(), value.clone()).unwrap();
+            let path = cache.inner.read().unwrap().pmem_block_path_for_key(&key).unwrap();
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap());
+            for _ in 0..16 {
+                cache.put(key.clone(), value.clone()).unwrap();
+            }
+            #[cfg(unix)]
+            assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap()), inode);
+            fs::write(&path, vec![8; size]).unwrap();
+            cache.put(key.clone(), value.clone()).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), value);
+            fs::remove_file(&path).unwrap();
+            cache.put(key.clone(), value.clone()).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), value);
+            let manifest = cache.inner.read().unwrap().pmem_manifest_path().unwrap();
+            fs::remove_file(manifest).unwrap();
+            cache.put(key.clone(), value.clone()).unwrap();
+            assert!(cache.stop());
+            drop(cache);
+            let recovered = MultiLayerCache::with_options(options());
+            recovered.start().unwrap();
+            assert_eq!(recovered.get(&key).unwrap(), Some(value));
+            assert!(recovered.stop());
+        }
+    }
+
     // rust-internal: validate the native block-cache budget on a real database.
     #[cfg(feature = "rocksdb-ssd")]
     #[test]
