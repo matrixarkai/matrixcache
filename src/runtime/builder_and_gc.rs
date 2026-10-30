@@ -996,14 +996,15 @@ impl CacheInner {
 
     #[cfg(not(feature = "rocksdb-ssd"))]
     fn append_disk_manifest_op(&self, op: CacheManifestOp) -> Result<(), CacheError> {
-        let line = op.encode_line();
+        let mut line = op.encode_line();
+        line.push('\n');
         creating_the_directory_if_missing(&self.disk_dir, || {
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(self.manifest_path())
                 .map_err(CacheError::Io)?;
-            writeln!(file, "{line}").map_err(CacheError::Io)
+            std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
         })?;
         self.compact_disk_manifest_if_long()
     }
@@ -1142,19 +1143,19 @@ impl CacheInner {
         })
     }
 
-    fn append_pmem_manifest_line(&self, line: String) -> Result<(), CacheError> {
+    fn append_pmem_manifest_line(&self, mut line: String) -> Result<(), CacheError> {
         let Some(path) = self.pmem_manifest_path() else {
             return Ok(());
         };
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        line.push('\n');
         creating_the_directory_if_missing(&parent, || {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
                 .map_err(CacheError::Io)?;
-            use std::io::Write as _;
-            writeln!(file, "{line}").map_err(CacheError::Io)
+            std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
         })
     }
 
