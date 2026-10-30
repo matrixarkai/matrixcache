@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Storage batch reads move returned buffers directly into the result when keys
+  are unique, avoiding a payload copy in both single-device and multi-device reads.
+
 - SSD bypass insertion checks for an identical stored value before encoding
   a replacement block, avoiding unnecessary encoding and compression on reuse.
 
