@@ -2150,11 +2150,14 @@ impl CacheInner {
     fn drop_stale_tier_copy(&mut self, key: &CacheKey, tier: CacheTier) {
         match tier {
             CacheTier::Memory => {
-                if let Some(stale) = self.take_resident(key) {
-                    self.memory_bytes = self.memory_bytes.saturating_sub(stale.len());
-                    self.stats.memory_bytes = self.memory_bytes as u64;
-                    self.stats.stale_tier_copies_dropped =
-                        self.stats.stale_tier_copies_dropped.saturating_add(1);
+                // Removing nothing must not invalidate batch replacement credit.
+                if self.resident_value(key).is_some() {
+                    if let Some(stale) = self.take_resident(key) {
+                        self.memory_bytes = self.memory_bytes.saturating_sub(stale.len());
+                        self.stats.memory_bytes = self.memory_bytes as u64;
+                        self.stats.stale_tier_copies_dropped =
+                            self.stats.stale_tier_copies_dropped.saturating_add(1);
+                    }
                 }
                 self.memory_order.remove(key);
             }
@@ -2615,16 +2618,26 @@ impl CacheInner {
         pending_bytes: u64,
         key: &CacheKey,
         block_bytes: u64,
+        credit: &mut Option<(u64, u64)>,
     ) -> u64 {
         let upper = self.ssd_bytes.saturating_add(pending_bytes).saturating_add(block_bytes);
         if upper <= self.ssd_capacity_bytes as u64 {
             return upper;
         }
-        let replaced = pending.iter().fold(
-            self.disk_index.get(key).copied().unwrap_or_default(),
-            |total, entry| total.saturating_add(
-                self.disk_index.get(&entry.key).copied().unwrap_or_default()),
-        );
+        // Batch-local replacement credit is reusable only while storage has not
+        // changed. Demotion and eviction invalidate the existing mutation epoch.
+        let pending_replaced = match *credit {
+            Some((epoch, bytes)) if epoch != u64::MAX && epoch == self.ssd_probe_epoch => bytes,
+            _ => {
+                let bytes = pending.iter().fold(0u64, |total, entry| {
+                    total.saturating_add(self.disk_index.get(&entry.key).copied().unwrap_or_default())
+                });
+                *credit = Some((self.ssd_probe_epoch, bytes));
+                bytes
+            }
+        };
+        let replaced = pending_replaced.saturating_add(
+            self.disk_index.get(key).copied().unwrap_or_default());
         self.ssd_bytes.saturating_sub(replaced)
             .saturating_add(pending_bytes).saturating_add(block_bytes)
     }
@@ -2635,9 +2648,10 @@ impl CacheInner {
         pending_bytes: u64,
         key: &CacheKey,
         block_bytes: u64,
+        credit: &mut Option<(u64, u64)>,
     ) -> bool {
         loop {
-            let projected = self.projected_ssd_install_bytes(pending, pending_bytes, key, block_bytes);
+            let projected = self.projected_ssd_install_bytes(pending, pending_bytes, key, block_bytes, credit);
             let capacity = self.ssd_capacity_bytes as u64;
             if projected <= capacity {
                 return true;

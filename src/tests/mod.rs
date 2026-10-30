@@ -68,6 +68,78 @@ mod tests {
         }
     }
 
+    // rust-internal: cached replacement bytes must not survive storage mutation.
+    #[test]
+    fn staged_ssd_credit_is_invalidated_by_storage_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 180).with_ssd_paths([dir.path().join("ssd")]),
+        );
+        cache.start().unwrap();
+        let first = CacheKey::string(0, "first");
+        let second = CacheKey::string(0, "second");
+        cache.put(first.clone(), vec![1; 64]).unwrap();
+        cache.put(second.clone(), vec![2; 64]).unwrap();
+        let pending = {
+            let inner = cache.inner.read().unwrap();
+            let request = inner.default_insert_request(&first, 64, 64);
+            let reason = inner.tiering_policy.decide(&request).reason;
+            vec![StagedSsdBatchWrite {
+                key: first.clone(), block: Vec::new(), block_len: 90,
+                value_len: 64, request, admission_reason: reason,
+            }]
+        };
+        let mut credit = None;
+        {
+            let inner = cache.inner.read().unwrap();
+            assert_eq!(inner.projected_ssd_install_bytes(&pending, 90, &second, 90, &mut credit), 180);
+            assert_eq!(credit.unwrap().1, 90);
+        }
+        cache.invalidate(&first).unwrap();
+        {
+            let mut inner = cache.inner.write().unwrap();
+            assert_eq!(inner.projected_ssd_install_bytes(&pending, 90, &second, 90, &mut credit), 180);
+            assert_eq!(credit.unwrap().1, 0);
+            inner.ssd_probe_epoch = u64::MAX;
+            credit = Some((u64::MAX, 90));
+            assert_eq!(inner.projected_ssd_install_bytes(&pending, 90, &second, 90, &mut credit), 180);
+        }
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn mixed_ssd_batches_preserve_capacity_and_latest_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(128, 128, 1440)
+                .with_pmem_paths([dir.path().join("pmem")])
+                .with_ssd_paths([dir.path().join("ssd")]),
+        );
+        cache.start().unwrap();
+        let keys: Vec<_> = (0..32).map(|i| CacheKey::string(0, &format!("mixed-{i}"))).collect();
+        for round in 0..8u8 {
+            let mut entries = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                entries.push((key.clone(), vec![round; if i % 3 == 0 { 128 } else { 64 }]));
+                if i % 2 == 0 {
+                    entries.push((key.clone(), vec![round; 64]));
+                }
+            }
+            cache.put_batch(entries).unwrap();
+            let inner = cache.inner.read().unwrap();
+            assert!(inner.ssd_bytes <= 1440);
+            assert_eq!(inner.ssd_bytes, inner.disk_index.values().sum::<u64>());
+            drop(inner);
+            for (i, key) in keys.iter().enumerate() {
+                if let Some(value) = cache.get(key).unwrap() {
+                    assert_eq!(value, vec![round; if i % 3 == 0 && i % 2 != 0 { 128 } else { 64 }]);
+                }
+            }
+        }
+        assert!(cache.stop());
+    }
+
     // rust-internal: rejected final batch entries must replace older staged values.
     #[test]
     fn batch_rejection_cannot_restore_an_older_ssd_value() {

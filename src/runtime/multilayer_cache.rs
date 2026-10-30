@@ -10039,7 +10039,7 @@ impl CacheInner {
             self.stats.puts += 1;
             return Ok(false);
         }
-        if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64) > self.ssd_capacity_bytes as u64
+        if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64, &mut None) > self.ssd_capacity_bytes as u64
             && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len())
         {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
@@ -10048,7 +10048,7 @@ impl CacheInner {
             self.stats.puts += 1;
             return Ok(false);
         }
-        if !self.make_room_for_ssd_install(&[], 0, key, block_len as u64) {
+        if !self.make_room_for_ssd_install(&[], 0, key, block_len as u64, &mut None) {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
@@ -10095,6 +10095,7 @@ impl CacheInner {
         let mut staged_ssd_positions = HashMap::<CacheKey, usize>::new();
         let mut ssd_rewrites = HashMap::<CacheKey, Arc<[u8]>>::new();
         let mut staged_ssd_bytes = 0u64;
+        let mut staged_replacement_credit: Option<(u64, u64)> = None;
         let mut inserted = 0usize;
 
         for (key, value, logical_size) in entries {
@@ -10102,6 +10103,12 @@ impl CacheInner {
             if let Some(position) = staged_ssd_positions.remove(&key) {
                 let removed = staged_ssd.swap_remove(position);
                 staged_ssd_bytes = staged_ssd_bytes.saturating_sub(removed.block_len);
+                if let Some((epoch, bytes)) = staged_replacement_credit.as_mut() {
+                    if *epoch == self.ssd_probe_epoch {
+                        *bytes = bytes.saturating_sub(
+                            self.disk_index.get(&removed.key).copied().unwrap_or_default());
+                    }
+                }
                 if let Some(moved) = staged_ssd.get(position) {
                     staged_ssd_positions.insert(moved.key.clone(), position);
                 }
@@ -10154,6 +10161,7 @@ impl CacheInner {
             } else if !self.ssd_instance_only {
                 self.stats.memory_admission_rejected =
                     self.stats.memory_admission_rejected.saturating_add(1);
+                self.drop_stale_tier_copy(&key, CacheTier::Memory);
             }
 
             if admit_pmem && !pmem_admitted_via_memory_fallback {
@@ -10169,6 +10177,9 @@ impl CacheInner {
             } else if !self.ssd_instance_only {
                 self.stats.pmem_admission_rejected =
                     self.stats.pmem_admission_rejected.saturating_add(1);
+                if !pmem_admitted_via_memory_fallback {
+                    self.drop_stale_tier_copy(&key, CacheTier::Pmem);
+                }
             }
 
             if !admit_ssd {
@@ -10218,7 +10229,7 @@ impl CacheInner {
                 inserted = inserted.saturating_add(1);
                 continue;
             }
-            if self.projected_ssd_install_bytes(&staged_ssd, staged_ssd_bytes, &key, block_len as u64)
+            if self.projected_ssd_install_bytes(&staged_ssd, staged_ssd_bytes, &key, block_len as u64, &mut staged_replacement_credit)
                 > self.ssd_capacity_bytes as u64
                 && self.incoming_ssd_block_is_colder_than_existing_groups(
                     &key,
@@ -10234,7 +10245,7 @@ impl CacheInner {
                 inserted = inserted.saturating_add(1);
                 continue;
             }
-            if !self.make_room_for_ssd_install(&staged_ssd, staged_ssd_bytes, &key, block_len as u64) {
+            if !self.make_room_for_ssd_install(&staged_ssd, staged_ssd_bytes, &key, block_len as u64, &mut staged_replacement_credit) {
                 self.stats.ssd_admission_rejected =
                     self.stats.ssd_admission_rejected.saturating_add(1);
                 self.stats.writeback_backpressure_events =
@@ -10251,6 +10262,12 @@ impl CacheInner {
                     .saturating_add(value.len().saturating_sub(block.len()) as u64);
             }
             staged_ssd_bytes = staged_ssd_bytes.saturating_add(block_len as u64);
+            if let Some((epoch, bytes)) = staged_replacement_credit.as_mut() {
+                if *epoch == self.ssd_probe_epoch {
+                    *bytes = bytes.saturating_add(
+                        self.disk_index.get(&key).copied().unwrap_or_default());
+                }
+            }
             let entry = StagedSsdBatchWrite {
                 key: key.clone(),
                 block,
