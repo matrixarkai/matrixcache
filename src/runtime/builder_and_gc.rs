@@ -1261,7 +1261,9 @@ impl CacheInner {
         if let Some(path) = self.pmem_block_path_for_key(key) {
             match fs::remove_file(path) {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // Recovery skips missing block files. An absent file needs no
+                // additional manifest record, including on repeated deletes.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => return Err(CacheError::Io(err)),
             }
         }
