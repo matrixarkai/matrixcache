@@ -366,10 +366,16 @@ impl CacheBlockCodec {
         }
         let needed = zstd::zstd_safe::compress_bound(value.len());
         self.scratch.clear();
-        let held = self.scratch.capacity();
-        if held < needed {
-            self.scratch.reserve(needed - held);
-        }
+        // `reserve` is relative to the LENGTH, which is zero here, so this asks
+        // for the whole bound. Asking for the difference from what the buffer
+        // already holds reads as the same thing and is not: on a cleared buffer
+        // `reserve(needed - capacity)` guarantees only `needed - capacity` of
+        // room, so a buffer already holding more than half of what the next
+        // block needs is left exactly as short as it was. An ascending sequence
+        // of value sizes is enough to reach it -- 256 bytes then 1,024 left a
+        // 771-byte buffer for a 1,092-byte bound -- and an output buffer that
+        // small makes the compressor refuse the block.
+        self.scratch.reserve(needed);
         let mut out = zstd::zstd_safe::OutBuffer::around(&mut self.scratch);
         if !value.is_empty() {
             let mut input = zstd::zstd_safe::InBuffer::around(value);
@@ -382,9 +388,12 @@ impl CacheBlockCodec {
                 )));
             }
         }
-        // `compress_bound` is zstd's own worst case for a single frame, so one
-        // pass ends it. A non-zero hint would mean output still pending with
-        // nowhere to put it, which is why this reports rather than loops.
+        // `compress_bound` is zstd's own worst case for a single frame and the
+        // buffer above holds it, so one pass ends it. A non-zero hint would
+        // mean output still pending with nowhere to put it, which is why this
+        // reports rather than loops -- and which is why the sizing above is
+        // tested rather than argued: the first version of it was short, and
+        // this is the arm that said so.
         if self.encoder.finish(&mut out, false)? != 0 {
             return Err(CacheError::CorruptBlock(
                 "the compressor had more to write than its own bound allows".to_string(),

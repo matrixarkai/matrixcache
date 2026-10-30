@@ -25076,6 +25076,102 @@ fn the_compressed_payload_is_what_the_streaming_encoder_wrote() {
     );
 }
 
+/// The codec's scratch buffer is sized for the block in front of it.
+///
+/// The buffer is reused, so each block asks it for `compress_bound` of its own
+/// value. `Vec::reserve` is relative to the **length**, which is zero on a
+/// cleared buffer, so asking for the difference between the bound and what is
+/// already held is not the same as asking for the bound: it guarantees only
+/// that difference, and a buffer already holding more than half of what the
+/// next block needs is left exactly as short as it was. 256 bytes and then
+/// 1,024 left a 771-byte buffer for a 1,092-byte bound, and the compressor
+/// refuses a block it cannot finish writing.
+///
+/// So this drives one thread's codec over an **ascending** sequence of sizes,
+/// each half again as large as the last, which is the regime where the two
+/// forms of the arithmetic differ. The values will not compress, deliberately:
+/// a compressible value comes out at a few dozen bytes and fits in any buffer,
+/// so the output buffer's size stops mattering.
+///
+/// The sweep that compares the codec against the streaming encoder could not
+/// find this. It covers larger values than these and more levels, but its
+/// first fixture is its largest, so the buffer was sized for the worst case
+/// before anything else was asked of it. A sweep's ORDER is part of what it
+/// covers.
+#[test]
+fn the_codec_sizes_its_buffer_for_the_block_it_is_about_to_write() {
+    let mut fill = 0x9e37_79b9_7f4a_7c15u64;
+    let mut sizes = vec![128usize];
+    while *sizes.last().expect("the sequence starts non-empty") < 64 * 1024 {
+        let next = sizes.last().expect("non-empty") * 3 / 2;
+        sizes.push(next);
+    }
+    assert!(
+        sizes.len() >= 10 && sizes.windows(2).all(|pair| pair[1] > pair[0]),
+        "the sequence has to be long and strictly ascending to reach the regime: {sizes:?}"
+    );
+
+    for &size in &sizes {
+        let value: Vec<u8> = (0..size)
+            .map(|_| {
+                fill ^= fill << 13;
+                fill ^= fill >> 7;
+                fill ^= fill << 17;
+                (fill & 0xff) as u8
+            })
+            .collect();
+        let compressed = with_cache_block_codec(3, |codec| {
+            codec.compress(&value, 3).map(<[u8]>::to_vec)
+        })
+        .unwrap_or_else(|err| panic!("a {size}-byte value must compress: {err}"));
+        // Incompressible, so the frame is about as large as the value. If this
+        // ever stops holding, the fixture has started compressing and the
+        // output buffer's size is no longer what the sweep is about.
+        assert!(
+            compressed.len() >= size,
+            "a {size}-byte incompressible value came out at {} bytes, so the fixture compresses \
+             and this no longer exercises a full output buffer",
+            compressed.len()
+        );
+        assert_eq!(
+            zstd::stream::decode_all(compressed.as_slice()).expect("the frame must decode"),
+            value,
+            "a {size}-byte value did not come back"
+        );
+        assert_eq!(
+            compressed,
+            zstd::stream::encode_all(value.as_slice(), 3).expect("the streaming encoder"),
+            "a {size}-byte value was not framed as the streaming encoder frames it"
+        );
+    }
+
+    // And through the block path, which is where a refused compression became
+    // a refused `put`.
+    for &size in &sizes {
+        let value: Vec<u8> = (0..size)
+            .map(|_| {
+                fill ^= fill << 13;
+                fill ^= fill >> 7;
+                fill ^= fill << 17;
+                (fill & 0xff) as u8
+            })
+            .collect();
+        let block = encode_cache_block(
+            &value,
+            CacheBlockOptions {
+                compression: CacheCompression::Zstd { level: 3 },
+                min_compress_bytes: 128,
+            },
+        )
+        .unwrap_or_else(|err| panic!("a {size}-byte value must frame: {err}"));
+        assert_eq!(
+            decode_cache_block(&block).expect("the block must decode"),
+            value,
+            "a {size}-byte block did not come back"
+        );
+    }
+}
+
 /// And the block carries that payload through unchanged.
 ///
 /// The test above is about the compressor. This one is about the frame: the
