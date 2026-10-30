@@ -2903,7 +2903,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
         {
             self.rocksdb()
                 .and_then(|db| {
-                    db.get(key.as_bytes())
+                    db.get_pinned(key.as_bytes())
                         .map_err(|err| CacheError::RocksDb(err.to_string()))
                 })
                 .map(|value| value.is_some())
