@@ -1967,12 +1967,7 @@ impl SsdTierStore {
         match self {
             Self::Disabled { .. } => Ok(()),
             Self::Single(storage) => storage.put_batch(entries).map(|_| ()),
-            Self::Multi(storage) => {
-                for (key, value) in entries {
-                    storage.put_view(&key, value)?;
-                }
-                Ok(())
-            }
+            Self::Multi(storage) => storage.put_batch(entries).map(|_| ()),
         }
     }
 
