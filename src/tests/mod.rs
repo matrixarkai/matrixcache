@@ -5,6 +5,35 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn write_budget_tracks_maintenance_only_windows() {
+        let start = Instant::now();
+        let mut budget = SsdWriteBudget::with_target(1000);
+        budget.record_written(10000, start);
+        budget.record_written(500, start + Duration::from_secs(1));
+        assert_eq!(budget.observed_bytes_per_sec(), 10000);
+        assert_eq!(budget.admitted_share(), 1000);
+        budget.record_written(100, start + Duration::from_secs(2));
+        assert_eq!(budget.observed_bytes_per_sec(), 500);
+        assert_eq!(budget.admitted_share(), 2000);
+        assert!(!budget.admits(9999u64 << 32, start + Duration::from_secs(2)));
+        assert!(budget.admits(0, start + Duration::from_secs(2)));
+    }
+
+    // rust-internal: rate arithmetic must not saturate before division.
+    #[test]
+    fn write_budget_preserves_large_rate_ratios() {
+        let start = Instant::now();
+        for (target, expected_share) in [(u64::MAX, 10000), (u64::MAX / 2, 4999)] {
+            let mut budget = SsdWriteBudget::with_target(target);
+            budget.record_written(u64::MAX, start);
+            budget.record_written(1, start + Duration::from_secs(1));
+            assert_eq!(budget.observed_bytes_per_sec(), u64::MAX);
+            assert_eq!(budget.admitted_share(), expected_share);
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn conditional_ssd_update_validates_stale_handles_and_corrupt_blocks() {
         for compression in [CacheCompression::None, CacheCompression::Zstd { level: 1 }] {
             let dir = tempfile::tempdir().unwrap();

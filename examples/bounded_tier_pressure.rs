@@ -7,6 +7,7 @@
 //! `--fifo-ssd` selects insertion-order SSD replacement without popularity gating.
 //! `--frequency-ssd` opts into bounded recent-frequency SSD admission and eviction.
 //! `--rounds N` repeats the working set 1..=1024 times (default: 4).
+//! `--ssd-write-budget N` sets the caller-reported SSD byte-rate target (zero: unlimited).
 
 use matrixcache::{CacheAdmissionRequest, CacheBlockKind, CacheKey, CacheOptions, MultiLayerCache};
 use std::time::Instant;
@@ -28,12 +29,20 @@ fn main() {
     let mut fifo_ssd = false;
     let mut frequency_ssd = false;
     let mut rounds = 4usize;
+    let mut write_budget = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--promoted-working-set" => promoted_working_set = true,
             "--fifo-ssd" => fifo_ssd = true,
             "--frequency-ssd" => frequency_ssd = true,
+            "--ssd-write-budget" => {
+                write_budget = args
+                    .next()
+                    .expect("--ssd-write-budget requires a value")
+                    .parse()
+                    .expect("--ssd-write-budget requires an unsigned integer");
+            }
             "--rounds" => {
                 rounds = args
                     .next()
@@ -59,6 +68,7 @@ fn main() {
     let cache = MultiLayerCache::with_options(options());
     cache.start().unwrap();
     cache.set_ssd_admission_filter_enabled(frequency_ssd);
+    cache.set_ssd_write_budget_bytes_per_sec(write_budget);
     let keys: Vec<_> = (0..8192)
         .map(|i| CacheKey::string(0, &format!("entry-{i:05}")))
         .collect();
@@ -115,6 +125,8 @@ fn main() {
     }
     let elapsed = started.elapsed().as_secs_f64();
     let stats = cache.stats();
+    assert_eq!(stats.ssd_write_budget_target_bytes_per_sec, write_budget);
+    println!("ssd_write_budget_bytes_per_sec={write_budget} budget_rejections={} reported_ssd_bytes_written={}", stats.ssd_write_budget_rejections, stats.ssd_bytes_written);
     assert!(stats.memory_evictions > 0 && stats.pmem_evictions > 0);
     assert!(stats.ssd_evictions > 0 || stats.ssd_admission_rejected > 0);
     if promoted_working_set || fifo_ssd || frequency_ssd {
