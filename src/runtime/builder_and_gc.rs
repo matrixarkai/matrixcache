@@ -3030,6 +3030,11 @@ impl CacheInner {
         request: &CacheAdmissionRequest,
         block_bytes: usize,
     ) -> bool {
+        // FIFO replaces by insertion order, not popularity. The capacity
+        // executor still checks pins and refuses an entry when none can leave.
+        if self.ssd_replacement_policy == CacheReplacementPolicy::Fifo {
+            return false;
+        }
         let incoming_score = EvictionScore {
             segment: 0,
             hotness: initial_hotness(request.block_kind, block_bytes).max(request.hotness),
