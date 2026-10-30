@@ -199,7 +199,7 @@ mod tests {
         {
             let mut inner = cache.inner.write().unwrap();
             assert!(!inner.disk_index.contains_key(&key));
-            inner.drop_stale_tier_copy(&key, CacheTier::Memory);
+            inner.drop_stale_tier_copy(&key, CacheTier::Memory).unwrap();
         }
         assert_eq!(cache.get(&key).unwrap(), None);
         assert!(cache.stop());
@@ -2835,6 +2835,52 @@ mod tests {
             stats.stale_tier_copies_dropped > 0,
             "the rewrites never routed past the memory tier, so this proves nothing"
         );
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn moved_pmem_rewrites_survive_restart() {
+        for (batch, fail_delete) in [(false, false), (true, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = || CacheOptions::new(64, 256, 4096)
+                .with_auto_recover_on_start(true)
+                .with_pmem_paths([dir.path().join("pmem")])
+                .with_ssd_paths([dir.path().join("ssd")]);
+            let cache = MultiLayerCache::with_options(options());
+            cache.start().unwrap();
+            let key = CacheKey::string(0, "moved-write");
+            cache.put(key.clone(), vec![1; 128]).unwrap();
+            assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+            let mut policy = cache.production_tiering_policy();
+            policy.data_placement = CacheDataPlacement::SideBySide;
+            policy.data_placement_threshold_bytes = 64;
+            policy.memory_hotness_threshold = 0;
+            policy.pmem_admit_hotness_threshold = u32::MAX;
+            cache.update_production_tiering_policy(policy);
+            let write = || {
+                if batch {
+                    cache.put_batch(vec![(key.clone(), vec![2; 64])]).map(|_| ())
+                } else {
+                    cache.put(key.clone(), vec![2; 64])
+                }
+            };
+            if fail_delete {
+                let path = cache.inner.read().unwrap().pmem_block_path_for_key(&key).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+                assert!(write().is_err(), "failed cleanup must not acknowledge the write");
+                fs::remove_dir(&path).unwrap();
+            }
+            write().unwrap();
+            assert_eq!(cache.get(&key).unwrap(), Some(vec![2; 64]));
+            assert!(!cache.inner.read().unwrap().pmem.contains_key(&key));
+            assert!(cache.stop());
+            drop(cache);
+            let recovered = MultiLayerCache::with_options(options());
+            recovered.start().unwrap();
+            assert_eq!(recovered.get(&key).unwrap(), Some(vec![2; 64]), "batch={batch}");
+            assert!(recovered.stop());
+        }
     }
 
     /// The severity counts are always present, so "nothing wrong" reads as a
