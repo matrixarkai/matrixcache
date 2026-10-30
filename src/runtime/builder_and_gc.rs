@@ -1167,7 +1167,15 @@ impl CacheInner {
                     .map_err(CacheError::Io)?;
                 std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
             }
-        })
+        })?;
+        if self.pmem_manifest_appends.fetch_add(1, Ordering::Relaxed) + 1
+            >= self.pmem_manifest_compact_after.load(Ordering::Relaxed)
+        {
+            // The append succeeded; maintenance failure must not undo admission.
+            let _ = self.compact_pmem_manifest();
+            self.pmem_manifest_appends.store(0, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn persist_pmem_put(&self, key: &CacheKey, value: &[u8]) -> Result<(), CacheError> {
@@ -1219,6 +1227,7 @@ impl CacheInner {
 
     fn clear_pmem_persistence(&self) -> Result<(), CacheError> {
         self.reset_pmem_manifest_writer();
+        self.reset_pmem_manifest_history();
         let Some(root) = self.pmem_root_dir() else {
             return Ok(());
         };

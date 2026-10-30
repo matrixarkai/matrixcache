@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- PMEM manifest history is periodically compacted from durable records, bounding
+  repeated-update growth without requiring all persisted entries to be resident.
+
 - Unix PMEM manifest appends reuse one descriptor per cache and verify file
   identity before writing. Lifecycle changes and write failures release it.
 
