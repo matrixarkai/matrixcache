@@ -3,6 +3,38 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: force SSD rejection after a previously durable cache write.
+    #[test]
+    fn rejected_ssd_rewrite_removes_the_previous_disk_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = || CacheOptions::new(1024, 0, 4096)
+            .with_ssd_paths([dir.path().join("ssd")]);
+        let cache = MultiLayerCache::with_options(options());
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "rewrite");
+        cache.put(key.clone(), vec![1; 64]).unwrap();
+        {
+            let mut inner = cache.inner.write().unwrap();
+            assert!(inner.disk_index.contains_key(&key));
+            inner.tiering_policy.max_ssd_block_bytes = 1;
+        }
+        cache.put(key.clone(), vec![2; 64]).unwrap();
+        if let Some(value) = cache.get(&key).unwrap() {
+            assert_eq!(value, vec![2; 64]);
+        }
+        {
+            let mut inner = cache.inner.write().unwrap();
+            assert!(!inner.disk_index.contains_key(&key));
+            inner.drop_stale_tier_copy(&key, CacheTier::Memory);
+        }
+        assert_eq!(cache.get(&key).unwrap(), None);
+        assert!(cache.stop());
+        drop(cache);
+        let recovered = MultiLayerCache::with_options(options());
+        recovered.start().unwrap();
+        assert_eq!(recovered.get(&key).unwrap(), None);
+    }
+
     // rust-internal: notification construction must move owned payloads and stay lazy.
     #[test]
     fn owned_eviction_notification_moves_payload_without_copying() {
