@@ -1212,6 +1212,8 @@ struct CacheInner {
     ssd_bytes: u64,
     disk_dir: PathBuf,
     pmem_paths: Vec<PathBuf>,
+    #[cfg(unix)]
+    pmem_manifest_writer: Mutex<Option<PmemManifestWriter>>,
     ssd_store: SsdTierStore,
     ssd_write_budget: SsdWriteBudget,
     /// Time to live applied to entries that do not ask for their own, in
@@ -2286,6 +2288,8 @@ impl MultiLayerCache {
                 ssd_bytes: 0,
                 disk_dir,
                 pmem_paths: Vec::new(),
+                #[cfg(unix)]
+                pmem_manifest_writer: Mutex::new(None),
                 ssd_store,
                 ssd_write_budget: SsdWriteBudget::unlimited(),
                 default_ttl_millis: 0,
@@ -2367,6 +2371,7 @@ impl MultiLayerCache {
         self.stop_async_writeback_worker();
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.started = false;
+        inner.reset_pmem_manifest_writer();
         inner.ssd_store.stop();
         true
     }
@@ -6358,6 +6363,7 @@ impl MultiLayerCache {
     fn set_pmem_paths(&self, paths: Vec<PathBuf>) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.pmem_paths = paths;
+        inner.reset_pmem_manifest_writer();
     }
 
     pub fn update_production_tiering_policy(&self, policy: CacheTieringPolicy) {
@@ -9756,7 +9762,16 @@ impl CacheInner {
         //   `memory_replacement_policy`,
         //   `pmem_replacement_policy`, `ssd_replacement_policy`,
         //   `block_options`, `tiering_policy`, `read_counters`, `stats`.
-        let fixed_bytes = self.disk_dir.capacity()
+        #[cfg(unix)]
+        let manifest_writer_bytes = self
+            .pmem_manifest_writer
+            .lock()
+            .expect("manifest writer poisoned")
+            .as_ref()
+            .map_or(0, |writer| writer.path.capacity());
+        #[cfg(not(unix))]
+        let manifest_writer_bytes = 0;
+        let fixed_bytes = manifest_writer_bytes + self.disk_dir.capacity()
             + self
                 .pmem_paths
                 .iter()

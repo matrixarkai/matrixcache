@@ -55,6 +55,7 @@ include!("runtime/storage_engines.rs");
 include!("runtime/multilayer_cache.rs");
 include!("runtime/cache_facades.rs");
 include!("runtime/builder_and_gc.rs");
+include!("runtime/manifest_writer.rs");
 include!("runtime/zoned_store.rs");
 include!("runtime/zoned_gc.rs");
 include!("core/frequency_sketch.rs");
