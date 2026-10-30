@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- SSD bypass insertion checks for an identical stored value before encoding
+  a replacement block, avoiding unnecessary encoding and compression on reuse.
+
 - **A snapshot of a sharded cache folds in one pass.**
   `ShardedMultiLayerCache::stats` built every shard's full `CacheStats` twice:
   once in the fold, and again in a second pass whose only purpose was to re-read
