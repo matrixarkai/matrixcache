@@ -629,6 +629,13 @@ fn decode_cache_block_shared(block: &[u8]) -> Result<Arc<[u8]>, CacheError> {
     Ok(Arc::<[u8]>::from(decode_cache_block(block)?))
 }
 
+fn cache_block_matches_value(block: &[u8], value: &[u8]) -> Result<bool, CacheError> {
+    if let Some(payload) = uncompressed_block_payload(block)? {
+        return Ok(payload == value);
+    }
+    Ok(decode_cache_block(block)? == value)
+}
+
 /// The payload of a block that needs no decompressing, or `None` when it does.
 ///
 /// The header checks are the ones [`decode_cache_block`] makes, in the same
