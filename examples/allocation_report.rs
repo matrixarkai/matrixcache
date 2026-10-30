@@ -542,42 +542,67 @@ fn main() {
     //       Rust after         27.11    58,223.8
     //    RocksDB after         11.11    54,914.2
     //
+    // And again when the codec stopped building a compressor per call. This
+    // row's value does not compress, so what it stopped paying for is a
+    // payload built and discarded:
+    //
+    //         backend   allocations       bytes
+    //       Rust after         25.11    24,422.8
+    //    RocksDB after          9.11    21,113.2
+    //
     // Per arm, because the two are not comparable: this allocator sees Rust
     // only, and with RocksDB the store's own bytes are allocated elsewhere.
     // Three runs of the same binary moved the figures by 0.01 allocations and
     // 8 bytes, so the margin here is wide rather than lucky.
-    // A read of a **compressed** block allocates 153,389 bytes for a value of
-    // 1,024 -- six times what the same read costs when the block is stored
-    // raw (24,310), and the figure is identical on both feature arms, so none
-    // of it is the store. It is the decompressor: `zstd::stream::decode_all`
-    // builds a context and its window on every call.
+    // The codec keeps its context between calls, so neither of these rows
+    // pays for one any more. Both figures below are per operation: calls into
+    // the global allocator, and bytes asked of it, averaged over REPEATS
+    // operations after one untimed pass.
     //
-    // A write that keeps its compressed form costs 49,498 bytes on the
-    // pure-Rust store and 48,342 through the other. A write whose value does
-    // NOT compress pays nearly the same -- the compressor still runs, and its
-    // output is discarded -- which is why the raw write row above is only
-    // ~9,000 bytes cheaper than this one.
+    //   row                                 before            after
+    //   get, promoting a compressed block   14.00 / 153,389   13.00 /  22,314
+    //   put, compressing a block, Rust      25.86 /  49,498   23.86 /  16,712
+    //   put, compressing a block, other     10.83 /  48,342    8.83 /  15,556
+    //   put, reaching the SSD tier, Rust    27.11 /  58,224   25.11 /  24,423
+    //   put, reaching the SSD tier, other   11.11 /  54,914    9.11 /  21,113
     //
-    // These bounds are where the codec is today. They are not an endorsement:
-    // a reused context would move both, and the bounds come down with it.
+    // The byte saving is 131,075 on the read and 32,786 on the write that
+    // keeps its block, and it is the same figure on BOTH feature arms to the
+    // byte -- which is what says the saving is the codec's and not the
+    // store's. Those two numbers are also exactly what the buffers cost when
+    // they are measured on their own, outside any cache:
+    // `zstd::stream::decode_all` reads through a buffer of `DCtx::in_size()`,
+    // which is 131,075 bytes, and `zstd::stream::encode_all` writes through a
+    // 32 KiB one.
+    //
+    // The third row is the write whose value does NOT compress, so the
+    // compressed payload is built and thrown away. It saves 33,801 bytes --
+    // more than the row that keeps its block, because the discarded payload
+    // was bigger. Nothing is allocated for it at all now: it is built in the
+    // codec's scratch buffer, which the next block reuses.
+    //
+    // What this instrument cannot see, and so is not claimed: zstd's context
+    // itself is allocated through C, not through Rust's allocator. Removing
+    // the per-call context removes that allocation too, and no figure here
+    // counts it either before or after.
     match find("get, promoting a compressed block") {
-        Some(row) if row.allocations <= 15.0 && row.bytes <= 156_000.0 => {}
+        Some(row) if row.allocations <= 14.0 && row.bytes <= 23_500.0 => {}
         Some(row) => failures.push(format!(
-            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 15 \
-             and 156,000",
+            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 14 \
+             and 23,500 -- the decompressor is building a context per call again",
             row.allocations, row.bytes
         )),
         None => failures.push("the compressed read is missing from the table".to_string()),
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 27.5;
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 24.5;
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const COMPRESSING_WRITE_BYTES: f64 = 51_000.0;
+    const COMPRESSING_WRITE_BYTES: f64 = 17_500.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 12.0;
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 9.5;
     #[cfg(feature = "rocksdb-ssd")]
-    const COMPRESSING_WRITE_BYTES: f64 = 50_000.0;
+    const COMPRESSING_WRITE_BYTES: f64 = 16_300.0;
     match find("put, compressing a block") {
         Some(row)
             if row.allocations <= COMPRESSING_WRITE_ALLOCATIONS
@@ -606,13 +631,13 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_ALLOCATIONS: f64 = 28.5;
+    const SSD_WRITE_ALLOCATIONS: f64 = 26.0;
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_BYTES: f64 = 59_000.0;
+    const SSD_WRITE_BYTES: f64 = 25_200.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_ALLOCATIONS: f64 = 12.5;
+    const SSD_WRITE_ALLOCATIONS: f64 = 10.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_BYTES: f64 = 55_700.0;
+    const SSD_WRITE_BYTES: f64 = 21_800.0;
     match find("put, reaching the SSD tier") {
         Some(row) if row.allocations <= SSD_WRITE_ALLOCATIONS && row.bytes <= SSD_WRITE_BYTES => {}
         Some(row) => failures.push(format!(

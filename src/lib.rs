@@ -25,6 +25,7 @@
 //! The Ssd backend is RocksDB via the default `rocksdb-ssd` feature; build with
 //! `--no-default-features` for a lightweight file-backed compatibility store.
 
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(not(feature = "rocksdb-ssd"))]
