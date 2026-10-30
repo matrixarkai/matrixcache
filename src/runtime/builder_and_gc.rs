@@ -2991,6 +2991,9 @@ impl CacheInner {
         self.disk_order
             .iter()
             .take(EVICTION_CANDIDATE_WINDOW)
+            // Admission must not approve a trade against an entry eviction
+            // cannot remove. Capacity checks still reject an entirely pinned tier.
+            .filter(|candidate| !self.is_pinned(candidate))
             .filter(|candidate| self.eviction_group_key(candidate) != incoming_group)
             .map(|candidate| self.eviction_score(candidate))
             .min()
