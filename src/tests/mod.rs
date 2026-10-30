@@ -24960,3 +24960,278 @@ fn a_raw_block_is_framed_exactly_as_it_always_was() {
         "the compressed block does not decode to what was written"
     );
 }
+
+/// Values that cover both sides of every branch in the codec, so a sweep over
+/// them is a sweep over the codec rather than over one shape of data.
+#[cfg(test)]
+fn cache_codec_fixtures() -> Vec<(&'static str, Vec<u8>)> {
+    let mut patterned = Vec::with_capacity(4096);
+    for index in 0..4096u32 {
+        patterned.push((index % 17) as u8);
+    }
+    let mut text = Vec::new();
+    while text.len() < 65536 {
+        text.extend_from_slice(b"the quick brown fox jumps over the lazy dog; ");
+    }
+    text.truncate(65536);
+    let mut fill = 0x2545_f491_4f6c_dd1du64;
+    let mut runs = Vec::with_capacity(49_152);
+    while runs.len() < 49_152 {
+        fill ^= fill << 13;
+        fill ^= fill >> 7;
+        fill ^= fill << 17;
+        let run = (fill % 40) as usize + 1;
+        let byte = (fill >> 20) as u8 % 6;
+        for _ in 0..run {
+            runs.push(byte);
+            if runs.len() == 49_152 {
+                break;
+            }
+        }
+    }
+    let mut noise = Vec::with_capacity(4096);
+    for _ in 0..4096 {
+        fill ^= fill << 13;
+        fill ^= fill >> 7;
+        fill ^= fill << 17;
+        noise.push((fill & 0xff) as u8);
+    }
+    vec![
+        ("a flat 4 KiB value", vec![7u8; 4096]),
+        ("a repeating pattern", patterned),
+        ("64 KiB of prose", text),
+        ("48 KiB of runs", runs),
+        ("a flat 1 KiB value", vec![7u8; 1024]),
+        ("a flat 128-byte value", vec![7u8; 128]),
+        ("no bytes at all", Vec::new()),
+        ("one byte", vec![9u8]),
+        ("4 KiB that will not compress", noise),
+    ]
+}
+
+/// The compressed payload is the bytes the streaming encoder wrote.
+///
+/// The codec used to build a context per call, through
+/// `zstd::stream::encode_all`. It now keeps one per thread and drives it
+/// directly, which is the same compressor over the same input -- but "the same
+/// bytes" is a claim about a **stored format**, not about a round trip, and
+/// two things would quietly break it:
+///
+/// * the compression level is a parameter of the context, so a context reused
+///   across levels has to be re-parameterised. A codec that set the level once
+///   would compress every later block at the first block's level, write
+///   perfectly valid frames, and still have changed what the cache stores. The
+///   sweep below alternates the level on nearly every call for exactly that.
+/// * an empty value must not be handed to the compressor at all. `encode_all`
+///   copies zero bytes in and so never calls it; feeding it an empty input
+///   instead makes the frame declare a window, and nine bytes come out
+///   different.
+///
+/// Both of those produce output that decodes correctly, so a round-trip test
+/// cannot see either. This compares against the function the codec replaced.
+#[test]
+fn the_compressed_payload_is_what_the_streaming_encoder_wrote() {
+    let levels = [1, 3, 9, 19];
+    let mut compared = 0usize;
+    let mut level_changes = 0usize;
+    let mut previous_level = None;
+    // Two rounds over one thread's codec, so a block is compared after the
+    // context has already compressed something else at another level.
+    for _ in 0..2 {
+        for (what, value) in cache_codec_fixtures() {
+            for level in levels {
+                let ours = with_cache_block_codec(level, |codec| {
+                    codec.compress(&value, level).map(<[u8]>::to_vec)
+                })
+                .expect("the codec must compress");
+                let streaming = zstd::stream::encode_all(value.as_slice(), level)
+                    .expect("the streaming encoder must compress");
+                assert_eq!(
+                    ours, streaming,
+                    "{what} at level {level}: the reused context wrote {} bytes and the \
+                     streaming encoder wrote {}",
+                    ours.len(),
+                    streaming.len()
+                );
+                compared += 1;
+                if previous_level.is_some_and(|earlier| earlier != level) {
+                    level_changes += 1;
+                }
+                previous_level = Some(level);
+            }
+        }
+    }
+    // Fixture checks, not conclusions: a sweep that compared nothing, or that
+    // never changed the level, would pass the assertion above while covering
+    // neither of the two things it exists for.
+    assert_eq!(
+        compared,
+        2 * cache_codec_fixtures().len() * levels.len(),
+        "the sweep did not compare every fixture at every level"
+    );
+    assert!(
+        level_changes >= compared - compared / levels.len() - 1,
+        "only {level_changes} of {compared} calls changed the level, so the re-parameterising \
+         is barely exercised"
+    );
+}
+
+/// And the block carries that payload through unchanged.
+///
+/// The test above is about the compressor. This one is about the frame: the
+/// bytes between the header and the end of the block are the compressor's
+/// output, so a change in how the block is assembled cannot smuggle a
+/// different payload past the comparison above.
+#[test]
+fn a_compressed_block_carries_exactly_the_compressors_output() {
+    let mut kept = 0usize;
+    let mut discarded = 0usize;
+    for (what, value) in cache_codec_fixtures() {
+        for level in [1, 3, 9] {
+            let options = CacheBlockOptions {
+                compression: CacheCompression::Zstd { level },
+                min_compress_bytes: 0,
+            };
+            let block = encode_cache_block(&value, options).expect("a value must encode");
+            if is_encoded_compressed_block(&block) {
+                let streaming = zstd::stream::encode_all(value.as_slice(), level)
+                    .expect("the streaming encoder must compress");
+                assert_eq!(
+                    &block[CACHE_HEADER_LEN..],
+                    streaming.as_slice(),
+                    "{what} at level {level}: the block's payload is not the compressor's output"
+                );
+                kept += 1;
+            } else {
+                assert_eq!(
+                    &block[CACHE_HEADER_LEN..],
+                    value.as_slice(),
+                    "{what} at level {level}: a block that stores the value raw must store it \
+                     as it is"
+                );
+                discarded += 1;
+            }
+            assert_eq!(
+                decode_cache_block(&block).expect("the block must decode"),
+                value,
+                "{what} at level {level}: the block does not decode to what was written"
+            );
+        }
+    }
+    // Both arms, or this is a test of one of them wearing the other's name.
+    assert!(
+        kept > 0 && discarded > 0,
+        "the sweep kept {kept} compressed blocks and discarded {discarded}, so one arm of the \
+         decision never ran"
+    );
+}
+
+/// A block written before the codec kept its context still decodes.
+///
+/// Two blocks, frozen as bytes rather than produced by this build, from the
+/// `zstd::stream::encode_all` the codec used to call. A round trip cannot
+/// catch a reader that only accepts what it would write -- both halves move
+/// together and agree with each other -- so the old shape has to be committed.
+///
+/// What makes these old specifically: a frame from the streaming encoder
+/// records **no** decompressed size, because the encoder is not told the
+/// length in advance. The decoder now sizes its output from the block header
+/// instead, which is the only reason it can read these at all.
+#[test]
+fn a_block_written_before_the_codec_kept_its_context_still_decodes() {
+    // `vec![7u8; 4096]` at level 1, as `encode_all` framed it.
+    const FLAT_4096_LEVEL_1: [u8; 44] = [
+        0x54, 0x53, 0x42, 0x43, 0x41, 0x43, 0x48, 0x45, 0x01, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0xb5, 0x2f, 0xfd,
+        0x00, 0x48, 0x4d, 0x00, 0x00, 0x10, 0x07, 0x07, 0x01, 0x00, 0xfb, 0xf7, 0x01, 0x16,
+    ];
+    // `(0..4096).map(|index| (index % 17) as u8)` at level 3, likewise.
+    const PATTERNED_4096_LEVEL_3: [u8; 60] = [
+        0x54, 0x53, 0x42, 0x43, 0x41, 0x43, 0x48, 0x45, 0x01, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0xb5, 0x2f, 0xfd,
+        0x00, 0x58, 0xcd, 0x00, 0x00, 0x88, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x01, 0x00, 0xd9, 0x4f, 0xfe, 0x5c, 0x02,
+    ];
+
+    let mut patterned = Vec::with_capacity(4096);
+    for index in 0..4096u32 {
+        patterned.push((index % 17) as u8);
+    }
+
+    for (what, block, expected) in [
+        (
+            "a flat 4 KiB value at level 1",
+            FLAT_4096_LEVEL_1.as_slice(),
+            vec![7u8; 4096],
+        ),
+        (
+            "a repeating pattern at level 3",
+            PATTERNED_4096_LEVEL_3.as_slice(),
+            patterned,
+        ),
+    ] {
+        assert!(
+            is_encoded_compressed_block(block),
+            "{what}: the committed bytes have to be a compressed block, or this reads a raw one"
+        );
+        assert_eq!(
+            zstd::bulk::Decompressor::upper_bound(&block[CACHE_HEADER_LEN..]),
+            None,
+            "{what}: a frame that records its size is not one the streaming encoder wrote, so \
+             these bytes are not the old shape"
+        );
+        assert_eq!(
+            decode_cache_block(block).expect("committed old bytes must decode"),
+            expected,
+            "{what}: the owning decode does not read what was written before the change"
+        );
+        assert_eq!(
+            decode_cache_block_shared(block)
+                .expect("committed old bytes must decode")
+                .as_ref(),
+            expected.as_slice(),
+            "{what}: the shared decode does not read what was written before the change"
+        );
+    }
+}
+
+/// A compressed block whose header understates its value is still refused by
+/// name.
+///
+/// The decode sizes its output from the header's original length, so a header
+/// claiming less than the payload expands to is the one case the sized decode
+/// cannot complete. It falls back to the unsized one so the block is rejected
+/// with the reason it has always carried -- a block rejected for the wrong
+/// reason has still changed behaviour, and the two decode paths are compared
+/// by their messages.
+#[test]
+fn a_compressed_block_that_understates_its_value_is_refused_for_the_length() {
+    let value = vec![7u8; 4096];
+    let mut block = encode_cache_block(
+        &value,
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 128,
+        },
+    )
+    .expect("a compressible value must encode");
+    assert!(
+        is_encoded_compressed_block(&block),
+        "the fixture has to be a compressed block for the sized decode to be the one tested"
+    );
+    block[10..18].copy_from_slice(&7u64.to_le_bytes());
+
+    let owning = decode_cache_block(&block).expect_err("a lying length must be refused");
+    assert_eq!(
+        owning.to_string(),
+        "corrupt cache block: original length mismatch",
+        "the reason a block with a lying original length is refused has changed"
+    );
+    let shared =
+        decode_cache_block_shared(&block).expect_err("a lying length must be refused either way");
+    assert_eq!(
+        shared.to_string(),
+        owning.to_string(),
+        "the two decodes refuse a lying original length for different reasons"
+    );
+}

@@ -286,6 +286,11 @@ const CACHE_BLOCK_VERSION: u8 = 1;
 const CACHE_CODEC_RAW: u8 = 0;
 const CACHE_CODEC_ZSTD: u8 = 1;
 const CACHE_HEADER_LEN: usize = 8 + 1 + 1 + 8 + 8;
+/// The level a codec is built with when the first thing a thread does is
+/// decode. Decompression takes no level, so this only decides what an encode
+/// on the same thread would start from -- and `compress` re-parameterises when
+/// the level it is handed differs.
+const CACHE_FALLBACK_COMPRESSION_LEVEL: i32 = 0;
 
 /// Frame a value as a block, with one copy of the payload.
 ///
@@ -298,32 +303,186 @@ const CACHE_HEADER_LEN: usize = 8 + 1 + 1 + 8 + 8;
 /// The compressed payload still needs a buffer of its own, because whether it
 /// is used at all is decided by how big it turns out to be. The raw payload
 /// does not: it is already in the caller's slice.
-fn encode_cache_block(value: &[u8], options: CacheBlockOptions) -> Result<Vec<u8>, CacheError> {
-    let compressed = match options.compression {
-        CacheCompression::Zstd { level } if value.len() >= options.min_compress_bytes => {
-            let compressed = zstd::stream::encode_all(value, level)?;
-            // Kept only if framing it is smaller than storing the value as it
-            // is, which is the same comparison as before.
-            if CACHE_HEADER_LEN + compressed.len() < value.len() {
-                Some(compressed)
-            } else {
-                None
+/// The compressor and the decompressor a thread keeps between calls.
+///
+/// Every call used to build its own. The context itself is zstd's, allocated
+/// through C and so invisible to a Rust counting allocator, but the buffers
+/// the convenience functions wrap it in are not: `zstd::stream::encode_all`
+/// allocates a 32 KiB output buffer per call, and `zstd::stream::decode_all`
+/// a 128 KiB input buffer sized from `DCtx::in_size()`. Measured on their own,
+/// those two are 32,786 and 132,099 bytes an operation; the context behind
+/// them is more allocation again that this instrument cannot see.
+///
+/// Held per thread rather than per cache, because the codec carries no cache
+/// state -- a level and a scratch buffer -- and a shard's writes can arrive on
+/// any thread. The price is that a thread which has compressed once keeps
+/// zstd's context until it exits: bounded resident state per working thread,
+/// against unbounded churn per call.
+struct CacheBlockCodec {
+    /// Reset per call with `reinit`, which keeps the workspace and starts a
+    /// new frame.
+    encoder: zstd::stream::raw::Encoder<'static>,
+    /// The level the encoder is currently parameterised for, so a run of
+    /// writes at one level does not re-set it on every block.
+    level: i32,
+    /// Where a compressed payload is built. Reused, so a payload that turns
+    /// out not to be worth keeping costs no allocation at all.
+    scratch: Vec<u8>,
+    decoder: zstd::bulk::Decompressor<'static>,
+}
+
+impl CacheBlockCodec {
+    fn new(level: i32) -> Result<Self, CacheError> {
+        Ok(Self {
+            encoder: zstd::stream::raw::Encoder::new(level)?,
+            level,
+            scratch: Vec::new(),
+            decoder: zstd::bulk::Decompressor::new()?,
+        })
+    }
+
+    /// Compress `value` into the scratch buffer and borrow the result.
+    ///
+    /// The bytes are the ones `zstd::stream::encode_all` wrote, frame for
+    /// frame -- `the_compressed_payload_is_what_the_streaming_encoder_wrote`
+    /// sweeps fixtures and levels and compares them. Two things make that
+    /// true and are easy to lose:
+    ///
+    /// * the level is a parameter of the context, so a reused context has to
+    ///   be re-parameterised when the level changes;
+    /// * an empty value is not run through the compressor at all. `encode_all`
+    ///   copies zero bytes into the encoder and so never calls it, and the
+    ///   frame it then ends is a single-segment one. Handing the compressor an
+    ///   empty input instead makes it declare a window, and the nine bytes
+    ///   come out different.
+    fn compress(&mut self, value: &[u8], level: i32) -> Result<&[u8], CacheError> {
+        use zstd::stream::raw::Operation as _;
+
+        self.encoder.reinit()?;
+        if level != self.level {
+            self.encoder
+                .set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))?;
+            self.level = level;
+        }
+        let needed = zstd::zstd_safe::compress_bound(value.len());
+        self.scratch.clear();
+        let held = self.scratch.capacity();
+        if held < needed {
+            self.scratch.reserve(needed - held);
+        }
+        let mut out = zstd::zstd_safe::OutBuffer::around(&mut self.scratch);
+        if !value.is_empty() {
+            let mut input = zstd::zstd_safe::InBuffer::around(value);
+            self.encoder.run(&mut input, &mut out)?;
+            if input.pos() != value.len() {
+                return Err(CacheError::CorruptBlock(format!(
+                    "the compressor took {} of {} bytes in one pass",
+                    input.pos(),
+                    value.len()
+                )));
             }
         }
-        CacheCompression::Zstd { .. } | CacheCompression::None => None,
-    };
-    let (codec, payload): (u8, &[u8]) = match compressed.as_deref() {
-        Some(compressed) => (CACHE_CODEC_ZSTD, compressed),
-        None => (CACHE_CODEC_RAW, value),
-    };
+        // `compress_bound` is zstd's own worst case for a single frame, so one
+        // pass ends it. A non-zero hint would mean output still pending with
+        // nowhere to put it, which is why this reports rather than loops.
+        if self.encoder.finish(&mut out, false)? != 0 {
+            return Err(CacheError::CorruptBlock(
+                "the compressor had more to write than its own bound allows".to_string(),
+            ));
+        }
+        let written = out.as_slice().len();
+        Ok(&self.scratch[..written])
+    }
+
+    /// Decompress `payload`, which the block header says holds `original_len`
+    /// bytes.
+    ///
+    /// Having the length means the output is allocated once at exactly the
+    /// size it needs. `zstd::stream::decode_all` cannot do that: the frames
+    /// this codec writes record no content size, so it reads through a 128 KiB
+    /// buffer and grows the output as it goes.
+    ///
+    /// `try_reserve_exact` rather than `reserve`, because `original_len` is
+    /// eight bytes off a device: a corrupt header asking for more than fits is
+    /// a rejected block, not an abort.
+    fn decompress(&mut self, payload: &[u8], original_len: usize) -> Result<Vec<u8>, CacheError> {
+        let mut decoded = Vec::new();
+        if decoded.try_reserve_exact(original_len).is_err() {
+            return Err(CacheError::CorruptBlock(format!(
+                "a block claiming {original_len} bytes will not fit in memory"
+            )));
+        }
+        match self.decoder.decompress_to_buffer(payload, &mut decoded) {
+            Ok(_) => Ok(decoded),
+            // The sized decode refuses a payload that expands past what the
+            // header claims, and refuses it with zstd's words about a
+            // destination buffer. The unsized one reaches the length check
+            // below this call, which names the mismatch -- and that is what
+            // every caller and every test has always been told. So a failure
+            // here falls back to it rather than changing the reason a corrupt
+            // block is rejected. It runs only for blocks already being
+            // refused, never on a read that succeeds.
+            Err(_) => Ok(zstd::stream::decode_all(payload)?),
+        }
+    }
+}
+
+thread_local! {
+    static CACHE_BLOCK_CODEC: RefCell<Option<CacheBlockCodec>> = const { RefCell::new(None) };
+}
+
+/// Run `use_codec` against this thread's codec, building it on first use.
+///
+/// Lazily, so a process that never compresses never pays for a context.
+fn with_cache_block_codec<T>(
+    level: i32,
+    use_codec: impl FnOnce(&mut CacheBlockCodec) -> Result<T, CacheError>,
+) -> Result<T, CacheError> {
+    CACHE_BLOCK_CODEC.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(CacheBlockCodec::new(level)?);
+        }
+        use_codec(slot.as_mut().expect("the codec was just built"))
+    })
+}
+
+/// Frame a payload that is already in the form it will be stored in.
+///
+/// Split out of `encode_cache_block` so the compressed arm can frame straight
+/// from the codec's scratch buffer while it is still borrowed. The bytes are
+/// the ones that arm always wrote.
+fn frame_cache_block(original_len: usize, codec: u8, payload: &[u8]) -> Vec<u8> {
     let mut block = Vec::with_capacity(CACHE_HEADER_LEN + payload.len());
     block.extend_from_slice(CACHE_BLOCK_MAGIC);
     block.push(CACHE_BLOCK_VERSION);
     block.push(codec);
-    block.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    block.extend_from_slice(&(original_len as u64).to_le_bytes());
     block.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     block.extend_from_slice(payload);
-    Ok(block)
+    block
+}
+
+fn encode_cache_block(value: &[u8], options: CacheBlockOptions) -> Result<Vec<u8>, CacheError> {
+    match options.compression {
+        CacheCompression::Zstd { level } if value.len() >= options.min_compress_bytes => {
+            with_cache_block_codec(level, |codec| {
+                let compressed = codec.compress(value, level)?;
+                // Kept only if framing it is smaller than storing the value as
+                // it is, which is the same comparison as before. The payload
+                // that loses that comparison was never allocated: it is in the
+                // codec's scratch, which the next block reuses.
+                if CACHE_HEADER_LEN + compressed.len() < value.len() {
+                    Ok(frame_cache_block(value.len(), CACHE_CODEC_ZSTD, compressed))
+                } else {
+                    Ok(frame_cache_block(value.len(), CACHE_CODEC_RAW, value))
+                }
+            })
+        }
+        CacheCompression::Zstd { .. } | CacheCompression::None => {
+            Ok(frame_cache_block(value.len(), CACHE_CODEC_RAW, value))
+        }
+    }
 }
 
 #[cfg(not(feature = "rocksdb-ssd"))]
@@ -537,7 +696,11 @@ fn decode_cache_block(block: &[u8]) -> Result<Vec<u8>, CacheError> {
     let payload = &block[CACHE_HEADER_LEN..];
     let decoded = match codec {
         CACHE_CODEC_RAW => payload.to_vec(),
-        CACHE_CODEC_ZSTD => zstd::stream::decode_all(payload)?,
+        // The level matters only to the compressor; a codec built for this
+        // read decompresses the same whatever it was parameterised with.
+        CACHE_CODEC_ZSTD => with_cache_block_codec(CACHE_FALLBACK_COMPRESSION_LEVEL, |codec| {
+            codec.decompress(payload, original_len)
+        })?,
         other => return Err(CacheError::UnsupportedCodec(other)),
     };
     if decoded.len() != original_len {
