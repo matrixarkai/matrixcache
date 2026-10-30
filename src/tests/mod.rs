@@ -3,6 +3,28 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: validate the native block-cache budget on a real database.
+    #[cfg(feature = "rocksdb-ssd")]
+    #[test]
+    fn native_block_cache_budget_tracks_capacity_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = StorageEngineRocksDb::new(dir.path().join("ssd").to_string_lossy());
+        for (bytes, expected_mb) in [
+            (0, 1), (1, 1), (1024 * 1024, 1), (1024 * 1024 + 1, 2),
+            (64 * 1024 * 1024, 64), (u64::MAX, 64),
+        ] {
+            store.SetCapacity(bytes);
+            assert_eq!(store.rocksdb_block_cache_mebibytes(), expected_mb);
+        }
+        store.SetCapacity(1024 * 1024);
+        assert!(store.Start());
+        assert_eq!(
+            store.db.as_ref().unwrap().property_int_value("rocksdb.block-cache-capacity").unwrap(),
+            Some(1024 * 1024),
+        );
+        assert!(store.Stop());
+    }
+
     // rust-internal: borrowed equality must preserve block decoder validation.
     #[test]
     fn stored_block_comparison_checks_values_and_corruption() {

@@ -2212,11 +2212,18 @@ impl StorageEngineRocksDb {
     }
 
     #[cfg(feature = "rocksdb-ssd")]
-    fn rocksdb_options() -> rocksdb::Options {
+    fn rocksdb_block_cache_mebibytes(&self) -> u64 {
+        // Budget at open, per database. Memtables and pinned blocks are separate
+        // allocations, so this is not a process memory limit.
+        self.capacity.div_ceil(1024 * 1024).clamp(1, 64)
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    fn rocksdb_options(&self) -> rocksdb::Options {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.increase_parallelism(4);
-        options.optimize_for_point_lookup(64);
+        options.optimize_for_point_lookup(self.rocksdb_block_cache_mebibytes());
         options.set_write_buffer_size(Self::rocksdb_write_buffer_bytes());
         options.set_max_write_buffer_number(4);
         options.set_level_zero_file_num_compaction_trigger(16);
@@ -2234,7 +2241,7 @@ impl StorageEngineRocksDb {
 
     #[cfg(feature = "rocksdb-ssd")]
     fn open_rocksdb(&self) -> Result<rocksdb::DB, CacheError> {
-        let options = Self::rocksdb_options();
+        let options = self.rocksdb_options();
         rocksdb::DB::open_cf_with_opts(
             &options,
             &self.db_path,
