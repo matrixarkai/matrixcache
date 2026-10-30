@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- PMEM and compatibility SSD manifest appends write each complete record as one
+  buffer, reducing write calls while preserving the on-disk format.
+
 - Storage batch reads move returned buffers directly into the result when keys
   are unique, avoiding a payload copy in both single-device and multi-device reads.
 
