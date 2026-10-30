@@ -3,6 +3,37 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: aging ownership never blocks concurrent sketch updates.
+    #[test]
+    fn frequency_aging_has_one_nonblocking_owner() {
+        let sketch = FrequencySketch::with_capacity(1);
+        let key = CacheKey::string(0, "aging-owner");
+        sketch.aging.store(true, Ordering::Release);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let sketch = &sketch;
+                let key = &key;
+                scope.spawn(move || {
+                    for _ in 0..16 { sketch.record(key); }
+                });
+            }
+        });
+        assert_eq!(sketch.window(), 64);
+        assert_eq!(sketch.estimate(&key), 64);
+        sketch.aging.store(false, Ordering::Release);
+        sketch.decay();
+        assert_eq!(sketch.window(), 32);
+        assert_eq!(sketch.estimate(&key), 32);
+        sketch.decay();
+        assert_eq!(sketch.window(), 16);
+        assert_eq!(sketch.estimate(&key), 16);
+        // Stale threshold observers must not start another sweep.
+        sketch.decay();
+        assert_eq!(sketch.window(), 16);
+        assert_eq!(sketch.estimate(&key), 16);
+        assert!(!sketch.aging.load(Ordering::Acquire));
+    }
+
     // rust-internal: optional sketch allocation stays bounded across shards and is released.
     #[test]
     fn ssd_frequency_configuration_is_bounded_per_shard() {

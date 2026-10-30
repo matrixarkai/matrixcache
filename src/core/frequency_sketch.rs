@@ -77,6 +77,8 @@ pub struct FrequencySketch {
     window: AtomicU64,
     /// Increments at which to halve.
     max_window: u64,
+    /// Only one reader sweeps the table; other readers keep recording hits.
+    aging: AtomicBool,
 }
 
 impl FrequencySketch {
@@ -125,6 +127,7 @@ impl FrequencySketch {
             mask: width - 1,
             window: AtomicU64::new(0),
             max_window: (entries.max(1) as u64).saturating_mul(WINDOW_TO_CAPACITY_RATIO),
+            aging: AtomicBool::new(false),
         }
     }
 
@@ -209,14 +212,29 @@ impl FrequencySketch {
     /// seen a hundred times still outranks something seen twice afterwards,
     /// which a reset would throw away.
     fn decay(&self) {
-        for counter in &self.counters {
-            let current = counter.load(Ordering::Relaxed);
-            if current != 0 {
-                counter.store(current >> 1, Ordering::Relaxed);
-            }
+        if self
+            .aging
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
-        let window = self.window.load(Ordering::Relaxed);
-        self.window.store(window >> 1, Ordering::Relaxed);
+        // A reader may have observed the threshold before another sweep finished.
+        if self.window.load(Ordering::Relaxed) < self.max_window {
+            self.aging.store(false, Ordering::Release);
+            return;
+        }
+        for counter in &self.counters {
+            #[allow(deprecated)]
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count != 0).then_some(count >> 1)
+            });
+        }
+        #[allow(deprecated)]
+        let _ = self.window.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count >> 1)
+        });
+        self.aging.store(false, Ordering::Release);
     }
 
     /// Counters held, for tests and for reporting memory use.
