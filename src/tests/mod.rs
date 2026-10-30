@@ -5652,13 +5652,51 @@ mod tests {
         let before_batch = journal_bytes(&store);
         store.put_batch((0..100).map(|value| ("key".into(), vec![value; 64])).collect()).unwrap();
         assert_eq!(journal_bytes(&store) - before_batch, one_record);
-        assert_eq!(store.get("key").unwrap().to_vec(), vec![99; 64]);
+        assert_eq!(store.get_owned("key").unwrap(), vec![99; 64]);
         assert!(store.stop());
         drop(store);
         let mut recovered = SsdTierStore::new(root.path(), &paths, 1 << 20);
         assert!(recovered.start());
-        assert_eq!(recovered.get("key").unwrap().to_vec(), vec![99; 64]);
+        assert_eq!(recovered.get_owned("key").unwrap(), vec![99; 64]);
         assert!(recovered.stop());
+    }
+
+    #[test]
+    fn ssd_tier_owned_reads_preserve_values_and_recover_across_devices() {
+        for device_count in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = (0..device_count)
+                .map(|index| root.path().join(format!("device-{index}")))
+                .collect::<Vec<_>>();
+            let mut store = SsdTierStore::new(root.path(), &paths, 1 << 20);
+            assert!(matches!(store.get_owned("a"), Err(CacheError::Stopped)));
+            assert!(store.start());
+            let entries = (0..32)
+                .map(|index| (format!("key-{index}"), vec![index as u8; 4096]))
+                .collect::<Vec<_>>();
+            store.put_batch(entries.clone()).unwrap();
+            store.put("empty", Vec::new()).unwrap();
+            assert!(store.stop());
+            drop(store);
+
+            let mut recovered = SsdTierStore::new(root.path(), &paths, 1 << 20);
+            assert!(recovered.start());
+            let keys = vec!["key-31".into(), "missing".into(), "key-0".into(),
+                "key-31".into(), "empty".into()];
+            let expected = vec![Some(vec![31; 4096]), None, Some(vec![0; 4096]),
+                Some(vec![31; 4096]), Some(Vec::new())];
+            assert_eq!(recovered.get_batch(&keys).unwrap(), expected);
+            for (key, value) in &entries {
+                assert_eq!(recovered.get_owned(key).unwrap(), *value);
+            }
+            let mut owned = recovered.get_owned("key-31").unwrap();
+            owned[0] = 99;
+            assert_eq!(recovered.get_owned("key-31").unwrap(), vec![31; 4096]);
+            assert!(matches!(recovered.get_owned("missing"), Err(CacheError::NotFound)));
+            assert!(recovered.get_batch(&[]).unwrap().is_empty());
+            assert!(recovered.stop());
+            assert!(matches!(recovered.get_owned("key-31"), Err(CacheError::Stopped)));
+        }
     }
 
     #[test]

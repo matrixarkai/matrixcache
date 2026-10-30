@@ -2588,6 +2588,24 @@ impl StorageEngineRocksDb {
         }
         Ok(view)
     }
+    // Internal decoders consume owned bytes, avoiding a temporary shared buffer.
+    pub(crate) fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
+        if !self.initialized {
+            return Err(CacheError::Stopped);
+        }
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            self.rocksdb()?
+                .get(key.as_bytes())
+                .map_err(|err| CacheError::RocksDb(err.to_string()))?
+                .ok_or(CacheError::NotFound)
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        {
+            self.records.get(key).cloned().ok_or(CacheError::NotFound)
+        }
+    }
+
     pub fn get_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
         self.get_batch_refs(&key_refs)
@@ -2872,18 +2890,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
     }
 
     fn get(&self, key: &str) -> Result<CacheBuffer, CacheError> {
-        if !self.initialized {
-            return Err(CacheError::Stopped);
-        }
-        #[cfg(feature = "rocksdb-ssd")]
-        let value = self
-            .rocksdb()?
-            .get(key.as_bytes())
-            .map_err(|err| CacheError::RocksDb(err.to_string()))?
-            .ok_or(CacheError::NotFound)?;
-        #[cfg(not(feature = "rocksdb-ssd"))]
-        let value = self.records.get(key).ok_or(CacheError::NotFound)?.clone();
-        let mut buffer = CacheBuffer::new(value);
+        let mut buffer = CacheBuffer::new(self.get_owned(key)?);
         buffer.SetKey(key);
         Ok(buffer)
     }
@@ -3122,6 +3129,11 @@ pub struct StorageEngineMultiSsd {
 }
 
 impl StorageEngineMultiSsd {
+    pub(crate) fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
+        let index = self.storage_index(key)?;
+        self.storages[index].get_owned(key)
+    }
+
     /// What every store behind this one holds in memory. See
     /// [`StorageEngineRocksDb::resident_bytes`].
     pub(crate) fn resident_bytes(&self) -> usize {
