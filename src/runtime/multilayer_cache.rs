@@ -10337,7 +10337,6 @@ impl CacheInner {
                 }
             }
             CacheTier::Ssd => {
-                let block = encode_cache_block(&value, self.block_options)?;
                 let existing_block_len = match self.read_ssd_block(&key)? {
                     Some(existing_block)
                         if decode_cache_block(&existing_block).ok().as_deref()
@@ -10350,6 +10349,7 @@ impl CacheInner {
                 let block_len = if let Some(existing_block_len) = existing_block_len {
                     existing_block_len
                 } else {
+                    let block = encode_cache_block(&value, self.block_options)?;
                     let block_len = block.len();
                     self.evict_ssd_for(block_len as u64);
                     self.write_ssd_block(&key, block)?;
