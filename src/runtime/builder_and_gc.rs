@@ -3062,11 +3062,7 @@ impl CacheInner {
         }
         const SET_MEMBERSHIP_THRESHOLD: usize = 8;
         let key_set = (keys.len() > SET_MEMBERSHIP_THRESHOLD)
-            .then(|| keys.iter().cloned().collect::<HashSet<_>>());
-        let disk_delete_set = disk_delete_keys.and_then(|delete_keys| {
-            (delete_keys.len() > SET_MEMBERSHIP_THRESHOLD)
-                .then(|| delete_keys.iter().cloned().collect::<HashSet<_>>())
-        });
+            .then(|| keys.iter().collect::<HashSet<_>>());
         let mut disk_keys = Vec::new();
         for key in keys {
             let key_pinned = self.is_pinned(key);
@@ -3084,12 +3080,7 @@ impl CacheInner {
                         .try_into()
                         .unwrap_or(usize::MAX),
                 );
-                let should_delete = match (disk_delete_keys, disk_delete_set.as_ref()) {
-                    (None, _) => true,
-                    (Some(_), Some(delete_keys)) => delete_keys.contains(key),
-                    (Some(delete_keys), None) => delete_keys.contains(key),
-                };
-                if disk_bytes > 0 || should_delete {
+                if disk_delete_keys.is_none() {
                     disk_keys.push(key.clone());
                 }
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(disk_bytes);
