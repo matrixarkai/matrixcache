@@ -20899,6 +20899,47 @@ mod tests {
             .count();
         assert!(surviving_cold < cold_keys.len());
     }
+
+    #[test]
+    fn ssd_admission_does_not_use_pinned_entries_as_victims() {
+        for batch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = MultiLayerCache::with_options(
+                CacheOptions::new(0, 0, 180).with_ssd_paths([dir.path().join("ssd")]),
+            );
+            cache.start().unwrap();
+            let pinned = CacheKey::string(0, "pinned-cold");
+            let hot = CacheKey::string(0, "unpinned-hot");
+            let incoming = CacheKey::string(0, "incoming-cold");
+            cache.put(pinned.clone(), vec![1; 64]).unwrap();
+            cache.pin(pinned.clone());
+            cache
+                .put_with_admission(
+                    hot.clone(),
+                    vec![2; 64],
+                    CacheAdmissionRequest {
+                        block_kind: CacheBlockKind::Object,
+                        shard_id: 0,
+                        routing_slot: None,
+                        block_bytes: 64,
+                        hotness: 64,
+                        pinned: false,
+                    },
+                )
+                .unwrap();
+            let before = cache.stats().ssd_admission_rejected;
+            if batch {
+                cache.put_batch(vec![(incoming.clone(), vec![3; 64])]).unwrap();
+            } else {
+                cache.put(incoming.clone(), vec![3; 64]).unwrap();
+            }
+            assert_eq!(cache.get(&hot).unwrap(), Some(vec![2; 64]), "batch={batch}");
+            assert_eq!(cache.get(&pinned).unwrap(), Some(vec![1; 64]));
+            assert_eq!(cache.get(&incoming).unwrap(), None);
+            assert_eq!(cache.stats().ssd_admission_rejected, before + 1);
+            assert!(cache.stop());
+        }
+    }
     #[test]
     fn async_writeback_drain_coalesces_duplicate_keys() {
         let cache = MultiLayerCache::with_tiering_policy(
