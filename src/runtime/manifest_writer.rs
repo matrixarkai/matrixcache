@@ -7,6 +7,41 @@ const PMEM_MANIFEST_COMPACT_MIN: u64 = 4096;
 mod pmem_manifest_compaction_tests {
     use super::*;
 
+    // rust-internal: absent files need no tombstone; recovery must skip old records.
+    #[test]
+    fn absent_pmem_deletes_do_not_grow_manifest_or_restore_missing_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let keep = CacheKey::string(0, "keep");
+        let missing = CacheKey::string(0, "missing");
+        let deleted = CacheKey::string(0, "deleted");
+        let mut inner = cache.inner.write().unwrap();
+        inner.persist_pmem_put(&keep, b"keep").unwrap();
+        inner.persist_pmem_put(&missing, b"old").unwrap();
+        inner.persist_pmem_put(&deleted, b"delete").unwrap();
+        inner.persist_pmem_delete(&deleted).unwrap();
+        fs::remove_file(inner.pmem_block_path_for_key(&missing).unwrap()).unwrap();
+        let manifest = inner.pmem_manifest_path().unwrap();
+        let before = fs::read(&manifest).unwrap();
+        for index in 0..2048 {
+            inner.persist_pmem_delete(&CacheKey::string(0, &format!("absent-{index}"))).unwrap();
+        }
+        inner.persist_pmem_delete(&missing).unwrap();
+        inner.persist_pmem_delete(&deleted).unwrap();
+        assert_eq!(fs::read(&manifest).unwrap(), before);
+        inner.reset_pmem_manifest_writer();
+        assert_eq!(inner.recover_pmem_index_locked().unwrap().recovered_files, 1);
+        assert!(inner.pmem.contains_key(&keep));
+        assert!(!inner.pmem.contains_key(&missing));
+        assert!(!inner.pmem.contains_key(&deleted));
+        inner.persist_pmem_put(&missing, b"new").unwrap();
+        inner.reset_pmem_manifest_writer();
+        assert_eq!(inner.recover_pmem_index_locked().unwrap().recovered_files, 2);
+        assert_eq!(inner.pmem.get(&missing).unwrap().as_ref(), b"new");
+    }
+
     // rust-internal: compact the durable log, including nonresident records.
     #[test]
     fn pmem_history_compacts_and_recovers_latest_live_records() {
