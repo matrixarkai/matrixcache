@@ -4,6 +4,7 @@
 //! Capacity-pressure exercise. PMEM is file-backed, not physical persistent memory.
 //! `--promoted-working-set` supplies increasing caller hotness to exercise SSD
 //! replacement. It does not measure automatic popularity adaptation.
+//! `--fifo-ssd` selects insertion-order SSD replacement without popularity gating.
 //! `--rounds N` repeats the working set 1..=1024 times (default: 4).
 
 use matrixcache::{CacheAdmissionRequest, CacheBlockKind, CacheKey, CacheOptions, MultiLayerCache};
@@ -23,11 +24,13 @@ fn payload(index: usize, round: usize) -> Vec<u8> {
 
 fn main() {
     let mut promoted_working_set = false;
+    let mut fifo_ssd = false;
     let mut rounds = 4usize;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--promoted-working-set" => promoted_working_set = true,
+            "--fifo-ssd" => fifo_ssd = true,
             "--rounds" => {
                 rounds = args
                     .next()
@@ -41,10 +44,14 @@ fn main() {
     }
     let dir = tempfile::tempdir().unwrap();
     let options = || {
-        CacheOptions::new(64 * 1024, 128 * 1024, 1024 * 1024)
+        let mut options = CacheOptions::new(64 * 1024, 128 * 1024, 1024 * 1024)
             .with_auto_recover_on_start(true)
             .with_pmem_paths([dir.path().join("pmem")])
-            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_paths([dir.path().join("ssd")]);
+        if fifo_ssd {
+            options.cache_ssd_replacement_policy = "fifo".to_string();
+        }
+        options
     };
     let cache = MultiLayerCache::with_options(options());
     cache.start().unwrap();
@@ -106,10 +113,10 @@ fn main() {
     let stats = cache.stats();
     assert!(stats.memory_evictions > 0 && stats.pmem_evictions > 0);
     assert!(stats.ssd_evictions > 0 || stats.ssd_admission_rejected > 0);
-    if promoted_working_set {
+    if promoted_working_set || fifo_ssd {
         assert!(
             stats.ssd_evictions > 0,
-            "promoted workload never exercised SSD eviction"
+            "selected workload never exercised SSD eviction"
         );
     }
     assert!(cache.stop());
@@ -128,7 +135,7 @@ fn main() {
     }
     assert!(retained > 0);
     let puts = rounds * keys.len();
-    println!("promoted_working_set={promoted_working_set} rounds={rounds} puts={puts} reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
+    println!("fifo_ssd={fifo_ssd} promoted_working_set={promoted_working_set} rounds={rounds} puts={puts} reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
         hits + misses, (puts + hits + misses) as f64 / elapsed,
         stats.memory_evictions, stats.pmem_evictions, stats.ssd_evictions, stats.ssd_admission_rejected);
     assert!(recovered.stop());

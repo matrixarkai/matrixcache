@@ -5,6 +5,50 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn ssd_fifo_admits_cold_replacements_without_displacing_pins() {
+        for policy in [CacheReplacementPolicy::Fifo, CacheReplacementPolicy::WeightedHotnessLru] {
+            for (batch, all_pinned) in [(false, false), (true, false), (false, true), (true, true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let cache = MultiLayerCache::with_options(
+                    CacheOptions::new(0, 0, 180).with_ssd_paths([dir.path().join("ssd")]),
+                );
+                cache.start().unwrap();
+                cache.set_replacement_policy_for_tier(CacheTier::Ssd, policy);
+                let pinned = CacheKey::string(0, "pinned");
+                let hot = CacheKey::string(0, "hot");
+                let incoming = CacheKey::string(0, "new");
+                cache.put(pinned.clone(), vec![1; 64]).unwrap();
+                cache.pin(pinned.clone());
+                cache.put_with_admission(hot.clone(), vec![2; 64], CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Object,
+                    shard_id: 0,
+                    routing_slot: None,
+                    block_bytes: 64,
+                    hotness: 100,
+                    pinned: false,
+                }).unwrap();
+                if all_pinned {
+                    cache.pin(hot.clone());
+                }
+                if batch {
+                    cache.put_batch(vec![(incoming.clone(), vec![3; 64])]).unwrap();
+                } else {
+                    cache.put(incoming.clone(), vec![3; 64]).unwrap();
+                }
+                let admitted = policy == CacheReplacementPolicy::Fifo && !all_pinned;
+                assert_eq!(cache.get_no_promotion(&incoming).unwrap().map(|r| r.value),
+                    admitted.then(|| vec![3; 64]), "policy={policy:?} batch={batch} all_pinned={all_pinned}");
+                assert_eq!(cache.get_no_promotion(&hot).unwrap().map(|r| r.value),
+                    (!admitted).then(|| vec![2; 64]));
+                assert_eq!(cache.get_no_promotion(&pinned).unwrap().unwrap().value, vec![1; 64]);
+                assert!(cache.stats().disk_bytes <= 180);
+                assert!(cache.stop());
+            }
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn identical_pmem_rewrites_reuse_valid_blocks_and_repair_persistence() {
         for (size, durable) in [(1024, false), (65536, false), (1024, true), (65536, true)] {
             let dir = tempfile::tempdir().unwrap();
