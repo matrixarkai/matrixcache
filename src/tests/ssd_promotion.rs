@@ -50,7 +50,7 @@ fn ssd_probe_rejects_mutations_before_refill() {
                 inner.delete_ssd_blocks(std::slice::from_ref(&key)).unwrap();
             }
         }
-        let current = inner.ssd_probe_is_current(epoch);
+        let current = inner.ssd_probe_is_current_for(&key, epoch);
         assert!(!current, "mutation {operation} must invalidate the probe");
         assert!(inner.refill_ssd_probe(&key, value, current));
         assert_ne!(
@@ -144,4 +144,57 @@ fn ssd_batch_probe_does_not_restore_an_evicted_newer_resident() {
     let epoch = inner.ssd_batch_probe_epoch(&[&key]);
     inner.pmem.remove(&key);
     assert!(!inner.ssd_probe_is_current(epoch));
+}
+
+// rust-internal: unrelated writes must not cancel a retained key's read ticket.
+#[test]
+fn ssd_probe_journal_distinguishes_keys_and_global_changes() {
+    let (_dir, cache) = cache();
+    let key = CacheKey::string(0, "read");
+    let other = CacheKey::string(0, "write");
+    let mut inner = cache.inner.write().unwrap();
+    let (value, epoch) = capture(&mut inner, &key);
+    assert!(inner.put_memory(&other, b"new".to_vec()));
+    assert!(inner.ssd_probe_is_current_for(&key, epoch));
+    assert!(!inner.ssd_probe_is_current_for(&other, epoch));
+    assert!(inner.refill_ssd_probe(&key, value, true));
+    let epoch = inner.ssd_probe_epoch;
+    inner.clear_resident();
+    assert!(!inner.ssd_probe_is_current_for(&key, epoch));
+    assert!(!inner.ssd_probe_is_current_for(&other, epoch));
+}
+
+// rust-internal: bounded history must reject old tickets, not assume no change.
+#[test]
+fn ssd_probe_journal_rejects_lost_history() {
+    let (_dir, cache) = cache();
+    let key = CacheKey::string(0, "read");
+    let other = CacheKey::string(0, "write");
+    let mut inner = cache.inner.write().unwrap();
+    let epoch = inner.ssd_probe_epoch;
+    for _ in 0..inner.ssd_probe_mutations.len() {
+        inner.note_ssd_probe_mutation(&other);
+    }
+    assert!(inner.ssd_probe_is_current_for(&key, epoch));
+    inner.note_ssd_probe_mutation(&other);
+    assert!(!inner.ssd_probe_is_current_for(&key, epoch));
+}
+
+// rust-internal: warmup must restore a journal slot as well as its sequence.
+#[test]
+fn ssd_probe_warmup_preserves_oldest_retained_mutation() {
+    let (_dir, cache) = cache();
+    let changed = CacheKey::string(0, "changed");
+    let other = CacheKey::string(0, "other");
+    let fill = CacheKey::string(0, "fill");
+    let mut inner = cache.inner.write().unwrap();
+    let epoch = inner.ssd_probe_epoch;
+    inner.note_ssd_probe_mutation(&changed);
+    for _ in 1..inner.ssd_probe_mutations.len() {
+        inner.note_ssd_probe_mutation(&other);
+    }
+    assert!(!inner.ssd_probe_is_current_for(&changed, epoch));
+    assert!(inner.refill_ssd_probe(&fill, Arc::from(&b"value"[..]), true));
+    assert!(!inner.ssd_probe_is_current_for(&changed, epoch));
+    assert!(inner.ssd_probe_is_current_for(&fill, epoch));
 }
