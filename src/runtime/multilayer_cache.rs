@@ -9870,6 +9870,17 @@ impl CacheInner {
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
         let outcome = self.put_with_request_inner(key, value, request);
+        if matches!(outcome, Ok(false)) && self.disk_index.contains_key(key) {
+            // Admission may reject a rewrite under pressure. Do not leave the
+            // previous SSD value available after the newer upper copy leaves.
+            self.delete_ssd_block(key)?;
+            self.append_disk_manifest_delete(key)?;
+            if let Some(bytes) = self.disk_index.remove(key) {
+                self.ssd_bytes = self.ssd_bytes.saturating_sub(bytes);
+                self.stats.disk_bytes = self.ssd_bytes;
+            }
+            self.disk_order.remove(key);
+        }
         if !self.memory.contains_key(key)
             && !self.pmem.contains_key(key)
             && !self.disk_index.contains_key(key)
@@ -9877,7 +9888,7 @@ impl CacheInner {
             self.forget_metadata_of(key);
             self.forget_expiry(key);
         }
-        outcome
+        outcome.map(|_| ())
     }
 
     /// One allocation for the bytes, shared by every tier that takes them.
@@ -9893,7 +9904,7 @@ impl CacheInner {
         key: &CacheKey,
         value: Arc<[u8]>,
         request: Option<CacheAdmissionRequest>,
-    ) -> Result<(), CacheError> {
+    ) -> Result<bool, CacheError> {
         // Reclaim a few lapsed entries before this write is placed. Done here
         // rather than inside the memory tier's admission: a cache with no
         // memory tier configured never reaches that, and its entries need
@@ -9983,7 +9994,7 @@ impl CacheInner {
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         if value.len() > self.tiering_policy.max_ssd_block_bytes
             || value.len() > self.ssd_capacity_bytes
@@ -9994,13 +10005,13 @@ impl CacheInner {
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         // Ask the write budget before encoding: a block the budget will not let
         // through is not worth compressing first.
         if !self.ssd_write_budget_admits(key) {
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         if self.tiering_policy.ssd_write_through && !decision.admit_ssd {
             self.stats.ssd_write_through_admissions =
@@ -10018,7 +10029,7 @@ impl CacheInner {
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64
             && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len())
@@ -10027,7 +10038,7 @@ impl CacheInner {
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         self.evict_ssd_for(block_len as u64);
         if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64 {
@@ -10035,7 +10046,7 @@ impl CacheInner {
             self.stats.writeback_backpressure_events =
                 self.stats.writeback_backpressure_events.saturating_add(1);
             self.stats.puts += 1;
-            return Ok(());
+            return Ok(false);
         }
         if compressed {
             self.stats.compressed_puts += 1;
@@ -10063,7 +10074,7 @@ impl CacheInner {
         self.stats.disk_fills += 1;
         self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
         self.append_disk_manifest_put(key, block_len as u64)?;
-        Ok(())
+        Ok(true)
     }
 
     fn put_batch_with_requests(
