@@ -1513,8 +1513,8 @@ impl CacheInner {
         if let Some(value) = self.pmem.remove(key) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
             self.stats.pmem_bytes = self.pmem_bytes as u64;
-            if notifying {
-                departing = departing.or(Some((CacheTier::Pmem, value.to_vec())));
+            if notifying && departing.is_none() {
+                departing = Some((CacheTier::Pmem, value.to_vec()));
             }
         }
         self.pmem_order.remove(key);
@@ -1556,7 +1556,7 @@ impl CacheInner {
         self.forget_expiry(key);
         self.stats.expired_removals = self.stats.expired_removals.saturating_add(1);
         if let Some((tier, value)) = departing {
-            self.record_eviction(tier, key, &value, CacheRemovalCause::Expired);
+            self.record_eviction_with_value(tier, key, || value, CacheRemovalCause::Expired);
         }
     }
 
@@ -3005,6 +3005,16 @@ impl CacheInner {
         value: &[u8],
         cause: CacheRemovalCause,
     ) {
+        self.record_eviction_with_value(tier, key, || value.to_vec(), cause);
+    }
+
+    fn record_eviction_with_value(
+        &mut self,
+        tier: CacheTier,
+        key: &CacheKey,
+        value: impl FnOnce() -> Vec<u8>,
+        cause: CacheRemovalCause,
+    ) {
         // The metric counts evictions and needs no value, so it is recorded
         // even while the eviction handler is disabled.
         if self.eviction_metric_callback.is_some() {
@@ -3015,7 +3025,7 @@ impl CacheInner {
                 .push_back(CacheEvictionRecord {
                     tier,
                     key: key.clone(),
-                    value: value.to_vec(),
+                    value: value(),
                     cause,
                 });
         }
