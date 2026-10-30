@@ -171,7 +171,23 @@ impl FrequencySketch {
 
     /// Records one access. Safe while holding the cache lock shared.
     pub fn record(&self, key: &CacheKey) {
-        for position in self.positions(key) {
+        self.record_positions(self.positions(key));
+    }
+
+    /// Records repeated accesses while hashing the key only once.
+    /// Counter saturation and aging are identical to repeated `record` calls.
+    pub fn record_many(&self, key: &CacheKey, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let positions = self.positions(key);
+        for _ in 0..count {
+            self.record_positions(positions);
+        }
+    }
+
+    fn record_positions(&self, positions: [usize; SKETCH_HASHES]) {
+        for position in positions {
             // A counter at its maximum is not written at all -- `fetch_update`
             // returns without a store when the closure declines. The keys that
             // would contend are the hot ones, and the hot ones are the ones
