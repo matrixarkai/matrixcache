@@ -5662,6 +5662,33 @@ mod tests {
     }
 
     #[test]
+    fn ssd_existence_probes_are_exact_across_restart_and_delete() {
+        for device_count in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = (0..device_count)
+                .map(|index| root.path().join(format!("device-{index}")))
+                .collect::<Vec<_>>();
+            let mut store = SsdTierStore::new(root.path(), &paths, 1 << 20);
+            assert!(!store.peek("payload"));
+            assert!(store.start());
+            store.put("payload", vec![7; 64 * 1024]).unwrap();
+            store.put("empty", Vec::new()).unwrap();
+            assert!(store.peek("payload") && store.peek("empty"));
+            assert!(!store.peek("missing"));
+            assert!(store.stop());
+            drop(store);
+            let mut store = SsdTierStore::new(root.path(), &paths, 1 << 20);
+            assert!(store.start());
+            assert!(store.peek("payload") && store.peek("empty"));
+            store.delete("payload").unwrap();
+            assert!(!store.peek("payload"));
+            assert!(store.peek("empty"));
+            assert!(store.stop());
+            assert!(!store.peek("empty"));
+        }
+    }
+
+    #[test]
     fn ssd_tier_owned_reads_preserve_values_and_recover_across_devices() {
         for device_count in [1, 2] {
             let root = tempfile::tempdir().unwrap();
