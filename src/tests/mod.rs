@@ -3,6 +3,39 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: notification construction must move owned payloads and stay lazy.
+    #[test]
+    fn owned_eviction_notification_moves_payload_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, dir.path());
+        let key = CacheKey::string(0, "expired");
+        {
+            let mut inner = cache.inner.write().unwrap();
+            inner.record_eviction_with_value(
+                CacheTier::Memory,
+                &key,
+                || panic!("disabled callback must not construct a payload"),
+                CacheRemovalCause::Expired,
+            );
+            assert!(inner.pending_eviction_records.is_empty());
+        }
+        cache.register_eviction_callback(|_| {});
+        let payload = vec![7; 65536];
+        let allocation = payload.as_ptr();
+        let mut inner = cache.inner.write().unwrap();
+        inner.record_eviction_with_value(
+            CacheTier::Memory,
+            &key,
+            || payload,
+            CacheRemovalCause::Expired,
+        );
+        let record = inner.pending_eviction_records.pop_front().unwrap();
+        assert_eq!(record.value.as_ptr(), allocation);
+        assert_eq!(record.value, vec![7; 65536]);
+        assert_eq!(record.cause, CacheRemovalCause::Expired);
+        assert_eq!(record.key, key);
+    }
+
     #[cfg(feature = "rocksdb-ssd")]
     #[test]
     fn rocksdb_write_buffer_size_is_configurable() {
