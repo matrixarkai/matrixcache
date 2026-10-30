@@ -3,6 +3,95 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: optional sketch allocation stays bounded across shards and is released.
+    #[test]
+    fn ssd_frequency_configuration_is_bounded_per_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 64 * 1024 * 1024).with_ssd_paths([dir.path().join("ssd")]), 4,
+        );
+        assert!(!cache.ssd_admission_filter_enabled());
+        cache.set_ssd_admission_filter_enabled(true);
+        assert!(cache.ssd_admission_filter_enabled());
+        for shard in cache.shards.iter() {
+            assert_eq!(shard.inner.read().unwrap().ssd_access_frequency.as_ref().unwrap().footprint_bytes(), 65536);
+        }
+        cache.set_ssd_admission_filter_enabled(false);
+        for shard in cache.shards.iter() {
+            assert!(shard.inner.read().unwrap().ssd_access_frequency.is_none());
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn ssd_frequency_replaces_the_entire_old_working_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 8 * 90).with_ssd_paths([dir.path().join("ssd")]),
+        );
+        cache.start().unwrap();
+        for i in 0..8 {
+            let key = CacheKey::string(0, &format!("old-{i}"));
+            cache.put(key.clone(), vec![1; 64]).unwrap();
+            for _ in 0..128 { cache.get(&key).unwrap(); }
+        }
+        cache.set_ssd_admission_filter_enabled(true);
+        let mut hits = 0;
+        for _ in 0..32 {
+            for i in 0..8 {
+                let key = CacheKey::string(0, &format!("new-{i}"));
+                if let Some(value) = cache.get(&key).unwrap() {
+                    assert_eq!(value, vec![2; 64]);
+                    hits += 1;
+                } else { cache.put(key, vec![2; 64]).unwrap(); }
+            }
+        }
+        assert!(hits >= 128);
+        for i in 0..8 {
+            assert_eq!(cache.get_no_promotion(&CacheKey::string(0, &format!("new-{i}"))).unwrap().unwrap().value, vec![2; 64]);
+            assert!(cache.get_no_promotion(&CacheKey::string(0, &format!("old-{i}"))).unwrap().is_none());
+        }
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn ssd_frequency_admission_learns_rejected_demand_and_respects_pins() {
+        for (batch, pinned) in [(false, false), (true, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = MultiLayerCache::with_options(
+                CacheOptions::new(0, 0, 90).with_ssd_paths([dir.path().join("ssd")]),
+            );
+            cache.start().unwrap();
+            assert!(!cache.ssd_admission_filter_enabled());
+            let hot = CacheKey::string(0, "old-hot");
+            let incoming = CacheKey::string(0, "repeated-new");
+            cache.put(hot.clone(), vec![1; 64]).unwrap();
+            for _ in 0..128 { assert!(cache.get(&hot).unwrap().is_some()); }
+            cache.set_ssd_admission_filter_enabled(true);
+            assert!(cache.ssd_admission_filter_enabled());
+            if pinned { cache.pin(hot.clone()); }
+            cache.put(incoming.clone(), vec![2; 64]).unwrap();
+            assert!(cache.get_no_promotion(&incoming).unwrap().is_none());
+            for _ in 0..128 {
+                if batch {
+                    cache.put_batch(vec![(incoming.clone(), vec![2; 64])]).unwrap();
+                } else {
+                    cache.put(incoming.clone(), vec![2; 64]).unwrap();
+                }
+            }
+            assert_eq!(cache.get_no_promotion(&incoming).unwrap().map(|r| r.value),
+                (!pinned).then(|| vec![2; 64]));
+            assert_eq!(cache.get_no_promotion(&hot).unwrap().map(|r| r.value),
+                pinned.then(|| vec![1; 64]));
+            assert!(cache.stats().disk_bytes <= 90);
+            assert!(cache.inner.read().unwrap().ssd_access_frequency.as_ref().unwrap().footprint_bytes() <= 65536);
+            cache.set_ssd_admission_filter_enabled(false);
+            assert!(!cache.ssd_admission_filter_enabled());
+            assert!(cache.stop());
+        }
+    }
+
     // shared-corpus: storage_cache_eviction
     #[test]
     fn ssd_fifo_admits_cold_replacements_without_displacing_pins() {

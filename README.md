@@ -137,6 +137,27 @@ tier that was never flushed, or a shard count that makes a tier refuse values
 it has room for. `MultiLayerCache::try_with_options` refuses the findings that
 mean the cache cannot do its job and starts anyway on the rest.
 
+## SSD working-set changes
+
+`cache.set_ssd_admission_filter_enabled(true)` opts into recent-frequency SSD
+admission and victim selection. It is available on single and sharded caches.
+Repeated rejected candidates accumulate demand, while sampled resident hits
+protect useful entries. Counters decay as requests arrive rather than retaining
+lifetime popularity. FIFO still uses insertion order; pins, capacity, block-size,
+expiry and write-budget checks remain active.
+
+The mode is off by default and allocates no counters while disabled. When enabled,
+it uses at most 64 KiB of counters per shard, sized from the resident count or the
+configured expected entry size. Large key populations can collide in that bounded
+table. Disabling releases it; restarting or re-enabling starts new history. It
+replaces the lifetime-hotness comparison, including caller-supplied hotness, so
+measure it on the workload before choosing it for priority-sensitive caches.
+
+Run `cargo run --release --example ssd_working_set_shift` for a moving-working-set
+exercise, or `cargo run --release --example bounded_tier_pressure --
+--frequency-ssd --rounds 16` for cross-tier pressure and restart checks. These
+workloads do not establish device endurance or general latency guarantees.
+
 ## Choosing a shard count
 
 `ShardedMultiLayerCache::with_options(options, shards)` takes a count and nothing
