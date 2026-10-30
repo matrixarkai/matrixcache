@@ -1857,8 +1857,9 @@ impl CacheInner {
         let crossed_threshold = if let Some(entry) = self.metadata_of(key) {
             let hits_before = entry.record_hits(1);
             if let Some(sketch) = &self.ssd_access_frequency {
-                if self.disk_index.contains_key(key) {
-                    for _ in 0..sampled_hit_count(hits_before, 1) {
+                let samples = sampled_hit_count(hits_before, 1);
+                if samples != 0 && self.disk_index.contains_key(key) {
+                    for _ in 0..samples {
                         sketch.record(key);
                     }
                 }
@@ -1934,8 +1935,9 @@ impl CacheInner {
         let occurrences = occurrences.max(1) as u64;
         let hits_before = entry.record_hits(occurrences);
         if let Some(sketch) = &self.ssd_access_frequency {
-            if self.disk_index.contains_key(key) {
-                for _ in 0..sampled_hit_count(hits_before, occurrences) {
+            let samples = sampled_hit_count(hits_before, occurrences);
+            if samples != 0 && self.disk_index.contains_key(key) {
+                for _ in 0..samples {
                     sketch.record(key);
                 }
             }
