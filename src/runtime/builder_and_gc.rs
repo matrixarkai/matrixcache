@@ -1117,6 +1117,7 @@ impl CacheInner {
             .map(|path| path.join("pmem-cache-manifest.log"))
     }
 
+    #[cfg(test)]
     fn pmem_manifest_key(key: &CacheKey, block_len: u64) -> String {
         manifest_line_for_key(key, block_len)
     }
@@ -1131,9 +1132,7 @@ impl CacheInner {
     /// is absent, the same path when it is there.
     fn pmem_block_path_for_key(&self, key: &CacheKey) -> Option<PathBuf> {
         let dir = self.pmem_block_dir()?;
-        let mut hasher = DefaultHasher::new();
-        Self::pmem_manifest_key(key, 0).hash(&mut hasher);
-        Some(dir.join(format!("{:016x}.bin", hasher.finish())))
+        Some(dir.join(format!("{:016x}.bin", pmem_key_hash(key))))
     }
 
     fn encode_pmem_delete_line(key: &CacheKey) -> String {
@@ -4006,12 +4005,40 @@ fn manifest_line(
     line
 }
 
-/// A `v1` manifest line for a key, without building the record first.
-///
-/// [`CacheManifestRecord::from_entry`] owns its three key fields, so asking a
-/// record for its line clones the record key, the namespace and the selector
-/// only to hex-encode each one and drop it. The line reads them where they
-/// already are.
+/// Hash the existing manifest-key representation without allocating its text.
+fn pmem_key_hash(key: &CacheKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(b"v1\t");
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut shard = key.shard_id;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (shard % 10) as u8;
+        shard /= 10;
+        if shard == 0 { break; }
+    }
+    hasher.write(&digits[start..]);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0u8; 128];
+    for field in [key.record_key.as_ref(), key.namespace.as_ref(), key.selector.as_ref()] {
+        hasher.write(b"\t");
+        for chunk in field.as_bytes().chunks(encoded.len() / 2) {
+            for (i, byte) in chunk.iter().enumerate() {
+                encoded[2 * i] = HEX[(byte >> 4) as usize];
+                encoded[2 * i + 1] = HEX[(byte & 15) as usize];
+            }
+            hasher.write(&encoded[..chunk.len() * 2]);
+        }
+    }
+    hasher.write(b"\t0");
+    // Match Hash for str, including its prefix-free terminator. Existing block
+    // filenames must remain addressable without a migration.
+    hasher.write_u8(0xff);
+    hasher.finish()
+}
+
+/// A `v1` manifest line built directly from borrowed key fields.
 fn manifest_line_for_key(key: &CacheKey, block_len: u64) -> String {
     manifest_line(
         "v1",
