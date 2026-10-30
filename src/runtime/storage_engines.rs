@@ -2256,6 +2256,12 @@ impl StorageEngineRocksDb {
     /// built up.
     #[cfg(not(feature = "rocksdb-ssd"))]
     fn append_journal_record(&mut self, record: Vec<u8>) -> Result<(), CacheError> {
+        self.append_journal_bytes(&record)?;
+        self.compact_journal_if_needed()
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn append_journal_bytes(&mut self, record: &[u8]) -> Result<(), CacheError> {
         let appended = record.len() as u64;
         if self.journal_file.is_none() {
             let path = self.journal_path();
@@ -2282,10 +2288,14 @@ impl StorageEngineRocksDb {
                 .journal_file
                 .as_mut()
                 .expect("the journal was just opened");
-            file.write_all(&record).map_err(CacheError::Io)?;
+            file.write_all(record).map_err(CacheError::Io)?;
         }
         self.journal_bytes = self.journal_bytes.saturating_add(appended);
+        Ok(())
+    }
 
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn compact_journal_if_needed(&mut self) -> Result<(), CacheError> {
         // Compact when the journal has grown past the snapshot it sits beside,
         // so the cost of snapshots is spread across at least their own size in
         // appends. The floor keeps a small store from snapshotting constantly.
@@ -2622,9 +2632,11 @@ impl StorageEngineRocksDb {
             for key in &unique_keys {
                 if self.records.remove(key.as_str()).is_some() {
                     deleted = deleted.saturating_add(1);
-                    self.journal_change(key, None)?;
+                    self.append_journal_bytes(&Self::encode_journal_change(key, None))?;
                 }
             }
+            // The map only shrinks during deletion; snapshot its smallest state once.
+            self.compact_journal_if_needed()?;
         }
         Ok(deleted)
     }

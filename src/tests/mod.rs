@@ -1753,6 +1753,48 @@ mod tests {
     /// So this writes across a compaction on purpose, and checks the far side.
     #[cfg(not(feature = "rocksdb-ssd"))]
     #[test]
+    fn storage_delete_batches_compact_the_final_map_and_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store").to_string_lossy().to_string();
+        let mut store = StorageEngineRocksDb::new(path.clone());
+        assert!(store.start());
+        let keys: Vec<_> = (0..64)
+            .map(|i| format!("{i:03}-{}", "k".repeat(512)))
+            .collect();
+        assert_eq!(
+            store
+                .put_batch(keys.iter().map(|key| (key.clone(), vec![7; 4096])).collect())
+                .unwrap(),
+            64
+        );
+        store.persist_records().unwrap();
+        assert_eq!(store.journal_bytes, 0);
+        assert!(!store.journal_path().exists());
+        drop(store);
+
+        let mut store = StorageEngineRocksDb::new(path.clone());
+        assert!(store.start());
+        assert_eq!(store.get_batch(&keys).unwrap(), vec![Some(vec![7; 4096]); 64]);
+        store
+            .put_batch(keys[..63].iter().map(|key| (key.clone(), vec![8; 4096])).collect())
+            .unwrap();
+        assert!(store.journal_bytes > 0 && store.journal_bytes < store.snapshot_bytes);
+        // The delete batch crosses the threshold while shrinking the live map.
+        assert_eq!(store.delete_batch(&keys).unwrap(), 64);
+        assert_eq!(store.journal_bytes, 0);
+        assert_eq!(store.snapshot_bytes, (StorageEngineRocksDb::STORE_MAGIC.len() + 8) as u64);
+        assert!(!store.journal_path().exists());
+        store.put_batch(vec![("after".into(), vec![9])]).unwrap();
+        drop(store);
+
+        let mut recovered = StorageEngineRocksDb::new(path);
+        assert!(recovered.start());
+        assert_eq!(recovered.get_batch(&keys).unwrap(), vec![None; 64]);
+        assert_eq!(recovered.get("after").unwrap().to_vec(), vec![9]);
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    #[test]
     fn records_written_after_a_compaction_survive_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
