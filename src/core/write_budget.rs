@@ -42,6 +42,8 @@ const WRITE_BUDGET_MAX_STEP_UP: u64 = 2;
 /// Constructed [`unlimited`](Self::unlimited) by default, in which case it
 /// admits everything and costs one comparison. Give it a target and it starts
 /// measuring.
+/// This is feedback-based admission, not a hard byte ceiling: startup bursts
+/// and writes outside admission control can exceed the target.
 ///
 /// The clock is passed in rather than read, so the behaviour can be tested
 /// across minutes of simulated time without waiting for any of them.
@@ -118,7 +120,7 @@ impl SsdWriteBudget {
         self.admitted_share
     }
 
-    /// Whether a write of `block_bytes` under `key_hash` may go ahead.
+    /// Whether a write under `key_hash` may go ahead.
     ///
     /// Rolls the measurement window first, so a caller that stops writing for a
     /// while sees the share recover rather than staying where the last burst
@@ -138,16 +140,14 @@ impl SsdWriteBudget {
 
     /// Record bytes actually written, so the next window can judge the rate.
     ///
-    /// Called for every physical write, including ones this budget did not gate
-    /// -- reclaim and recovery wear the drive exactly as admissions do, and a
-    /// budget that ignored them would aim at the wrong number.
+    /// Include writes this budget did not gate, such as reclaim and recovery.
+    /// This counts caller-reported bytes, not unreported backend or device
+    /// amplification. Advance feedback even when no admissions are attempted.
     pub fn record_written(&mut self, bytes: u64, now: Instant) {
         if self.target_bytes_per_sec == 0 {
             return;
         }
-        if self.window_started.is_none() {
-            self.window_started = Some(now);
-        }
+        self.roll_window(now);
         self.bytes_this_window = self.bytes_this_window.saturating_add(bytes);
     }
 
@@ -162,12 +162,10 @@ impl SsdWriteBudget {
         }
 
         // Bytes the target would have allowed over the window that just ended.
-        let allowed = self
-            .target_bytes_per_sec
-            .saturating_mul(elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
-            / 1_000;
+        let elapsed_millis = elapsed.as_millis().min(u128::from(u64::MAX));
+        let allowed = u128::from(self.target_bytes_per_sec) * elapsed_millis / 1_000;
 
-        self.admitted_share = if self.bytes_this_window <= allowed {
+        self.admitted_share = if u128::from(self.bytes_this_window) <= allowed {
             // Under target: open up, but by a bounded step, so a quiet window
             // does not immediately undo a share that took several windows to
             // find. A window that saw nothing at all takes this branch too, and
@@ -182,17 +180,18 @@ impl SsdWriteBudget {
             // Over target: scale the share by how far over we went. Never to
             // zero -- a budget that admits nothing can never learn that the
             // pressure has passed.
-            (self.admitted_share.saturating_mul(allowed) / self.bytes_this_window).max(1)
+            (u128::from(self.admitted_share) * allowed / u128::from(self.bytes_this_window))
+                .max(1) as u64
         };
 
         // Recorded before the counter is reset, and from the window that just
         // closed rather than the one starting, so it describes something that
         // actually happened.
-        let elapsed_millis = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         self.observed_bytes_per_sec = if elapsed_millis == 0 {
             0
         } else {
-            self.bytes_this_window.saturating_mul(1_000) / elapsed_millis
+            (u128::from(self.bytes_this_window) * 1_000 / elapsed_millis)
+                .min(u128::from(u64::MAX)) as u64
         };
         self.bytes_this_window = 0;
         self.window_started = Some(now);
