@@ -3821,7 +3821,8 @@ fn decimal_width(value: u64) -> usize {
 /// **The bytes are unchanged.** These lines are RocksDB keys and manifest
 /// records already written to disk; a changed byte would not fail a test, it
 /// would make an entry that is present unfindable. The capacity below is the
-/// exact length of the result, so the line is allocated once and never grown.
+/// length of the result plus one byte, so appending a journal newline does not
+/// grow and copy the entire encoded key. Store keys keep the same bytes.
 fn manifest_line(
     tag: &str,
     shard_id: ShardId,
@@ -3840,7 +3841,8 @@ fn manifest_line(
             + namespace.len() * 2
             + 1
             + selector.len() * 2
-            + block_len.map_or(0, |len| 1 + decimal_width(len)),
+            + block_len.map_or(0, |len| 1 + decimal_width(len))
+            + 1,
     );
     line.push_str(tag);
     line.push('\t');
