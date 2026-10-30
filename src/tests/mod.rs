@@ -3,6 +3,29 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: borrowed equality must preserve block decoder validation.
+    #[test]
+    fn stored_block_comparison_checks_values_and_corruption() {
+        for compression in [CacheCompression::None, CacheCompression::Zstd { level: 1 }] {
+            let value = vec![7; 65536];
+            let block = encode_cache_block(&value, CacheBlockOptions {
+                compression, min_compress_bytes: 0,
+            }).unwrap();
+            assert!(cache_block_matches_value(&block, &value).unwrap());
+            assert!(!cache_block_matches_value(&block, b"different").unwrap());
+            for offset in [8, 9, 10, 18] {
+                let mut corrupt = block.clone();
+                corrupt[offset] = 255;
+                assert!(cache_block_matches_value(&corrupt, &value).is_err());
+            }
+            assert!(cache_block_matches_value(&block[..block.len() - 1], &value).is_err());
+        }
+        assert!(cache_block_matches_value(b"legacy", b"legacy").unwrap());
+        assert!(!cache_block_matches_value(b"legacy", b"other").unwrap());
+        assert!(cache_block_matches_value(b"", b"").unwrap());
+        assert!(cache_block_matches_value(CACHE_BLOCK_MAGIC, b"").is_err());
+    }
+
     // rust-internal: replacement credit must prevent eviction of a same-size block.
     #[test]
     fn same_size_ssd_replacement_needs_no_extra_capacity() {

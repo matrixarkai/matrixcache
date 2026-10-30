@@ -9872,9 +9872,9 @@ impl CacheInner {
         let outcome = self.put_with_request_inner(key, Arc::clone(&value), request);
         let stale_ssd = if matches!(outcome, Ok(false)) && self.disk_index.contains_key(key) {
             self.read_ssd_block(key)?
-                .map(|block| decode_cache_block(&block))
+                .map(|block| cache_block_matches_value(&block, &value))
                 .transpose()?
-                .as_deref() != Some(value.as_ref())
+                != Some(true)
         } else {
             false
         };
@@ -10273,9 +10273,9 @@ impl CacheInner {
         for (key, value) in ssd_rewrites {
             if !staged_ssd_positions.contains_key(&key)
                 && self.read_ssd_block(&key)?
-                    .map(|block| decode_cache_block(&block))
+                    .map(|block| cache_block_matches_value(&block, &value))
                     .transpose()?
-                    .as_deref() != Some(value.as_ref())
+                    != Some(true)
             {
                 stale_keys.push(key);
             }
