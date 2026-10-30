@@ -302,6 +302,37 @@ jobs:
             --json-output /tmp/matrixcache-allocations.json \
             --require-passed
 
+      - name: Write amplification report smoke
+        run: |
+          cargo run --locked --release --no-default-features --example write_amplification_report --             --json-output /tmp/matrixcache-write-amplification.json             --require-passed
+          python3 -c "
+          import json
+          report = json.load(open('/tmp/matrixcache-write-amplification.json'))
+          assert report['passed'], report
+          rows = report['rows']
+          # A sweep of one row says nothing about how the figure responds to its
+          # denominator, which is half of what this report is for.
+          assert len(rows) >= 4, rows
+          for row in rows:
+              assert row['payload_bytes'] == report['entries'] * row['value_bytes'], row
+              # Each term of the on-disk decomposition carries bytes, checked
+              # here as well as in the report so a weakened self-check does not
+              # take the gate with it.
+              assert row['families'], row
+              assert row['written_bytes'] > row['payload_bytes'], row
+              # The figure the cache publishes is a fraction of what the path
+              # writes. If that ever stops being true the discrepancy has been
+              # closed, which is a change worth failing for rather than
+              # ignoring.
+              assert 0 < row['charged_bytes'] < row['written_bytes'], row
+          first, last = rows[0], rows[-1]
+          ratio = lambda row: row['written_bytes'] / row['payload_bytes']
+          assert ratio(last) < ratio(first), [ratio(first), ratio(last)]
+          print('write amplification ok:', round(ratio(first), 3), 'at',
+                first['value_bytes'], 'bytes down to', round(ratio(last), 3), 'at',
+                last['value_bytes'])
+          "
+
       - name: Footprint report smoke
         run: |
           cargo run --locked --release --no-default-features --example footprint_report -- \
