@@ -9970,7 +9970,7 @@ impl CacheInner {
             // A key gets here by having grown hot enough for the tiering
             // decision to route its rewrite past memory, which is exactly the
             // case of a key being written repeatedly.
-            self.drop_stale_tier_copy(key, CacheTier::Memory);
+            self.drop_stale_tier_copy(key, CacheTier::Memory)?;
         }
 
         if admit_pmem && !pmem_admitted_via_memory_fallback {
@@ -9993,7 +9993,7 @@ impl CacheInner {
             // value here. That path lands in this branch too, and dropping the
             // copy it wrote would throw away the write it was making.
             if !pmem_admitted_via_memory_fallback {
-                self.drop_stale_tier_copy(key, CacheTier::Pmem);
+                self.drop_stale_tier_copy(key, CacheTier::Pmem)?;
             }
         }
 
@@ -10161,7 +10161,7 @@ impl CacheInner {
             } else if !self.ssd_instance_only {
                 self.stats.memory_admission_rejected =
                     self.stats.memory_admission_rejected.saturating_add(1);
-                self.drop_stale_tier_copy(&key, CacheTier::Memory);
+                self.drop_stale_tier_copy(&key, CacheTier::Memory)?;
             }
 
             if admit_pmem && !pmem_admitted_via_memory_fallback {
@@ -10178,7 +10178,7 @@ impl CacheInner {
                 self.stats.pmem_admission_rejected =
                     self.stats.pmem_admission_rejected.saturating_add(1);
                 if !pmem_admitted_via_memory_fallback {
-                    self.drop_stale_tier_copy(&key, CacheTier::Pmem);
+                    self.drop_stale_tier_copy(&key, CacheTier::Pmem)?;
                 }
             }
 

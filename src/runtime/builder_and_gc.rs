@@ -2147,7 +2147,7 @@ impl CacheInner {
     /// Deliberately leaves the entry's metadata alone. The key is still cached,
     /// just at a different level, and its hotness and hit history are what
     /// routed the write in the first place.
-    fn drop_stale_tier_copy(&mut self, key: &CacheKey, tier: CacheTier) {
+    fn drop_stale_tier_copy(&mut self, key: &CacheKey, tier: CacheTier) -> Result<(), CacheError> {
         match tier {
             CacheTier::Memory => {
                 // Removing nothing must not invalidate batch replacement credit.
@@ -2162,6 +2162,11 @@ impl CacheInner {
                 self.memory_order.remove(key);
             }
             CacheTier::Pmem => {
+                if self.pmem.contains_key(key) {
+                    // Recovery must not restore the older copy ahead of SSD.
+                    self.persist_pmem_delete(key)?;
+                    self.note_ssd_probe_mutation(key);
+                }
                 if let Some(stale) = self.pmem.remove(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(stale.len());
                     self.stats.pmem_bytes = self.pmem_bytes as u64;
@@ -2172,6 +2177,7 @@ impl CacheInner {
             }
             CacheTier::Ssd | CacheTier::Reject => {}
         }
+        Ok(())
     }
 
     fn put_memory(&mut self, key: &CacheKey, value: Vec<u8>) -> bool {
