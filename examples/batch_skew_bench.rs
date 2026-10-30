@@ -31,13 +31,13 @@
 //! ```
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 const VALUE_BYTES: usize = 64;
 const KEY_SPACE: usize = 8192;
 const BATCH: usize = 32;
-const BATCHES_PER_THREAD: usize = 400;
+const BATCHES_PER_THREAD: usize = 4_000;
 const REPEATS: usize = 5;
 
 fn median(mut samples: Vec<f64>) -> f64 {
@@ -82,50 +82,63 @@ enum ReadShape {
 
 /// Aggregate keys read per second for one read shape.
 fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) -> f64 {
+    let barrier = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
+            let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let mut state = 0x2545_F491_4F6C_DD1D ^ ((worker as u64) << 32);
                 let keys_read = BATCHES_PER_THREAD * BATCH;
-                let started = Instant::now();
-                for _ in 0..BATCHES_PER_THREAD {
-                    let batch = (0..BATCH)
-                        .map(|_| CacheKey::string(0, &format!("sk-{:05}", skewed(&mut state))))
-                        .collect::<Vec<_>>();
+                let batches = (0..BATCHES_PER_THREAD)
+                    .map(|_| {
+                        (0..BATCH)
+                            .map(|_| CacheKey::string(0, &format!("sk-{:05}", skewed(&mut state))))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                barrier.wait();
+                barrier.wait();
+                for batch in &batches {
                     match shape {
                         ReadShape::CopyingBatch => {
-                            let values = cache.get_batch(&batch).expect("get_batch");
+                            let values = cache.get_batch(batch).expect("get_batch");
                             assert!(values.iter().all(|value| value.is_some()), "all resident");
                         }
                         ReadShape::SharedBatch => {
-                            let values = cache.get_shared_batch(&batch).expect("get_shared_batch");
+                            let values = cache.get_shared_batch(batch).expect("get_shared_batch");
                             assert!(values.iter().all(|value| value.is_some()), "all resident");
                         }
                         ReadShape::GetLoop => {
-                            for key in &batch {
+                            for key in batch {
                                 assert!(cache.get(key).expect("get").is_some(), "all resident");
                             }
                         }
                     }
                 }
-                keys_read as f64 / started.elapsed().as_secs_f64()
+                (keys_read, batches)
             })
         })
         .collect::<Vec<_>>();
-    // Each worker times its own run, so a descheduled thread inflates its own
-    // elapsed time rather than everyone's.
-    workers
+    // Exclude workload construction and teardown; time all workers over one interval.
+    barrier.wait();
+    let started = Instant::now();
+    barrier.wait();
+    let results = workers
         .into_iter()
         .map(|worker| worker.join().expect("worker"))
-        .sum()
+        .collect::<Vec<_>>();
+    let elapsed = started.elapsed();
+    let completed: usize = results.iter().map(|(count, _)| count).sum();
+    assert_eq!(completed, threads * BATCHES_PER_THREAD * BATCH);
+    completed as f64 / elapsed.as_secs_f64()
 }
 
 fn main() {
     let cache = build();
     println!(
         "{KEY_SPACE} resident values of {VALUE_BYTES} bytes, skewed reads, \
-         batches of {BATCH}, median of {REPEATS}"
+         batches of {BATCH}, median of {REPEATS}; common wall-clock interval, prebuilt keys"
     );
     println!(
         "refresh window left at its default: {:?}\n",
