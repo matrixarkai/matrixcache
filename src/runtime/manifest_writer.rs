@@ -1,6 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+const PMEM_MANIFEST_COMPACT_MIN: u64 = 4096;
+
+#[cfg(test)]
+mod pmem_manifest_compaction_tests {
+    use super::*;
+
+    // rust-internal: compact the durable log, including nonresident records.
+    #[test]
+    fn pmem_history_compacts_and_recovers_latest_live_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let dormant = CacheKey::string(0, "dormant");
+        let updated = CacheKey::string(0, "updated");
+        let deleted = CacheKey::string(0, "deleted");
+        let mut inner = cache.inner.write().unwrap();
+        inner.persist_pmem_put(&dormant, b"keep").unwrap();
+        inner.persist_pmem_put(&deleted, b"remove").unwrap();
+        inner.persist_pmem_delete(&deleted).unwrap();
+        for index in 0..PMEM_MANIFEST_COMPACT_MIN {
+            inner
+                .persist_pmem_put(&updated, index.to_string().as_bytes())
+                .unwrap();
+        }
+        assert!(inner.pmem.is_empty());
+        let text = fs::read_to_string(inner.pmem_manifest_path().unwrap()).unwrap();
+        assert!(text.lines().count() < 10, "history was not compacted");
+        let report = inner.recover_pmem_index_locked().unwrap();
+        assert_eq!(report.recovered_files, 2);
+        assert_eq!(inner.pmem.get(&dormant).unwrap().as_ref(), b"keep");
+        assert_eq!(inner.pmem.get(&updated).unwrap().as_ref(), b"4095");
+        assert!(!inner.pmem.contains_key(&deleted));
+    }
+
+    // rust-internal: failed compaction must retain the successful append.
+    #[test]
+    fn pmem_history_preserves_log_on_compaction_failure_and_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let key = CacheKey::string(0, "key");
+        let mut inner = cache.inner.write().unwrap();
+        inner.persist_pmem_put(&key, b"old").unwrap();
+        let path = inner.pmem_manifest_path().unwrap();
+        let temporary = path.with_extension("compact.tmp");
+        fs::create_dir(&temporary).unwrap();
+        inner
+            .pmem_manifest_compact_after
+            .store(1, Ordering::Relaxed);
+        inner.persist_pmem_put(&key, b"new-value").unwrap();
+        assert_eq!(
+            inner.recover_pmem_index_locked().unwrap().recovered_files,
+            1
+        );
+        assert_eq!(inner.pmem.get(&key).unwrap().as_ref(), b"new-value");
+        fs::remove_dir(&temporary).unwrap();
+        fs::write(&path, b"invalid-record\n").unwrap();
+        assert!(inner.compact_pmem_manifest().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"invalid-record\n");
+    }
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct PmemManifestWriter {
@@ -46,6 +110,53 @@ impl PmemManifestWriter {
 }
 
 impl CacheInner {
+    fn reset_pmem_manifest_history(&self) {
+        self.pmem_manifest_appends.store(0, Ordering::Relaxed);
+        self.pmem_manifest_compact_after
+            .store(PMEM_MANIFEST_COMPACT_MIN, Ordering::Relaxed);
+    }
+
+    fn compact_pmem_manifest(&self) -> Result<(), CacheError> {
+        use std::io::{BufRead, Write};
+        let Some(path) = self.pmem_manifest_path() else {
+            return Ok(());
+        };
+        // The resident map can be incomplete when automatic recovery is off.
+        // Derive the durable live set from the log, including this append.
+        let mut live = HashMap::<CacheKey, u64>::new();
+        for line in std::io::BufReader::new(File::open(&path)?).lines() {
+            let line = line?;
+            if let Some(record) = CacheManifestRecord::decode_line(&line) {
+                live.insert(record.key(), record.block_len);
+            } else if let Some(key) = Self::decode_pmem_delete_line(&line) {
+                live.remove(&key);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid PMEM manifest record",
+                )
+                .into());
+            }
+        }
+        let temporary = path.with_extension("compact.tmp");
+        {
+            let mut output = std::io::BufWriter::new(File::create(&temporary)?);
+            for (key, length) in &live {
+                writeln!(output, "{}", manifest_line_for_key(key, *length))?;
+            }
+            output.flush()?;
+            output.get_ref().sync_all()?;
+        }
+        self.reset_pmem_manifest_writer();
+        fs::rename(&temporary, &path)?;
+        sync_parent_dir(&path)?;
+        self.pmem_manifest_compact_after.store(
+            PMEM_MANIFEST_COMPACT_MIN.max((live.len() as u64).saturating_mul(3)),
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
     fn reset_pmem_manifest_writer(&self) {
         #[cfg(unix)]
         {

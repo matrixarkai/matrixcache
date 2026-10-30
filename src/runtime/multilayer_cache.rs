@@ -1212,6 +1212,8 @@ struct CacheInner {
     ssd_bytes: u64,
     disk_dir: PathBuf,
     pmem_paths: Vec<PathBuf>,
+    pmem_manifest_appends: AtomicU64,
+    pmem_manifest_compact_after: AtomicU64,
     #[cfg(unix)]
     pmem_manifest_writer: Mutex<Option<PmemManifestWriter>>,
     ssd_store: SsdTierStore,
@@ -2288,6 +2290,8 @@ impl MultiLayerCache {
                 ssd_bytes: 0,
                 disk_dir,
                 pmem_paths: Vec::new(),
+                pmem_manifest_appends: AtomicU64::new(0),
+                pmem_manifest_compact_after: AtomicU64::new(PMEM_MANIFEST_COMPACT_MIN),
                 #[cfg(unix)]
                 pmem_manifest_writer: Mutex::new(None),
                 ssd_store,
@@ -6363,6 +6367,7 @@ impl MultiLayerCache {
     fn set_pmem_paths(&self, paths: Vec<PathBuf>) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.pmem_paths = paths;
+        inner.reset_pmem_manifest_history();
         inner.reset_pmem_manifest_writer();
     }
 
@@ -9752,6 +9757,7 @@ impl CacheInner {
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
         //   `pinned_removals_seen`, `manifest_appends`,
+        //   `pmem_manifest_appends`, `pmem_manifest_compact_after`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
         //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
