@@ -4,6 +4,7 @@
 //! Capacity-pressure exercise. PMEM is file-backed, not physical persistent memory.
 //! `--promoted-working-set` supplies increasing caller hotness to exercise SSD
 //! replacement. It does not measure automatic popularity adaptation.
+//! `--rounds N` repeats the working set 1..=1024 times (default: 4).
 
 use matrixcache::{CacheAdmissionRequest, CacheBlockKind, CacheKey, CacheOptions, MultiLayerCache};
 use std::time::Instant;
@@ -21,12 +22,27 @@ fn payload(index: usize, round: usize) -> Vec<u8> {
 }
 
 fn main() {
-    let promoted_working_set = std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--promoted-working-set");
+    let mut promoted_working_set = false;
+    let mut rounds = 4usize;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--promoted-working-set" => promoted_working_set = true,
+            "--rounds" => {
+                rounds = args
+                    .next()
+                    .expect("--rounds requires a value")
+                    .parse()
+                    .expect("--rounds requires an integer");
+                assert!((1..=1024).contains(&rounds), "--rounds must be 1..=1024");
+            }
+            _ => panic!("unknown argument: {arg}"),
+        }
+    }
     let dir = tempfile::tempdir().unwrap();
     let options = || {
         CacheOptions::new(64 * 1024, 128 * 1024, 1024 * 1024)
+            .with_auto_recover_on_start(true)
             .with_pmem_paths([dir.path().join("pmem")])
             .with_ssd_paths([dir.path().join("ssd")])
     };
@@ -38,7 +54,7 @@ fn main() {
     let started = Instant::now();
     let mut hits = 0;
     let mut misses = 0;
-    for round in 0..4 {
+    for round in 0..rounds {
         for (index, key) in keys.iter().enumerate() {
             let value = payload(index, round);
             if promoted_working_set {
@@ -78,6 +94,13 @@ fn main() {
         assert!(stats.memory_bytes <= 64 * 1024);
         assert!(stats.pmem_bytes <= 128 * 1024);
         assert!(stats.disk_bytes <= 1024 * 1024);
+        if (round + 1) % 16 == 0 {
+            eprintln!(
+                "completed_rounds={} elapsed_s={:.1}",
+                round + 1,
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
     let elapsed = started.elapsed().as_secs_f64();
     let stats = cache.stats();
@@ -97,15 +120,16 @@ fn main() {
     for (index, key) in keys.iter().enumerate() {
         if let Some(value) = recovered.get(key).unwrap() {
             assert!(
-                value == payload(index, 3),
+                value == payload(index, rounds - 1),
                 "incorrect recovered value: index={index}"
             );
             retained += 1;
         }
     }
     assert!(retained > 0);
-    println!("promoted_working_set={promoted_working_set} puts=32768 reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
-        hits + misses, (32768 + hits + misses) as f64 / elapsed,
+    let puts = rounds * keys.len();
+    println!("promoted_working_set={promoted_working_set} rounds={rounds} puts={puts} reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
+        hits + misses, (puts + hits + misses) as f64 / elapsed,
         stats.memory_evictions, stats.pmem_evictions, stats.ssd_evictions, stats.ssd_admission_rejected);
     assert!(recovered.stop());
 }
