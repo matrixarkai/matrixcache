@@ -69,3 +69,7 @@ include!("tests/mod.rs");
 #[cfg(test)]
 #[path = "tests/pmem_promotion.rs"]
 mod pmem_promotion_tests;
+
+#[cfg(test)]
+#[path = "tests/ssd_promotion.rs"]
+mod ssd_promotion_tests;
