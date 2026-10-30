@@ -7,6 +7,26 @@ const PMEM_MANIFEST_COMPACT_MIN: u64 = 4096;
 mod pmem_manifest_compaction_tests {
     use super::*;
 
+    // rust-internal: streamed filename hashing must match persisted manifest keys.
+    #[test]
+    fn pmem_streamed_key_hash_preserves_existing_filenames() {
+        for shard_id in [0, 1, 9, 10, 999, u64::MAX] {
+            for length in [0, 1, 63, 64, 65, 127, 128, 4096] {
+                for field in ["", "\t\n\0", "ascii", "\u{00e9}\u{1f642}"] {
+                    let key = CacheKey {
+                        shard_id,
+                        record_key: format!("{field}{}", "x".repeat(length)).into(),
+                        namespace: field.to_string().into(),
+                        selector: format!("{}end", "z".repeat(length)).into(),
+                    };
+                    let mut expected = DefaultHasher::new();
+                    CacheInner::pmem_manifest_key(&key, 0).hash(&mut expected);
+                    assert_eq!(pmem_key_hash(&key), expected.finish());
+                }
+            }
+        }
+    }
+
     // rust-internal: compaction drops missing files without relying on resident state.
     #[test]
     fn pmem_compaction_prunes_missing_blocks_and_reopens_for_new_writes() {
