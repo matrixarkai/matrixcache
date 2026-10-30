@@ -840,6 +840,7 @@ impl CacheInner {
     /// this returns -- so what a failure can leave behind is a file nothing
     /// points at, which recovery ignores because recovery reads the manifest.
     fn write_ssd_block(&mut self, key: &CacheKey, block: Vec<u8>) -> Result<(), CacheError> {
+        self.bump_ssd_probe_epoch();
         self.charge_ssd_write(block.len() as u64);
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
@@ -865,6 +866,7 @@ impl CacheInner {
         if entries.is_empty() {
             return Ok(());
         }
+        self.bump_ssd_probe_epoch();
         let written: u64 = entries.iter().map(|(_, block)| block.len() as u64).sum();
         self.charge_ssd_write(written);
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -931,6 +933,7 @@ impl CacheInner {
     }
 
     fn delete_ssd_block(&mut self, key: &CacheKey) -> Result<(), CacheError> {
+        self.bump_ssd_probe_epoch();
         let _ = fs::remove_file(self.disk_path(key));
         match self.ssd_store.delete(&Self::ssd_store_key(key)) {
             Ok(()) | Err(CacheError::NotFound) => Ok(()),
@@ -944,6 +947,7 @@ impl CacheInner {
         if keys.is_empty() {
             return Ok(());
         }
+        self.bump_ssd_probe_epoch();
         for key in keys {
             let _ = fs::remove_file(self.disk_path(key.borrow()));
         }
@@ -2238,6 +2242,7 @@ impl CacheInner {
         value: Arc<[u8]>,
         persist: bool,
     ) -> bool {
+        self.bump_ssd_probe_epoch();
         let eviction_started = Instant::now();
         if self.pmem_capacity_bytes == 0 || value.len() > self.pmem_capacity_bytes {
             self.stats.pmem_admission_rejected =
@@ -2391,6 +2396,39 @@ impl CacheInner {
         if !self.put_memory_shared(key, Arc::clone(value)) {
             self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
         }
+    }
+
+    fn bump_ssd_probe_epoch(&mut self) {
+        self.ssd_probe_epoch = self.ssd_probe_epoch.saturating_add(1);
+    }
+
+    fn ssd_probe_is_current(&self, epoch: u64) -> bool {
+        epoch != u64::MAX && epoch == self.ssd_probe_epoch
+    }
+
+    fn ssd_batch_probe_epoch(&self, keys: &[&CacheKey]) -> u64 {
+        // A resident may have arrived since the initial miss scan. Its bytes
+        // can be newer than SSD even if it is evicted before this batch refills.
+        if keys.iter().any(|key| self.memory.contains_key(*key) || self.pmem.contains_key(*key)) {
+            u64::MAX
+        } else {
+            self.ssd_probe_epoch
+        }
+    }
+
+    // Skipping a raced promotion is not a refill failure. The caller may still
+    // return the value observed by its read, but must not install it again.
+    fn refill_ssd_probe(&mut self, key: &CacheKey, value: Arc<[u8]>, current: bool) -> bool {
+        if !current
+            || !self.started
+            || self.ssd_instance_only
+            || self.memory.contains_key(key)
+            || self.pmem.contains_key(key)
+            || self.entry_expired(key, CoarseClock::now_millis())
+        {
+            return true;
+        }
+        self.refill_from_ssd_shared(key, value)
     }
 
     fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
@@ -3030,6 +3068,7 @@ impl CacheInner {
     }
 
     fn clear_all_locked(&mut self, reset_stats: bool) -> Result<(), CacheError> {
+        self.bump_ssd_probe_epoch();
         self.memory.clear();
         self.pmem.clear();
         self.clear_pmem_persistence()?;
