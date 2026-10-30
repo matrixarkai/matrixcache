@@ -25457,6 +25457,18 @@ fn the_shared_block_decode_answers_exactly_what_the_owning_one_does() {
 
     for (what, block) in blocks {
         let owning = decode_cache_block(&block);
+        let consumed_input = block.clone();
+        let allocation = consumed_input.as_ptr();
+        let raw = uncompressed_block_payload(&consumed_input).is_ok_and(|value| value.is_some());
+        let consumed = decode_cache_block_owned(consumed_input);
+        assert_eq!(
+            consumed.as_ref().map(Vec::as_slice).map_err(ToString::to_string),
+            owning.as_ref().map(Vec::as_slice).map_err(ToString::to_string),
+            "owned decode differs for {what}",
+        );
+        if raw {
+            assert_eq!(consumed.as_ref().unwrap().as_ptr(), allocation, "raw buffer copied: {what}");
+        }
         let shared = decode_cache_block_shared(&block);
         match (owning, shared) {
             (Ok(owning), Ok(shared)) => assert_eq!(

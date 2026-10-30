@@ -680,6 +680,19 @@ fn uncompressed_block_payload(block: &[u8]) -> Result<Option<&[u8]>, CacheError>
     Ok(Some(payload))
 }
 
+fn decode_cache_block_owned(mut block: Vec<u8>) -> Result<Vec<u8>, CacheError> {
+    if let Some(payload) = uncompressed_block_payload(&block)? {
+        let len = payload.len();
+        let start = block.len() - len;
+        if start != 0 {
+            block.copy_within(start.., 0);
+            block.truncate(len);
+        }
+        return Ok(block);
+    }
+    decode_cache_block(&block)
+}
+
 fn decode_cache_block(block: &[u8]) -> Result<Vec<u8>, CacheError> {
     if !block.starts_with(CACHE_BLOCK_MAGIC) {
         return Ok(block.to_vec());
@@ -3138,7 +3151,7 @@ impl CacheInner {
         self.read_ssd_block(key)
             .ok()
             .flatten()
-            .and_then(|block| decode_cache_block(&block).ok())
+            .and_then(|block| decode_cache_block_owned(block).ok())
             .unwrap_or_default()
     }
 
