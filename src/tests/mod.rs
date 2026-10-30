@@ -23863,33 +23863,32 @@ fn every_manifest_line_shape_still_decodes_to_its_entry() {
     }
 }
 
-/// One allocation, asserted the only way a test inside a crate that forbids
-/// `unsafe` can assert it: the line is never grown, so the capacity it was
-/// given is exactly the length it ended up with. A builder that reserved too
-/// little would have grown (capacity above length, and an allocation spent
-/// doing it); one that reserved too much would leave capacity above length too.
-///
-/// This is a band, not a bound: equality fails on both sides.
+// rust-internal: exact terminator capacity and allocation identity for journal lines.
 #[test]
-fn a_manifest_line_is_sized_exactly_and_never_grown() {
-    let shapes = every_manifest_key_shape();
+fn a_manifest_line_reserves_one_terminator_byte_and_never_grows() {
+    let mut shapes = every_manifest_key_shape();
     assert!(shapes.len() >= 25, "the shape set has shrunk");
+    for size in [4096, 65536] {
+        shapes.push(CacheKey::string(u64::MAX, &"x".repeat(size)));
+    }
     let mut checked = 0usize;
     for key in &shapes {
         for block_len in [0u64, 1, 9, 10, 99, 100, 4096, u64::MAX] {
-            for line in [
+            for mut line in [
                 CacheInner::ssd_store_key(key),
                 CacheInner::pmem_manifest_key(key, block_len),
                 CacheInner::encode_pmem_delete_line(key),
             ] {
                 assert_eq!(
                     line.capacity(),
-                    line.len(),
-                    "a manifest line was sized {} for {} bytes, so it was not built in one \
-                     allocation: {line}",
-                    line.capacity(),
-                    line.len()
+                    line.len() + 1,
+                    "manifest lines must reserve exactly one terminator byte"
                 );
+                let before = line.clone();
+                let allocation = line.as_ptr();
+                line.push('\n');
+                assert_eq!(line.as_ptr(), allocation);
+                assert_eq!(line.strip_suffix('\n'), Some(before.as_str()));
                 checked += 1;
             }
         }
