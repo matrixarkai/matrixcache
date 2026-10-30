@@ -10598,20 +10598,14 @@ impl CacheInner {
         old_handle: &CachePinnedHandle,
         new_value: Vec<u8>,
     ) -> Result<(), CacheError> {
-        let memory_result = self.update_cached_value_if_current_for_tier(
-            CacheTier::Memory,
-            key,
-            old_handle,
-            new_value.clone(),
-        );
-        match memory_result {
-            Ok(()) => return Ok(()),
-            Err(CacheError::ReplaceMismatch) => return Err(CacheError::ReplaceMismatch),
-            Err(CacheError::NotFound) => {}
-            Err(other) => return Err(other),
-        }
-
-        self.update_cached_value_if_current_for_tier(CacheTier::Pmem, key, old_handle, new_value)
+        // The caller holds the write lock: choose once without copying a value
+        // for a speculative update. A stale memory handle must not fall back.
+        let tier = if self.resident_value(key).is_some() {
+            CacheTier::Memory
+        } else {
+            CacheTier::Pmem
+        };
+        self.update_cached_value_if_current_for_tier(tier, key, old_handle, new_value)
     }
 
     fn update_cached_value_if_current_for_tier(
