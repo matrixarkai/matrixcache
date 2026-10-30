@@ -5559,6 +5559,34 @@ mod tests {
         assert!(recovered.stop());
     }
 
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    #[test]
+    fn multi_ssd_batch_overwrites_write_one_journal_record_and_recover() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = vec![root.path().join("a"), root.path().join("b")];
+        let mut store = SsdTierStore::new(root.path(), &paths, 1 << 20);
+        assert!(store.start());
+        let journal_bytes = |store: &SsdTierStore| match store {
+            SsdTierStore::Multi(multi) => multi.storages.iter()
+                .map(|device| device.journal_bytes).sum::<u64>(),
+            _ => panic!("expected multiple devices"),
+        };
+        let before = journal_bytes(&store);
+        store.put_batch(vec![("key".into(), vec![0; 64])]).unwrap();
+        let one_record = journal_bytes(&store) - before;
+        assert!(one_record > 0);
+        let before_batch = journal_bytes(&store);
+        store.put_batch((0..100).map(|value| ("key".into(), vec![value; 64])).collect()).unwrap();
+        assert_eq!(journal_bytes(&store) - before_batch, one_record);
+        assert_eq!(store.get("key").unwrap().to_vec(), vec![99; 64]);
+        assert!(store.stop());
+        drop(store);
+        let mut recovered = SsdTierStore::new(root.path(), &paths, 1 << 20);
+        assert!(recovered.start());
+        assert_eq!(recovered.get("key").unwrap().to_vec(), vec![99; 64]);
+        assert!(recovered.stop());
+    }
+
     #[test]
     fn storage_engine_multi_ssd_is_path_backed_and_recovers_by_device() {
         let paths = [unique_temp_path("multi-ssd-device-a"),
