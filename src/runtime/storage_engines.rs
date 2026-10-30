@@ -2532,6 +2532,9 @@ impl StorageEngineRocksDb {
             .iter()
             .map(|key| self.records.get(*key).cloned())
             .collect::<Vec<_>>();
+        if unique_values.len() == output_positions.len() {
+            return Ok(unique_values);
+        }
         Ok(output_positions
             .into_iter()
             .map(|position| unique_values[position].clone())
@@ -3187,6 +3190,9 @@ impl StorageEngineMultiSsd {
             }
         }
 
+        if unique_values.len() == output_positions.len() {
+            return Ok(unique_values);
+        }
         Ok(output_positions
             .into_iter()
             .map(|position| unique_values[position].clone())

@@ -5627,6 +5627,19 @@ mod tests {
 
         let mut recovered = StorageEngineMultiSsd::new(path_strings, 4096);
         assert!(recovered.Start());
+        let keys = vec![routed[1].0.clone(), "missing-batch-key".into(), routed[0].0.clone()];
+        let expected = vec![
+            Some(format!("value-for-{}", routed[1].0).into_bytes()),
+            None,
+            Some(format!("value-for-{}", routed[0].0).into_bytes()),
+        ];
+        assert_eq!(recovered.get_batch(&keys).unwrap(), expected);
+        let mut repeated_keys = keys.clone();
+        repeated_keys.push(keys[0].clone());
+        let mut repeated_expected = expected.clone();
+        repeated_expected.push(expected[0].clone());
+        assert_eq!(recovered.get_batch(&repeated_keys).unwrap(), repeated_expected);
+        assert!(recovered.get_batch(&[]).unwrap().is_empty());
         for (key, _) in &routed {
             assert_eq!(
                 recovered.Get(key).unwrap().to_vec(),
