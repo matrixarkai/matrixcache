@@ -3,6 +3,48 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: replacement credit must prevent eviction of a same-size block.
+    #[test]
+    fn same_size_ssd_replacement_needs_no_extra_capacity() {
+        for batch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = MultiLayerCache::with_options(
+                CacheOptions::new(0, 0, 128).with_ssd_paths([dir.path().join("ssd")]),
+            );
+            cache.start().unwrap();
+            let key = CacheKey::string(0, "same-size");
+            cache.put(key.clone(), vec![1; 64]).unwrap();
+            let before = cache.stats();
+            if batch {
+                cache.put_batch(vec![(key.clone(), vec![2; 64])]).unwrap();
+            } else {
+                cache.put(key.clone(), vec![2; 64]).unwrap();
+            }
+            assert_eq!(cache.get(&key).unwrap(), Some(vec![2; 64]));
+            let after = cache.stats();
+            assert_eq!(after.ssd_evictions, before.ssd_evictions);
+            assert_eq!(after.disk_bytes, before.disk_bytes);
+        }
+    }
+
+    // rust-internal: pending encoded blocks must count against the SSD budget.
+    #[test]
+    fn staged_ssd_batches_stay_within_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 512).with_ssd_paths([dir.path().join("ssd")]),
+        );
+        cache.start().unwrap();
+        for round in 0..3 {
+            cache.put_batch((0..32).map(|index| {
+                (CacheKey::string(0, &format!("bounded-{index}")), vec![round; 64])
+            }).collect()).unwrap();
+            let inner = cache.inner.read().unwrap();
+            assert!(inner.ssd_bytes <= 512, "SSD bytes: {}", inner.ssd_bytes);
+            assert_eq!(inner.ssd_bytes, inner.disk_index.values().sum::<u64>());
+        }
+    }
+
     // rust-internal: rejected final batch entries must replace older staged values.
     #[test]
     fn batch_rejection_cannot_restore_an_older_ssd_value() {

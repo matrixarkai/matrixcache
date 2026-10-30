@@ -2602,6 +2602,49 @@ impl CacheInner {
         self.evict_ssd_for_batch(incoming_bytes);
     }
 
+    fn projected_ssd_install_bytes(
+        &self,
+        pending: &[StagedSsdBatchWrite],
+        pending_bytes: u64,
+        key: &CacheKey,
+        block_bytes: u64,
+    ) -> u64 {
+        let upper = self.ssd_bytes.saturating_add(pending_bytes).saturating_add(block_bytes);
+        if upper <= self.ssd_capacity_bytes as u64 {
+            return upper;
+        }
+        let replaced = pending.iter().fold(
+            self.disk_index.get(key).copied().unwrap_or_default(),
+            |total, entry| total.saturating_add(
+                self.disk_index.get(&entry.key).copied().unwrap_or_default()),
+        );
+        self.ssd_bytes.saturating_sub(replaced)
+            .saturating_add(pending_bytes).saturating_add(block_bytes)
+    }
+
+    fn make_room_for_ssd_install(
+        &mut self,
+        pending: &[StagedSsdBatchWrite],
+        pending_bytes: u64,
+        key: &CacheKey,
+        block_bytes: u64,
+    ) -> bool {
+        loop {
+            let projected = self.projected_ssd_install_bytes(pending, pending_bytes, key, block_bytes);
+            let capacity = self.ssd_capacity_bytes as u64;
+            if projected <= capacity {
+                return true;
+            }
+            let before = self.ssd_bytes;
+            let incoming = capacity.saturating_sub(before).saturating_add(projected - capacity);
+            self.evict_ssd_for(incoming);
+            if self.ssd_bytes >= before {
+                return false;
+            }
+            // Eviction may remove an old copy whose replacement credit we used.
+        }
+    }
+
     fn evict_ssd_to_capacity(&mut self) {
         self.evict_ssd_for_batch(0);
     }
