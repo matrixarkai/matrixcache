@@ -2725,10 +2725,10 @@ impl CacheInner {
             // that order, so leaving it until after the loop lets the next
             // round pick the same key, whose bytes are already gone.
             self.disk_order.remove(&victim);
-            self.record_eviction(
+            self.record_eviction_with_value(
                 CacheTier::Ssd,
                 &victim,
-                &evicted_value,
+                || evicted_value,
                 removal_cause(reason),
             );
             self.ssd_bytes = self.ssd_bytes.saturating_sub(removed_bytes);
