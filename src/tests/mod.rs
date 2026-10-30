@@ -3,6 +3,24 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: reused sketch positions preserve every counter and decay boundary.
+    #[test]
+    fn frequency_batch_records_match_individual_records() {
+        for capacity in [1, 17, 4096] {
+            let individual = FrequencySketch::with_capacity(capacity);
+            let batched = FrequencySketch::with_capacity(capacity);
+            for (i, count) in [0, 1, 31, 32, 255, 4096, 17].into_iter().enumerate() {
+                let key = CacheKey::string(0, &format!("{i}-{}", "k".repeat(4096)));
+                for _ in 0..count { individual.record(&key); }
+                batched.record_many(&key, count);
+                assert_eq!(individual.window(), batched.window());
+                for (left, right) in individual.counters.iter().zip(&batched.counters) {
+                    assert_eq!(left.load(Ordering::Relaxed), right.load(Ordering::Relaxed));
+                }
+            }
+        }
+    }
+
     // rust-internal: aging ownership never blocks concurrent sketch updates.
     #[test]
     fn frequency_aging_has_one_nonblocking_owner() {

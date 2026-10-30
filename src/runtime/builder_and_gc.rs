@@ -1859,9 +1859,7 @@ impl CacheInner {
             if let Some(sketch) = &self.ssd_access_frequency {
                 let samples = sampled_hit_count(hits_before, 1);
                 if samples != 0 && self.disk_index.contains_key(key) {
-                    for _ in 0..samples {
-                        sketch.record(key);
-                    }
+                    sketch.record_many(key, samples);
                 }
             }
             let before = entry.hotness.fetch_add(1, Ordering::Relaxed);
@@ -1937,9 +1935,7 @@ impl CacheInner {
         if let Some(sketch) = &self.ssd_access_frequency {
             let samples = sampled_hit_count(hits_before, occurrences);
             if samples != 0 && self.disk_index.contains_key(key) {
-                for _ in 0..samples {
-                    sketch.record(key);
-                }
+                sketch.record_many(key, samples);
             }
         }
         // A sampled hit signal for the admission sketch, and only when the
@@ -1952,9 +1948,7 @@ impl CacheInner {
         // records far more than one hit twice.
         if self.admission_filter_enabled {
             let sample_hits = sampled_hit_count(hits_before, occurrences);
-            for _ in 0..sample_hits {
-                self.access_frequency.record(key);
-            }
+            self.access_frequency.record_many(key, sample_hits);
         }
         let hotness_delta = occurrences.min(u32::MAX as u64) as u32;
         let before = entry.hotness.fetch_add(hotness_delta, Ordering::Relaxed);
@@ -2139,9 +2133,7 @@ impl CacheInner {
             let records = sampled_hit_count(0, hits).min(SKETCH_RESEED_RECORDS_PER_ENTRY);
             // Every resident key gets at least one, so a key the cache is
             // holding outranks a key nothing has ever seen.
-            for _ in 0..records.max(1) {
-                sized.record(key.as_ref());
-            }
+            sized.record_many(key.as_ref(), records.max(1));
         }
         self.access_frequency = sized;
     }

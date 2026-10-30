@@ -2956,9 +2956,7 @@ impl MultiLayerCache {
             let sketch = FrequencySketch::with_capacity(entries);
             for key in inner.disk_index.keys() {
                 let hits = inner.metadata_of(key).map_or(0, CacheEntryMeta::hits);
-                for _ in 0..sampled_hit_count(0, hits).clamp(1, 16) {
-                    sketch.record(key);
-                }
+                sketch.record_many(key, sampled_hit_count(0, hits).clamp(1, 16));
             }
             inner.ssd_access_frequency = Some(sketch);
         }
