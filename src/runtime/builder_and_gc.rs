@@ -2428,7 +2428,26 @@ impl CacheInner {
         {
             return true;
         }
-        self.refill_from_ssd_shared(key, value)
+        // Installing the bytes just read into unused memory does not change
+        // logical data. Do not cancel other pending reads for that placement.
+        // Retain invalidation when placement can evict or touch another tier.
+        let memory_target = !matches!(
+            self.tiering_policy.data_placement,
+            CacheDataPlacement::SideBySide
+        ) || self.pmem_capacity_bytes == 0
+            || value.len() <= self.tiering_policy.data_placement_threshold_bytes;
+        let spare_memory = self.memory_bytes.checked_add(value.len())
+            .is_some_and(|bytes| bytes <= self.memory_capacity_bytes);
+        let epoch = self.ssd_probe_epoch;
+        let refilled = self.refill_from_ssd_shared(key, value);
+        // The cache lock stays exclusive here. Suppress only the single
+        // resident insertion increment; any extra mutation keeps the guard.
+        if refilled && memory_target && spare_memory
+            && epoch.checked_add(1) == Some(self.ssd_probe_epoch)
+        {
+            self.ssd_probe_epoch = epoch;
+        }
+        refilled
     }
 
     fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {

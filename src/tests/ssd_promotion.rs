@@ -92,6 +92,40 @@ fn ssd_probe_epoch_saturates_and_disables_promotion() {
     assert!(!inner.ssd_probe_is_current(u64::MAX));
 }
 
+// rust-internal: independent pending reads must not cancel pure memory fills.
+#[test]
+fn ssd_refill_into_spare_memory_preserves_pending_probes() {
+    let (_dir, cache) = cache();
+    let first = CacheKey::string(0, "first");
+    let second = CacheKey::string(0, "second");
+    let mut inner = cache.inner.write().unwrap();
+    let (value, _) = capture(&mut inner, &first);
+    let (other, epoch) = capture(&mut inner, &second);
+    assert!(inner.refill_ssd_probe(&first, value, true));
+    assert!(inner.ssd_probe_is_current(epoch));
+    assert!(inner.refill_ssd_probe(&second, other, true));
+    assert!(inner.ssd_probe_is_current(epoch));
+    assert!(inner.put_memory(&first, b"new".to_vec()));
+    assert!(!inner.ssd_probe_is_current(epoch));
+}
+
+// rust-internal: capacity pressure must retain conservative invalidation.
+#[test]
+fn ssd_refill_with_eviction_invalidates_pending_probes() {
+    let (_dir, cache) = cache();
+    let first = CacheKey::string(0, "first");
+    let second = CacheKey::string(0, "second");
+    let mut inner = cache.inner.write().unwrap();
+    let (value, _) = capture(&mut inner, &first);
+    let (other, _) = capture(&mut inner, &second);
+    inner.memory_capacity_bytes = value.len();
+    assert!(inner.refill_ssd_probe(&first, value, true));
+    let epoch = inner.ssd_probe_epoch;
+    assert!(inner.refill_ssd_probe(&second, other, true));
+    assert!(!inner.ssd_probe_is_current(epoch));
+    assert!(inner.stats.memory_evictions > 0);
+}
+
 // rust-internal: a resident appearing before the disk read invalidates the batch.
 #[test]
 fn ssd_batch_probe_does_not_restore_an_evicted_newer_resident() {
