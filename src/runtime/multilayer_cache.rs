@@ -897,7 +897,7 @@ impl CacheInner {
     /// in which case its metadata stays exactly as it was, because an
     /// overwrite is not a new entry and its hit history carries across.
     fn make_resident(&mut self, key: Arc<CacheKey>, value: Arc<[u8]>) -> Option<Arc<[u8]>> {
-        self.bump_ssd_probe_epoch();
+        self.note_ssd_probe_mutation(&key);
         if let Some(resident) = self.memory.get_mut(key.as_ref()) {
             return Some(std::mem::replace(&mut resident.value, value));
         }
@@ -932,7 +932,7 @@ impl CacheInner {
     /// SSD eviction throwing that away was a real bug, and this is the same
     /// moment one tier up.
     fn take_resident(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
-        self.bump_ssd_probe_epoch();
+        self.note_ssd_probe_mutation(key);
         let (held, resident) = self.memory.remove_entry(key)?;
         if let Some(meta) = resident.meta {
             self.metadata.insert(held, meta);
@@ -1215,6 +1215,8 @@ struct CacheInner {
     ssd_bytes: u64,
     // Conservatively invalidate pending SSD promotions on data mutations.
     ssd_probe_epoch: u64,
+    ssd_probe_global_epoch: u64,
+    ssd_probe_mutations: [u64; 64],
     disk_dir: PathBuf,
     pmem_paths: Vec<PathBuf>,
     pmem_manifest_appends: AtomicU64,
@@ -2290,6 +2292,8 @@ impl MultiLayerCache {
                 pmem_paths: Vec::new(),
                 pmem_manifest_appends: AtomicU64::new(0),
                 ssd_probe_epoch: 0,
+                ssd_probe_global_epoch: 0,
+                ssd_probe_mutations: [0; 64],
                 pmem_manifest_compact_after: AtomicU64::new(PMEM_MANIFEST_COMPACT_MIN),
                 #[cfg(unix)]
                 pmem_manifest_writer: Mutex::new(None),
@@ -3416,7 +3420,7 @@ impl MultiLayerCache {
                 // of a shared read is that there is one.
                 let value = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current(probe_epoch);
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 inner
                     .read_counters
@@ -3624,9 +3628,9 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let current = inner.ssd_probe_is_current(probe_epoch);
             for (unique_position, started, decoded_block) in decoded {
                 let key = unique_keys[unique_position];
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match decoded_block {
                     Some((value, compressed)) => {
                         inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
@@ -4106,7 +4110,7 @@ impl MultiLayerCache {
             Some(block) => {
                 let decoded = CacheDecodedBlock::decode(&block, refill_wanted)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current(probe_epoch);
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 if is_encoded_compressed_block(&block) {
                     inner.stats.compressed_hits += 1;
@@ -4348,8 +4352,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let current = inner.ssd_probe_is_current(probe_epoch);
             for (key, positions, started, refill_started, decoded) in ssd_reads {
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match decoded {
                     Some((value, compressed)) => {
                         if let Some(refill) = value.to_refill() {
@@ -4585,7 +4589,7 @@ impl MultiLayerCache {
             Some(block) => {
                 let decoded = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current(probe_epoch);
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.increment_pin_for_handle(key, decoded.len());
                 if !inner.ssd_instance_only
                     && !inner.refill_ssd_probe(key, Arc::clone(&decoded), current)
@@ -5058,8 +5062,8 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
-            let current = inner.ssd_probe_is_current(probe_epoch);
             for (key, positions, started, value) in decoded {
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match value {
                     Some((value, compressed)) => {
                         let occurrences = positions.len();
@@ -9742,6 +9746,7 @@ impl CacheInner {
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
         //   `pinned_removals_seen`, `manifest_appends`,
         //   `pmem_manifest_appends`, `pmem_manifest_compact_after`, `ssd_probe_epoch`,
+        //   `ssd_probe_global_epoch`, `ssd_probe_mutations`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
         //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,

@@ -840,7 +840,7 @@ impl CacheInner {
     /// this returns -- so what a failure can leave behind is a file nothing
     /// points at, which recovery ignores because recovery reads the manifest.
     fn write_ssd_block(&mut self, key: &CacheKey, block: Vec<u8>) -> Result<(), CacheError> {
-        self.bump_ssd_probe_epoch();
+        self.note_ssd_probe_mutation(key);
         self.charge_ssd_write(block.len() as u64);
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
@@ -866,7 +866,9 @@ impl CacheInner {
         if entries.is_empty() {
             return Ok(());
         }
-        self.bump_ssd_probe_epoch();
+        for (key, _) in &entries {
+            self.note_ssd_probe_mutation(key);
+        }
         let written: u64 = entries.iter().map(|(_, block)| block.len() as u64).sum();
         self.charge_ssd_write(written);
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -933,7 +935,7 @@ impl CacheInner {
     }
 
     fn delete_ssd_block(&mut self, key: &CacheKey) -> Result<(), CacheError> {
-        self.bump_ssd_probe_epoch();
+        self.note_ssd_probe_mutation(key);
         let _ = fs::remove_file(self.disk_path(key));
         match self.ssd_store.delete(&Self::ssd_store_key(key)) {
             Ok(()) | Err(CacheError::NotFound) => Ok(()),
@@ -947,8 +949,8 @@ impl CacheInner {
         if keys.is_empty() {
             return Ok(());
         }
-        self.bump_ssd_probe_epoch();
         for key in keys {
+            self.note_ssd_probe_mutation(key.borrow());
             let _ = fs::remove_file(self.disk_path(key.borrow()));
         }
         // A store with no capacity holds nothing and accepts nothing: its own
@@ -2242,7 +2244,7 @@ impl CacheInner {
         value: Arc<[u8]>,
         persist: bool,
     ) -> bool {
-        self.bump_ssd_probe_epoch();
+        self.note_ssd_probe_mutation(key);
         let eviction_started = Instant::now();
         if self.pmem_capacity_bytes == 0 || value.len() > self.pmem_capacity_bytes {
             self.stats.pmem_admission_rejected =
@@ -2400,8 +2402,40 @@ impl CacheInner {
 
     fn bump_ssd_probe_epoch(&mut self) {
         self.ssd_probe_epoch = self.ssd_probe_epoch.saturating_add(1);
+        self.ssd_probe_global_epoch = self.ssd_probe_epoch;
     }
 
+    fn note_ssd_probe_mutation(&mut self, key: &CacheKey) {
+        self.ssd_probe_epoch = self.ssd_probe_epoch.saturating_add(1);
+        let mut hash = DefaultHasher::new();
+        key.hash(&mut hash);
+        let index = self.ssd_probe_epoch as usize % self.ssd_probe_mutations.len();
+        self.ssd_probe_mutations[index] = hash.finish();
+    }
+
+    fn ssd_probe_is_current_for(&self, key: &CacheKey, epoch: u64) -> bool {
+        if epoch == u64::MAX || self.ssd_probe_epoch == u64::MAX
+            || epoch < self.ssd_probe_global_epoch || epoch > self.ssd_probe_epoch
+        {
+            return false;
+        }
+        let changed = self.ssd_probe_epoch - epoch;
+        if changed == 0 {
+            return true;
+        }
+        if changed > self.ssd_probe_mutations.len() as u64 {
+            return false;
+        }
+        let mut hash = DefaultHasher::new();
+        key.hash(&mut hash);
+        let hash = hash.finish();
+        // A hash collision can only skip promotion, never admit stale bytes.
+        (epoch + 1..=self.ssd_probe_epoch).all(|sequence| {
+            self.ssd_probe_mutations[sequence as usize % self.ssd_probe_mutations.len()] != hash
+        })
+    }
+
+    #[cfg(test)]
     fn ssd_probe_is_current(&self, epoch: u64) -> bool {
         epoch != u64::MAX && epoch == self.ssd_probe_epoch
     }
@@ -2439,13 +2473,17 @@ impl CacheInner {
         let spare_memory = self.memory_bytes.checked_add(value.len())
             .is_some_and(|bytes| bytes <= self.memory_capacity_bytes);
         let epoch = self.ssd_probe_epoch;
+        let journal_index = epoch.saturating_add(1) as usize % self.ssd_probe_mutations.len();
+        let previous_mutation = self.ssd_probe_mutations[journal_index];
         let refilled = self.refill_from_ssd_shared(key, value);
         // The cache lock stays exclusive here. Suppress only the single
         // resident insertion increment; any extra mutation keeps the guard.
         if refilled && memory_target && spare_memory
             && epoch.checked_add(1) == Some(self.ssd_probe_epoch)
+            && self.ssd_probe_global_epoch <= epoch
         {
             self.ssd_probe_epoch = epoch;
+            self.ssd_probe_mutations[journal_index] = previous_mutation;
         }
         refilled
     }
