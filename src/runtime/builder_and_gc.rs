@@ -2959,18 +2959,6 @@ impl CacheInner {
         }
     }
 
-    /// An entry's score, unsegmented.
-    ///
-    /// Its one caller weighs an *incoming* SSD block against the blocks already
-    /// there, which is an admission question rather than a victim-selection
-    /// one: an arriving block has no history, so ranking it below everything
-    /// protected would answer that question by construction rather than by
-    /// weighing it. Segments decide which resident entry gives way, and that is
-    /// [`select_eviction_victim`](Self::select_eviction_victim).
-    fn eviction_score(&self, key: &CacheKey) -> EvictionScore {
-        eviction_score_of(self.metadata_of(key), false)
-    }
-
     fn incoming_ssd_block_is_colder_than_existing_groups(
         &self,
         key: &CacheKey,
@@ -2988,21 +2976,28 @@ impl CacheInner {
             .or_else(|| extract_routing_slot(key))
             .map(EvictionGroupKey::Slot)
             .unwrap_or(EvictionGroupKey::Object(key));
-        self.disk_order
-            .iter()
-            .take(EVICTION_CANDIDATE_WINDOW)
-            // Admission must not approve a trade against an entry eviction
-            // cannot remove. Capacity checks still reject an entirely pinned tier.
-            .filter(|candidate| !self.is_pinned(candidate))
-            .filter(|candidate| self.eviction_group_key(candidate) != incoming_group)
-            .map(|candidate| self.eviction_score(candidate))
-            .min()
-            .map(|coldest_existing| incoming_score < coldest_existing)
-            .unwrap_or(false)
-    }
-
-    fn eviction_group_key<'a>(&self, key: &'a CacheKey) -> EvictionGroupKey<'a> {
-        eviction_group_key_of(self.metadata_of(key), key)
+        let mut weighed = 0;
+        for candidate in self.disk_order.iter() {
+            if self.is_pinned(candidate) {
+                continue;
+            }
+            let meta = self.metadata_of(candidate);
+            if eviction_group_key_of(meta, candidate) == incoming_group {
+                continue;
+            }
+            // Admission compares popularity, not resident protection segments.
+            // One eligible colder entry suffices; no minimum needs materializing.
+            if eviction_score_of(meta, false) <= incoming_score {
+                return false;
+            }
+            weighed += 1;
+            if weighed == EVICTION_CANDIDATE_WINDOW {
+                break;
+            }
+        }
+        // Count eligible entries, so a pinned prefix cannot hide the actual
+        // victims. An entirely pinned tier is rejected by the capacity check.
+        weighed != 0
     }
 
     fn record_expired_eviction(&mut self) {

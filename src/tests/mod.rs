@@ -20902,17 +20902,22 @@ mod tests {
 
     #[test]
     fn ssd_admission_does_not_use_pinned_entries_as_victims() {
-        for batch in [false, true] {
+        for (batch, pinned_count) in [(false, 1), (true, 1), (false, 128), (true, 128)] {
             let dir = tempfile::tempdir().unwrap();
             let cache = MultiLayerCache::with_options(
-                CacheOptions::new(0, 0, 180).with_ssd_paths([dir.path().join("ssd")]),
+                CacheOptions::new(0, 0, (pinned_count + 1) * 90)
+                    .with_ssd_paths([dir.path().join("ssd")]),
             );
             cache.start().unwrap();
-            let pinned = CacheKey::string(0, "pinned-cold");
+            let pinned: Vec<_> = (0..pinned_count)
+                .map(|i| CacheKey::string(0, &format!("pinned-cold-{i}")))
+                .collect();
             let hot = CacheKey::string(0, "unpinned-hot");
             let incoming = CacheKey::string(0, "incoming-cold");
-            cache.put(pinned.clone(), vec![1; 64]).unwrap();
-            cache.pin(pinned.clone());
+            for key in &pinned {
+                cache.put(key.clone(), vec![1; 64]).unwrap();
+                cache.pin(key.clone());
+            }
             cache
                 .put_with_admission(
                     hot.clone(),
@@ -20933,8 +20938,10 @@ mod tests {
             } else {
                 cache.put(incoming.clone(), vec![3; 64]).unwrap();
             }
-            assert_eq!(cache.get(&hot).unwrap(), Some(vec![2; 64]), "batch={batch}");
-            assert_eq!(cache.get(&pinned).unwrap(), Some(vec![1; 64]));
+            assert_eq!(cache.get(&hot).unwrap(), Some(vec![2; 64]), "batch={batch}, pinned={pinned_count}");
+            for key in &pinned {
+                assert_eq!(cache.get(key).unwrap(), Some(vec![1; 64]));
+            }
             assert_eq!(cache.get(&incoming).unwrap(), None);
             assert_eq!(cache.stats().ssd_admission_rejected, before + 1);
             assert!(cache.stop());
