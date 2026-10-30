@@ -2234,22 +2234,26 @@ impl StorageEngineRocksDb {
     #[cfg(not(feature = "rocksdb-ssd"))]
     fn encode_journal_change(key: &str, value: Option<&[u8]>) -> Vec<u8> {
         let mut record = Vec::with_capacity(key.len() + value.map_or(0, <[u8]>::len) + 24);
+        Self::encode_journal_change_into(&mut record, key, value);
+        record
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    fn encode_journal_change_into(record: &mut Vec<u8>, key: &str, value: Option<&[u8]>) {
         match value {
             Some(value) => {
                 record.push(Self::JOURNAL_PUT);
-                put_fixed_uint64(&mut record, key.len() as u64);
-                put_fixed_uint64(&mut record, value.len() as u64);
+                put_fixed_uint64(record, key.len() as u64);
+                put_fixed_uint64(record, value.len() as u64);
                 record.extend_from_slice(key.as_bytes());
                 record.extend_from_slice(value);
             }
             None => {
                 record.push(Self::JOURNAL_DELETE);
-                put_fixed_uint64(&mut record, key.len() as u64);
+                put_fixed_uint64(record, key.len() as u64);
                 record.extend_from_slice(key.as_bytes());
             }
         }
-
-        record
     }
 
     /// Append an encoded change, and take a fresh snapshot once enough have
@@ -2629,11 +2633,31 @@ impl StorageEngineRocksDb {
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
+            const BUFFER_LIMIT: usize = 64 * 1024;
+            let capacity = unique_keys.iter().fold(0usize, |size, key| {
+                size.saturating_add(key.len()).saturating_add(9).min(BUFFER_LIMIT)
+            });
+            let mut journal = Vec::new();
             for key in &unique_keys {
                 if self.records.remove(key.as_str()).is_some() {
                     deleted = deleted.saturating_add(1);
-                    self.append_journal_bytes(&Self::encode_journal_change(key, None))?;
+                    let size = key.len().saturating_add(9);
+                    if !journal.is_empty() && journal.len().saturating_add(size) > BUFFER_LIMIT {
+                        self.append_journal_bytes(&journal)?;
+                        journal.clear();
+                    }
+                    if size > BUFFER_LIMIT {
+                        self.append_journal_bytes(&Self::encode_journal_change(key, None))?;
+                    } else {
+                        if journal.capacity() == 0 {
+                            journal.reserve_exact(capacity);
+                        }
+                        Self::encode_journal_change_into(&mut journal, key, None);
+                    }
                 }
+            }
+            if !journal.is_empty() {
+                self.append_journal_bytes(&journal)?;
             }
             // The map only shrinks during deletion; snapshot its smallest state once.
             self.compact_journal_if_needed()?;

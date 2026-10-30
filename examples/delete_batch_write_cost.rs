@@ -8,18 +8,20 @@
 fn main() {
     use matrixcache::{StorageEngineApi, StorageEngineRocksDb};
 
-    fn written() -> u64 {
-        std::fs::read_to_string("/proc/self/io")
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("wchar:"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+    fn written() -> (u64, u64) {
+        let io = std::fs::read_to_string("/proc/self/io").unwrap();
+        let counter = |name| {
+            io.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
+        (counter("wchar:"), counter("syscw:"))
     }
 
-    println!("keys,single_delete_write_bytes,batch_delete_write_bytes");
+    println!("keys,single_delete_write_bytes,batch_delete_write_bytes,single_write_calls,batch_write_calls");
     for count in [64, 256] {
         let mut costs = Vec::new();
         for batched in [false, true] {
@@ -51,15 +53,19 @@ fn main() {
                     assert_eq!(store.delete_batch(std::slice::from_ref(key)).unwrap(), 1);
                 }
             }
-            costs.push(written() - before);
+            let after = written();
+            costs.push((after.0 - before.0, after.1 - before.1));
             // Do not stop: recovery must use the snapshot and any remaining journal.
             drop(store);
             let mut recovered = StorageEngineRocksDb::new(path);
             assert!(recovered.start());
             assert_eq!(recovered.get_batch(&keys).unwrap(), vec![None; count]);
         }
-        assert!(costs[1] < costs[0]);
-        println!("{count},{},{}", costs[0], costs[1]);
+        assert!(costs[1].0 < costs[0].0);
+        println!(
+            "{count},{},{},{},{}",
+            costs[0].0, costs[1].0, costs[0].1, costs[1].1
+        );
     }
 }
 

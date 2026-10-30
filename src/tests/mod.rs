@@ -1753,6 +1753,38 @@ mod tests {
     /// So this writes across a compaction on purpose, and checks the far side.
     #[cfg(not(feature = "rocksdb-ssd"))]
     #[test]
+    fn buffered_delete_records_preserve_bytes_across_chunk_and_large_key_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store").to_string_lossy().to_string();
+        let mut store = StorageEngineRocksDb::new(path.clone());
+        assert!(store.start());
+        let mut keys: Vec<_> = (0..200)
+            .map(|i| format!("{i:03}-{}", "k".repeat(512)))
+            .collect();
+        keys.insert(150, "large".repeat(16 * 1024));
+        store.put_batch(keys.iter().map(|k| (k.clone(), vec![1])).collect()).unwrap();
+        store.put_view("survivor", vec![2; 1024 * 1024]).unwrap();
+        store.persist_records().unwrap();
+        let mut requested = keys.clone();
+        requested.push(keys[0].clone());
+        requested.push("absent".into());
+        assert_eq!(store.delete_batch(&requested).unwrap(), keys.len());
+        let mut expected = StorageEngineRocksDb::JOURNAL_MAGIC.to_vec();
+        for key in &keys {
+            expected.extend(StorageEngineRocksDb::encode_journal_change(key, None));
+        }
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), expected);
+        assert_eq!(store.delete_batch(&requested).unwrap(), 0);
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), expected);
+        drop(store);
+        let mut recovered = StorageEngineRocksDb::new(path);
+        assert!(recovered.start());
+        assert_eq!(recovered.get_batch(&keys).unwrap(), vec![None; keys.len()]);
+        assert_eq!(recovered.get("survivor").unwrap().to_vec(), vec![2; 1024 * 1024]);
+    }
+
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    #[test]
     fn storage_delete_batches_compact_the_final_map_and_recover() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store").to_string_lossy().to_string();
