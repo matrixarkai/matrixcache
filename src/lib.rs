@@ -66,3 +66,6 @@ include!("core/config_check.rs");
 include!("core/cluster.rs");
 include!("core/legacy_names.rs");
 include!("tests/mod.rs");
+#[cfg(test)]
+#[path = "tests/pmem_promotion.rs"]
+mod pmem_promotion_tests;

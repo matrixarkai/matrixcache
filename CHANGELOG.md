@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- PMEM reads revalidate captured values before deferred memory promotion, so
+  concurrent replacement, invalidation, expiry, or stop cannot restore stale data.
+
 - PMEM manifest history is periodically compacted from durable records, bounding
   repeated-update growth without requiring all persisted entries to be resident.
 

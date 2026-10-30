@@ -3390,13 +3390,7 @@ impl MultiLayerCache {
                         .read_counters
                         .shared_buffer_hits
                         .fetch_add(1, Ordering::Relaxed);
-                    if inner.pmem.contains_key(key) {
-                        inner.record_hit(key, length);
-                    }
-                    if !inner.put_memory_shared(key, Arc::clone(&value)) {
-                        inner.stats.refill_failures =
-                            inner.stats.refill_failures.saturating_add(1);
-                    }
+                    inner.promote_pmem_probe_if_current(key, &value);
                     inner.record_get_latency(started);
                     inner.record_read_through_latency(started);
                     inner.record_refill_latency(started);
@@ -3594,18 +3588,7 @@ impl MultiLayerCache {
             for (unique_position, value, started) in pmem_refills {
                 let key = unique_keys[unique_position];
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                if inner.pmem.contains_key(key) {
-                    inner.record_hit(key, value.len());
-                }
-                // `value` is already the `Arc<[u8]>` this batch returns, so the
-                // memory tier takes a handle to it. The `to_vec` that used to
-                // be here copied the payload so that `put_memory` could copy it
-                // again into an `Arc` -- two copies to store what was in hand,
-                // and the caller was then left holding a different allocation
-                // from the one the tier kept.
-                if !inner.put_memory_shared(key, Arc::clone(&value)) {
-                    inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
-                }
+                inner.promote_pmem_probe_if_current(key, &value);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 inner.record_refill_latency(started);
@@ -4098,12 +4081,7 @@ impl MultiLayerCache {
 
             let mut inner = self.inner.write().expect("cache lock poisoned");
             inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-            if inner.pmem.contains_key(key) {
-                inner.record_hit(key, decoded.len());
-            }
-            if !inner.put_memory_shared(key, Arc::clone(&value)) {
-                inner.stats.refill_failures += 1;
-            }
+            inner.promote_pmem_probe_if_current(key, &value);
             inner.record_get_latency(started);
             inner.record_read_through_latency(started);
             inner.record_refill_latency(started);
