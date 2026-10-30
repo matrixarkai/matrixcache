@@ -7,6 +7,56 @@ const PMEM_MANIFEST_COMPACT_MIN: u64 = 4096;
 mod pmem_manifest_compaction_tests {
     use super::*;
 
+    // rust-internal: compaction drops missing files without relying on resident state.
+    #[test]
+    fn pmem_compaction_prunes_missing_blocks_and_reopens_for_new_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let mut inner = cache.inner.write().unwrap();
+        let keep = CacheKey::string(0, "nonresident");
+        inner.persist_pmem_put(&keep, b"keep").unwrap();
+        for i in 0..512 {
+            let key = CacheKey::string(0, &format!("missing-{i}"));
+            inner.persist_pmem_put(&key, b"old").unwrap();
+            fs::remove_file(inner.pmem_block_path_for_key(&key).unwrap()).unwrap();
+        }
+        assert!(inner.pmem.is_empty());
+        let manifest = inner.pmem_manifest_path().unwrap();
+        assert_eq!(fs::read_to_string(&manifest).unwrap().lines().count(), 513);
+        inner.compact_pmem_manifest().unwrap();
+        assert_eq!(fs::read_to_string(&manifest).unwrap().lines().count(), 1);
+        let restored = CacheKey::string(0, "missing-0");
+        inner.persist_pmem_put(&restored, b"new").unwrap();
+        inner.reset_pmem_manifest_writer();
+        let report = inner.recover_pmem_index_locked().unwrap();
+        assert_eq!(report.scanned_files, 2);
+        assert_eq!(report.recovered_files, 2);
+        assert_eq!(inner.pmem.get(&keep).unwrap().as_ref(), b"keep");
+        assert_eq!(inner.pmem.get(&restored).unwrap().as_ref(), b"new");
+    }
+
+    // rust-internal: metadata errors must not replace the original manifest.
+    #[test]
+    fn pmem_compaction_preserves_manifest_on_block_metadata_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let inner = cache.inner.write().unwrap();
+        let key = CacheKey::string(0, "keep");
+        inner.persist_pmem_put(&key, b"keep").unwrap();
+        let manifest = inner.pmem_manifest_path().unwrap();
+        let original = fs::read(&manifest).unwrap();
+        let block_dir = inner.pmem_block_path_for_key(&key).unwrap().parent().unwrap().to_path_buf();
+        let saved = block_dir.with_extension("saved");
+        fs::rename(&block_dir, &saved).unwrap();
+        fs::write(&block_dir, b"not a directory").unwrap();
+        assert!(inner.compact_pmem_manifest().is_err());
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+    }
+
     // rust-internal: absent files need no tombstone; recovery must skip old records.
     #[test]
     fn absent_pmem_deletes_do_not_grow_manifest_or_restore_missing_blocks() {
@@ -174,10 +224,21 @@ impl CacheInner {
             }
         }
         let temporary = path.with_extension("compact.tmp");
+        let mut retained = 0u64;
         {
             let mut output = std::io::BufWriter::new(File::create(&temporary)?);
             for (key, length) in &live {
+                if let Some(block_path) = self.pmem_block_path_for_key(key) {
+                    match fs::metadata(block_path) {
+                        Ok(_) => {}
+                        // Recovery already skips these entries; do not carry
+                        // them into every future manifest rewrite and restart.
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    }
+                }
                 writeln!(output, "{}", manifest_line_for_key(key, *length))?;
+                retained = retained.saturating_add(1);
             }
             output.flush()?;
             output.get_ref().sync_all()?;
@@ -186,7 +247,7 @@ impl CacheInner {
         fs::rename(&temporary, &path)?;
         sync_parent_dir(&path)?;
         self.pmem_manifest_compact_after.store(
-            PMEM_MANIFEST_COMPACT_MIN.max((live.len() as u64).saturating_mul(3)),
+            PMEM_MANIFEST_COMPACT_MIN.max(retained.saturating_mul(3)),
             Ordering::Relaxed,
         );
         Ok(())
