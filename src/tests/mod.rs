@@ -3,6 +3,27 @@
 
 #[cfg(test)]
 mod tests {
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn conditional_pmem_update_preserves_pins_and_rejects_stale_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "conditional-pmem");
+        cache.put(key.clone(), vec![7; 64]).unwrap();
+        let old = cache.acquire(&key).unwrap().unwrap();
+        assert_eq!(cache.get_no_promotion(&key).unwrap().unwrap().tier, CacheReadTier::Pmem);
+        cache.update_cached_value_if_current(&key, &old, vec![9; 64]).unwrap();
+        assert_eq!(old.as_slice(), &[7; 64]);
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![9; 64]);
+        assert!(matches!(cache.update_cached_value_if_current(&key, &old, vec![3; 64]), Err(CacheError::ReplaceMismatch)));
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![9; 64]);
+        cache.release(old);
+        assert!(cache.stop());
+    }
+
     // rust-internal: reused sketch positions preserve every counter and decay boundary.
     #[test]
     fn frequency_batch_records_match_individual_records() {
