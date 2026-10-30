@@ -32,6 +32,18 @@ block shadow files. A small file-backed compatibility store is available with
 `--no-default-features` for lightweight local diagnostics; it is not intended as
 a production backend.
 
+Native batch deletion checks existence with batched pinned reads before issuing
+its write batch, avoiding Rust copies of values that will be discarded. Duplicate
+keys are deleted once; missing keys do not increase the deletion count. The default
+column family uses the same configured options and remains compatible with
+existing databases.
+
+`cargo run --release --example storage_batch_delete_allocations` verifies deletion,
+idempotence, survivors, and reopen behavior for one and two devices. For 128 values
+of 64 KiB, Rust allocation volume fell from 8,412,212 to 18,573 bytes on one device,
+and from 8,424,538 to 30,899 bytes on two. These counters exclude native allocations
+and do not measure disk-read volume or throughput.
+
 The default feature set compiles RocksDB from source, which requires a native build toolchain plus `clang`/`libclang` and `cmake`:
 
 ```bash

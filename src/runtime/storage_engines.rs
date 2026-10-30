@@ -2234,8 +2234,13 @@ impl StorageEngineRocksDb {
 
     #[cfg(feature = "rocksdb-ssd")]
     fn open_rocksdb(&self) -> Result<rocksdb::DB, CacheError> {
-        rocksdb::DB::open(&Self::rocksdb_options(), &self.db_path)
-            .map_err(|err| CacheError::RocksDb(err.to_string()))
+        let options = Self::rocksdb_options();
+        rocksdb::DB::open_cf_with_opts(
+            &options,
+            &self.db_path,
+            [(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, options.clone())],
+        )
+        .map_err(|err| CacheError::RocksDb(err.to_string()))
     }
 
     #[cfg(feature = "rocksdb-ssd")]
@@ -2694,8 +2699,12 @@ impl StorageEngineRocksDb {
         #[cfg(feature = "rocksdb-ssd")]
         {
             let db = self.rocksdb()?;
+            let cf = db.cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+                .ok_or_else(|| CacheError::RocksDb("default column family is unavailable".into()))?;
+            // Only existence is needed; pinned values avoid copying payloads
+            // into Rust buffers that would be discarded before deletion.
             let existing = db
-                .multi_get(unique_keys.iter().map(|key| key.as_bytes()))
+                .batched_multi_get_cf(cf, unique_keys.iter().map(String::as_bytes), false)
                 .into_iter()
                 .map(|result| result.map_err(|err| CacheError::RocksDb(err.to_string())))
                 .collect::<Result<Vec<_>, _>>()?;

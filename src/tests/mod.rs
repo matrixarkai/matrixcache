@@ -6034,6 +6034,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rocksdb-ssd")]
+    fn pinned_batch_delete_preserves_default_family_compatibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store");
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        {
+            let db = rocksdb::DB::open(&options, &path).unwrap();
+            db.put("large", vec![7; 65536]).unwrap();
+            db.put("empty", []).unwrap();
+            db.put("survivor", b"keep").unwrap();
+        }
+        let mut store = StorageEngineRocksDb::new(path.to_string_lossy().to_string());
+        assert!(store.start());
+        let keys = ["large", "empty", "missing", "large"].map(str::to_string);
+        assert_eq!(store.delete_batch(&keys).unwrap(), 2);
+        assert_eq!(store.delete_batch(&keys).unwrap(), 0);
+        drop(store);
+        let db = rocksdb::DB::open(&options, &path).unwrap();
+        assert_eq!(db.get("large").unwrap(), None);
+        assert_eq!(db.get("empty").unwrap(), None);
+        assert_eq!(db.get("survivor").unwrap().unwrap(), b"keep");
+    }
+
+    #[test]
     fn storage_engine_rocksdb_batch_delete_is_persistent_and_idempotent() {
         let path = unique_temp_path("rocksdb-batch-delete");
         let mut storage = StorageEngineRocksDb::new(path.to_string_lossy().to_string());
