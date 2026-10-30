@@ -198,3 +198,25 @@ fn ssd_probe_warmup_preserves_oldest_retained_mutation() {
     assert!(!inner.ssd_probe_is_current_for(&changed, epoch));
     assert!(inner.ssd_probe_is_current_for(&fill, epoch));
 }
+
+// rust-internal: disabled SSD mutations need a fence, not key-hash bookkeeping.
+#[test]
+fn disabled_ssd_uses_a_global_fence_and_resumes_key_history() {
+    let (_dir, cache) = cache();
+    let key = CacheKey::string(0, "read");
+    let writer = CacheKey::string(0, "write");
+    let mut inner = cache.inner.write().unwrap();
+    let (_, epoch) = capture(&mut inner, &key);
+    let history = inner.ssd_probe_mutations;
+    inner.ssd_capacity_bytes = 0;
+    assert!(inner.put_memory(&writer, b"value".to_vec()));
+    assert_eq!(inner.ssd_probe_mutations, history);
+    assert!(!inner.ssd_probe_is_current_for(&key, epoch));
+    assert_eq!(inner.ssd_probe_global_epoch, inner.ssd_probe_epoch);
+
+    inner.ssd_capacity_bytes = 4096;
+    let epoch = inner.ssd_probe_epoch;
+    assert!(inner.put_memory(&writer, b"updated".to_vec()));
+    assert!(inner.ssd_probe_is_current_for(&key, epoch));
+    assert!(!inner.ssd_probe_is_current_for(&writer, epoch));
+}
