@@ -3733,7 +3733,7 @@ impl MultiLayerCache {
         };
         match block {
             Some(block) => Ok(Some(CacheReadResult {
-                value: decode_cache_block(&block)?,
+                value: decode_cache_block_owned(block)?,
                 tier: CacheReadTier::Ssd,
             })),
             None => Ok(None),
@@ -3798,10 +3798,10 @@ impl MultiLayerCache {
             let Some(block) = block else {
                 continue;
             };
-            // The decode already allocated these bytes. Every position but the
+            // The decode owns these bytes. Every position but the
             // last takes a copy; the last takes the original, so a key asked
             // for once -- the common case -- copies nothing.
-            let mut decoded = Some(decode_cache_block(&block)?);
+            let mut decoded = Some(decode_cache_block_owned(block)?);
             let last = positions.len().saturating_sub(1);
             for (offset, index) in positions.into_iter().enumerate() {
                 let value = if offset == last {
