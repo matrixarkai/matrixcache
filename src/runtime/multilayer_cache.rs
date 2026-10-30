@@ -9869,8 +9869,16 @@ impl CacheInner {
         value: Arc<[u8]>,
         request: Option<CacheAdmissionRequest>,
     ) -> Result<(), CacheError> {
-        let outcome = self.put_with_request_inner(key, value, request);
-        if matches!(outcome, Ok(false)) && self.disk_index.contains_key(key) {
+        let outcome = self.put_with_request_inner(key, Arc::clone(&value), request);
+        let stale_ssd = if matches!(outcome, Ok(false)) && self.disk_index.contains_key(key) {
+            self.read_ssd_block(key)?
+                .map(|block| decode_cache_block(&block))
+                .transpose()?
+                .as_deref() != Some(value.as_ref())
+        } else {
+            false
+        };
+        if stale_ssd {
             // Admission may reject a rewrite under pressure. Do not leave the
             // previous SSD value available after the newer upper copy leaves.
             self.delete_ssd_block(key)?;
@@ -10086,12 +10094,24 @@ impl CacheInner {
         self.sweep_some_expired();
         let mut staged_ssd = Vec::<StagedSsdBatchWrite>::new();
         let mut staged_ssd_positions = HashMap::<CacheKey, usize>::new();
+        let mut ssd_rewrites = HashMap::<CacheKey, Arc<[u8]>>::new();
         let mut staged_ssd_bytes = self.ssd_bytes;
         let mut inserted = 0usize;
 
         for (key, value, logical_size) in entries {
+            // A later rejected entry must not leave an earlier value staged.
+            if let Some(position) = staged_ssd_positions.remove(&key) {
+                let removed = staged_ssd.swap_remove(position);
+                staged_ssd_bytes = staged_ssd_bytes.saturating_sub(removed.block_len);
+                if let Some(moved) = staged_ssd.get(position) {
+                    staged_ssd_positions.insert(moved.key.clone(), position);
+                }
+            }
             // Shared across the tiers, exactly as the single-entry path above.
             let value = Arc::<[u8]>::from(value);
+            if self.disk_index.contains_key(&key) || ssd_rewrites.contains_key(&key) {
+                ssd_rewrites.insert(key.clone(), Arc::clone(&value));
+            }
             if !self.is_pinned(&key) {
                 self.pins_for(&key).entries.remove(&key);
             }
@@ -10266,6 +10286,28 @@ impl CacheInner {
             }
             inserted = inserted.saturating_add(1);
         }
+
+        let mut stale_keys = Vec::new();
+        for (key, value) in ssd_rewrites {
+            if !staged_ssd_positions.contains_key(&key)
+                && self.read_ssd_block(&key)?
+                    .map(|block| decode_cache_block(&block))
+                    .transpose()?
+                    .as_deref() != Some(value.as_ref())
+            {
+                stale_keys.push(key);
+            }
+        }
+        self.delete_ssd_blocks(&stale_keys)?;
+        for key in &stale_keys {
+            self.append_disk_manifest_delete(key)?;
+            if let Some(bytes) = self.disk_index.remove(key) {
+                self.ssd_bytes = self.ssd_bytes.saturating_sub(bytes);
+            }
+            self.disk_order.remove(key);
+            self.forget_metadata_unless_resident(key);
+        }
+        self.stats.disk_bytes = self.ssd_bytes;
 
         // Move the blocks out rather than copying them: `entry.block` is read
         // here and nowhere afterwards, so the batch's bytes can go straight to

@@ -3,6 +3,41 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: rejected final batch entries must replace older staged values.
+    #[test]
+    fn batch_rejection_cannot_restore_an_older_ssd_value() {
+        for duplicate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = || CacheOptions::new(0, 0, 4096)
+                .with_ssd_paths([dir.path().join("ssd")]);
+            let cache = MultiLayerCache::with_options(options());
+            cache.start().unwrap();
+            let key = CacheKey::string(0, "batch-rewrite");
+            cache.put(key.clone(), vec![1; 64]).unwrap();
+            assert_eq!(cache.get(&key).unwrap(), Some(vec![1; 64]));
+            let mut entries = Vec::new();
+            let other = CacheKey::string(0, "other-rewrite");
+            if duplicate {
+                entries.push((key.clone(), vec![2; 64]));
+                entries.push((other.clone(), vec![4; 64]));
+            }
+            entries.push((key.clone(), vec![3; 8192]));
+            if duplicate {
+                entries.push((other.clone(), vec![5; 64]));
+            }
+            cache.put_batch(entries).unwrap();
+            assert_eq!(cache.get(&key).unwrap(), None);
+            if duplicate {
+                assert_eq!(cache.get(&other).unwrap(), Some(vec![5; 64]));
+            }
+            assert!(cache.stop());
+            drop(cache);
+            let cache = MultiLayerCache::with_options(options());
+            cache.start().unwrap();
+            assert_eq!(cache.get(&key).unwrap(), None);
+        }
+    }
+
     // rust-internal: force SSD rejection after a previously durable cache write.
     #[test]
     fn rejected_ssd_rewrite_removes_the_previous_disk_value() {
@@ -18,6 +53,8 @@ mod tests {
             assert!(inner.disk_index.contains_key(&key));
             inner.tiering_policy.max_ssd_block_bytes = 1;
         }
+        cache.put(key.clone(), vec![1; 64]).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), Some(vec![1; 64]));
         cache.put(key.clone(), vec![2; 64]).unwrap();
         if let Some(value) = cache.get(&key).unwrap() {
             assert_eq!(value, vec![2; 64]);
