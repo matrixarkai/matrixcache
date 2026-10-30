@@ -2406,6 +2406,12 @@ impl CacheInner {
     }
 
     fn note_ssd_probe_mutation(&mut self, key: &CacheKey) {
+        if self.ssd_capacity_bytes == 0 {
+            // No SSD admission needs key history. A global fence also rejects
+            // any read still pending from before the tier was disabled.
+            self.bump_ssd_probe_epoch();
+            return;
+        }
         self.ssd_probe_epoch = self.ssd_probe_epoch.saturating_add(1);
         let mut hash = DefaultHasher::new();
         key.hash(&mut hash);
