@@ -2554,17 +2554,19 @@ impl MultiLayerCache {
         expired.len()
     }
 
-    /// Cap how fast the SSD tier is allowed to absorb writes, in bytes per
-    /// second. Zero, the default, means no cap.
+    /// Set the SSD admission controller's reported-write target, in bytes per
+    /// second. Zero, the default, means unlimited admission.
     ///
     /// Flash wears out by being written to, so a cache that is expected to
     /// outlive a warranty needs a rate it can sustain rather than the rate its
-    /// workload happens to offer. Above the cap, admissions are turned away by
+    /// workload happens to offer. Above the target, admissions are turned away by
     /// key rather than by size, so large entries keep their share of a tight
     /// budget instead of being crowded out by small ones.
     ///
     /// Reclaim and recovery writes are counted against the budget but never
     /// refused by it: they are work the cache has already committed to.
+    /// Startup traffic and backend-internal writes can exceed the target; this
+    /// feedback controller is not a hard device-write limit.
     pub fn set_ssd_write_budget_bytes_per_sec(&self, bytes_per_sec: u64) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner
@@ -2573,7 +2575,7 @@ impl MultiLayerCache {
         inner.refresh_ssd_write_budget_stats();
     }
 
-    /// The SSD write cap in bytes per second, or zero when uncapped.
+    /// The reported-write target in bytes per second, or zero when unlimited.
     pub fn ssd_write_budget_bytes_per_sec(&self) -> u64 {
         self.inner
             .read()
@@ -8982,6 +8984,8 @@ impl ShardedMultiLayerCache {
     ///
     /// Split the same way capacity is, so the shards together aim at the
     /// number asked for rather than each aiming at all of it.
+    /// Shards assigned zero bytes reject new budgeted admissions. Setting the
+    /// total to zero explicitly restores unlimited admission on every shard.
     pub fn set_ssd_write_budget_bytes_per_sec(&self, bytes_per_sec: u64) {
         let shard_count = self.shard_count() as u64;
         if shard_count == 0 {
@@ -8993,7 +8997,13 @@ impl ShardedMultiLayerCache {
             if (index as u64) < bytes_per_sec % shard_count {
                 share = share.saturating_add(1);
             }
-            shard.set_ssd_write_budget_bytes_per_sec(share);
+            if bytes_per_sec != 0 && share == 0 {
+                let mut inner = shard.inner.write().expect("cache lock poisoned");
+                inner.ssd_write_budget.disable_admission();
+                inner.refresh_ssd_write_budget_stats();
+            } else {
+                shard.set_ssd_write_budget_bytes_per_sec(share);
+            }
         }
     }
 

@@ -49,6 +49,8 @@ const WRITE_BUDGET_MAX_STEP_UP: u64 = 2;
 /// across minutes of simulated time without waiting for any of them.
 #[derive(Debug, Clone)]
 pub struct SsdWriteBudget {
+    /// A zero allocation within a limited sharded budget is not unlimited.
+    admission_disabled: bool,
     /// Bytes per second the tier is allowed to absorb. Zero means no limit.
     target_bytes_per_sec: u64,
     /// Share of keys currently admitted, out of [`WRITE_BUDGET_SCALE`].
@@ -74,6 +76,7 @@ impl SsdWriteBudget {
     /// is told a drive it has to look after.
     pub fn unlimited() -> Self {
         Self {
+            admission_disabled: false,
             target_bytes_per_sec: 0,
             admitted_share: WRITE_BUDGET_SCALE,
             bytes_this_window: 0,
@@ -85,6 +88,7 @@ impl SsdWriteBudget {
     /// A budget targeting `bytes_per_sec`. Zero is the same as unlimited.
     pub fn with_target(bytes_per_sec: u64) -> Self {
         Self {
+            admission_disabled: false,
             target_bytes_per_sec: bytes_per_sec,
             admitted_share: WRITE_BUDGET_SCALE,
             bytes_this_window: 0,
@@ -106,8 +110,21 @@ impl SsdWriteBudget {
         self.target_bytes_per_sec
     }
 
+    /// Start a fresh measurement window when the target changes. Retain the
+    /// admitted share between limited targets so tuning does not reopen a burst.
+    /// Reapplying the current target preserves the in-flight measurement.
     pub fn set_target_bytes_per_sec(&mut self, bytes_per_sec: u64) {
+        if bytes_per_sec == self.target_bytes_per_sec && !self.admission_disabled {
+            return;
+        }
+        if self.admission_disabled {
+            self.admitted_share = WRITE_BUDGET_SCALE;
+        }
+        self.admission_disabled = false;
         self.target_bytes_per_sec = bytes_per_sec;
+        self.bytes_this_window = 0;
+        self.window_started = None;
+        self.observed_bytes_per_sec = 0;
         if bytes_per_sec == 0 {
             self.admitted_share = WRITE_BUDGET_SCALE;
         }
@@ -120,12 +137,21 @@ impl SsdWriteBudget {
         self.admitted_share
     }
 
+    pub(crate) fn disable_admission(&mut self) {
+        self.set_target_bytes_per_sec(0);
+        self.admission_disabled = true;
+        self.admitted_share = 0;
+    }
+
     /// Whether a write under `key_hash` may go ahead.
     ///
     /// Rolls the measurement window first, so a caller that stops writing for a
     /// while sees the share recover rather than staying where the last burst
     /// left it.
     pub fn admits(&mut self, key_hash: u64, now: Instant) -> bool {
+        if self.admission_disabled {
+            return false;
+        }
         if self.target_bytes_per_sec == 0 {
             return true;
         }
