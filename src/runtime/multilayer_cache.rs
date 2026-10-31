@@ -1088,6 +1088,24 @@ impl PartialEq for EvictionGroupKey<'_> {
 
 impl Eq for EvictionGroupKey<'_> {}
 
+impl PartialOrd for EvictionGroupKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EvictionGroupKey<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Slot(left), Self::Slot(right)) => left.cmp(right),
+            (Self::Slot(_), Self::Object(_)) => std::cmp::Ordering::Less,
+            (Self::Object(_), Self::Slot(_)) => std::cmp::Ordering::Greater,
+            (Self::Object(left), Self::Object(right)) => left.namespace.cmp(&right.namespace)
+                .then_with(|| left.record_key.cmp(&right.record_key)),
+        }
+    }
+}
+
 impl std::hash::Hash for EvictionGroupKey<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {

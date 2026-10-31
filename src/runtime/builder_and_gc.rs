@@ -2995,13 +2995,10 @@ impl CacheInner {
         I: IntoIterator<Item = &'a CacheKey>,
     {
         let mut pinned_skips = 0u64;
-        // Sized for the window up front. The candidate walk is a linked list,
-        // so the iterator cannot say how many are coming and the table grew
-        // from empty on every eviction: measured at 11.48 allocations and
-        // 44,140 bytes for one evicting write, most of it this table doubling
-        // and copying itself four or five times on the way up.
-        let mut groups: HashMap<EvictionGroupKey<'a>, SlotEvictionGroup<'a>> =
-            HashMap::with_capacity(candidates.min(EVICTION_CANDIDATE_WINDOW));
+        // Keep wide fallback scans hash-grouped: many entries can share one group.
+        let wide = candidates > EVICTION_CANDIDATE_WINDOW;
+        let mut wide_groups = HashMap::<EvictionGroupKey<'a>, SlotEvictionGroup<'a>>::new();
+        let mut groups = Vec::with_capacity(if wide { 0 } else { candidates });
         for key in keys {
             if self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
@@ -3020,20 +3017,43 @@ impl CacheInner {
                 score.segment = u8::from(segmented && recent as u64 >= SLRU_PROTECTED_HITS);
             }
             let group_key = eviction_group_key_of(meta, key);
-            groups
-                .entry(group_key)
-                .and_modify(|group| group.observe(key, score))
-                .or_insert_with(|| SlotEvictionGroup::new(key, score));
+            if wide {
+                wide_groups.entry(group_key)
+                    .and_modify(|group| group.observe(key, score))
+                    .or_insert_with(|| SlotEvictionGroup::new(key, score));
+            } else {
+                groups.push((group_key, SlotEvictionGroup::new(key, score)));
+            }
         }
-        let group_count = groups.len();
-        let victim = groups
-            .into_values()
-            .min_by(|left, right| {
-                left.group_score
-                    .cmp(&right.group_score)
+        if wide {
+            let groups_weighed = wide_groups.len();
+            let victim = wide_groups.into_values().min_by(|left, right| {
+                left.group_score.cmp(&right.group_score)
                     .then_with(|| left.victim_score.cmp(&right.victim_score))
                     .then_with(|| left.victim.cmp(right.victim))
-            })
+            }).map(|group| (group.victim.clone(), eviction_reason_for(group.victim_score), pinned_skips));
+            return PickedEvictionVictim { victim, groups_weighed, promote: Vec::new() };
+        }
+        groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut groups = groups.into_iter().peekable();
+        let mut group_count = 0;
+        let mut best: Option<SlotEvictionGroup<'a>> = None;
+        while let Some((key, mut group)) = groups.next() {
+            while groups.peek().is_some_and(|next| next.0 == key) {
+                let (_, member) = groups.next().expect("group member present");
+                group.observe(member.victim, member.victim_score);
+            }
+            group_count += 1;
+            let replace = best.as_ref().is_none_or(|old| {
+                group.group_score.cmp(&old.group_score)
+                    .then_with(|| group.victim_score.cmp(&old.victim_score))
+                    .then_with(|| group.victim.cmp(old.victim)).is_lt()
+            });
+            if replace {
+                best = Some(group);
+            }
+        }
+        let victim = best
             .map(|group| {
                 // The one clone this selection makes.
                 (

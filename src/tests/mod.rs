@@ -5,6 +5,66 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn sorted_eviction_groups_match_hash_group_selection() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
+        let mut keys = Vec::new();
+        for index in 0..256 {
+            let key = CacheKey::page_with_slot(0, index / 4, index * 64, 64,
+                (index % 3 == 0).then_some((index % 7) as u32));
+            cache.put_with_admission(key.clone(), vec![1; 64], CacheAdmissionRequest {
+                block_kind: CacheBlockKind::Object,
+                shard_id: 0,
+                routing_slot: None,
+                block_bytes: 64,
+                hotness: (index % 13) as u32,
+                pinned: index % 11 == 0,
+            }).unwrap();
+            keys.push(key);
+        }
+        cache.set_ssd_admission_filter_enabled(true);
+        let inner = cache.inner.read().unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            inner.ssd_access_frequency.as_ref().unwrap().record_many(key, (index % 19) as u64);
+        }
+        for rotation in [0, 1, 31, 128] {
+            keys.rotate_left(rotation);
+            for count in [0, 1, 64, 128, 256] {
+            let keys = &keys[..count];
+            for segmented in [false, true] {
+                for frequency in [false, true] {
+                    let mut groups = HashMap::<EvictionGroupKey<'_>, SlotEvictionGroup<'_>>::new();
+                    let mut pinned = 0;
+                    for key in keys {
+                        if inner.is_pinned(key) { pinned += 1; continue; }
+                        let meta = inner.metadata_of(key);
+                        let mut score = eviction_score_of(meta, segmented);
+                        if frequency {
+                            let recent = inner.ssd_access_frequency.as_ref().unwrap().estimate(key);
+                            score.hotness = recent as u32;
+                            score.hits = 0;
+                            score.segment = u8::from(segmented && recent as u64 >= SLRU_PROTECTED_HITS);
+                        }
+                        groups.entry(eviction_group_key_of(meta, key))
+                            .and_modify(|group| group.observe(key, score))
+                            .or_insert_with(|| SlotEvictionGroup::new(key, score));
+                    }
+                    let count = groups.len();
+                    let expected = groups.into_values().min_by(|left, right| {
+                        left.group_score.cmp(&right.group_score)
+                            .then_with(|| left.victim_score.cmp(&right.victim_score))
+                            .then_with(|| left.victim.cmp(right.victim))
+                    }).map(|group| (group.victim.clone(), eviction_reason_for(group.victim_score), pinned));
+                    let actual = inner.select_eviction_victim(keys.iter(), segmented, keys.len(), frequency);
+                    assert_eq!(actual.victim, expected);
+                    assert_eq!(actual.groups_weighed, count);
+                }
+            }
+            }
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn write_budget_hashes_only_for_partial_admission() {
         let start = Instant::now();
         let unused = || panic!("unconditional admission must not hash");
