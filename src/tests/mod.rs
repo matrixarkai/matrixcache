@@ -5,6 +5,53 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn sharded_small_write_budget_does_not_create_unlimited_shards() {
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(0, 0, 0), 4);
+        let now = Instant::now();
+        for target in [1, 2, 3, 8, 1, 0, 2, 0] {
+            cache.set_ssd_write_budget_bytes_per_sec(target);
+            assert_eq!(cache.ssd_write_budget_bytes_per_sec(), target);
+            for (index, shard) in cache.shards.iter().enumerate() {
+                let mut inner = shard.inner.write().unwrap();
+                let enabled = target == 0 || target >= 4 || (index as u64) < target;
+                assert_eq!(inner.ssd_write_budget.admits(0, now), enabled);
+                if !enabled {
+                    assert_eq!(inner.stats.ssd_write_budget_share, 0);
+                }
+            }
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn write_budget_target_changes_separate_measurement_windows() {
+        let start = Instant::now();
+        let mut budget = SsdWriteBudget::with_target(1000);
+        budget.record_written(10000, start);
+        budget.record_written(500, start + Duration::from_secs(1));
+        assert_eq!(budget.admitted_share(), 1000);
+        assert_eq!(budget.observed_bytes_per_sec(), 10000);
+        budget.set_target_bytes_per_sec(2000);
+        assert_eq!(budget.admitted_share(), 1000);
+        assert_eq!(budget.observed_bytes_per_sec(), 0);
+        budget.record_written(2000, start + Duration::from_secs(10));
+        budget.set_target_bytes_per_sec(2000);
+        assert!(budget.admits(0, start + Duration::from_secs(11)));
+        assert_eq!(budget.observed_bytes_per_sec(), 2000);
+        assert_eq!(budget.admitted_share(), 2000);
+        budget.set_target_bytes_per_sec(0);
+        assert_eq!(budget.observed_bytes_per_sec(), 0);
+        assert_eq!(budget.admitted_share(), WRITE_BUDGET_SCALE);
+        budget.record_written(u64::MAX, start + Duration::from_secs(20));
+        budget.set_target_bytes_per_sec(1000);
+        budget.record_written(500, start + Duration::from_secs(50));
+        assert!(budget.admits(u64::MAX, start + Duration::from_secs(51)));
+        assert_eq!(budget.observed_bytes_per_sec(), 500);
+        assert_eq!(budget.admitted_share(), WRITE_BUDGET_SCALE);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn write_budget_tracks_maintenance_only_windows() {
         let start = Instant::now();
         let mut budget = SsdWriteBudget::with_target(1000);
