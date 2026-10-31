@@ -5,6 +5,37 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn write_budget_hashes_only_for_partial_admission() {
+        let start = Instant::now();
+        let unused = || panic!("unconditional admission must not hash");
+        let mut budget = SsdWriteBudget::unlimited();
+        assert!(budget.admits_with_hash(unused, start));
+        budget.disable_admission();
+        assert!(!budget.admits_with_hash(unused, start));
+        budget.set_target_bytes_per_sec(1000);
+        assert!(budget.admits_with_hash(unused, start));
+        budget.record_written(10000, start);
+        let now = start + Duration::from_secs(1);
+        let mut eager = budget.clone();
+        let mut calls = 0;
+        for hash in [0, 999u64 << 32, 1000u64 << 32, u64::MAX] {
+            assert_eq!(budget.admits_with_hash(|| {
+                calls += 1;
+                hash
+            }, now), eager.admits(hash, now));
+        }
+        assert_eq!(calls, 4);
+        assert_eq!(budget.admitted_share(), 1000);
+        // Quiet windows restore full admission before deciding whether to hash.
+        for second in 2..5 {
+            budget.admits(0, start + Duration::from_secs(second));
+        }
+        assert!(budget.admits_with_hash(unused, start + Duration::from_secs(5)));
+        assert_eq!(budget.admitted_share(), WRITE_BUDGET_SCALE);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn sharded_small_write_budget_does_not_create_unlimited_shards() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(0, 0, 0), 4);
         let now = Instant::now();
