@@ -1176,7 +1176,7 @@ impl CacheInner {
         };
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         line.push('\n');
-        creating_the_directory_if_missing(&parent, || {
+        let appended = creating_the_directory_if_missing(&parent, || {
             #[cfg(unix)]
             {
                 let mut writer = self
@@ -1192,9 +1192,13 @@ impl CacheInner {
                     .append(true)
                     .open(&path)
                     .map_err(CacheError::Io)?;
-                std::io::Write::write_all(&mut file, line.as_bytes()).map_err(CacheError::Io)
+                std::io::Write::write_all(&mut file, line.as_bytes())
+                    .map(|()| true).map_err(CacheError::Io)
             }
         })?;
+        if !appended {
+            return Ok(());
+        }
         if self.pmem_manifest_appends.fetch_add(1, Ordering::Relaxed) + 1
             >= self.pmem_manifest_compact_after.load(Ordering::Relaxed)
         {

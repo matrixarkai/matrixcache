@@ -193,7 +193,7 @@ impl PmemManifestWriter {
         (metadata.dev(), metadata.ino())
     }
 
-    fn append(writer: &mut Option<Self>, path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    fn append(writer: &mut Option<Self>, path: &Path, bytes: &[u8]) -> Result<bool, CacheError> {
         let metadata = fs::metadata(path).ok();
         let matches = writer.as_ref().is_some_and(|current| {
             current.path == path
@@ -204,7 +204,7 @@ impl PmemManifestWriter {
             current.last_record == bytes && current.last_version.is_some()
                 && metadata.as_ref().map(Self::version) == current.last_version
         }) {
-            return Ok(());
+            return Ok(false);
         }
         if !matches {
             *writer = None;
@@ -241,7 +241,7 @@ impl PmemManifestWriter {
                 }
             }
         }
-        result.map_err(CacheError::Io)
+        result.map(|()| true).map_err(CacheError::Io)
     }
 }
 
@@ -318,6 +318,37 @@ impl CacheInner {
 #[cfg(all(test, unix))]
 mod manifest_writer_tests {
     use super::*;
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn manifest_compaction_counts_appended_records_not_duplicate_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0).with_pmem_paths([dir.path().join("pmem")]),
+        );
+        let mut inner = cache.inner.write().unwrap();
+        inner.pmem_manifest_compact_after.store(4, Ordering::Relaxed);
+        let first = CacheKey::string(0, "first");
+        let second = CacheKey::string(0, "second");
+        inner.persist_pmem_put(&first, b"one").unwrap();
+        let path = inner.pmem_manifest_path().unwrap();
+        let original = fs::read(&path).unwrap();
+        for _ in 0..32 {
+            inner.append_pmem_manifest_line(manifest_line_for_key(&first, 3)).unwrap();
+        }
+        assert_eq!(inner.pmem_manifest_appends.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.pmem_manifest_compact_after.load(Ordering::Relaxed), 4);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        inner.persist_pmem_put(&second, b"two").unwrap();
+        inner.persist_pmem_put(&first, b"new").unwrap();
+        inner.persist_pmem_put(&second, b"last").unwrap();
+        assert_eq!(inner.pmem_manifest_appends.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        inner.reset_pmem_manifest_writer();
+        assert_eq!(inner.recover_pmem_index_locked().unwrap().recovered_files, 2);
+        assert_eq!(inner.pmem.get(&first).unwrap().as_ref(), b"new");
+        assert_eq!(inner.pmem.get(&second).unwrap().as_ref(), b"last");
+    }
 
     // shared-corpus: storage_cache_eviction
     #[test]
