@@ -9819,7 +9819,7 @@ impl CacheInner {
             .lock()
             .expect("manifest writer poisoned")
             .as_ref()
-            .map_or(0, |writer| writer.path.capacity());
+            .map_or(0, |writer| writer.path.capacity() + writer.last_record.capacity());
         #[cfg(not(unix))]
         let manifest_writer_bytes = 0;
         let fixed_bytes = manifest_writer_bytes + self.disk_dir.capacity()

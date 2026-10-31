@@ -176,21 +176,36 @@ struct PmemManifestWriter {
     path: PathBuf,
     identity: (u64, u64),
     file: File,
+    last_record: Vec<u8>,
+    last_version: Option<(u64, i64, i64, i64, i64)>,
 }
 
 #[cfg(unix)]
 impl PmemManifestWriter {
+    fn version(metadata: &fs::Metadata) -> (u64, i64, i64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.len(), metadata.mtime(), metadata.mtime_nsec(),
+            metadata.ctime(), metadata.ctime_nsec())
+    }
+
     fn identity(metadata: &fs::Metadata) -> (u64, u64) {
         use std::os::unix::fs::MetadataExt;
         (metadata.dev(), metadata.ino())
     }
 
     fn append(writer: &mut Option<Self>, path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+        let metadata = fs::metadata(path).ok();
         let matches = writer.as_ref().is_some_and(|current| {
             current.path == path
-                && fs::metadata(path)
-                    .is_ok_and(|metadata| Self::identity(&metadata) == current.identity)
+                && metadata.as_ref()
+                    .is_some_and(|metadata| Self::identity(metadata) == current.identity)
         });
+        if matches && writer.as_ref().is_some_and(|current| {
+            current.last_record == bytes && current.last_version.is_some()
+                && metadata.as_ref().map(Self::version) == current.last_version
+        }) {
+            return Ok(());
+        }
         if !matches {
             *writer = None;
             let file = fs::OpenOptions::new()
@@ -201,6 +216,8 @@ impl PmemManifestWriter {
                 path: path.to_path_buf(),
                 identity: Self::identity(&file.metadata()?),
                 file,
+                last_record: Vec::new(),
+                last_version: None,
             });
         }
         let result = std::io::Write::write_all(
@@ -209,6 +226,20 @@ impl PmemManifestWriter {
         );
         if result.is_err() {
             *writer = None;
+        } else {
+            let current = writer.as_mut().expect("manifest writer opened");
+            current.last_record.clear();
+            current.last_version = None;
+            // Bound retained key bytes independently of caller key length.
+            if bytes.len() <= 4096 {
+                if let Ok(metadata) = current.file.metadata() {
+                    if bytes.len() > current.last_record.capacity() {
+                        current.last_record = Vec::with_capacity(bytes.len());
+                    }
+                    current.last_record.extend_from_slice(bytes);
+                    current.last_version = Some(Self::version(&metadata));
+                }
+            }
         }
         result.map_err(CacheError::Io)
     }
@@ -288,6 +319,42 @@ impl CacheInner {
 mod manifest_writer_tests {
     use super::*;
 
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn consecutive_manifest_records_coalesce_without_hiding_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+        let mut writer = None;
+        for _ in 0..128 {
+            PmemManifestWriter::append(&mut writer, &path, b"first\n").unwrap();
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        PmemManifestWriter::append(&mut writer, &path, b"other\n").unwrap();
+        PmemManifestWriter::append(&mut writer, &path, b"first\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first\nother\nfirst\n");
+        fs::write(&path, b"").unwrap();
+        PmemManifestWriter::append(&mut writer, &path, b"first\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&path, b"other\n").unwrap();
+        PmemManifestWriter::append(&mut writer, &path, b"first\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"other\nfirst\n");
+        fs::remove_file(&path).unwrap();
+        PmemManifestWriter::append(&mut writer, &path, b"first\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        for size in [3000, 4000] {
+            PmemManifestWriter::append(&mut writer, &path, &vec![b'y'; size]).unwrap();
+            assert!(writer.as_ref().unwrap().last_record.capacity() <= 4096);
+        }
+        fs::write(&path, b"first\n").unwrap();
+        let large = vec![b'x'; 8192];
+        for _ in 0..2 {
+            PmemManifestWriter::append(&mut writer, &path, &large).unwrap();
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), 6 + 16384);
+        assert!(writer.as_ref().unwrap().last_record.capacity() <= 4096);
+    }
+
     // rust-internal: cached descriptor identity and reopening behavior.
     #[test]
     fn pmem_manifest_writer_follows_replacement_and_deletion() {
@@ -357,9 +424,11 @@ mod manifest_writer_tests {
             .unwrap()
             .path
             .capacity();
+        let record_bytes = cache.inner.read().unwrap().pmem_manifest_writer
+            .lock().unwrap().as_ref().unwrap().last_record.capacity();
         assert_eq!(
             cache.footprint().fixed_bytes,
-            initial_fixed_bytes + path_bytes
+            initial_fixed_bytes + path_bytes + record_bytes
         );
         cache.stop();
         assert_eq!(cache.footprint().fixed_bytes, initial_fixed_bytes);
