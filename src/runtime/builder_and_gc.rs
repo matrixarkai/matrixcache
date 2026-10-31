@@ -3022,7 +3022,8 @@ impl CacheInner {
                     .and_modify(|group| group.observe(key, score))
                     .or_insert_with(|| SlotEvictionGroup::new(key, score));
             } else {
-                groups.push((group_key, SlotEvictionGroup::new(key, score)));
+                // Until folding, the group and victim scores are identical.
+                groups.push((group_key, key, score));
             }
         }
         if wide {
@@ -3038,10 +3039,11 @@ impl CacheInner {
         let mut groups = groups.into_iter().peekable();
         let mut group_count = 0;
         let mut best: Option<SlotEvictionGroup<'a>> = None;
-        while let Some((key, mut group)) = groups.next() {
+        while let Some((key, victim, score)) = groups.next() {
+            let mut group = SlotEvictionGroup::new(victim, score);
             while groups.peek().is_some_and(|next| next.0 == key) {
-                let (_, member) = groups.next().expect("group member present");
-                group.observe(member.victim, member.victim_score);
+                let (_, member, score) = groups.next().expect("group member present");
+                group.observe(member, score);
             }
             group_count += 1;
             let replace = best.as_ref().is_none_or(|old| {
