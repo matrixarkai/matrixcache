@@ -149,6 +149,14 @@ impl SsdWriteBudget {
     /// while sees the share recover rather than staying where the last burst
     /// left it.
     pub fn admits(&mut self, key_hash: u64, now: Instant) -> bool {
+        self.admits_with_hash(|| key_hash, now)
+    }
+
+    pub(crate) fn admits_with_hash(
+        &mut self,
+        key_hash: impl FnOnce() -> u64,
+        now: Instant,
+    ) -> bool {
         if self.admission_disabled {
             return false;
         }
@@ -161,7 +169,7 @@ impl SsdWriteBudget {
         }
         // The top bits are the well-mixed ones for most hashers, and using them
         // keeps this independent of the low bits a hash map uses for bucketing.
-        (key_hash >> 32) % WRITE_BUDGET_SCALE < self.admitted_share
+        (key_hash() >> 32) % WRITE_BUDGET_SCALE < self.admitted_share
     }
 
     /// Record bytes actually written, so the next window can judge the rate.

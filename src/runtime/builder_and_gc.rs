@@ -939,11 +939,13 @@ impl CacheInner {
     /// cache has already committed to, and refusing it would lose data rather
     /// than save a write.
     fn ssd_write_budget_admits(&mut self, key: &CacheKey) -> bool {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
         let admits = self
             .ssd_write_budget
-            .admits(hasher.finish(), Instant::now());
+            .admits_with_hash(|| {
+                let mut hasher = DefaultHasher::new();
+                key.hash(&mut hasher);
+                hasher.finish()
+            }, Instant::now());
         self.refresh_ssd_write_budget_stats();
         if !admits {
             self.stats.ssd_write_budget_rejections =
