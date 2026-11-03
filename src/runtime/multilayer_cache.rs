@@ -10844,9 +10844,29 @@ impl MultiLayerCache {
         for key in &slot_keys {
             if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
+                // THE ONLY COPY MAY BE THE ONE WE ARE DROPPING. A log-backed hot block lives
+                // at a synthetic address with no file behind it, so a resident value removed
+                // here can be the sole home of an acked write -- dropping it made the write
+                // read back as MISSING until a full reload. The eviction handler exists to
+                // spill exactly that, and it is fed from eviction RECORDS; this function
+                // removed entries without queueing any, so the handler could never fire.
+                // `invalidate_shard` deliberately does NOT do this: it runs as part of unload,
+                // where the WAL is the recovery path and the redirect map is cleared anyway.
+                inner.record_eviction_with_value(
+                    CacheTier::Memory,
+                    key,
+                    || value.to_vec(),
+                    CacheRemovalCause::Evicted,
+                );
             }
             if let Some(value) = inner.pmem.remove(key) {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
+                inner.record_eviction_with_value(
+                    CacheTier::Pmem,
+                    key,
+                    || value.to_vec(),
+                    CacheRemovalCause::Evicted,
+                );
             }
             if let Some(bytes) = inner.disk_index.remove(key) {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
@@ -10872,7 +10892,13 @@ impl MultiLayerCache {
             .invalidations
             .saturating_add(slot_keys.len() as u64);
         inner.ssd_bytes = inner.ssd_bytes.saturating_sub(disk_bytes_removed);
-        inner.rewrite_disk_manifest()?;
+        // Deliberately NOT `?`. The resident values are already out of the cache, so the spill
+        // below must happen even if the manifest rewrite fails -- returning early would leave an
+        // acked write with no home at all. The error is reported after the records are drained.
+        let rewrite = inner.rewrite_disk_manifest();
+        drop(inner);
+        self.drain_eviction_records();
+        rewrite?;
         Ok(CacheGcReport {
             shard_id,
             memory_entries_removed,
@@ -10908,9 +10934,29 @@ impl MultiLayerCache {
         for key in &segment_keys {
             if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
+                // THE ONLY COPY MAY BE THE ONE WE ARE DROPPING. A log-backed hot block lives
+                // at a synthetic address with no file behind it, so a resident value removed
+                // here can be the sole home of an acked write -- dropping it made the write
+                // read back as MISSING until a full reload. The eviction handler exists to
+                // spill exactly that, and it is fed from eviction RECORDS; this function
+                // removed entries without queueing any, so the handler could never fire.
+                // `invalidate_shard` deliberately does NOT do this: it runs as part of unload,
+                // where the WAL is the recovery path and the redirect map is cleared anyway.
+                inner.record_eviction_with_value(
+                    CacheTier::Memory,
+                    key,
+                    || value.to_vec(),
+                    CacheRemovalCause::Evicted,
+                );
             }
             if let Some(value) = inner.pmem.remove(key) {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
+                inner.record_eviction_with_value(
+                    CacheTier::Pmem,
+                    key,
+                    || value.to_vec(),
+                    CacheRemovalCause::Evicted,
+                );
             }
             if let Some(bytes) = inner.disk_index.remove(key) {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
@@ -10936,7 +10982,13 @@ impl MultiLayerCache {
             .invalidations
             .saturating_add(segment_keys.len() as u64);
         inner.ssd_bytes = inner.ssd_bytes.saturating_sub(disk_bytes_removed);
-        inner.rewrite_disk_manifest()?;
+        // Deliberately NOT `?`. The resident values are already out of the cache, so the spill
+        // below must happen even if the manifest rewrite fails -- returning early would leave an
+        // acked write with no home at all. The error is reported after the records are drained.
+        let rewrite = inner.rewrite_disk_manifest();
+        drop(inner);
+        self.drain_eviction_records();
+        rewrite?;
         Ok(CacheGcReport {
             shard_id,
             memory_entries_removed,
