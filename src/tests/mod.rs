@@ -26345,3 +26345,112 @@ fn a_compressed_block_that_understates_its_value_is_refused_for_the_length() {
         "the two decodes refuse a lying original length for different reasons"
     );
 }
+
+/// What an invalidation owes a registered eviction handler.
+///
+/// `invalidate_slot` and `invalidate_page_segment` each carry their own inline
+/// removal loop rather than going through `invalidate_keys_locked`, and neither
+/// queued an eviction record. A consumer whose handler spills a memory-only
+/// block to durable storage therefore never heard about the one removal path
+/// that could destroy an acked write.
+#[cfg(test)]
+mod an_invalidation_tells_the_eviction_handler {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{CacheKey, CacheRemovalCause, MultiLayerCache};
+
+    type Seen = Arc<Mutex<Vec<(CacheKey, CacheRemovalCause, Vec<u8>)>>>;
+
+    fn cache_with_recorder(dir: &std::path::Path) -> (MultiLayerCache, Seen) {
+        let cache = MultiLayerCache::new(1 << 20, dir);
+        cache.start().unwrap();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        cache.register_eviction_callback(move |record| {
+            recorder
+                .lock()
+                .expect("recorder poisoned")
+                .push((record.key.clone(), record.cause, record.value.clone()));
+        });
+        (cache, seen)
+    }
+
+    /// The defect this pins: the sole copy of an acked write left without a word.
+    #[test]
+    fn an_invalidated_slot_hands_the_handler_the_bytes_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, seen) = cache_with_recorder(dir.path());
+
+        // The shape a log-backed hot block actually has: `page` namespace, a
+        // segment record key, and a routing slot in the selector.
+        let key = CacheKey::page_with_slot(7, u64::from(u32::MAX), 4096, 11, Some(3));
+        cache.put(key.clone(), b"only-copy-xy".to_vec()[..11].to_vec()).unwrap();
+
+        cache.invalidate_slot(7, 3).unwrap();
+
+        let seen = seen.lock().expect("recorder poisoned");
+        let hit = seen.iter().find(|(seen_key, _, _)| seen_key == &key);
+        let Some((_, cause, value)) = hit else {
+            panic!(
+                "the handler was never told the slot dropped this block, so a \
+                 memory-only value had no chance to be spilled; it heard about \
+                 {} other departures",
+                seen.len()
+            );
+        };
+        // The VALUE is the load-bearing part: a handler that writes the bytes
+        // onwards cannot do its job from a key alone.
+        assert_eq!(
+            value.as_slice(),
+            b"only-copy-x",
+            "the handler was told a block left but not what was in it"
+        );
+        assert_eq!(*cause, CacheRemovalCause::Evicted);
+    }
+
+    /// The sibling path, which targets page segments by name and so is the one
+    /// most likely to be pointed straight at a hot segment.
+    #[test]
+    fn an_invalidated_page_segment_hands_the_handler_the_bytes_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, seen) = cache_with_recorder(dir.path());
+
+        let segment = u64::from(u32::MAX);
+        let key = CacheKey::page_with_slot(2, segment, 8192, 9, Some(5));
+        cache.put(key.clone(), b"segment-9".to_vec()).unwrap();
+
+        cache.invalidate_page_segment(2, segment).unwrap();
+
+        let seen = seen.lock().expect("recorder poisoned");
+        assert!(
+            seen.iter().any(|(seen_key, _, value)| seen_key == &key
+                && value.as_slice() == b"segment-9"),
+            "invalidating a page segment dropped a resident block without \
+             telling the handler what it was"
+        );
+    }
+
+    /// The counter-case, and it is deliberate rather than an oversight.
+    ///
+    /// Without it, "record everything that leaves" would read as the rule and
+    /// the next change would make unload spill every resident block of a shard
+    /// that is going away -- work with no reader, since the log is the recovery
+    /// path there and the consumer drops its redirect state on unload.
+    #[test]
+    fn an_invalidated_shard_stays_silent_because_unload_has_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, seen) = cache_with_recorder(dir.path());
+
+        let key = CacheKey::page_with_slot(4, u64::from(u32::MAX), 64, 8, Some(1));
+        cache.put(key.clone(), b"unloaded".to_vec()).unwrap();
+
+        cache.invalidate_shard(4).unwrap();
+
+        let seen = seen.lock().expect("recorder poisoned");
+        assert!(
+            !seen.iter().any(|(seen_key, _, _)| seen_key == &key),
+            "unloading a shard reported its blocks as evictions, so a handler \
+             would spill bytes for a shard that is going away"
+        );
+    }
+}
