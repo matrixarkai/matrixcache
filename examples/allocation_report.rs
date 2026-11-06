@@ -668,6 +668,23 @@ fn main() {
                 pinned.keys_asked, bookkeeping
             ));
         }
+        if pinned.allocations > 5.0 || pinned.bytes > 2_700.0 {
+            failures.push(format!(
+                "a pinned batch over {} distinct keys allocates {:.2} times and {:.1} bytes, \
+                 against 5 and 2,700 -- pin stripe sorting is using heap storage again",
+                pinned.keys_asked, pinned.allocations, pinned.bytes
+            ));
+        }
+    }
+
+    match find("acquire_batch") {
+        Some(row) if row.allocations <= 5.0 && row.bytes <= 2_800.0 => {}
+        Some(row) => failures.push(format!(
+            "a promoting pinned batch allocates {:.2} times and {:.1} bytes, against 5 and \
+             2,800 -- pin stripe sorting is using heap storage again",
+            row.allocations, row.bytes
+        )),
+        None => failures.push("the promoting pinned batch is missing from the table".to_string()),
     }
 
     // The promoting row is a row about a lower-tier hit only if the reads went

@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+const INLINE_PIN_BATCH_UPDATES: usize = 128;
+
+fn with_sorted_pin_updates<I, F>(upper_bound: usize, updates: I, consume: F)
+where
+    I: IntoIterator<Item = (usize, usize)>,
+    F: FnOnce(&[(usize, usize)]),
+{
+    if upper_bound <= INLINE_PIN_BATCH_UPDATES {
+        let mut inline = [(0usize, 0usize); INLINE_PIN_BATCH_UPDATES];
+        let mut len = 0usize;
+        for update in updates {
+            inline[len] = update;
+            len += 1;
+        }
+        inline[..len].sort_unstable_by_key(|(stripe, _)| *stripe);
+        consume(&inline[..len]);
+        return;
+    }
+
+    let mut heap = Vec::with_capacity(upper_bound);
+    heap.extend(updates);
+    heap.sort_unstable_by_key(|(stripe, _)| *stripe);
+    consume(&heap);
+}
+
 impl MatrixCacheBuilder {
     pub fn build_cache(options: CacheOptions) -> MultiLayerCache {
         MultiLayerCache::with_options(options)
@@ -3461,78 +3486,74 @@ impl CacheInner {
         if counts.is_empty() {
             return;
         }
-        let mut updates = Vec::<(usize, usize)>::with_capacity(counts.len());
-        for (index, (key, _, count)) in counts.iter().enumerate() {
-            if *count == 0 {
-                continue;
-            }
-            updates.push((self.pin_stripe_index(key), index));
-        }
-
-        if updates.is_empty() {
-            return;
-        }
-        self.add_pin_handles(
-            updates
+        with_sorted_pin_updates(
+            counts.len(),
+            counts
                 .iter()
-                .map(|(_, index)| counts[*index].2 as u64)
-                .fold(0, u64::saturating_add),
-        );
-        updates.sort_unstable_by_key(|(stripe, _)| *stripe);
-        let mut cursor = 0;
-        while cursor < updates.len() {
-            let stripe = updates[cursor].0;
-            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
-            while cursor < updates.len() && updates[cursor].0 == stripe {
-                let index = updates[cursor].1;
-                let (key, bytes, count) = &counts[index];
-                let entry = pins.entries.entry(self.shared_key(key)).or_default();
-                entry.handles = entry.handles.saturating_add(*count as u64);
-                entry.handle_bytes = entry.handle_bytes.max(*bytes);
-                pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
-                cursor += 1;
+                .enumerate()
+                .filter(|(_, (_, _, count))| *count != 0)
+                .map(|(index, (key, _, _))| (self.pin_stripe_index(key), index)),
+            |updates| {
+                self.add_pin_handles(
+                    updates
+                        .iter()
+                        .map(|(_, index)| counts[*index].2 as u64)
+                        .fold(0, u64::saturating_add),
+                );
+                let mut cursor = 0;
+                while cursor < updates.len() {
+                    let stripe = updates[cursor].0;
+                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                        let index = updates[cursor].1;
+                        let (key, bytes, count) = &counts[index];
+                        let entry = pins.entries.entry(self.shared_key(key)).or_default();
+                        entry.handles = entry.handles.saturating_add(*count as u64);
+                        entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                        pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
+                        cursor += 1;
+                    }
+                }
             }
-        }
+        );
     }
 
     fn increment_pin_handle_counts(&self, counts: &[(&CacheKey, usize, usize, usize)]) {
         if counts.is_empty() {
             return;
         }
-        let mut updates = Vec::<(usize, usize)>::with_capacity(counts.len());
-        for (index, (key, _, handles, _)) in counts.iter().enumerate() {
-            if *handles == 0 {
-                continue;
-            }
-            updates.push((self.pin_stripe_index(key), index));
-        }
-
-        if updates.is_empty() {
-            return;
-        }
-        self.add_pin_handles(
-            updates
+        with_sorted_pin_updates(
+            counts.len(),
+            counts
                 .iter()
-                .map(|(_, index)| counts[*index].2 as u64)
-                .fold(0, u64::saturating_add),
-        );
-        updates.sort_unstable_by_key(|(stripe, _)| *stripe);
-        let mut cursor = 0;
-        while cursor < updates.len() {
-            let stripe = updates[cursor].0;
-            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
-            while cursor < updates.len() && updates[cursor].0 == stripe {
-                let index = updates[cursor].1;
-                let (key, bytes, handles, handle_hits) = &counts[index];
-                let entry = pins.entries.entry(self.shared_key(key)).or_default();
-                entry.handles = entry.handles.saturating_add(*handles as u64);
-                entry.handle_bytes = entry.handle_bytes.max(*bytes);
-                pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
-                pins.zero_copy_handle_hits =
-                    pins.zero_copy_handle_hits.saturating_add(*handle_hits as u64);
-                cursor += 1;
+                .enumerate()
+                .filter(|(_, (_, _, handles, _))| *handles != 0)
+                .map(|(index, (key, _, _, _))| (self.pin_stripe_index(key), index)),
+            |updates| {
+                self.add_pin_handles(
+                    updates
+                        .iter()
+                        .map(|(_, index)| counts[*index].2 as u64)
+                        .fold(0, u64::saturating_add),
+                );
+                let mut cursor = 0;
+                while cursor < updates.len() {
+                    let stripe = updates[cursor].0;
+                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                        let index = updates[cursor].1;
+                        let (key, bytes, handles, handle_hits) = &counts[index];
+                        let entry = pins.entries.entry(self.shared_key(key)).or_default();
+                        entry.handles = entry.handles.saturating_add(*handles as u64);
+                        entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                        pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
+                        pins.zero_copy_handle_hits =
+                            pins.zero_copy_handle_hits.saturating_add(*handle_hits as u64);
+                        cursor += 1;
+                    }
+                }
             }
-        }
+        );
     }
 
     /// Pin, and count the handle, under a single acquisition.
@@ -3616,42 +3637,40 @@ impl CacheInner {
         if counts.is_empty() {
             return;
         }
-        let mut updates = Vec::<(usize, usize)>::with_capacity(counts.len());
-        for (index, (key, count)) in counts.iter().enumerate() {
-            if *count == 0 {
-                continue;
-            }
-            updates.push((self.pin_stripe_index(key), index));
-        }
-
-        if updates.is_empty() {
-            return;
-        }
-        updates.sort_unstable_by_key(|(stripe, _)| *stripe);
         let mut removed_handles = 0u64;
-        let mut cursor = 0;
-        while cursor < updates.len() {
-            let stripe = updates[cursor].0;
-            let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
-            while cursor < updates.len() && updates[cursor].0 == stripe {
-                let index = updates[cursor].1;
-                let (key, count) = &counts[index];
-                let Some(entry) = pins.entries.get_mut(key) else {
-                    cursor += 1;
-                    continue;
-                };
-                let count = *count as u64;
-                removed_handles = removed_handles.saturating_add(entry.handles.min(count));
-                if entry.handles > count {
-                    entry.handles -= count;
-                } else {
-                    pins.entries.remove(key);
-                    Self::shrink_pin_stripe_if_sparse(&mut pins);
+        with_sorted_pin_updates(
+            counts.len(),
+            counts
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, count))| *count != 0)
+                .map(|(index, (key, _))| (self.pin_stripe_index(key), index)),
+            |updates| {
+                let mut cursor = 0;
+                while cursor < updates.len() {
+                    let stripe = updates[cursor].0;
+                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                        let index = updates[cursor].1;
+                        let (key, count) = &counts[index];
+                        let Some(entry) = pins.entries.get_mut(key) else {
+                            cursor += 1;
+                            continue;
+                        };
+                        let count = *count as u64;
+                        removed_handles = removed_handles.saturating_add(entry.handles.min(count));
+                        if entry.handles > count {
+                            entry.handles -= count;
+                        } else {
+                            pins.entries.remove(key);
+                            Self::shrink_pin_stripe_if_sparse(&mut pins);
+                        }
+                        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+                        cursor += 1;
+                    }
                 }
-                pins.unpin_operations = pins.unpin_operations.saturating_add(count);
-                cursor += 1;
             }
-        }
+        );
         self.remove_pin_handles(removed_handles);
     }
 
