@@ -3396,22 +3396,16 @@ impl CacheInner {
         if count == 0 {
             return;
         }
-        let _ = self.pin_handles.fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_add(count)),
-        );
+        let previous = self.pin_handles.fetch_add(count, Ordering::Release);
+        debug_assert!(previous <= u64::MAX - count, "pin handle count overflow");
     }
 
     fn remove_pin_handles(&self, count: u64) {
         if count == 0 {
             return;
         }
-        let _ = self.pin_handles.fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(count)),
-        );
+        let previous = self.pin_handles.fetch_sub(count, Ordering::Release);
+        debug_assert!(previous >= count, "pin handle count underflow");
     }
 
     fn remove_pin_entry(&self, key: &CacheKey) {
