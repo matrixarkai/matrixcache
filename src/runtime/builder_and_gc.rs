@@ -2896,19 +2896,18 @@ impl CacheInner {
         // one up, in preference to weighing live entries against each other and
         // throwing out something a caller still wants.
         //
-        // Scanned over the same bounded window as the scoring below, so this
-        // adds a comparison per candidate rather than a pass over the tier.
-        let now_millis = CoarseClock::now_millis();
-        for candidate in order.iter_access().take(candidates) {
-            if self.is_pinned(candidate) {
-                continue;
-            }
-            if self.entry_expired(candidate, now_millis) {
-                return PickedEvictionVictim {
-                    victim: Some((candidate.clone(), EvictionReason::Expired, 0)),
-                    groups_weighed: 0,
-                    promote: Vec::new(),
-                };
+        // With TTL disabled there can be no expired victim. With TTL enabled,
+        // only expired candidates need a pin lookup in this preliminary pass.
+        if self.ttl_in_use {
+            let now_millis = CoarseClock::now_millis();
+            for candidate in order.iter_access().take(candidates) {
+                if self.entry_expired(candidate, now_millis) && !self.is_pinned(candidate) {
+                    return PickedEvictionVictim {
+                        victim: Some((candidate.clone(), EvictionReason::Expired, 0)),
+                        groups_weighed: 0,
+                        promote: Vec::new(),
+                    };
+                }
             }
         }
         // The rule a three-list policy applies at the tail of its cold list: an
