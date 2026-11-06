@@ -2548,9 +2548,29 @@ impl CacheInner {
             Some(HitOutcome::NeedsAccessOrderRefresh) => self.refresh_access_order(key),
             Some(HitOutcome::NeedsMetadata) | None => self.record_hit(key, value.len()),
         }
+        // A PMEM hit is already served. Refill is useful only when the value
+        // can actually belong in memory. Retrying an impossible admission on
+        // every read wastes the exclusive lock, distorts rejection/failure
+        // counters, and defeats side-by-side placement by duplicating values
+        // that policy deliberately assigned to PMEM.
+        if !self.pmem_should_refill_memory(value.len()) {
+            return;
+        }
         if !self.put_memory_shared(key, Arc::clone(value)) {
             self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
         }
+    }
+
+    /// Whether a value served from PMEM belongs in the memory tier too.
+    fn pmem_should_refill_memory(&self, value_len: usize) -> bool {
+        if self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes {
+            return false;
+        }
+        !matches!(
+            self.tiering_policy.data_placement,
+            CacheDataPlacement::SideBySide
+        ) || self.pmem_capacity_bytes == 0
+            || value_len <= self.tiering_policy.data_placement_threshold_bytes
     }
 
     fn bump_ssd_probe_epoch(&mut self) {
