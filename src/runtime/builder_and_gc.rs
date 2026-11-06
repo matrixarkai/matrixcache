@@ -1260,7 +1260,10 @@ impl CacheInner {
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let tmp = path.with_extension("tmp");
         let durable = self.pmem_block_durability;
-        if self.pmem.get(key).is_some_and(|old| old.as_ref() == value) {
+        if self
+            .pmem_value(key)
+            .is_some_and(|old| old.as_ref() == value)
+        {
             if let Some(file) = Self::open_matching_pmem_block(&path, value)? {
                 // Keep the durability operations and manifest append: the file
                 // may have been written under a different policy or recovered.
@@ -1373,7 +1376,7 @@ impl CacheInner {
                 report.skipped_files = report.skipped_files.saturating_add(1);
             }
         }
-        self.pmem.clear();
+        self.clear_pmem_resident();
         self.pmem_order.clear();
         self.pmem_bytes = 0;
         for (key, expected_len) in live {
@@ -1592,7 +1595,7 @@ impl CacheInner {
             }
         }
         self.memory_order.remove(key);
-        if let Some(value) = self.pmem.remove(key) {
+        if let Some(value) = self.take_pmem_resident(key) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
             self.stats.pmem_bytes = self.pmem_bytes as u64;
             if notifying && departing.is_none() {
@@ -2250,7 +2253,7 @@ impl CacheInner {
                     self.persist_pmem_delete(key)?;
                     self.note_ssd_probe_mutation(key);
                 }
-                if let Some(stale) = self.pmem.remove(key) {
+                if let Some(stale) = self.take_pmem_resident(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(stale.len());
                     self.stats.pmem_bytes = self.pmem_bytes as u64;
                     self.stats.stale_tier_copies_dropped =
@@ -2358,7 +2361,7 @@ impl CacheInner {
         self.stats.pmem_admission_accepted = self.stats.pmem_admission_accepted.saturating_add(1);
         self.stats.pmem_fills = self.stats.pmem_fills.saturating_add(1);
         let shared = self.shared_key(key);
-        if let Some(old) = self.pmem.insert(Arc::clone(&shared), Arc::clone(&value)) {
+        if let Some(old) = self.make_pmem_resident(Arc::clone(&shared), Arc::clone(&value)) {
             self.pmem_bytes = self.pmem_bytes.saturating_sub(old.len());
         } else {
             self.pmem_order.push_back_if_absent_shared(shared);
@@ -2489,7 +2492,9 @@ impl CacheInner {
             || self.ssd_instance_only
             || self.memory.contains_key(key)
             || self.entry_expired(key, CoarseClock::now_millis())
-            || !self.pmem.get(key).is_some_and(|current| Arc::ptr_eq(current, value))
+            || !self
+                .pmem_value(key)
+                .is_some_and(|current| Arc::ptr_eq(current, value))
         {
             return;
         }
@@ -2675,7 +2680,7 @@ impl CacheInner {
             // that order, so leaving it until after the loop lets the next
             // round pick the same key, whose bytes are already gone.
             self.pmem_order.remove(&victim);
-            let Some(old_value) = self.pmem.remove(&victim) else {
+            let Some(old_value) = self.take_pmem_resident(&victim) else {
                 // A key the order still listed but the tier no longer holds.
                 // It is gone from the order now, so the next round makes
                 // progress rather than picking it again.
@@ -3301,7 +3306,7 @@ impl CacheInner {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(disk_bytes);
                 let _ = self.append_disk_manifest_delete(key);
             }
-            if let Some(value) = self.pmem.remove(key) {
+            if let Some(value) = self.take_pmem_resident(key) {
                 removed_pinned_bytes = removed_pinned_bytes.max(value.len());
                 self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
             }
@@ -3349,7 +3354,7 @@ impl CacheInner {
     fn clear_all_locked(&mut self, reset_stats: bool) -> Result<(), CacheError> {
         self.bump_ssd_probe_epoch();
         self.memory.clear();
-        self.pmem.clear();
+        self.clear_pmem_resident();
         self.clear_pmem_persistence()?;
         self.disk_index.clear();
         self.disk_order.clear();
@@ -3468,7 +3473,7 @@ impl CacheInner {
         let bytes = self
             .resident_value(key)
             .map(|value| value.len())
-            .or_else(|| self.pmem.get(key).map(|value| value.len()))
+            .or_else(|| self.pmem_value(key).map(|value| value.len()))
             .or_else(|| {
                 self.pins_for(key)
                     .entries

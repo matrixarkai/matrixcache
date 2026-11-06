@@ -17944,7 +17944,7 @@ mod tests {
 
         let honest = inner.footprint().table_bytes;
         let stale = map_table_bytes(&inner.memory)
-            + estimated_table_bytes::<CacheKey, Arc<[u8]>>(inner.pmem.capacity())
+            + estimated_table_bytes::<CacheKey, PmemResident>(inner.pmem.capacity())
             + estimated_table_bytes::<CacheKey, u64>(inner.disk_index.capacity())
             + map_table_bytes(&inner.metadata);
 
@@ -25257,16 +25257,27 @@ fn an_entrys_metadata_lives_in_exactly_one_place() {
     }
 
     let inner = cache.inner.read().expect("cache lock poisoned");
-    let both: Vec<&CacheKey> = inner
+    let memory_and_overflow: Vec<&CacheKey> = inner
         .memory
         .keys()
         .filter(|held| inner.metadata.contains_key(held.as_ref()))
         .map(|held| held.as_ref())
         .collect();
     assert!(
-        both.is_empty(),
+        memory_and_overflow.is_empty(),
         "{} entries have metadata in the tier and in the map beside it",
-        both.len()
+        memory_and_overflow.len()
+    );
+    let pmem_and_overflow: Vec<&CacheKey> = inner
+        .pmem
+        .keys()
+        .filter(|held| inner.metadata.contains_key(held.as_ref()))
+        .map(|held| held.as_ref())
+        .collect();
+    assert!(
+        pmem_and_overflow.is_empty(),
+        "{} entries have metadata in PMEM and in the overflow map",
+        pmem_and_overflow.len()
     );
 
     let missing = keys
@@ -25285,6 +25296,11 @@ fn an_entrys_metadata_lives_in_exactly_one_place() {
         .values()
         .filter(|resident| resident.meta.is_some())
         .count()
+        + inner
+            .pmem
+            .values()
+            .filter(|resident| resident.meta.is_some())
+            .count()
         + inner.metadata.len();
     assert_eq!(
         inner.metadata_len(),
