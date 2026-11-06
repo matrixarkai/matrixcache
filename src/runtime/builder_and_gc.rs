@@ -1959,7 +1959,27 @@ impl CacheInner {
         occurrences: usize,
         epoch: u64,
     ) -> HitOutcome {
-        let Some(entry) = self.metadata_of(key) else {
+        self.record_known_hit_shared_occurrences_at(
+            key,
+            self.metadata_of(key),
+            occurrences,
+            epoch,
+        )
+    }
+
+    /// Account for a hit when the tier lookup already found the metadata.
+    ///
+    /// The single-key resident read path has the value and metadata from one
+    /// bucket. Passing that metadata through avoids probing the same map again
+    /// solely to update counters.
+    fn record_known_hit_shared_occurrences_at(
+        &self,
+        key: &CacheKey,
+        entry: Option<&CacheEntryMeta>,
+        occurrences: usize,
+        epoch: u64,
+    ) -> HitOutcome {
+        let Some(entry) = entry else {
             return HitOutcome::NeedsMetadata;
         };
         let threshold = self.tiering_policy.memory_hotness_threshold;
