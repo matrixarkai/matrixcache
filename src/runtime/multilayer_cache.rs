@@ -4748,7 +4748,28 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
+        // SSD-only mode has no resident tier to re-check. Classify its live
+        // keys under shared ownership and reserve the exclusive path below
+        // for entries that actually need expiry cleanup.
         {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if inner.ssd_instance_only {
+                let mut expired = Vec::new();
+                for item @ (key, _, _) in deferred.drain(..) {
+                    if inner.entry_expired(key, now_millis) {
+                        expired.push(item);
+                    } else {
+                        ssd_candidates.push(item);
+                    }
+                }
+                deferred = expired;
+            }
+        }
+
+        if !deferred.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
@@ -4848,6 +4869,80 @@ impl MultiLayerCache {
                 None => None,
             };
             ssd_reads.push((key, positions, started, refill_started, decoded));
+        }
+
+        if !refill_wanted {
+            let mut deferred = Vec::new();
+            {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                if inner.ssd_instance_only {
+                    if !inner.started {
+                        return Err(CacheError::Stopped);
+                    }
+                    let hit_epoch = CoarseClock::now_millis();
+                    inner.reconfigure_refresh_window(hit_epoch);
+                    for (key, positions, started, refill_started, decoded) in ssd_reads {
+                        let occurrences = positions.len();
+                        match decoded {
+                            Some((value, compressed)) => {
+                                inner
+                                    .read_counters
+                                    .disk_hits
+                                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                                if compressed {
+                                    inner
+                                        .read_counters
+                                        .compressed_hits
+                                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                                }
+                                let outcome = inner.record_hit_shared_at(key, hit_epoch);
+                                if !matches!(outcome, HitOutcome::Accounted) {
+                                    deferred.push((key, outcome, value.len()));
+                                }
+                                let micros = elapsed_micros(started);
+                                inner
+                                    .record_get_latency_micros_many(micros, occurrences);
+                                inner.record_read_through_latency_micros_many(
+                                    micros,
+                                    occurrences,
+                                );
+                                inner.record_refill_latency(refill_started);
+                                for index in positions {
+                                    results[index] = Some(value.to_vec());
+                                }
+                            }
+                            None => {
+                                inner
+                                    .read_counters
+                                    .misses
+                                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                                let micros = elapsed_micros(started);
+                                inner
+                                    .record_get_latency_micros_many(micros, occurrences);
+                                inner.record_read_through_latency_micros_many(
+                                    micros,
+                                    occurrences,
+                                );
+                            }
+                        }
+                    }
+                    drop(inner);
+
+                    if !deferred.is_empty() {
+                        let mut inner = self.inner.write().expect("cache lock poisoned");
+                        for (key, outcome, len) in deferred {
+                            match outcome {
+                                HitOutcome::Accounted => {}
+                                HitOutcome::NeedsAccessOrderRefresh => {
+                                    inner.refresh_access_order(key)
+                                }
+                                HitOutcome::NeedsMetadata => inner.record_hit(key, len),
+                            }
+                        }
+                    }
+                    return Ok(results);
+                }
+            }
         }
 
         {
