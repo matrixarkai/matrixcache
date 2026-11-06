@@ -12742,7 +12742,7 @@ mod tests {
 
         let batch = [repeated.clone(), remote.clone(), repeated.clone()];
         assert!(
-            batch.len() < ShardedMultiLayerCache::BATCH_FANOUT_THRESHOLD,
+            batch.len() < ShardedMultiLayerCache::READ_BATCH_FANOUT_THRESHOLD,
             "precondition: and stay under the threshold, or it takes the fanout path"
         );
         for promoting in [false, true] {
@@ -12769,6 +12769,47 @@ mod tests {
             }
             cache.release_batch(handles.into_iter().flatten().collect());
         }
+    }
+
+    #[test]
+    fn sharded_resident_reads_use_the_inline_crossover_and_large_reads_fan_out() {
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
+        let resident = (0..1_024)
+            .map(|index| CacheKey::string(index as u64, &format!("inline-read-{index:04}")))
+            .collect::<Vec<_>>();
+        assert!(cache.batch_shard_fanout(&resident) > 1);
+        for key in &resident {
+            cache.put(key.clone(), vec![7; 16]).unwrap();
+        }
+
+        let before = cache.stats();
+        let values = cache.get_batch(&resident).unwrap();
+        assert!(values.iter().all(Option::is_some));
+        let handles = cache.acquire_batch_no_promotion(&resident).unwrap();
+        assert!(handles.iter().all(Option::is_some));
+        let after_inline = cache.stats();
+        assert!(
+            after_inline.sharded_batch_local_operations
+                >= before.sharded_batch_local_operations + 2
+        );
+        assert_eq!(
+            after_inline.sharded_batch_fanout_operations,
+            before.sharded_batch_fanout_operations
+        );
+        cache.release_batch(handles.into_iter().flatten().collect());
+        let after_release = cache.stats();
+
+        let large = (0..ShardedMultiLayerCache::READ_BATCH_FANOUT_THRESHOLD)
+            .map(|index| CacheKey::string(index as u64, &format!("fanout-read-{index:04}")))
+            .collect::<Vec<_>>();
+        assert!(cache.batch_shard_fanout(&large) > 1);
+        let misses = cache.get_batch(&large).unwrap();
+        assert!(misses.iter().all(Option::is_none));
+        let after_fanout = cache.stats();
+        assert_eq!(
+            after_fanout.sharded_batch_fanout_operations,
+            after_release.sharded_batch_fanout_operations + 1
+        );
     }
 
     #[test]
