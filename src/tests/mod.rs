@@ -22990,6 +22990,28 @@ mod tests {
         cache.put(repeated.clone(), b"repeated-value".to_vec()).unwrap();
         cache.put(other.clone(), b"other-value".to_vec()).unwrap();
 
+        let unique_before = cache.stats();
+        let unique_values = cache
+            .get_batch(&[repeated.clone(), other.clone()])
+            .unwrap();
+        let unique_after = cache.stats();
+        assert_eq!(unique_values[0].as_deref(), Some(&b"repeated-value"[..]));
+        assert_eq!(unique_values[1].as_deref(), Some(&b"other-value"[..]));
+        assert_eq!(unique_after.memory_hits - unique_before.memory_hits, 2);
+        assert_eq!(
+            unique_after.shared_buffer_hits - unique_before.shared_buffer_hits,
+            2
+        );
+        assert_eq!(
+            unique_after.get_latency_samples - unique_before.get_latency_samples,
+            2
+        );
+        assert_eq!(
+            unique_after.read_through_latency_samples
+                - unique_before.read_through_latency_samples,
+            2
+        );
+
         let before = cache.stats().memory_hits;
         // The repeated key three times, interleaved, plus one absent key.
         let batch = vec![
