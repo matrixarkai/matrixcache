@@ -2997,7 +2997,15 @@ impl CacheInner {
         // Keep wide fallback scans hash-grouped: many entries can share one group.
         let wide = candidates > EVICTION_CANDIDATE_WINDOW;
         let mut wide_groups = HashMap::<EvictionGroupKey<'a>, SlotEvictionGroup<'a>>::new();
-        let mut groups = Vec::with_capacity(if wide { 0 } else { candidates });
+        // The bounded path is the steady-state one. Its upper bound is a
+        // compile-time constant, so keeping candidates on the stack avoids a
+        // short-lived allocation on every capacity write while retaining the
+        // same sort-and-fold selection below.
+        let mut bounded_groups: [
+            Option<(EvictionGroupKey<'a>, &'a CacheKey, EvictionScore)>;
+            EVICTION_CANDIDATE_WINDOW
+        ] = [None; EVICTION_CANDIDATE_WINDOW];
+        let mut bounded_group_count = 0usize;
         for key in keys {
             if self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
@@ -3022,7 +3030,8 @@ impl CacheInner {
                     .or_insert_with(|| SlotEvictionGroup::new(key, score));
             } else {
                 // Until folding, the group and victim scores are identical.
-                groups.push((group_key, key, score));
+                bounded_groups[bounded_group_count] = Some((group_key, key, score));
+                bounded_group_count += 1;
             }
         }
         if wide {
@@ -3034,8 +3043,17 @@ impl CacheInner {
             }).map(|group| (group.victim.clone(), eviction_reason_for(group.victim_score), pinned_skips));
             return PickedEvictionVictim { victim, groups_weighed, promote: Vec::new() };
         }
-        groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let mut groups = groups.into_iter().peekable();
+        let groups = &mut bounded_groups[..bounded_group_count];
+        groups.sort_unstable_by(|left, right| {
+            left.as_ref()
+                .expect("bounded candidate present")
+                .0
+                .cmp(&right.as_ref().expect("bounded candidate present").0)
+        });
+        let mut groups = groups
+            .iter_mut()
+            .map(|candidate| candidate.take().expect("bounded candidate present"))
+            .peekable();
         let mut group_count = 0;
         let mut best: Option<SlotEvictionGroup<'a>> = None;
         while let Some((key, victim, score)) = groups.next() {
