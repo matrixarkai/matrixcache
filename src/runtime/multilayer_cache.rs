@@ -755,11 +755,11 @@ pub struct CacheFootprint {
     pub key_bytes: usize,
     /// Per-entry metadata **content**, for decomposition only.
     ///
-    /// A `HashMap` stores its values inline in the table it allocates, and the
-    /// metadata map's value is a `CacheEntryMeta` rather than a handle to one.
-    /// So these bytes are **inside `table_bytes`** and are not added to
-    /// `total_bytes`: they say how much of that table is metadata, which is
-    /// worth reporting, but adding them counted every entry's metadata twice.
+    /// A `HashMap` stores its values inline in the table it allocates. Resident
+    /// metadata is inline in a memory or PMEM bucket; cold metadata is inline
+    /// in the overflow map. So these bytes are **inside `table_bytes`** and are
+    /// not added to `total_bytes`: they say how much of those tables is
+    /// metadata, but adding them counted every entry's metadata twice.
     pub metadata_bytes: usize,
     /// The recency orders -- node arenas and free lists -- excluding the keys
     /// in them, which are counted in `key_bytes`.
@@ -784,13 +784,13 @@ pub struct CacheFootprint {
     /// here because the aggregate says how much the tables cost and nothing
     /// about which of them to go after -- and the answer was not the one I
     /// would have guessed. In a tiered cache holding 2,000 entries the
-    /// per-entry metadata map is the largest table in the cache, larger than
-    /// either tier map whose entries it describes, because its value is
-    /// stored inline in the bucket rather than behind a handle.
+    /// per-entry metadata map used to be the largest table in the cache,
+    /// because its value was stored inline in a second bucket rather than
+    /// beside the resident value.
     ///
-    /// That reading is what sent the metadata of memory-resident entries into
-    /// the memory tier's own buckets, so in a memory-only cache the metadata
-    /// line here is zero and the memory line carries it.
+    /// That reading sent resident metadata into the memory and PMEM tier
+    /// buckets. The metadata line now carries only entries resident in neither
+    /// tier.
     pub table_bytes_by_map: CacheTableBytes,
     /// What the SSD tier's store holds in **memory**.
     ///
@@ -847,13 +847,11 @@ pub struct CacheTableBytes {
     pub pmem: usize,
     /// The SSD tier's index: a key handle and a block length to a bucket.
     pub disk_index: usize,
-    /// The metadata of entries the memory tier is **not** holding, held
-    /// inline in its buckets -- so this is the one table here that holds its
-    /// values rather than handles to them.
+    /// The metadata of entries neither the memory nor PMEM tier is holding,
+    /// held inline in its buckets -- so this is the one table here that holds
+    /// its values rather than handles to them.
     ///
-    /// Empty for a memory-only cache: a resident entry's metadata is in
-    /// `memory` above. In a tiered cache this is the largest table there is,
-    /// because most entries are not memory-resident.
+    /// Empty while every tracked entry remains in either resident tier.
     pub metadata: usize,
     /// The expiries, which are empty -- and so free -- for a cache that was
     /// never given a time to live.
@@ -879,41 +877,45 @@ impl CacheTableBytes {
 /// The per-entry metadata, reached through accessors rather than as a map.
 ///
 /// Every reader goes through these, so that **where** an entry's metadata is
-/// kept can change without touching any of them. It is one map today, and
-/// that map is the largest table in the cache: its bucket is a key handle,
-/// the struct inline and a control byte, against a key handle and a
-/// sixteen-byte handle in the tier map beside it.
+/// kept can change without touching any of them. Metadata lives beside a
+/// memory- or PMEM-resident value. The overflow map is used only while neither
+/// resident tier holds the entry.
 ///
 /// The field itself stays visible to the sizing and shrinking code, which is
 /// about the map as storage rather than about an entry's metadata.
 impl CacheInner {
-    /// An entry's metadata, from whichever of its two homes holds it.
+    /// An entry's metadata, from whichever of its three homes holds it.
     ///
-    /// The tier first, then the map beside it -- and that order is a trade
-    /// worth stating. For a memory-resident entry this is one hash lookup,
-    /// exactly as the single map was. For an entry the tier does not hold it
-    /// is **two**: a miss in the tier and then the map. A tiered cache reads
-    /// mostly non-resident entries, so those reads pay one extra probe on a
-    /// path that was already going to a lower tier for the bytes. Measured in
-    /// bytes rather than in time here, and the bytes are the reason for it:
-    /// the alternative is a second bucket, a second key handle and a second
-    /// table's slack for every entry, resident or not.
+    /// Memory is checked first, then PMEM, then the overflow map. A hit in a
+    /// resident tier gets the value and metadata from the same bucket. A
+    /// disk-only entry pays the resident misses before the overflow lookup,
+    /// on a path that was already going to storage for its bytes.
     fn metadata_of(&self, key: &CacheKey) -> Option<&CacheEntryMeta> {
         match self.memory.get(key) {
             Some(resident) => resident.meta.as_ref(),
-            None => self.metadata.get(key),
+            None => match self.pmem.get(key) {
+                Some(resident) => resident.meta.as_ref(),
+                None => self.metadata.get(key),
+            },
         }
     }
 
     fn metadata_of_mut(&mut self, key: &CacheKey) -> Option<&mut CacheEntryMeta> {
         match self.memory.get_mut(key) {
             Some(resident) => resident.meta.as_mut(),
-            None => self.metadata.get_mut(key),
+            None => match self.pmem.get_mut(key) {
+                Some(resident) => resident.meta.as_mut(),
+                None => self.metadata.get_mut(key),
+            },
         }
     }
 
     fn set_metadata(&mut self, key: Arc<CacheKey>, meta: CacheEntryMeta) {
         if let Some(resident) = self.memory.get_mut(key.as_ref()) {
+            resident.meta = Some(meta);
+            return;
+        }
+        if let Some(resident) = self.pmem.get_mut(key.as_ref()) {
             resident.meta = Some(meta);
             return;
         }
@@ -927,6 +929,10 @@ impl CacheInner {
             resident.meta.get_or_insert(meta);
             return;
         }
+        if let Some(resident) = self.pmem.get_mut(key.as_ref()) {
+            resident.meta.get_or_insert(meta);
+            return;
+        }
         self.metadata.entry(key).or_insert(meta);
     }
 
@@ -934,10 +940,13 @@ impl CacheInner {
         if let Some(resident) = self.memory.get_mut(key) {
             resident.meta = None;
         }
+        if let Some(resident) = self.pmem.get_mut(key) {
+            resident.meta = None;
+        }
         self.metadata.remove(key);
     }
 
-    /// How many entries have metadata, across both places it can be.
+    /// How many entries have metadata, across all places it can be.
     ///
     /// A walk rather than two lengths, because a memory-resident entry may
     /// have none recorded yet. The footprint is the only caller and it already
@@ -947,6 +956,11 @@ impl CacheInner {
             .values()
             .filter(|resident| resident.meta.is_some())
             .count()
+            + self
+                .pmem
+                .values()
+                .filter(|resident| resident.meta.is_some())
+                .count()
             + self.metadata.len()
     }
 
@@ -956,18 +970,13 @@ impl CacheInner {
             .iter()
             .filter(|(_, resident)| resident.meta.is_some())
             .map(|(key, _)| key)
+            .chain(
+                self.pmem
+                    .iter()
+                    .filter(|(_, resident)| resident.meta.is_some())
+                    .map(|(key, _)| key),
+            )
             .chain(self.metadata.keys())
-    }
-
-    /// The handle this cache holds for a key that has metadata, which is the
-    /// one allocation several structures share.
-    fn shared_metadata_key(&self, key: &CacheKey) -> Option<&Arc<CacheKey>> {
-        if let Some((held, resident)) = self.memory.get_key_value(key) {
-            if resident.meta.is_some() {
-                return Some(held);
-            }
-        }
-        self.metadata.get_key_value(key).map(|(held, _)| held)
     }
 
     /// The bytes the memory tier holds for a key.
@@ -991,8 +1000,23 @@ impl CacheInner {
             .map(|(key, resident)| (key, &resident.value))
     }
 
+    fn pmem_value(&self, key: &CacheKey) -> Option<&Arc<[u8]>> {
+        self.pmem.get(key).map(|resident| &resident.value)
+    }
+
+    fn pmem_value_mut(&mut self, key: &CacheKey) -> Option<&mut Arc<[u8]>> {
+        self.pmem.get_mut(key).map(|resident| &mut resident.value)
+    }
+
+    fn pmem_values(&self) -> impl Iterator<Item = &Arc<[u8]>> + '_ {
+        self.pmem.values().map(|resident| &resident.value)
+    }
+
     fn clear_metadata(&mut self) {
         for resident in self.memory.values_mut() {
+            resident.meta = None;
+        }
+        for resident in self.pmem.values_mut() {
             resident.meta = None;
         }
         self.metadata.clear();
@@ -1008,7 +1032,11 @@ impl CacheInner {
         if let Some(resident) = self.memory.get_mut(key.as_ref()) {
             return Some(std::mem::replace(&mut resident.value, value));
         }
-        let meta = self.metadata.remove(key.as_ref());
+        let meta = self
+            .pmem
+            .get_mut(key.as_ref())
+            .and_then(|resident| resident.meta.take())
+            .or_else(|| self.metadata.remove(key.as_ref()));
         self.memory.insert(key, MemoryResident { value, meta });
         None
     }
@@ -1026,7 +1054,11 @@ impl CacheInner {
         let drained: Vec<(Arc<CacheKey>, MemoryResident)> = self.memory.drain().collect();
         for (held, resident) in drained {
             if let Some(meta) = resident.meta {
-                self.metadata.insert(held, meta);
+                if let Some(pmem) = self.pmem.get_mut(held.as_ref()) {
+                    pmem.meta = Some(meta);
+                } else {
+                    self.metadata.insert(held, meta);
+                }
             }
         }
     }
@@ -1042,9 +1074,55 @@ impl CacheInner {
         self.note_ssd_probe_mutation(key);
         let (held, resident) = self.memory.remove_entry(key)?;
         if let Some(meta) = resident.meta {
-            self.metadata.insert(held, meta);
+            if let Some(pmem) = self.pmem.get_mut(key) {
+                pmem.meta = Some(meta);
+            } else {
+                self.metadata.insert(held, meta);
+            }
         }
         Some(resident.value)
+    }
+
+    fn make_pmem_resident(
+        &mut self,
+        key: Arc<CacheKey>,
+        value: Arc<[u8]>,
+    ) -> Option<Arc<[u8]>> {
+        if let Some(resident) = self.pmem.get_mut(key.as_ref()) {
+            return Some(std::mem::replace(&mut resident.value, value));
+        }
+        let meta = if self.memory.contains_key(key.as_ref()) {
+            None
+        } else {
+            self.metadata.remove(key.as_ref())
+        };
+        self.pmem.insert(key, PmemResident { value, meta });
+        None
+    }
+
+    fn take_pmem_resident(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
+        let (held, resident) = self.pmem.remove_entry(key)?;
+        if let Some(meta) = resident.meta {
+            if let Some(memory) = self.memory.get_mut(key) {
+                memory.meta = Some(meta);
+            } else {
+                self.metadata.insert(held, meta);
+            }
+        }
+        Some(resident.value)
+    }
+
+    fn clear_pmem_resident(&mut self) {
+        let drained: Vec<(Arc<CacheKey>, PmemResident)> = self.pmem.drain().collect();
+        for (held, resident) in drained {
+            if let Some(meta) = resident.meta {
+                if let Some(memory) = self.memory.get_mut(held.as_ref()) {
+                    memory.meta = Some(meta);
+                } else {
+                    self.metadata.insert(held, meta);
+                }
+            }
+        }
     }
 }
 
@@ -1322,6 +1400,31 @@ struct MemoryResident {
     meta: Option<CacheEntryMeta>,
 }
 
+/// A PMEM-resident value and its single metadata authority.
+///
+/// Memory owns the metadata while the value is present in both resident tiers.
+/// Demotion moves it here; removing the PMEM copy moves it to memory or the
+/// overflow map. This avoids a second hash bucket for every PMEM-resident key.
+#[derive(Debug)]
+struct PmemResident {
+    value: Arc<[u8]>,
+    meta: Option<CacheEntryMeta>,
+}
+
+impl std::ops::Deref for PmemResident {
+    type Target = Arc<[u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl AsRef<[u8]> for PmemResident {
+    fn as_ref(&self) -> &[u8] {
+        self.value.as_ref()
+    }
+}
+
 #[derive(Debug)]
 struct CacheInner {
     started: bool,
@@ -1408,17 +1511,17 @@ struct CacheInner {
     block_options: CacheBlockOptions,
     /// Keyed on a shared handle, not on the key itself.
     ///
-    /// The entry map, the metadata map and the memory tier's recency order all
-    /// hold the same key, and each used to hold its own copy of the struct --
+    /// The resident maps, the metadata map and each tier's recency order all
+    /// hold shared keys, and each used to hold its own copy of the struct --
     /// seventy-two bytes, three times, plus a table slot sized to carry it.
     /// They now hold one `Arc<CacheKey>` between them, so a slot carries a
     /// pointer. Lookups are unaffected: `Arc<CacheKey>` borrows as a
     /// `CacheKey`, so `get`, `remove` and `contains_key` still take `&CacheKey`.
-    /// The memory tier, holding each entry metadata beside its bytes --
-    /// see [`MemoryResident`]. The map below holds the metadata of entries
-    /// this tier is **not** holding.
+    /// The memory and PMEM tiers hold entry metadata beside their bytes -- see
+    /// [`MemoryResident`] and [`PmemResident`]. The metadata map below is only
+    /// for entries held by neither resident tier.
     memory: HashMap<Arc<CacheKey>, MemoryResident>,
-    pmem: HashMap<Arc<CacheKey>, Arc<[u8]>>,
+    pmem: HashMap<Arc<CacheKey>, PmemResident>,
     disk_index: HashMap<Arc<CacheKey>, u64>,
     disk_order: CacheKeyOrder,
     /// Everything about which entries are pinned, behind its own lock.
@@ -3490,8 +3593,7 @@ impl MultiLayerCache {
                     .map(|value| (value, CacheReadTier::Memory))
                     .or_else(|| {
                         inner
-                            .pmem
-                            .get(key)
+                            .pmem_value(key)
                             .cloned()
                             .map(|value| (value, CacheReadTier::Pmem))
                     })
@@ -3716,7 +3818,7 @@ impl MultiLayerCache {
                         unique_values[unique_position] = Some(value);
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem_value(key).cloned() {
                         pmem_refills.push((unique_position, value, started));
                         continue;
                     }
@@ -3887,7 +3989,7 @@ impl MultiLayerCache {
                     tier: CacheReadTier::Memory,
                 }));
             }
-            if let Some(value) = inner.pmem.get(key).cloned() {
+            if let Some(value) = inner.pmem_value(key).cloned() {
                 return Ok(Some(CacheReadResult {
                     value: value.to_vec(),
                     tier: CacheReadTier::Pmem,
@@ -3936,7 +4038,7 @@ impl MultiLayerCache {
                         });
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem_value(key).cloned() {
                         results[index] = Some(CacheReadResult {
                             value: value.to_vec(),
                             tier: CacheReadTier::Pmem,
@@ -4170,8 +4272,7 @@ impl MultiLayerCache {
                     .map(|value| (value, CacheReadTier::Memory))
                     .or_else(|| {
                         inner
-                            .pmem
-                            .get(key)
+                            .pmem_value(key)
                             .cloned()
                             .map(|value| (value, CacheReadTier::Pmem))
                     })
@@ -4452,7 +4553,7 @@ impl MultiLayerCache {
                         }
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem_value(key).cloned() {
                         let occurrences = positions.len();
                         inner
                             .read_counters
@@ -4731,7 +4832,7 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if let Some(value) = inner.pmem.get(key).cloned() {
+            if let Some(value) = inner.pmem_value(key).cloned() {
                 inner.increment_pin_for_handle(key, value.len());
                 if !inner.put_memory_shared(key, Arc::clone(&value)) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
@@ -4814,7 +4915,7 @@ impl MultiLayerCache {
                         tier: CacheReadTier::Memory,
                     }));
                 }
-                if let Some(value) = inner.pmem.get(key).cloned() {
+                if let Some(value) = inner.pmem_value(key).cloned() {
                     inner.increment_pin_with_size(key, value.len());
                     return Ok(Some(CachePinnedHandle {
                         key: key.clone(),
@@ -4904,7 +5005,7 @@ impl MultiLayerCache {
                         pin_counts.push((key, value.len(), occurrences));
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem_value(key).cloned() {
                         let occurrences = positions.len();
                         for position in positions {
                             results[position] = Some(CachePinnedHandle {
@@ -5171,7 +5272,7 @@ impl MultiLayerCache {
                         pin_counts.push((key, value.len(), pinned_occurrences, 1));
                         continue;
                     }
-                    if let Some(value) = inner.pmem.get(key).cloned() {
+                    if let Some(value) = inner.pmem_value(key).cloned() {
                         let occurrences = positions.len();
                         if !inner.put_memory_shared(key, Arc::clone(&value)) {
                             inner.stats.refill_failures =
@@ -5391,7 +5492,7 @@ impl MultiLayerCache {
         let handle_value = if !inner.ssd_instance_only {
             if let Some(memory_value) = inner.resident_value(&key).cloned() {
                 Some((memory_value, CacheReadTier::Memory))
-            } else if let Some(pmem_value) = inner.pmem.get(&key).cloned() {
+            } else if let Some(pmem_value) = inner.pmem_value(&key).cloned() {
                 Some((pmem_value, CacheReadTier::Pmem))
             } else if inner.disk_index.contains_key(&key) || inner.ssd_block_exists(&key) {
                 Some((Arc::clone(&shared), CacheReadTier::Ssd))
@@ -5637,7 +5738,7 @@ impl MultiLayerCache {
                 }))
             }
             CacheTier::Pmem => {
-                let Some(value) = inner.pmem.get(key).cloned() else {
+                let Some(value) = inner.pmem_value(key).cloned() else {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
@@ -6432,7 +6533,7 @@ impl MultiLayerCache {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
         }
-        if let Some(value) = inner.pmem.remove(key) {
+        if let Some(value) = inner.take_pmem_resident(key) {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
         }
@@ -6504,7 +6605,7 @@ impl MultiLayerCache {
         inner.ssd_instance_only = enabled;
         if enabled {
             inner.clear_resident();
-            inner.pmem.clear();
+            inner.clear_pmem_resident();
             inner.memory_order.clear();
             inner.pmem_order.clear();
             inner.memory_bytes = 0;
@@ -9716,21 +9817,19 @@ impl CacheInner {
     /// because they all ask the same question they all get the same answer:
     /// one `CacheKey` per entry rather than three.
     ///
-    /// The cost is a lookup. The entry map is asked first because it is the
-    /// one most likely to hold the key already, and a miss on all three is
-    /// the first write of that key, where the allocation was going to happen
-    /// anyway.
+    /// The cost is a lookup. Resident tiers are asked first because they are
+    /// most likely to hold the key already, and a miss everywhere is the first
+    /// write of that key, where the allocation was going to happen anyway.
     fn shared_key(&self, key: &CacheKey) -> Arc<CacheKey> {
         // Asked in the order a key is most likely to be found, so the common
-        // case is one lookup. The metadata map is second because every
-        // memory-tier entry has an entry in it.
+        // resident cases are one or two lookups.
         if let Some((held, _)) = self.memory.get_key_value(key) {
             return Arc::clone(held);
         }
-        if let Some(held) = self.shared_metadata_key(key) {
+        if let Some((held, _)) = self.pmem.get_key_value(key) {
             return Arc::clone(held);
         }
-        if let Some((held, _)) = self.pmem.get_key_value(key) {
+        if let Some((held, _)) = self.metadata.get_key_value(key) {
             return Arc::clone(held);
         }
         if let Some((held, _)) = self.disk_index.get_key_value(key) {
@@ -9848,7 +9947,7 @@ impl CacheInner {
         let mut counted_payloads = std::collections::HashSet::new();
         let mut payload_bytes = 0usize;
         let mut payload_header_bytes = 0usize;
-        for value in self.resident_values().chain(self.pmem.values()) {
+        for value in self.resident_values().chain(self.pmem_values()) {
             if counted_payloads.insert(value.as_ptr()) {
                 payload_bytes = payload_bytes.saturating_add(value.len());
                 // Once per allocation, exactly as the bytes are: an entry in
@@ -9999,10 +10098,9 @@ impl CacheInner {
             eviction_queue_bytes,
             total_bytes: 0,
         };
-        // `metadata_bytes` is deliberately absent: the metadata map stores a
-        // `CacheEntryMeta` inline in every bucket, so `table_bytes` already
-        // holds it. It was added here as well, which counted 32 bytes an entry
-        // twice and inflated every per-entry figure this type has reported.
+        // `metadata_bytes` is deliberately absent: resident maps and the
+        // overflow metadata map store `CacheEntryMeta` inline, so
+        // `table_bytes` already holds it.
         footprint.total_bytes = footprint.payload_bytes
             + footprint.payload_header_bytes
             + footprint.key_bytes
@@ -10692,7 +10790,7 @@ impl CacheInner {
                 self.memory_order.remove(key);
             }
             CacheTier::Pmem => {
-                if let Some(value) = self.pmem.remove(key) {
+                if let Some(value) = self.take_pmem_resident(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
                     if self.is_pinned(key) {
                         self.pinned_removals_seen.store(true, Ordering::Relaxed);
@@ -10768,17 +10866,21 @@ impl CacheInner {
                 Ok(())
             }
             CacheTier::Pmem => {
-                let Some(current) = self.pmem.get_mut(key) else {
-                    return Err(CacheError::NotFound);
+                let replaced = {
+                    let Some(current) = self.pmem_value_mut(key) else {
+                        return Err(CacheError::NotFound);
+                    };
+                    if !Arc::ptr_eq(current, &old_handle.value) {
+                        return Err(CacheError::ReplaceMismatch);
+                    }
+                    let replaced = current.len();
+                    *current = Arc::clone(&new_value);
+                    replaced
                 };
-                if !Arc::ptr_eq(current, &old_handle.value) {
-                    return Err(CacheError::ReplaceMismatch);
-                }
                 self.pmem_bytes = self
                     .pmem_bytes
-                    .saturating_sub(current.len())
+                    .saturating_sub(replaced)
                     .saturating_add(new_value.len());
-                *current = Arc::clone(&new_value);
                 Ok(())
             }
             CacheTier::Ssd => {
@@ -10881,7 +10983,7 @@ impl MultiLayerCache {
             if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
-            if let Some(value) = inner.pmem.remove(key) {
+            if let Some(value) = inner.take_pmem_resident(key) {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
             }
         }
@@ -10955,7 +11057,7 @@ impl MultiLayerCache {
             if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
-            if let Some(value) = inner.pmem.remove(key) {
+            if let Some(value) = inner.take_pmem_resident(key) {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
             }
             if let Some(bytes) = inner.disk_index.remove(key) {
@@ -11017,7 +11119,7 @@ impl MultiLayerCache {
             if let Some(value) = inner.take_resident(key) {
                 inner.memory_bytes = inner.memory_bytes.saturating_sub(value.len());
             }
-            if let Some(value) = inner.pmem.remove(key) {
+            if let Some(value) = inner.take_pmem_resident(key) {
                 inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
             }
             if let Some(bytes) = inner.disk_index.remove(key) {
@@ -11210,7 +11312,7 @@ impl MultiLayerCache {
                         let memory_bytes =
                             inner.resident_value(key).map(|value| value.len()).unwrap_or(0);
                         let pmem_bytes =
-                            inner.pmem.get(key).map(|value| value.len()).unwrap_or(0);
+                            inner.pmem_value(key).map(|value| value.len()).unwrap_or(0);
                         memory_bytes
                             .max(pmem_bytes)
                             .max(entry.handle_bytes)
@@ -11694,7 +11796,7 @@ impl MultiLayerCache {
     pub fn clear_memory_for_test(&self) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.clear_resident();
-        inner.pmem.clear();
+        inner.clear_pmem_resident();
         inner.memory_bytes = 0;
         inner.pmem_bytes = 0;
     }

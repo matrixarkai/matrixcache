@@ -14,11 +14,9 @@
 //! self-check below asserts.
 //!
 //! The `metadata` column is printed for decomposition and **not added**: a
-//! `HashMap` stores its values inline in the table it allocates, and the
-//! metadata map's value is a `CacheEntryMeta` rather than a handle to one, so
-//! those bytes are already in `tables`. They were added as well until today,
-//! which inflated every per-entry figure this report published by the size of
-//! that struct.
+//! `HashMap` stores its values inline in the table it allocates. Resident
+//! metadata lives in the memory or PMEM table; metadata for entries in neither
+//! tier lives in the overflow table. Those bytes are already in `tables`.
 //!
 //! The one term that is not per entry is the admission sketch, which is sized
 //! from `memory_capacity_bytes` when the admission filter is switched on. With
@@ -633,10 +631,9 @@ fn main() {
         );
     }
     println!();
-    println!("  The metadata column holds the entries this tier is not holding: a memory-resident");
-    println!("  entry keeps its metadata inline in the memory tier's own bucket, which is why the");
-    println!("  memory-only arm above reports no metadata table at all and this arm, where almost");
-    println!("  every entry has been demoted, reports the largest table in the cache.");
+    println!("  Resident metadata is inline in the memory or PMEM bucket. The metadata column");
+    println!("  holds only entries resident in neither tier, which is why both the memory-only");
+    println!("  arm and this PMEM-heavy arm avoid a second resident metadata table.");
     println!();
     // Named, because this table reads off the memory-only rows measured near
     // the top of this arm, not off the tiered rows printed just above it. It
