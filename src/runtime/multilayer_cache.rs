@@ -4562,10 +4562,60 @@ impl MultiLayerCache {
         match block {
             Some(block) => {
                 let decoded = CacheDecodedBlock::decode(&block, refill_wanted)?;
+                let compressed = is_encoded_compressed_block(&block);
+                if !refill_wanted {
+                    let outcome = {
+                        let inner = self.inner.read().expect("cache lock poisoned");
+                        if inner.ssd_instance_only {
+                            if !inner.started {
+                                return Err(CacheError::Stopped);
+                            }
+                            inner
+                                .read_counters
+                                .disk_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            if compressed {
+                                inner
+                                    .read_counters
+                                    .compressed_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            let hit_epoch = CoarseClock::now_millis();
+                            inner.reconfigure_refresh_window(hit_epoch);
+                            let outcome = inner.record_hit_shared_at(key, hit_epoch);
+                            let micros = elapsed_micros(started);
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                            inner.record_refill_latency(refill_started);
+                            Some(outcome)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(outcome) = outcome {
+                        match outcome {
+                            HitOutcome::Accounted => {}
+                            HitOutcome::NeedsAccessOrderRefresh => {
+                                let mut inner =
+                                    self.inner.write().expect("cache lock poisoned");
+                                inner.refresh_access_order(key);
+                            }
+                            HitOutcome::NeedsMetadata => {
+                                let mut inner =
+                                    self.inner.write().expect("cache lock poisoned");
+                                inner.record_hit(key, decoded.len());
+                            }
+                        }
+                        return Ok(Some(CacheReadResult {
+                            value: decoded.into_vec(),
+                            tier: CacheReadTier::Ssd,
+                        }));
+                    }
+                }
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
-                if is_encoded_compressed_block(&block) {
+                if compressed {
                     inner.stats.compressed_hits += 1;
                 }
                 inner.record_hit(key, decoded.len());

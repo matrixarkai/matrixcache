@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
-//! SSD-only shared-read scaling with hot storage blocks.
+//! SSD-only owned and shared read scaling with hot storage blocks.
 
 use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
 use std::hint::black_box;
@@ -31,7 +31,35 @@ fn cache() -> (tempfile::TempDir, MultiLayerCache, Vec<CacheKey>) {
     (directory, cache, keys)
 }
 
-fn single_read_qps(readers: usize) -> f64 {
+fn owned_read_qps(readers: usize) -> f64 {
+    let (_directory, cache, keys) = cache();
+    let barrier = Arc::new(Barrier::new(readers + 1));
+    let started = std::thread::scope(|scope| {
+        let workers = (0..readers)
+            .map(|reader| {
+                let barrier = Arc::clone(&barrier);
+                let cache = &cache;
+                let keys = &keys;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for read in 0..READS_PER_THREAD {
+                        let index = (read.wrapping_mul(17) + reader) % keys.len();
+                        black_box(cache.get(&keys[index]).unwrap().unwrap());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let started = Instant::now();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        started
+    });
+    (readers * READS_PER_THREAD) as f64 / started.elapsed().as_secs_f64()
+}
+
+fn shared_read_qps(readers: usize) -> f64 {
     let (_directory, cache, keys) = cache();
     let barrier = Arc::new(Barrier::new(readers + 1));
     let started = std::thread::scope(|scope| {
@@ -94,11 +122,12 @@ fn batch_read_qps(readers: usize) -> f64 {
 }
 
 fn main() {
-    println!("readers,single_read_qps,batch_item_qps");
+    println!("readers,owned_read_qps,shared_read_qps,batch_item_qps");
     for readers in [1, 2, 4, 8] {
         println!(
-            "{readers},{:.0},{:.0}",
-            single_read_qps(readers),
+            "{readers},{:.0},{:.0},{:.0}",
+            owned_read_qps(readers),
+            shared_read_qps(readers),
             batch_read_qps(readers)
         );
     }

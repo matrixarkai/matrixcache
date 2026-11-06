@@ -306,3 +306,55 @@ fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
         .iter()
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));
 }
+
+// rust-internal: warm SSD-only owned reads need no exclusive cache ownership.
+#[test]
+fn ssd_only_owned_reads_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 128,
+            pmem_capacity_bytes: 128,
+            ssd_capacity_bytes: 4096,
+            ..CacheTieringPolicy::default()
+        },
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 1,
+        },
+    );
+    cache.set_ssd_instance_only(true);
+    let key = CacheKey::string(0, "ssd-only-owned");
+    cache.put(key.clone(), vec![7; 64]).unwrap();
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+
+    // Establish metadata and access-order state before another reader keeps
+    // the cache shared. The next read should need only atomic accounting.
+    assert_eq!(cache.get(&key).unwrap(), Some(vec![7; 64]));
+    let before = cache.stats();
+    let result = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let key = &key;
+        let worker = scope.spawn(move || {
+            sender.send(cache.get_with_tier(key).unwrap()).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        result
+    })
+    .expect("SSD-only owned read requested the write lock")
+    .expect("SSD value missing");
+
+    assert_eq!(result.value, vec![7; 64]);
+    assert_eq!(result.tier, CacheReadTier::Ssd);
+    let after = cache.stats();
+    assert_eq!(after.memory_fills, before.memory_fills);
+    assert_eq!(after.pmem_fills, before.pmem_fills);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 1);
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+}
