@@ -3779,7 +3779,7 @@ impl MultiLayerCache {
         // against -- and a key copy allocates for each of its two `Cow` fields
         // that is computed rather than a literal.
         let mut needs_exclusive = Vec::<(usize, HitOutcome, usize)>::new();
-        let mut pmem_refills = Vec::<(usize, Arc<[u8]>, Instant)>::new();
+        let mut pmem_refills = Vec::<(usize, Arc<[u8]>, HitOutcome, Instant)>::new();
         let mut ssd_candidates = Vec::<(usize, Instant)>::new();
         let mut expired_keys = Vec::<(usize, Instant)>::new();
         {
@@ -3821,8 +3821,15 @@ impl MultiLayerCache {
                         unique_values[unique_position] = Some(value);
                         continue;
                     }
-                    if let Some(value) = inner.pmem_value(key).cloned() {
-                        pmem_refills.push((unique_position, value, started));
+                    if let Some(resident) = inner.pmem.get(key) {
+                        let value = Arc::clone(&resident.value);
+                        let outcome = inner.record_known_hit_shared_occurrences_at(
+                            key,
+                            resident.meta.as_ref(),
+                            1,
+                            hit_epoch,
+                        );
+                        pmem_refills.push((unique_position, value, outcome, started));
                         continue;
                     }
                 }
@@ -3862,10 +3869,10 @@ impl MultiLayerCache {
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
             }
-            for (unique_position, value, started) in pmem_refills {
+            for (unique_position, value, outcome, started) in pmem_refills {
                 let key = unique_keys[unique_position];
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                inner.promote_pmem_probe_if_current(key, &value);
+                inner.promote_accounted_pmem_probe_if_current(key, &value, outcome);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 inner.record_refill_latency(started);

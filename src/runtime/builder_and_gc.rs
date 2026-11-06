@@ -2506,6 +2506,31 @@ impl CacheInner {
     }
 
     fn promote_pmem_probe_if_current(&mut self, key: &CacheKey, value: &Arc<[u8]>) {
+        self.promote_pmem_probe_with_outcome_if_current(key, value, None);
+    }
+
+    /// Promote a PMEM probe whose hit accounting was already completed while
+    /// the resident bucket was borrowed under the shared cache lock.
+    ///
+    /// Carrying the outcome through avoids looking the same PMEM metadata up
+    /// again after upgrading to the exclusive lock. The current value is
+    /// still revalidated here, so a concurrent overwrite or invalidation can
+    /// never be resurrected by the captured probe.
+    fn promote_accounted_pmem_probe_if_current(
+        &mut self,
+        key: &CacheKey,
+        value: &Arc<[u8]>,
+        outcome: HitOutcome,
+    ) {
+        self.promote_pmem_probe_with_outcome_if_current(key, value, Some(outcome));
+    }
+
+    fn promote_pmem_probe_with_outcome_if_current(
+        &mut self,
+        key: &CacheKey,
+        value: &Arc<[u8]>,
+        accounted: Option<HitOutcome>,
+    ) {
         // A read can return its captured value, but must not restore it after
         // another operation replaced, invalidated, or expired the entry.
         if !self.started
@@ -2518,7 +2543,11 @@ impl CacheInner {
         {
             return;
         }
-        self.record_hit(key, value.len());
+        match accounted {
+            Some(HitOutcome::Accounted) => {}
+            Some(HitOutcome::NeedsAccessOrderRefresh) => self.refresh_access_order(key),
+            Some(HitOutcome::NeedsMetadata) | None => self.record_hit(key, value.len()),
+        }
         if !self.put_memory_shared(key, Arc::clone(value)) {
             self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
         }
