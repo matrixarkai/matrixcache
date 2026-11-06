@@ -466,3 +466,119 @@ fn ssd_only_pinned_reads_stay_on_the_shared_lock_path() {
     assert_eq!(after.pinned_entries, 0);
     assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
 }
+
+// rust-internal: warm SSD-only pinned batches use striped pin ownership only.
+#[test]
+fn ssd_only_pinned_batches_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 128,
+            pmem_capacity_bytes: 128,
+            ssd_capacity_bytes: 8192,
+            ..CacheTieringPolicy::default()
+        },
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 1,
+        },
+    );
+    cache.set_ssd_instance_only(true);
+    let keys = (0..8)
+        .map(|index| CacheKey::string(0, &format!("ssd-only-pinned-batch-{index}")))
+        .collect::<Vec<_>>();
+    for (index, key) in keys.iter().enumerate() {
+        cache.put(key.clone(), vec![index as u8; 64]).unwrap();
+    }
+
+    let warm = cache.acquire_batch(&keys).unwrap();
+    cache.release_batch(warm.into_iter().flatten().collect());
+    let before = cache.stats();
+    let handles = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let keys = &keys;
+        let worker = scope.spawn(move || {
+            sender.send(cache.acquire_batch(keys).unwrap()).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        result
+    })
+    .expect("SSD-only pinned batch requested the write lock");
+
+    assert!(handles.iter().all(Option::is_some));
+    assert!(handles
+        .iter()
+        .flatten()
+        .all(|handle| handle.tier() == CacheReadTier::Ssd));
+    assert_eq!(
+        cache.release_batch(handles.into_iter().flatten().collect()),
+        8
+    );
+    let after = cache.stats();
+    assert_eq!(after.memory_fills, before.memory_fills);
+    assert_eq!(after.pmem_fills, before.pmem_fills);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 8);
+    assert_eq!(after.pinned_entries, 0);
+    assert!(keys
+        .iter()
+        .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));
+}
+
+// rust-internal: SSD-only pinned batches preserve duplicate, miss, and expiry accounting.
+#[test]
+fn ssd_only_pinned_batches_preserve_mixed_results_and_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(0, 0, 8192)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_instance_only(true),
+    );
+    let repeated = CacheKey::string(0, "ssd-only-batch-repeated");
+    let expired = CacheKey::string(0, "ssd-only-batch-expired");
+    let missing = CacheKey::string(0, "ssd-only-batch-missing");
+    cache.put(repeated.clone(), b"repeat".to_vec()).unwrap();
+    cache
+        .put_with_ttl(
+            expired.clone(),
+            b"old".to_vec(),
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+
+    let before = cache.stats();
+    let handles = cache
+        .acquire_batch(&[repeated.clone(), missing, repeated.clone(), expired.clone()])
+        .unwrap();
+    assert_eq!(handles[0].as_ref().unwrap().value(), b"repeat");
+    assert!(handles[1].is_none());
+    assert_eq!(handles[2].as_ref().unwrap().value(), b"repeat");
+    assert!(handles[3].is_none());
+
+    let after = cache.stats();
+    assert_eq!(after.disk_hits - before.disk_hits, 2);
+    assert_eq!(after.misses - before.misses, 2);
+    assert_eq!(
+        after.zero_copy_handle_misses - before.zero_copy_handle_misses,
+        1
+    );
+    assert_eq!(after.pin_operations - before.pin_operations, 2);
+    assert_eq!(
+        after.zero_copy_handle_hits - before.zero_copy_handle_hits,
+        1
+    );
+    assert_eq!(after.expired_reads - before.expired_reads, 1);
+    assert_eq!(after.pinned_entries, 1);
+    assert_eq!(
+        cache.release_batch(handles.into_iter().flatten().collect()),
+        2
+    );
+    assert_eq!(cache.stats().pinned_entries, 0);
+    assert_eq!(cache.peek_tier(&expired), None);
+}
