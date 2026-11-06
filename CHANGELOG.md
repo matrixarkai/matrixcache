@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Shared resident reads update latency and batch-hit counters after releasing
+  the cache lock, and unique resident batches now count every returned hit.
+
 - Memory-resident copied reads complete latency accounting through shared
   counters, avoiding a second cache lock and redundant resident-key probe.
 

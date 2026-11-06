@@ -13901,13 +13901,33 @@ mod tests {
         assert_eq!(values.capacity(), original_capacity);
         assert_eq!(values[0].as_deref(), Some(&b"other"[..]));
 
+        let before_unique = cache.stats();
         cache
             .get_shared_batch_into(&[repeated.clone(), other.clone()], &mut values)
             .unwrap();
+        let after_unique = cache.stats();
         assert_eq!(values.len(), 2);
         assert_eq!(values.capacity(), original_capacity);
         assert_eq!(values[0].as_deref(), Some(&b"repeated"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"other"[..]));
+        assert_eq!(
+            after_unique
+                .shared_buffer_hits
+                .saturating_sub(before_unique.shared_buffer_hits),
+            2
+        );
+        assert_eq!(
+            after_unique
+                .get_latency_samples
+                .saturating_sub(before_unique.get_latency_samples),
+            2
+        );
+        assert_eq!(
+            after_unique
+                .read_through_latency_samples
+                .saturating_sub(before_unique.read_through_latency_samples),
+            2
+        );
     }
 
     #[test]
