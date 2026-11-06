@@ -116,6 +116,25 @@ fn main() {
     rows.push(measure("get_batch, copying", BATCH, || {
         let _ = cache.get_batch(&batch).expect("get_batch");
     }));
+    // Half resident and half absent. This bypasses the all-memory fast path
+    // and exercises the mixed owned-value expansion without changing cache
+    // state between samples.
+    let mixed_batch = (0..BATCH)
+        .map(|index| {
+            if index % 2 == 0 {
+                key(index)
+            } else {
+                key(RESIDENT + index)
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.push(measure("get_batch, mixed hits and misses", BATCH, || {
+        let values = cache.get_batch(&mixed_batch).expect("get_batch");
+        assert_eq!(
+            values.iter().filter(|value| value.is_some()).count(),
+            BATCH / 2
+        );
+    }));
     rows.push(measure("get_shared_batch", BATCH, || {
         let _ = cache.get_shared_batch(&batch).expect("get_shared_batch");
     }));
@@ -493,6 +512,7 @@ fn main() {
     // separately below), so there is nothing to tolerate but a change.
     //
     //   pinned batch of 8        15 -> 7 allocations
+    //   mixed owned batch of 8   42 -> 38 allocations, 12,632 -> 8,536 bytes
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
     //   a promoting read         13.00 -> 12.00 allocations, 25,334.0 -> 24,310.0 bytes
@@ -502,6 +522,7 @@ fn main() {
     for (path, max_allocations, max_bytes) in [
         ("get, copying", 1.5, 1_100.0),
         ("get_batch, copying", 11.5, 9_400.0),
+        ("get_batch, mixed hits and misses", 38.5, 9_000.0),
         ("get_shared_batch", 2.5, 500.0),
         ("acquire_batch_no_promotion", 7.5, 3_000.0),
         ("acquire_batch", 7.5, 3_100.0),

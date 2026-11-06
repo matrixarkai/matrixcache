@@ -129,7 +129,10 @@ fn own_unique_positioned_batch_keys(
 
 #[cfg(test)]
 mod batch_value_expansion_tests {
-    use super::{own_unique_positioned_batch_keys, visit_batch_values, CacheKey};
+    use super::{
+        fill_owned_batch_positions, own_unique_positioned_batch_keys, visit_batch_values,
+        BatchPositions, CacheKey,
+    };
 
     #[test]
     fn unique_values_move_and_duplicates_copy_only_extra_outputs() {
@@ -166,6 +169,30 @@ mod batch_value_expansion_tests {
 
         assert_eq!(unique, vec![first, second]);
         assert_eq!(positions, vec![(7, 0), (2, 1), (4, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn owned_batch_positions_fill_exactly_the_requested_outputs() {
+        let source = vec![9u8; 4_096];
+        let mut results = super::empty_batch_results(4);
+        fill_owned_batch_positions(
+            &mut results,
+            BatchPositions::Many(vec![3, 1, 2]),
+            &source,
+        );
+
+        assert!(results[0].is_none());
+        assert_eq!(results[1].as_deref(), Some(source.as_slice()));
+        assert_eq!(results[2].as_deref(), Some(source.as_slice()));
+        assert_eq!(results[3].as_deref(), Some(source.as_slice()));
+        assert_ne!(
+            results[1].as_ref().unwrap().as_ptr(),
+            results[2].as_ref().unwrap().as_ptr()
+        );
+        assert_ne!(
+            results[2].as_ref().unwrap().as_ptr(),
+            results[3].as_ref().unwrap().as_ptr()
+        );
     }
 }
 
@@ -321,6 +348,29 @@ impl IntoIterator for BatchPositions {
         match self {
             Self::One(position) => BatchPositionsIter::One(Some(position)),
             Self::Many(positions) => BatchPositionsIter::Many(positions.into_iter()),
+        }
+    }
+}
+
+/// Copy one shared value into every owned result position without creating a
+/// throwaway buffer. The final position takes the first allocation; only
+/// additional duplicate positions require a clone.
+fn fill_owned_batch_positions(
+    results: &mut [Option<Vec<u8>>],
+    positions: BatchPositions,
+    value: &[u8],
+) {
+    match positions {
+        BatchPositions::One(position) => results[position] = Some(value.to_vec()),
+        BatchPositions::Many(mut positions) => {
+            let final_position = positions
+                .pop()
+                .expect("a multi-position batch has at least two positions");
+            let value = value.to_vec();
+            for position in positions {
+                results[position] = Some(value.clone());
+            }
+            results[final_position] = Some(value);
         }
     }
 }
@@ -4736,10 +4786,7 @@ impl MultiLayerCache {
         // The copy that turns the shared buffer into the returned `Vec` is the
         // expensive part of a hit, and it is done here with no lock held.
         for (positions, value) in memory_hits {
-            let decoded = value.to_vec();
-            for position in positions {
-                results[position] = Some(decoded.clone());
-            }
+            fill_owned_batch_positions(&mut results, positions, value.as_ref());
         }
 
         // One exclusive acquisition for the whole batch's leftovers, rather
@@ -4819,10 +4866,7 @@ impl MultiLayerCache {
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
-                        let decoded = value.to_vec();
-                        for index in positions {
-                            results[index] = Some(decoded.clone());
-                        }
+                        fill_owned_batch_positions(&mut results, positions, value.as_ref());
                         continue;
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
@@ -4832,7 +4876,6 @@ impl MultiLayerCache {
                             .pmem_hits
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner.record_hit_metadata(key, value.len());
-                        let decoded = value.to_vec();
                         if !inner.put_memory_shared(key, Arc::clone(&value)) {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
@@ -4841,9 +4884,7 @@ impl MultiLayerCache {
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
-                        for index in positions {
-                            results[index] = Some(decoded.clone());
-                        }
+                        fill_owned_batch_positions(&mut results, positions, value.as_ref());
                         needs_eviction_drain = true;
                         continue;
                     }
