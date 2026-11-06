@@ -5,6 +5,35 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn expiry_victim_scan_preserves_pins_and_disabled_ttl() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1024, 0, 0));
+        let pinned = CacheKey::string(0, "expired-pinned");
+        let live = CacheKey::string(0, "live");
+        let expired = CacheKey::string(0, "expired");
+        for key in [&pinned, &live, &expired] {
+            cache.put(key.clone(), vec![1; 64]).unwrap();
+        }
+        let mut inner = cache.inner.write().unwrap();
+        inner.set_entry_expiry(&pinned, 1, 1);
+        inner.set_entry_expiry(&expired, 1, 1);
+        inner.increment_pin(&pinned);
+        inner.ttl_in_use = false;
+        let selected = inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false);
+        let (key, reason, _) = selected.victim.unwrap();
+        assert_ne!(key, pinned);
+        assert_ne!(reason, EvictionReason::Expired);
+        inner.ttl_in_use = true;
+        let selected = inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false);
+        assert_eq!(selected.victim.unwrap().0, expired);
+        inner.increment_pin(&expired);
+        let selected = inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false);
+        assert_eq!(selected.victim.unwrap().0, live);
+        inner.increment_pin(&live);
+        assert!(inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false).victim.is_none());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn sorted_eviction_groups_match_hash_group_selection() {
         let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
         let mut keys = Vec::new();
