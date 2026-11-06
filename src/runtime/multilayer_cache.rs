@@ -1740,6 +1740,7 @@ struct ReadPathCounters {
     pmem_hits: AtomicU64,
     disk_hits: AtomicU64,
     misses: AtomicU64,
+    zero_copy_handle_misses: AtomicU64,
     shared_buffer_hits: AtomicU64,
     shared_buffer_misses: AtomicU64,
     hotness_promotions: AtomicU64,
@@ -1756,6 +1757,7 @@ impl ReadPathCounters {
         self.pmem_hits.store(0, Ordering::Relaxed);
         self.disk_hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+        self.zero_copy_handle_misses.store(0, Ordering::Relaxed);
         self.shared_buffer_hits.store(0, Ordering::Relaxed);
         self.shared_buffer_misses.store(0, Ordering::Relaxed);
         self.hotness_promotions.store(0, Ordering::Relaxed);
@@ -5185,7 +5187,16 @@ impl MultiLayerCache {
                         inner.record_refill_latency(started);
                         Some(Some((decoded, outcome)))
                     }
-                    None => Some(None),
+                    None => {
+                        inner
+                            .read_counters
+                            .zero_copy_handle_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                        inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                        inner.record_get_latency(started);
+                        inner.record_read_through_latency(started);
+                        Some(None)
+                    }
                 }
             } else {
                 None
@@ -5212,12 +5223,6 @@ impl MultiLayerCache {
                     }));
                 }
                 None => {
-                    let mut inner = self.inner.write().expect("cache lock poisoned");
-                    inner.stats.zero_copy_handle_misses =
-                        inner.stats.zero_copy_handle_misses.saturating_add(1);
-                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                    inner.record_get_latency(started);
-                    inner.record_read_through_latency(started);
                     return Ok(None);
                 }
             }
@@ -5279,9 +5284,11 @@ impl MultiLayerCache {
                 }))
             }
             None => {
-                let mut inner = self.inner.write().expect("cache lock poisoned");
-                inner.stats.zero_copy_handle_misses =
-                    inner.stats.zero_copy_handle_misses.saturating_add(1);
+                let inner = self.inner.read().expect("cache lock poisoned");
+                inner
+                    .read_counters
+                    .zero_copy_handle_misses
+                    .fetch_add(1, Ordering::Relaxed);
                 inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
@@ -5560,7 +5567,6 @@ impl MultiLayerCache {
         let mut results = empty_batch_results(keys.len());
         let mut expired = Vec::<(&CacheKey, usize, Instant)>::new();
         let mut exclusive_work = Vec::<(&CacheKey, HitOutcome, usize)>::new();
-        let mut missing_handles = 0u64;
 
         {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -5634,10 +5640,13 @@ impl MultiLayerCache {
                         pin_counts.push((key, value.len(), occurrences, 1));
                     }
                     None => {
-                        missing_handles = missing_handles.saturating_add(occurrences as u64);
                         inner
                             .read_counters
                             .misses
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .zero_copy_handle_misses
                             .fetch_add(occurrences as u64, Ordering::Relaxed);
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
@@ -5648,8 +5657,7 @@ impl MultiLayerCache {
             inner.increment_pin_handle_counts(&pin_counts);
         }
 
-        let needs_exclusive =
-            !expired.is_empty() || missing_handles != 0 || !exclusive_work.is_empty();
+        let needs_exclusive = !expired.is_empty() || !exclusive_work.is_empty();
         let mut removed_expired = false;
         if needs_exclusive {
             let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -5668,10 +5676,6 @@ impl MultiLayerCache {
                 inner.record_read_through_latency_micros_many(micros, occurrences);
                 removed_expired = true;
             }
-            inner.stats.zero_copy_handle_misses = inner
-                .stats
-                .zero_copy_handle_misses
-                .saturating_add(missing_handles);
             for (key, outcome, len) in exclusive_work {
                 match outcome {
                     HitOutcome::Accounted => {}
@@ -5914,10 +5918,10 @@ impl MultiLayerCache {
                     }
                     None => {
                         let occurrences = positions.len();
-                        inner.stats.zero_copy_handle_misses = inner
-                            .stats
+                        inner
+                            .read_counters
                             .zero_copy_handle_misses
-                            .saturating_add(occurrences as u64);
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
                         inner
                             .read_counters
                             .misses
@@ -11934,6 +11938,15 @@ impl MultiLayerCache {
             pin_operations,
             unpin_operations,
             zero_copy_handle_hits,
+            zero_copy_handle_misses: inner
+                .stats
+                .zero_copy_handle_misses
+                .saturating_add(
+                    inner
+                        .read_counters
+                        .zero_copy_handle_misses
+                        .load(Ordering::Relaxed),
+                ),
             shared_buffer_hits: inner
                 .read_counters
                 .shared_buffer_hits

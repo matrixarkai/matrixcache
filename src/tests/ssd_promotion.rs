@@ -582,3 +582,71 @@ fn ssd_only_pinned_batches_preserve_mixed_results_and_counters() {
     assert_eq!(cache.stats().pinned_entries, 0);
     assert_eq!(cache.peek_tier(&expired), None);
 }
+
+// rust-internal: SSD-only pinned misses update atomic read counters under a shared lock.
+#[test]
+fn ssd_only_pinned_misses_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(0, 0, 8192)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_instance_only(true),
+    );
+    let key = CacheKey::string(0, "ssd-only-pinned-miss");
+    let before = cache.stats();
+    let result = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let key = &key;
+        let worker = scope.spawn(move || sender.send(cache.acquire(key).unwrap()).unwrap());
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        result
+    })
+    .expect("SSD-only pinned miss requested the write lock");
+
+    assert!(result.is_none());
+    let after = cache.stats();
+    assert_eq!(after.misses - before.misses, 1);
+    assert_eq!(
+        after.zero_copy_handle_misses - before.zero_copy_handle_misses,
+        1
+    );
+}
+
+// rust-internal: SSD-only pinned batch misses do not serialize on the cache lock.
+#[test]
+fn ssd_only_pinned_batch_misses_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(0, 0, 8192)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_instance_only(true),
+    );
+    let keys = (0..8)
+        .map(|index| CacheKey::string(0, &format!("ssd-only-pinned-miss-{index}")))
+        .collect::<Vec<_>>();
+    let before = cache.stats();
+    let results = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let keys = &keys;
+        let worker = scope.spawn(move || sender.send(cache.acquire_batch(keys).unwrap()).unwrap());
+        let results = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        results
+    })
+    .expect("SSD-only pinned batch miss requested the write lock");
+
+    assert!(results.iter().all(Option::is_none));
+    let after = cache.stats();
+    assert_eq!(after.misses - before.misses, 8);
+    assert_eq!(
+        after.zero_copy_handle_misses - before.zero_copy_handle_misses,
+        8
+    );
+}
