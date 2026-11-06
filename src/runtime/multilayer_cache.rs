@@ -6923,6 +6923,11 @@ fn finish_sharded_fanout_batch<T, E>(
 
 impl ShardedMultiLayerCache {
     const BATCH_FANOUT_THRESHOLD: usize = 256;
+    // Spawning one short-lived worker per active shard costs more than the
+    // resident read itself for medium batches. Keep those reads inline while
+    // preserving parallel fanout for larger batches and the lower write
+    // crossover.
+    const READ_BATCH_FANOUT_THRESHOLD: usize = 2_048;
 
     /// Build a sharded cache, refusing a configuration it cannot honour.
     ///
@@ -7955,7 +7960,7 @@ impl ShardedMultiLayerCache {
             self.sharded_stats.record_latency(started);
             return result;
         }
-        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+        if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let mut grouped = vec![Vec::new(); self.shard_count()];
             for (position, key) in keys.iter().cloned().enumerate() {
@@ -8275,7 +8280,7 @@ impl ShardedMultiLayerCache {
             self.sharded_stats.record_latency(started);
             return result;
         }
-        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+        if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let result = self.acquire_batch_no_promotion_locally(keys);
             self.sharded_stats.record_latency(started);
@@ -8367,7 +8372,7 @@ impl ShardedMultiLayerCache {
             self.sharded_stats.record_latency(started);
             return result;
         }
-        if keys.len() < Self::BATCH_FANOUT_THRESHOLD {
+        if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
             let result = self.acquire_batch_locally(keys);
             self.sharded_stats.record_latency(started);
