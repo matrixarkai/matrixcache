@@ -3587,16 +3587,33 @@ impl MultiLayerCache {
             if inner.ssd_instance_only || expired {
                 None
             } else {
-                inner
-                    .resident_value(key)
-                    .cloned()
-                    .map(|value| (value, CacheReadTier::Memory))
-                    .or_else(|| {
-                        inner
-                            .pmem_value(key)
-                            .cloned()
-                            .map(|value| (value, CacheReadTier::Pmem))
-                    })
+                if let Some(resident) = inner.memory.get(key) {
+                    let value = Arc::clone(&resident.value);
+                    inner
+                        .read_counters
+                        .memory_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .read_counters
+                        .shared_buffer_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    inner.reconfigure_refresh_window(now_millis);
+                    let outcome = inner.record_known_hit_shared_occurrences_at(
+                        key,
+                        resident.meta.as_ref(),
+                        1,
+                        now_millis,
+                    );
+                    let micros = elapsed_micros(started);
+                    inner.record_get_latency_micros(micros);
+                    inner.record_read_through_latency_micros(micros);
+                    Some((value, CacheReadTier::Memory, Some(outcome)))
+                } else {
+                    inner
+                        .pmem_value(key)
+                        .cloned()
+                        .map(|value| (value, CacheReadTier::Pmem, None))
+                }
             }
         };
 
@@ -3618,30 +3635,12 @@ impl MultiLayerCache {
             return Ok(None);
         }
 
-        if let Some((value, tier)) = probe {
+        if let Some((value, tier, memory_outcome)) = probe {
             let length = value.len();
             match tier {
                 CacheReadTier::Memory => {
-                    let outcome = {
-                        let inner = self.inner.read().expect("cache lock poisoned");
-                        inner
-                            .read_counters
-                            .memory_hits
-                            .fetch_add(1, Ordering::Relaxed);
-                        inner
-                            .read_counters
-                            .shared_buffer_hits
-                            .fetch_add(1, Ordering::Relaxed);
-                        let outcome = if inner.memory.contains_key(key) {
-                            inner.record_hit_shared(key)
-                        } else {
-                            HitOutcome::Accounted
-                        };
-                        let micros = elapsed_micros(started);
-                        inner.record_get_latency_micros(micros);
-                        inner.record_read_through_latency_micros(micros);
-                        outcome
-                    };
+                    let outcome = memory_outcome
+                        .expect("the memory probe always records its hit outcome");
                     match outcome {
                         HitOutcome::Accounted => {}
                         HitOutcome::NeedsAccessOrderRefresh => {
@@ -3788,6 +3787,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
+            let hit_epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(hit_epoch);
             for (unique_position, key) in unique_keys.iter().enumerate() {
                 // The unique keys are borrowed from the caller's slice now, so
                 // iterating them yields a double reference. Rebound once here
@@ -3799,16 +3800,18 @@ impl MultiLayerCache {
                     continue;
                 }
                 if !inner.ssd_instance_only {
-                    if let Some(value) = inner.resident_value(key).cloned() {
+                    if let Some(resident) = inner.memory.get(key) {
+                        let value = Arc::clone(&resident.value);
                         inner
                             .read_counters
                             .memory_hits
                             .fetch_add(1, Ordering::Relaxed);
-                        let outcome = if inner.memory.contains_key(key) {
-                            inner.record_hit_shared(key)
-                        } else {
-                            HitOutcome::Accounted
-                        };
+                        let outcome = inner.record_known_hit_shared_occurrences_at(
+                            key,
+                            resident.meta.as_ref(),
+                            1,
+                            hit_epoch,
+                        );
                         if !matches!(outcome, HitOutcome::Accounted) {
                             needs_exclusive.push((unique_position, outcome, value.len()));
                         }
