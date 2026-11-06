@@ -3664,9 +3664,6 @@ impl MultiLayerCache {
                         1,
                         now_millis,
                     );
-                    let micros = elapsed_micros(started);
-                    inner.record_get_latency_micros(micros);
-                    inner.record_read_through_latency_micros(micros);
                     Some((value, CacheReadTier::Memory, Some(outcome)))
                 } else if let Some(resident) = inner.pmem.get(key) {
                     let value = Arc::clone(&resident.value);
@@ -3685,9 +3682,6 @@ impl MultiLayerCache {
                             1,
                             now_millis,
                         );
-                        let micros = elapsed_micros(started);
-                        inner.record_get_latency_micros(micros);
-                        inner.record_read_through_latency_micros(micros);
                         Some((value, CacheReadTier::Pmem, Some(outcome)))
                     }
                 } else {
@@ -3715,6 +3709,18 @@ impl MultiLayerCache {
         }
 
         if let Some((value, tier, hit_outcome)) = probe {
+            // Resident reads that do not promote need only atomic accounting
+            // after the probe. Keep it outside the cache lock so writers are
+            // not delayed by histogram updates.
+            if hit_outcome.is_some() {
+                let micros = elapsed_micros(started);
+                self.read_counters
+                    .get_latency
+                    .observe_with_total(micros);
+                self.read_counters
+                    .read_through_latency
+                    .observe_with_total(micros);
+            }
             let length = value.len();
             match tier {
                 CacheReadTier::Memory => {
@@ -4207,13 +4213,10 @@ impl MultiLayerCache {
             results[position] = value;
         }
         if shared_hits != 0 || shared_misses != 0 {
-            let inner = self.inner.read().expect("cache lock poisoned");
-            inner
-                .read_counters
+            self.read_counters
                 .shared_buffer_hits
                 .fetch_add(shared_hits, Ordering::Relaxed);
-            inner
-                .read_counters
+            self.read_counters
                 .shared_buffer_misses
                 .fetch_add(shared_misses, Ordering::Relaxed);
         }
@@ -4466,16 +4469,26 @@ impl MultiLayerCache {
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (key, value, started) in &memory_hits {
+            for (key, value, _) in &memory_hits {
                 inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
                 let outcome = inner.record_hit_shared_at(key, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
                     needs_exclusive.push(((*key).clone(), outcome, value.len()));
                 }
-                let micros = elapsed_micros(*started);
-                inner.record_get_latency_micros(micros);
-                inner.record_read_through_latency_micros(micros);
             }
+        }
+
+        self.read_counters
+            .shared_buffer_hits
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        for (_, _, started) in &memory_hits {
+            let micros = elapsed_micros(*started);
+            self.read_counters
+                .get_latency
+                .observe_with_total(micros);
+            self.read_counters
+                .read_through_latency
+                .observe_with_total(micros);
         }
 
         if !needs_exclusive.is_empty() {
