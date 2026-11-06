@@ -3323,6 +3323,7 @@ impl CacheInner {
                 pins.zero_copy_handle_hits = 0;
             }
         }
+        self.pin_handles.store(0, Ordering::Release);
         self.clear_metadata();
         self.expiries.clear();
         self.async_writeback_queue.clear();
@@ -3385,7 +3386,45 @@ impl CacheInner {
     }
 
     fn is_pinned(&self, key: &CacheKey) -> bool {
+        if self.pin_handles.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.pins_for(key).entries.contains_key(key)
+    }
+
+    fn add_pin_handles(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let _ = self.pin_handles.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(count)),
+        );
+    }
+
+    fn remove_pin_handles(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let _ = self.pin_handles.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(count)),
+        );
+    }
+
+    fn remove_pin_entry(&self, key: &CacheKey) {
+        let removed_handles = {
+            let mut pins = self.pins_for(key);
+            let removed = pins
+                .entries
+                .remove(key)
+                .map_or(0, |entry| entry.handles);
+            Self::shrink_pin_stripe_if_sparse(&mut pins);
+            removed
+        };
+        self.remove_pin_handles(removed_handles);
     }
 
     fn increment_pin(&self, key: &CacheKey) {
@@ -3421,6 +3460,12 @@ impl CacheInner {
         if updates.is_empty() {
             return;
         }
+        self.add_pin_handles(
+            updates
+                .iter()
+                .map(|(_, index)| counts[*index].2 as u64)
+                .fold(0, u64::saturating_add),
+        );
         updates.sort_unstable_by_key(|(stripe, _)| *stripe);
         let mut cursor = 0;
         while cursor < updates.len() {
@@ -3453,6 +3498,12 @@ impl CacheInner {
         if updates.is_empty() {
             return;
         }
+        self.add_pin_handles(
+            updates
+                .iter()
+                .map(|(_, index)| counts[*index].2 as u64)
+                .fold(0, u64::saturating_add),
+        );
         updates.sort_unstable_by_key(|(stripe, _)| *stripe);
         let mut cursor = 0;
         while cursor < updates.len() {
@@ -3478,6 +3529,7 @@ impl CacheInner {
     /// describe the same event, so there is no reason to take the lock twice
     /// for it.
     fn increment_pin_for_handle(&self, key: &CacheKey, bytes: usize) {
+        self.add_pin_handles(1);
         let mut pins = self.pins_for(key);
         // One lookup for the whole handle: the count and its size are the same
         // entry, so they cannot be found separately or updated apart.
@@ -3492,6 +3544,7 @@ impl CacheInner {
     /// point: a reader taking a handle no longer serialises against every
     /// other reader.
     fn increment_pin_with_optional_size(&self, key: &CacheKey, bytes: Option<usize>) {
+        self.add_pin_handles(1);
         // One guard for the count and the size together: they describe the
         // same handle and must not be seen apart.
         let mut pins = self.pins_for(key);
@@ -3533,6 +3586,7 @@ impl CacheInner {
             return;
         };
         let count = count as u64;
+        let removed = entry.handles.min(count);
         if entry.handles > count {
             entry.handles -= count;
         } else {
@@ -3542,6 +3596,8 @@ impl CacheInner {
             Self::shrink_pin_stripe_if_sparse(&mut pins);
         }
         pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+        drop(pins);
+        self.remove_pin_handles(removed);
     }
 
     fn decrement_pin_counts(&self, counts: &[(CacheKey, usize)]) {
@@ -3560,6 +3616,7 @@ impl CacheInner {
             return;
         }
         updates.sort_unstable_by_key(|(stripe, _)| *stripe);
+        let mut removed_handles = 0u64;
         let mut cursor = 0;
         while cursor < updates.len() {
             let stripe = updates[cursor].0;
@@ -3572,6 +3629,7 @@ impl CacheInner {
                     continue;
                 };
                 let count = *count as u64;
+                removed_handles = removed_handles.saturating_add(entry.handles.min(count));
                 if entry.handles > count {
                     entry.handles -= count;
                 } else {
@@ -3582,6 +3640,7 @@ impl CacheInner {
                 cursor += 1;
             }
         }
+        self.remove_pin_handles(removed_handles);
     }
 
     fn pinned_removed_bytes_total(&self) -> usize {

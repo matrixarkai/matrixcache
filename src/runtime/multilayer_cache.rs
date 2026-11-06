@@ -1333,6 +1333,12 @@ struct CacheInner {
     /// through a borrow of the cache, so nothing can take it the other way
     /// round.
     pins: Vec<Mutex<CachePinState>>,
+    /// Total live handles across every pin stripe.
+    ///
+    /// Eviction usually runs with no handles in the process. Keeping that
+    /// common fact separately avoids a mutex acquisition and hash probe for
+    /// every candidate while the striped maps remain the exact authority.
+    pin_handles: AtomicU64,
     memory_order: CacheKeyOrder,
     pmem_order: CacheKeyOrder,
     async_writeback_queue: VecDeque<CacheWritebackJob>,
@@ -2333,6 +2339,7 @@ impl MultiLayerCache {
                 pins: (0..PIN_STRIPES)
                     .map(|_| Mutex::new(CachePinState::default()))
                     .collect(),
+                pin_handles: AtomicU64::new(0),
                 cold_eviction_share_pct: COLD_EVICTION_SHARE_PCT_DEFAULT,
                 memory_order: CacheKeyOrder::new(),
                 pmem_order: CacheKeyOrder::new(),
@@ -9818,7 +9825,7 @@ impl CacheInner {
         //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
-        //   `pinned_removals_seen`, `manifest_appends`,
+        //   `pinned_removals_seen`, `pin_handles`, `manifest_appends`,
         //   `pmem_manifest_appends`, `pmem_manifest_compact_after`, `ssd_probe_epoch`,
         //   `ssd_probe_global_epoch`, `ssd_probe_mutations`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
@@ -10802,9 +10809,18 @@ impl MultiLayerCache {
         let _ = inner.delete_ssd_blocks(&disk_keys);
         inner.disk_order.retain(|key| key.shard_id != shard_id);
         inner.metadata.retain(|key, _| key.shard_id != shard_id);
+        let mut removed_pin_handles = 0u64;
         for mut pins in inner.all_pins() {
-            pins.entries.retain(|key, _| key.shard_id != shard_id);
+            pins.entries.retain(|key, entry| {
+                if key.shard_id == shard_id {
+                    removed_pin_handles = removed_pin_handles.saturating_add(entry.handles);
+                    false
+                } else {
+                    true
+                }
+            });
         }
+        inner.remove_pin_handles(removed_pin_handles);
         inner.stats.invalidations = inner
             .stats
             .invalidations
@@ -10852,9 +10868,7 @@ impl MultiLayerCache {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
-            {
-                inner.pins_for(key).entries.remove(key);
-            }
+            inner.remove_pin_entry(key);
             inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
@@ -10916,9 +10930,7 @@ impl MultiLayerCache {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
-            {
-                inner.pins_for(key).entries.remove(key);
-            }
+            inner.remove_pin_entry(key);
             inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);

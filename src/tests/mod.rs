@@ -16101,6 +16101,49 @@ mod tests {
         assert!(cache.acquire(&k("missing")).unwrap().is_none());
     }
 
+    // rust-internal: the eviction fast-path count must track every striped pin mutation.
+    #[test]
+    fn pin_handle_fast_path_tracks_clone_invalidate_release_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let key = CacheKey::string(0, "pin-count");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        let first = cache.acquire(&key).unwrap().unwrap();
+        let second = cache.clone_handle(&first);
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 2);
+
+        cache.invalidate_memory_only(&key);
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 2);
+        assert_eq!(cache.release_batch(vec![second]), 1);
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 1);
+        cache.release(first);
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        let held_during_clear = cache.acquire(&key).unwrap().unwrap();
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 1);
+        cache.reset().unwrap();
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        cache.release(held_during_clear);
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+
+        let bucket_key = CacheKey::page_with_slot(7, 1, 0, 5, Some(11));
+        cache.put(bucket_key.clone(), b"block".to_vec()).unwrap();
+        let held_during_bucket_invalidation = cache.acquire(&bucket_key).unwrap().unwrap();
+        cache.invalidate_slot(7, 11).unwrap();
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        cache.release(held_during_bucket_invalidation);
+
+        let shard_key = CacheKey::string(9, "shard-pin-count");
+        cache.put(shard_key.clone(), b"value".to_vec()).unwrap();
+        let held_during_shard_invalidation = cache.acquire(&shard_key).unwrap().unwrap();
+        cache.invalidate_shard(9).unwrap();
+        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        cache.release(held_during_shard_invalidation);
+    }
+
     #[test]
     fn release_batch_iter_drains_pins_without_collecting_handles() {
         let dir = tempfile::tempdir().unwrap();
