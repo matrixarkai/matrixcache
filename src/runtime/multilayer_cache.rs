@@ -1744,6 +1744,7 @@ struct ReadPathCounters {
     shared_buffer_misses: AtomicU64,
     hotness_promotions: AtomicU64,
     access_order_refreshes: AtomicU64,
+    compressed_hits: AtomicU64,
     get_latency: AtomicLatencyHistogram,
     read_through_latency: AtomicLatencyHistogram,
     refill_latency: AtomicLatencyHistogram,
@@ -1759,6 +1760,7 @@ impl ReadPathCounters {
         self.shared_buffer_misses.store(0, Ordering::Relaxed);
         self.hotness_promotions.store(0, Ordering::Relaxed);
         self.access_order_refreshes.store(0, Ordering::Relaxed);
+        self.compressed_hits.store(0, Ordering::Relaxed);
         self.get_latency.reset();
         self.read_through_latency.reset();
         self.refill_latency.reset();
@@ -3726,6 +3728,48 @@ impl MultiLayerCache {
                 // different copy from the one the cache kept. The whole point
                 // of a shared read is that there is one.
                 let value = decode_cache_block_shared(&block)?;
+                let compressed = is_encoded_compressed_block(&block);
+                {
+                    let inner = self.inner.read().expect("cache lock poisoned");
+                    if inner.ssd_instance_only {
+                        if !inner.started {
+                            return Err(CacheError::Stopped);
+                        }
+                        inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .shared_buffer_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        let hit_epoch = CoarseClock::now_millis();
+                        inner.reconfigure_refresh_window(hit_epoch);
+                        let outcome = inner.record_hit_shared_at(key, hit_epoch);
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros(micros);
+                        inner.record_read_through_latency_micros(micros);
+                        inner.record_refill_latency(started);
+                        if compressed {
+                            inner
+                                .read_counters
+                                .compressed_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(inner);
+
+                        if !matches!(outcome, HitOutcome::Accounted) {
+                            let mut inner = self.inner.write().expect("cache lock poisoned");
+                            match outcome {
+                                HitOutcome::Accounted => {}
+                                HitOutcome::NeedsAccessOrderRefresh => {
+                                    inner.refresh_access_order(key)
+                                }
+                                HitOutcome::NeedsMetadata => {
+                                    inner.record_hit(key, value.len())
+                                }
+                            }
+                        }
+                        return Ok(Some(value));
+                    }
+                }
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
@@ -3733,7 +3777,7 @@ impl MultiLayerCache {
                     .read_counters
                     .shared_buffer_hits
                     .fetch_add(1, Ordering::Relaxed);
-                if is_encoded_compressed_block(&block) {
+                if compressed {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
                 inner.record_hit(key, value.len());
@@ -3971,43 +4015,106 @@ impl MultiLayerCache {
                 };
                 decoded.push((unique_position, started, decoded_block));
             }
-            let mut inner = self.inner.write().expect("cache lock poisoned");
-            if !inner.started {
-                return Err(CacheError::Stopped);
-            }
-            for (unique_position, started, decoded_block) in decoded {
-                let key = unique_keys[unique_position];
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
-                match decoded_block {
-                    Some((value, compressed)) => {
-                        inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
-                        if compressed {
-                            inner.stats.compressed_hits =
-                                inner.stats.compressed_hits.saturating_add(1);
-                        }
-                        inner.record_hit(key, value.len());
-                        // `value` is already the `Arc<[u8]>` this batch
-                        // returns, so the tier takes a handle to it. The
-                        // `to_vec` that used to be here copied the payload so
-                        // that `refill_from_ssd` could copy it again into an
-                        // `Arc` -- two copies of the bytes to store what was
-                        // in hand.
-                        if !inner.ssd_instance_only
-                            && !inner.refill_ssd_probe(key, Arc::clone(&value), current)
-                        {
-                            inner.stats.refill_failures =
-                                inner.stats.refill_failures.saturating_add(1);
-                        }
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
-                        inner.record_refill_latency(refill_started);
-                        unique_values[unique_position] = Some(value);
-                        needs_eviction_drain = true;
+            let ssd_only = self
+                .inner
+                .read()
+                .expect("cache lock poisoned")
+                .ssd_instance_only;
+            if ssd_only {
+                let mut deferred = Vec::new();
+                let mut compressed_hits = 0u64;
+                {
+                    let inner = self.inner.read().expect("cache lock poisoned");
+                    if !inner.started {
+                        return Err(CacheError::Stopped);
                     }
-                    None => {
-                        inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                        inner.record_get_latency(started);
-                        inner.record_read_through_latency(started);
+                    let hit_epoch = CoarseClock::now_millis();
+                    inner.reconfigure_refresh_window(hit_epoch);
+                    for (unique_position, started, decoded_block) in decoded {
+                        let key = unique_keys[unique_position];
+                        match decoded_block {
+                            Some((value, compressed)) => {
+                                inner
+                                    .read_counters
+                                    .disk_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                                compressed_hits += u64::from(compressed);
+                                let outcome = inner.record_hit_shared_at(key, hit_epoch);
+                                if !matches!(outcome, HitOutcome::Accounted) {
+                                    deferred.push((unique_position, outcome, value.len()));
+                                }
+                                let micros = elapsed_micros(started);
+                                inner.record_get_latency_micros(micros);
+                                inner.record_read_through_latency_micros(micros);
+                                inner.record_refill_latency(refill_started);
+                                unique_values[unique_position] = Some(value);
+                            }
+                            None => {
+                                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                                let micros = elapsed_micros(started);
+                                inner.record_get_latency_micros(micros);
+                                inner.record_read_through_latency_micros(micros);
+                            }
+                        }
+                    }
+                    if compressed_hits != 0 {
+                        inner
+                            .read_counters
+                            .compressed_hits
+                            .fetch_add(compressed_hits, Ordering::Relaxed);
+                    }
+                }
+                if !deferred.is_empty() {
+                    let mut inner = self.inner.write().expect("cache lock poisoned");
+                    for (unique_position, outcome, len) in deferred {
+                        let key = unique_keys[unique_position];
+                        match outcome {
+                            HitOutcome::Accounted => {}
+                            HitOutcome::NeedsAccessOrderRefresh => {
+                                inner.refresh_access_order(key)
+                            }
+                            HitOutcome::NeedsMetadata => inner.record_hit(key, len),
+                        }
+                    }
+                }
+            } else {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if !inner.started {
+                    return Err(CacheError::Stopped);
+                }
+                for (unique_position, started, decoded_block) in decoded {
+                    let key = unique_keys[unique_position];
+                    let current = inner.ssd_probe_is_current_for(key, probe_epoch);
+                    match decoded_block {
+                        Some((value, compressed)) => {
+                            inner
+                                .read_counters
+                                .disk_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            if compressed {
+                                inner.stats.compressed_hits =
+                                    inner.stats.compressed_hits.saturating_add(1);
+                            }
+                            inner.record_hit(key, value.len());
+                            // `value` is already the `Arc<[u8]>` this batch
+                            // returns, so the tier takes a handle to it.
+                            if !inner.ssd_instance_only
+                                && !inner.refill_ssd_probe(key, Arc::clone(&value), current)
+                            {
+                                inner.stats.refill_failures =
+                                    inner.stats.refill_failures.saturating_add(1);
+                            }
+                            inner.record_get_latency(started);
+                            inner.record_read_through_latency(started);
+                            inner.record_refill_latency(refill_started);
+                            unique_values[unique_position] = Some(value);
+                            needs_eviction_drain = true;
+                        }
+                        None => {
+                            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                            inner.record_get_latency(started);
+                            inner.record_read_through_latency(started);
+                        }
                     }
                 }
             }
@@ -11488,6 +11595,12 @@ impl MultiLayerCache {
                 .read_counters
                 .access_order_refreshes
                 .load(Ordering::Relaxed),
+            compressed_hits: inner.stats.compressed_hits.saturating_add(
+                inner
+                    .read_counters
+                    .compressed_hits
+                    .load(Ordering::Relaxed),
+            ),
             get_latency_samples: inner.read_counters.get_latency.samples(),
             get_latency_total_micros: inner
                 .read_counters
