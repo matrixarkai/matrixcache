@@ -5547,6 +5547,145 @@ impl MultiLayerCache {
         }
     }
 
+    /// Acquire an SSD-only batch without serialising readers on the cache
+    /// write lock. The SSD store and pin stripes provide their own
+    /// synchronisation; only expiry cleanup and uncommon metadata repair need
+    /// exclusive cache ownership.
+    fn acquire_batch_ssd_only(
+        &self,
+        keys: &[CacheKey],
+        positions_by_key: &[(&CacheKey, BatchPositions)],
+        now_millis: u64,
+    ) -> Result<Option<Vec<Option<CachePinnedHandle>>>, CacheError> {
+        let mut results = empty_batch_results(keys.len());
+        let mut expired = Vec::<(&CacheKey, usize, Instant)>::new();
+        let mut exclusive_work = Vec::<(&CacheKey, HitOutcome, usize)>::new();
+        let mut missing_handles = 0u64;
+
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if !inner.ssd_instance_only {
+                return Ok(None);
+            }
+
+            let mut candidates = Vec::<(&CacheKey, &BatchPositions, Instant)>::new();
+            for (key, positions) in positions_by_key {
+                let started = Instant::now();
+                if inner.entry_expired(key, now_millis) {
+                    expired.push((*key, positions.len(), started));
+                } else {
+                    candidates.push((*key, positions, started));
+                }
+            }
+
+            let candidate_keys = candidates
+                .iter()
+                .map(|(key, _, _)| *key)
+                .collect::<Vec<_>>();
+            let blocks = inner.read_ssd_blocks(&candidate_keys)?;
+            let mut decoded = Vec::with_capacity(candidates.len());
+            for ((key, positions, started), block) in candidates.into_iter().zip(blocks) {
+                let value = match block {
+                    Some(block) => Some((
+                        decode_cache_block_shared(&block)?,
+                        is_encoded_compressed_block(&block),
+                    )),
+                    None => None,
+                };
+                decoded.push((key, positions, started, value));
+            }
+
+            let hit_epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(hit_epoch);
+            let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
+            for (key, positions, started, value) in decoded {
+                let occurrences = positions.len();
+                match value {
+                    Some((value, compressed)) => {
+                        inner
+                            .read_counters
+                            .disk_hits
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        if compressed {
+                            inner
+                                .read_counters
+                                .compressed_hits
+                                .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        }
+                        let outcome =
+                            inner.record_hit_shared_occurrences_at(key, occurrences, hit_epoch);
+                        if !matches!(outcome, HitOutcome::Accounted) {
+                            exclusive_work.push((key, outcome, value.len()));
+                        }
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
+                        inner.record_refill_latency(started);
+                        for position in positions {
+                            results[position] = Some(CachePinnedHandle {
+                                key: key.clone(),
+                                value: value.clone(),
+                                tier: CacheReadTier::Ssd,
+                            });
+                        }
+                        pin_counts.push((key, value.len(), occurrences, 1));
+                    }
+                    None => {
+                        missing_handles = missing_handles.saturating_add(occurrences as u64);
+                        inner
+                            .read_counters
+                            .misses
+                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros_many(micros, occurrences);
+                        inner.record_read_through_latency_micros_many(micros, occurrences);
+                    }
+                }
+            }
+            inner.increment_pin_handle_counts(&pin_counts);
+        }
+
+        let needs_exclusive =
+            !expired.is_empty() || missing_handles != 0 || !exclusive_work.is_empty();
+        let mut removed_expired = false;
+        if needs_exclusive {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (key, occurrences, started) in expired {
+                if !inner.entry_expired(key, now_millis) {
+                    continue;
+                }
+                inner.remove_expired_entry(key);
+                inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                inner
+                    .read_counters
+                    .misses
+                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                let micros = elapsed_micros(started);
+                inner.record_get_latency_micros_many(micros, occurrences);
+                inner.record_read_through_latency_micros_many(micros, occurrences);
+                removed_expired = true;
+            }
+            inner.stats.zero_copy_handle_misses = inner
+                .stats
+                .zero_copy_handle_misses
+                .saturating_add(missing_handles);
+            for (key, outcome, len) in exclusive_work {
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
+                    HitOutcome::NeedsMetadata => inner.record_hit(key, len),
+                }
+            }
+        }
+        if removed_expired {
+            self.drain_eviction_records();
+        }
+        Ok(Some(results))
+    }
+
     pub fn acquire_batch(
         &self,
         keys: &[CacheKey],
@@ -5562,9 +5701,17 @@ impl MultiLayerCache {
 
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
 
+        let now_millis = CoarseClock::now_millis();
+        if self.ssd_instance_only() {
+            if let Some(results) =
+                self.acquire_batch_ssd_only(keys, &positions_by_key, now_millis)?
+            {
+                return Ok(results);
+            }
+        }
+
         let mut remaining = Vec::<(&CacheKey, BatchPositions)>::new();
         let mut exclusive_work = Vec::<(&CacheKey, HitOutcome, usize)>::new();
-        let now_millis = CoarseClock::now_millis();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
