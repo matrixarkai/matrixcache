@@ -73,6 +73,42 @@ fn metadata_has_one_authority_across_pmem_and_memory_transitions() {
     assert_eq!(inner.metadata_of(&key).unwrap().hits(), 13);
 }
 
+// rust-internal: shared PMEM accounting is carried into promotion exactly once.
+#[test]
+fn accounted_pmem_promotion_preserves_one_hit_and_one_metadata_authority() {
+    let (_dir, cache) = cache();
+    let key = CacheKey::string(0, "accounted-promotion");
+    let mut inner = cache.inner.write().unwrap();
+    assert!(inner.put_pmem(&key, b"value".to_vec()));
+    let shared = inner.shared_key(&key);
+    inner.set_metadata(
+        shared,
+        CacheEntryMeta::new(
+            CacheBlockKind::Other,
+            None,
+            1,
+            0,
+            CoarseClock::now_millis(),
+            CacheAdmissionReason::PersistentMemory,
+        ),
+    );
+    let value = inner.pmem_value(&key).unwrap().clone();
+    let outcome = inner.record_known_hit_shared_occurrences_at(
+        &key,
+        inner.pmem.get(&key).unwrap().meta.as_ref(),
+        1,
+        CoarseClock::now_millis(),
+    );
+    assert_eq!(inner.metadata_of(&key).unwrap().hits(), 1);
+
+    inner.promote_accounted_pmem_probe_if_current(&key, &value, outcome);
+
+    assert_eq!(inner.metadata_of(&key).unwrap().hits(), 1);
+    assert!(inner.memory.get(&key).unwrap().meta.is_some());
+    assert!(inner.pmem.get(&key).unwrap().meta.is_none());
+    assert!(!inner.metadata.contains_key(&key));
+}
+
 // rust-internal: deterministically interleave mutations between probe and refill.
 #[test]
 fn stale_pmem_probe_does_not_replace_a_new_value() {
