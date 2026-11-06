@@ -414,3 +414,55 @@ fn ssd_only_owned_batches_stay_on_the_shared_lock_path() {
         .iter()
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));
 }
+
+// rust-internal: warm SSD-only pinned reads use striped pin ownership only.
+#[test]
+fn ssd_only_pinned_reads_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 128,
+            pmem_capacity_bytes: 128,
+            ssd_capacity_bytes: 4096,
+            ..CacheTieringPolicy::default()
+        },
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 1,
+        },
+    );
+    cache.set_ssd_instance_only(true);
+    let key = CacheKey::string(0, "ssd-only-pinned");
+    cache.put(key.clone(), vec![9; 64]).unwrap();
+
+    let warm = cache.acquire(&key).unwrap().unwrap();
+    cache.release(warm);
+    let before = cache.stats();
+    let handle = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let key = &key;
+        let worker = scope.spawn(move || {
+            sender.send(cache.acquire(key).unwrap()).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        result
+    })
+    .expect("SSD-only pinned read requested the write lock")
+    .expect("SSD value missing");
+
+    assert_eq!(handle.value(), &[9; 64]);
+    assert_eq!(handle.tier(), CacheReadTier::Ssd);
+    cache.release(handle);
+    let after = cache.stats();
+    assert_eq!(after.memory_fills, before.memory_fills);
+    assert_eq!(after.pmem_fills, before.pmem_fills);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 1);
+    assert_eq!(after.pinned_entries, 0);
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+}
