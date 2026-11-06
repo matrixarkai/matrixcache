@@ -4446,7 +4446,8 @@ impl MultiLayerCache {
         now_millis: u64,
         results: &mut [Option<Arc<[u8]>>],
     ) -> Result<bool, CacheError> {
-        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>, Instant)>::with_capacity(keys.len());
+        let started = Instant::now();
+        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>)>::with_capacity(keys.len());
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -4457,20 +4458,18 @@ impl MultiLayerCache {
                 return Ok(false);
             }
             for key in keys {
-                let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
                 let Some(value) = inner.resident_value(key).cloned() else {
                     return Ok(false);
                 };
-                memory_hits.push((key, value, started));
+                memory_hits.push((key, value));
             }
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (key, value, _) in &memory_hits {
-                inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+            for (key, value) in &memory_hits {
                 let outcome = inner.record_hit_shared_at(key, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
                     needs_exclusive.push(((*key).clone(), outcome, value.len()));
@@ -4479,17 +4478,18 @@ impl MultiLayerCache {
         }
 
         self.read_counters
+            .memory_hits
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        self.read_counters
             .shared_buffer_hits
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        for (_, _, started) in &memory_hits {
-            let micros = elapsed_micros(*started);
-            self.read_counters
-                .get_latency
-                .observe_with_total(micros);
-            self.read_counters
-                .read_through_latency
-                .observe_with_total(micros);
-        }
+        let micros = elapsed_micros(started);
+        self.read_counters
+            .get_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters
+            .read_through_latency
+            .observe_many_with_total(micros, keys.len());
 
         if !needs_exclusive.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -4506,7 +4506,7 @@ impl MultiLayerCache {
             }
         }
 
-        for (position, (_, value, _)) in memory_hits.into_iter().enumerate() {
+        for (position, (_, value)) in memory_hits.into_iter().enumerate() {
             results[position] = Some(value);
         }
         Ok(true)
