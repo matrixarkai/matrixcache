@@ -54,6 +54,62 @@ fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
     results
 }
 
+// Move each unique result on its final requested position. Earlier duplicate
+// positions receive a clone, so owned byte buffers are copied only when the
+// caller actually requested the same key more than once.
+fn visit_batch_values<T: Clone>(
+    mut values: Vec<Option<T>>,
+    requested_positions: Vec<(usize, usize)>,
+    mut visit: impl FnMut(usize, Option<T>),
+) {
+    if values.len() == requested_positions.len() {
+        for ((position, _), value) in requested_positions.into_iter().zip(values) {
+            visit(position, value);
+        }
+        return;
+    }
+    let mut remaining = vec![0usize; values.len()];
+    for &(_, unique_position) in &requested_positions {
+        remaining[unique_position] += 1;
+    }
+    for (position, unique_position) in requested_positions {
+        remaining[unique_position] -= 1;
+        let value = if remaining[unique_position] == 0 {
+            values[unique_position].take()
+        } else {
+            values[unique_position].clone()
+        };
+        visit(position, value);
+    }
+}
+
+#[cfg(test)]
+mod batch_value_expansion_tests {
+    use super::visit_batch_values;
+
+    #[test]
+    fn unique_values_move_and_duplicates_copy_only_extra_outputs() {
+        let first = vec![3u8; 4_096];
+        let second = vec![7u8; 8_192];
+        let first_ptr = first.as_ptr();
+        let second_ptr = second.as_ptr();
+        let mut expanded = Vec::new();
+        visit_batch_values(
+            vec![Some(first), None, Some(second)],
+            vec![(4, 0), (1, 1), (3, 2), (0, 0), (2, 2)],
+            |position, value| expanded.push((position, value)),
+        );
+
+        assert_eq!(expanded.len(), 5);
+        assert_eq!(expanded[0].0, 4);
+        assert_ne!(expanded[0].1.as_ref().unwrap().as_ptr(), first_ptr);
+        assert_eq!(expanded[3].1.as_ref().unwrap().as_ptr(), first_ptr);
+        assert_ne!(expanded[2].1.as_ref().unwrap().as_ptr(), second_ptr);
+        assert_eq!(expanded[4].1.as_ref().unwrap().as_ptr(), second_ptr);
+        assert!(expanded[1].1.is_none());
+    }
+}
+
 /// The distinct keys of a batch, and which request each one answers.
 ///
 /// The unique keys are **borrowed from `keys`**, which the caller owns for as
@@ -7987,9 +8043,9 @@ impl ShardedMultiLayerCache {
                     requested_positions.push((position, unique_position));
                 }
                 let values = reader(&self.shards[index], &unique_keys)?;
-                for (position, unique_position) in requested_positions {
-                    results[position] = values[unique_position].clone();
-                }
+                visit_batch_values(values, requested_positions, |position, value| {
+                    results[position] = value;
+                });
             }
             self.sharded_stats.record_latency(started);
             return Ok(results);
@@ -8023,14 +8079,11 @@ impl ShardedMultiLayerCache {
                         requested_positions.push((position, unique_position));
                     }
                     let values = reader(shard, &unique_keys)?;
-                    Ok::<_, CacheError>(
-                        requested_positions
-                            .into_iter()
-                            .map(|(position, unique_position)| {
-                                (position, values[unique_position].clone())
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    let mut expanded = Vec::with_capacity(requested_positions.len());
+                    visit_batch_values(values, requested_positions, |position, value| {
+                        expanded.push((position, value));
+                    });
+                    Ok::<_, CacheError>(expanded)
                 }));
             }
 
