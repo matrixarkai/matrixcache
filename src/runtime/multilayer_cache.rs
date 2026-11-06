@@ -4763,25 +4763,27 @@ impl MultiLayerCache {
             return Ok(results);
         }
 
-        // SSD-only mode has no resident tier to re-check. Classify its live
-        // keys under shared ownership and reserve the exclusive path below
-        // for entries that actually need expiry cleanup.
+        // Missing keys have no resident state to mutate. Classify them under
+        // shared ownership and reserve the exclusive path below for expiry
+        // cleanup, a resident race, or PMEM promotion.
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if inner.ssd_instance_only {
-                let mut expired = Vec::new();
-                for item @ (key, _, _) in deferred.drain(..) {
-                    if inner.entry_expired(key, now_millis) {
-                        expired.push(item);
-                    } else {
-                        ssd_candidates.push(item);
-                    }
+            let mut exclusive_deferred = Vec::new();
+            for item @ (key, _, _) in deferred.drain(..) {
+                if inner.entry_expired(key, now_millis)
+                    || (!inner.ssd_instance_only
+                        && (inner.resident_value(key).is_some()
+                            || inner.pmem_value(key).is_some()))
+                {
+                    exclusive_deferred.push(item);
+                } else {
+                    ssd_candidates.push(item);
                 }
-                deferred = expired;
             }
+            deferred = exclusive_deferred;
         }
 
         if !deferred.is_empty() {
@@ -4960,7 +4962,25 @@ impl MultiLayerCache {
             }
         }
 
+        if ssd_reads
+            .iter()
+            .all(|(_, _, _, _, decoded)| decoded.is_none())
         {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (_, positions, started, _, _) in ssd_reads {
+                let occurrences = positions.len();
+                inner
+                    .read_counters
+                    .misses
+                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                let micros = elapsed_micros(started);
+                inner.record_get_latency_micros_many(micros, occurrences);
+                inner.record_read_through_latency_micros_many(micros, occurrences);
+            }
+        } else {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);

@@ -12,6 +12,13 @@ const KEYS: usize = 256;
 const BATCH_SIZE: usize = 16;
 const BATCHES_PER_THREAD: usize = 1_024;
 
+#[derive(Clone, Copy)]
+enum BatchRead {
+    Shared,
+    Pinned,
+    Owned,
+}
+
 fn cache() -> (tempfile::TempDir, MultiLayerCache, Vec<CacheKey>) {
     let directory = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(
@@ -23,7 +30,7 @@ fn cache() -> (tempfile::TempDir, MultiLayerCache, Vec<CacheKey>) {
     (directory, cache, keys)
 }
 
-fn batch_qps(readers: usize, pinned: bool) -> f64 {
+fn batch_qps(readers: usize, read: BatchRead) -> f64 {
     let (_directory, cache, keys) = cache();
     let barrier = Arc::new(Barrier::new(readers + 1));
     let started = std::thread::scope(|scope| {
@@ -42,10 +49,16 @@ fn batch_qps(readers: usize, pinned: bool) -> f64 {
                             (0..BATCH_SIZE)
                                 .map(|offset| keys[(first + offset) % keys.len()].clone()),
                         );
-                        if pinned {
-                            black_box(cache.acquire_batch(&batch).unwrap());
-                        } else {
-                            black_box(cache.get_shared_batch(&batch).unwrap());
+                        match read {
+                            BatchRead::Shared => {
+                                black_box(cache.get_shared_batch(&batch).unwrap());
+                            }
+                            BatchRead::Pinned => {
+                                black_box(cache.acquire_batch(&batch).unwrap());
+                            }
+                            BatchRead::Owned => {
+                                black_box(cache.get_batch(&batch).unwrap());
+                            }
                         }
                     }
                 })
@@ -62,12 +75,15 @@ fn batch_qps(readers: usize, pinned: bool) -> f64 {
 }
 
 fn main() {
-    println!("readers,shared_batch_values_per_second,pinned_batch_values_per_second");
+    println!(
+        "readers,shared_batch_values_per_second,pinned_batch_values_per_second,owned_batch_values_per_second"
+    );
     for readers in [1, 2, 4, 8] {
         println!(
-            "{readers},{:.0},{:.0}",
-            batch_qps(readers, false),
-            batch_qps(readers, true)
+            "{readers},{:.0},{:.0},{:.0}",
+            batch_qps(readers, BatchRead::Shared),
+            batch_qps(readers, BatchRead::Pinned),
+            batch_qps(readers, BatchRead::Owned)
         );
     }
 }
