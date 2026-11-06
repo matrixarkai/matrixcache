@@ -57,9 +57,10 @@ fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
 // Move each unique result on its final requested position. Earlier duplicate
 // positions receive a clone, so owned byte buffers are copied only when the
 // caller actually requested the same key more than once.
-fn visit_batch_values<T: Clone>(
+fn visit_batch_values_with<T>(
     mut values: Vec<Option<T>>,
     requested_positions: Vec<(usize, usize)>,
+    mut clone_value: impl FnMut(&T) -> T,
     mut visit: impl FnMut(usize, Option<T>),
 ) {
     if values.len() == requested_positions.len() {
@@ -77,15 +78,58 @@ fn visit_batch_values<T: Clone>(
         let value = if remaining[unique_position] == 0 {
             values[unique_position].take()
         } else {
-            values[unique_position].clone()
+            values[unique_position].as_ref().map(&mut clone_value)
         };
         visit(position, value);
     }
 }
 
+fn visit_batch_values<T: Clone>(
+    values: Vec<Option<T>>,
+    requested_positions: Vec<(usize, usize)>,
+    visit: impl FnMut(usize, Option<T>),
+) {
+    visit_batch_values_with(values, requested_positions, T::clone, visit);
+}
+
+fn own_unique_positioned_batch_keys(
+    group: Vec<(usize, &CacheKey)>,
+) -> (Vec<CacheKey>, Vec<(usize, usize)>) {
+    let mut unique_keys = Vec::<CacheKey>::new();
+    let mut requested_positions = Vec::with_capacity(group.len());
+    if group.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        for (position, key) in group {
+            let unique_position = unique_keys
+                .iter()
+                .position(|existing| existing == key)
+                .unwrap_or_else(|| {
+                    let unique_position = unique_keys.len();
+                    unique_keys.push(key.clone());
+                    unique_position
+                });
+            requested_positions.push((position, unique_position));
+        }
+        return (unique_keys, requested_positions);
+    }
+
+    let mut unique_positions = HashMap::<&CacheKey, usize>::new();
+    for (position, key) in group {
+        let unique_position = if let Some(position) = unique_positions.get(key).copied() {
+            position
+        } else {
+            let position = unique_keys.len();
+            unique_positions.insert(key, position);
+            unique_keys.push(key.clone());
+            position
+        };
+        requested_positions.push((position, unique_position));
+    }
+    (unique_keys, requested_positions)
+}
+
 #[cfg(test)]
 mod batch_value_expansion_tests {
-    use super::visit_batch_values;
+    use super::{own_unique_positioned_batch_keys, visit_batch_values, CacheKey};
 
     #[test]
     fn unique_values_move_and_duplicates_copy_only_extra_outputs() {
@@ -107,6 +151,21 @@ mod batch_value_expansion_tests {
         assert_ne!(expanded[2].1.as_ref().unwrap().as_ptr(), second_ptr);
         assert_eq!(expanded[4].1.as_ref().unwrap().as_ptr(), second_ptr);
         assert!(expanded[1].1.is_none());
+    }
+
+    #[test]
+    fn positioned_keys_are_owned_once_per_distinct_key() {
+        let first = CacheKey::string(1, "first");
+        let second = CacheKey::string(1, "second");
+        let (unique, positions) = own_unique_positioned_batch_keys(vec![
+            (7, &first),
+            (2, &second),
+            (4, &first),
+            (0, &second),
+        ]);
+
+        assert_eq!(unique, vec![first, second]);
+        assert_eq!(positions, vec![(7, 0), (2, 1), (4, 0), (0, 1)]);
     }
 }
 
@@ -269,18 +328,10 @@ impl IntoIterator for BatchPositions {
 /// The distinct keys of a batch and which requested positions each answers,
 /// **borrowing** the keys from `keys`.
 ///
-/// The copying form below is the same grouping with the keys cloned out: once
-/// per distinct key on its small path, and on its large path -- which iterates
-/// `keys.iter().cloned()` and then clones again into its lookup map -- once per
-/// *requested* key plus once per distinct one. A key copy is a seventy-two byte
-/// struct plus a string allocation for each of its two `Cow` fields that is
-/// computed rather than a literal, so a batch pays that before it has looked
-/// anything up.
-///
-/// Every caller owns `keys` for as long as its read runs, so none of them needs
-/// the copies. They are being moved over one at a time, because the deferred
-/// state each one builds from the result is shaped differently; when the last
-/// has moved, the copying form goes.
+/// Every caller owns `keys` for as long as its read runs, so the grouping does
+/// not need copies. A caller that requires owned keys can clone each distinct
+/// key after grouping instead of cloning every requested key before it knows
+/// which ones are duplicates.
 fn coalesce_batch_positions_borrowed<'a>(
     keys: &'a [CacheKey],
 ) -> Vec<(&'a CacheKey, BatchPositions)> {
@@ -7098,6 +7149,19 @@ impl ShardedMultiLayerCache {
         count
     }
 
+    fn group_keys_by_shard<'a>(
+        &self,
+        keys: &'a [CacheKey],
+    ) -> Vec<Vec<(usize, &'a CacheKey)>> {
+        let mut groups = (0..self.shard_count())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        for (position, key) in keys.iter().enumerate() {
+            groups[self.shard_index_for_key(key)].push((position, key));
+        }
+        groups
+    }
+
     fn single_shard_for_keys(&self, keys: &[CacheKey]) -> Option<usize> {
         let mut iter = keys.iter();
         let first = iter.next()?;
@@ -8018,30 +8082,14 @@ impl ShardedMultiLayerCache {
         }
         if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
             self.sharded_stats.record_local();
-            let mut grouped = vec![Vec::new(); self.shard_count()];
-            for (position, key) in keys.iter().cloned().enumerate() {
-                grouped[self.shard_index_for_key(&key)].push((position, key));
-            }
+            let grouped = self.group_keys_by_shard(keys);
             let mut results = empty_batch_results(keys.len());
             for (index, group) in grouped.into_iter().enumerate() {
                 if group.is_empty() {
                     continue;
                 }
-                let mut unique_positions = HashMap::new();
-                let mut unique_keys = Vec::new();
-                let mut requested_positions = Vec::with_capacity(group.len());
-                for (position, key) in group {
-                    let unique_position =
-                        if let Some(position) = unique_positions.get(&key).copied() {
-                            position
-                        } else {
-                            let position = unique_keys.len();
-                            unique_positions.insert(key.clone(), position);
-                            unique_keys.push(key);
-                            position
-                        };
-                    requested_positions.push((position, unique_position));
-                }
+                let (unique_keys, requested_positions) =
+                    own_unique_positioned_batch_keys(group);
                 let values = reader(&self.shards[index], &unique_keys)?;
                 visit_batch_values(values, requested_positions, |position, value| {
                     results[position] = value;
@@ -8051,10 +8099,7 @@ impl ShardedMultiLayerCache {
             return Ok(results);
         }
         self.sharded_stats.record_fanout(self.batch_shard_fanout(keys));
-        let mut grouped = vec![Vec::new(); self.shard_count()];
-        for (position, key) in keys.iter().cloned().enumerate() {
-            grouped[self.shard_index_for_key(&key)].push((position, key));
-        }
+        let grouped = self.group_keys_by_shard(keys);
         let shard_results = std::thread::scope(|scope| {
             let mut workers = Vec::new();
             for (index, group) in grouped.into_iter().enumerate() {
@@ -8063,21 +8108,8 @@ impl ShardedMultiLayerCache {
                 }
                 let shard = &self.shards[index];
                 workers.push(scope.spawn(move || {
-                    let mut unique_positions = HashMap::new();
-                    let mut unique_keys = Vec::new();
-                    let mut requested_positions = Vec::with_capacity(group.len());
-                    for (position, key) in group {
-                        let unique_position =
-                            if let Some(position) = unique_positions.get(&key).copied() {
-                                position
-                            } else {
-                                let position = unique_keys.len();
-                                unique_positions.insert(key.clone(), position);
-                                unique_keys.push(key);
-                                position
-                            };
-                        requested_positions.push((position, unique_position));
-                    }
+                    let (unique_keys, requested_positions) =
+                        own_unique_positioned_batch_keys(group);
                     let values = reader(shard, &unique_keys)?;
                     let mut expanded = Vec::with_capacity(requested_positions.len());
                     visit_batch_values(values, requested_positions, |position, value| {
@@ -8342,12 +8374,7 @@ impl ShardedMultiLayerCache {
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
         let mut results = empty_batch_results(keys.len());
-        let mut groups = (0..self.shard_count())
-            .map(|_| Vec::<(usize, CacheKey)>::new())
-            .collect::<Vec<_>>();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            groups[self.shard_index_for_key(&key)].push((position, key));
-        }
+        let groups = self.group_keys_by_shard(keys);
         let batches = std::thread::scope(|scope| {
             let workers = groups
                 .into_iter()
@@ -8357,11 +8384,18 @@ impl ShardedMultiLayerCache {
                         None
                     } else {
                         let shard = &self.shards[shard_index];
-                        let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
                         Some(scope.spawn(move || {
-                            shard
-                                .acquire_batch_no_promotion(&shard_keys)
-                                .map(|shard_results| (positions, shard_results))
+                            let (unique_keys, requested_positions) =
+                                own_unique_positioned_batch_keys(group);
+                            let handles = shard.acquire_batch_no_promotion(&unique_keys)?;
+                            let mut expanded = Vec::with_capacity(requested_positions.len());
+                            visit_batch_values_with(
+                                handles,
+                                requested_positions,
+                                |handle| shard.clone_handle(handle),
+                                |position, handle| expanded.push((position, handle)),
+                            );
+                            Ok::<_, CacheError>(expanded)
                         }))
                     }
                 })
@@ -8381,8 +8415,8 @@ impl ShardedMultiLayerCache {
             }
             Ok(batches)
         })?;
-        for (positions, shard_results) in batches {
-            for (position, handle) in positions.into_iter().zip(shard_results) {
+        for batch in batches {
+            for (position, handle) in batch {
                 results[position] = handle;
             }
         }
@@ -8434,12 +8468,7 @@ impl ShardedMultiLayerCache {
         let fanout = self.batch_shard_fanout(keys);
         self.sharded_stats.record_fanout(fanout);
         let mut results = empty_batch_results(keys.len());
-        let mut groups = (0..self.shard_count())
-            .map(|_| Vec::<(usize, CacheKey)>::new())
-            .collect::<Vec<_>>();
-        for (position, key) in keys.iter().cloned().enumerate() {
-            groups[self.shard_index_for_key(&key)].push((position, key));
-        }
+        let groups = self.group_keys_by_shard(keys);
         let batches = std::thread::scope(|scope| {
             let workers = groups
                 .into_iter()
@@ -8449,11 +8478,18 @@ impl ShardedMultiLayerCache {
                         None
                     } else {
                         let shard = &self.shards[shard_index];
-                        let (positions, shard_keys): (Vec<_>, Vec<_>) = group.into_iter().unzip();
                         Some(scope.spawn(move || {
-                            shard
-                                .acquire_batch(&shard_keys)
-                                .map(|shard_results| (positions, shard_results))
+                            let (unique_keys, requested_positions) =
+                                own_unique_positioned_batch_keys(group);
+                            let handles = shard.acquire_batch(&unique_keys)?;
+                            let mut expanded = Vec::with_capacity(requested_positions.len());
+                            visit_batch_values_with(
+                                handles,
+                                requested_positions,
+                                |handle| shard.clone_handle(handle),
+                                |position, handle| expanded.push((position, handle)),
+                            );
+                            Ok::<_, CacheError>(expanded)
                         }))
                     }
                 })
@@ -8473,8 +8509,8 @@ impl ShardedMultiLayerCache {
             }
             Ok(batches)
         })?;
-        for (positions, shard_results) in batches {
-            for (position, handle) in positions.into_iter().zip(shard_results) {
+        for batch in batches {
+            for (position, handle) in batch {
                 results[position] = handle;
             }
         }
