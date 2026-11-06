@@ -220,3 +220,89 @@ fn disabled_ssd_uses_a_global_fence_and_resumes_key_history() {
     assert!(inner.ssd_probe_is_current_for(&key, epoch));
     assert!(!inner.ssd_probe_is_current_for(&writer, epoch));
 }
+
+// rust-internal: warm SSD-only shared reads need no exclusive cache ownership.
+#[test]
+fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_tiering_policy(
+        dir.path(),
+        CacheTieringPolicy {
+            memory_capacity_bytes: 128,
+            pmem_capacity_bytes: 128,
+            ssd_capacity_bytes: 4096,
+            ..CacheTieringPolicy::default()
+        },
+        CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 1,
+        },
+    );
+    cache.set_ssd_instance_only(true);
+    let keys = (0..4)
+        .map(|index| CacheKey::string(0, &format!("ssd-only-{index}")))
+        .collect::<Vec<_>>();
+    for (index, key) in keys.iter().enumerate() {
+        cache.put(key.clone(), vec![index as u8; 64]).unwrap();
+        assert_eq!(cache.peek_tier(key), Some(CacheReadTier::Ssd));
+    }
+
+    // The first reads establish metadata and access-order state. Subsequent
+    // reads can account through atomics while another reader owns the lock.
+    assert!(cache.get_shared(&keys[0]).unwrap().is_some());
+    assert!(cache
+        .get_shared_batch(&keys)
+        .unwrap()
+        .iter()
+        .all(Option::is_some));
+    let before = cache.stats();
+
+    let single_completed = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let key = &keys[0];
+        let worker = scope.spawn(move || {
+            sender.send(cache.get_shared(key).unwrap()).unwrap();
+        });
+        let completed = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        drop(guard);
+        worker.join().unwrap();
+        completed
+    });
+    assert!(
+        single_completed,
+        "SSD-only shared read requested the write lock"
+    );
+
+    let batch_completed = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let keys = &keys;
+        let worker = scope.spawn(move || {
+            sender.send(cache.get_shared_batch(keys).unwrap()).unwrap();
+        });
+        let completed = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        drop(guard);
+        worker.join().unwrap();
+        completed
+    });
+    assert!(
+        batch_completed,
+        "SSD-only shared batch requested the write lock"
+    );
+
+    let after = cache.stats();
+    assert_eq!(after.memory_fills, before.memory_fills);
+    assert_eq!(after.pmem_fills, before.pmem_fills);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 5);
+    assert!(keys
+        .iter()
+        .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));
+}
