@@ -9355,7 +9355,9 @@ mod tests {
         assert_eq!(stats.refill_failures, 0);
         assert_eq!(cache.get_memory(&key), None);
         assert_eq!(cache.get(&key).unwrap(), Some(b"too-large".to_vec()));
-        assert_eq!(cache.stats().refill_failures, 1);
+        let stats_after_read = cache.stats();
+        assert_eq!(stats_after_read.memory_admission_rejected, 1);
+        assert_eq!(stats_after_read.refill_failures, 0);
     }
 
     #[test]

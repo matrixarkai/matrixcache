@@ -3608,11 +3608,30 @@ impl MultiLayerCache {
                     inner.record_get_latency_micros(micros);
                     inner.record_read_through_latency_micros(micros);
                     Some((value, CacheReadTier::Memory, Some(outcome)))
+                } else if let Some(resident) = inner.pmem.get(key) {
+                    let value = Arc::clone(&resident.value);
+                    if inner.pmem_should_refill_memory(value.len()) {
+                        Some((value, CacheReadTier::Pmem, None))
+                    } else {
+                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                        inner
+                            .read_counters
+                            .shared_buffer_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        inner.reconfigure_refresh_window(now_millis);
+                        let outcome = inner.record_known_hit_shared_occurrences_at(
+                            key,
+                            resident.meta.as_ref(),
+                            1,
+                            now_millis,
+                        );
+                        let micros = elapsed_micros(started);
+                        inner.record_get_latency_micros(micros);
+                        inner.record_read_through_latency_micros(micros);
+                        Some((value, CacheReadTier::Pmem, Some(outcome)))
+                    }
                 } else {
-                    inner
-                        .pmem_value(key)
-                        .cloned()
-                        .map(|value| (value, CacheReadTier::Pmem, None))
+                    None
                 }
             }
         };
@@ -3635,11 +3654,11 @@ impl MultiLayerCache {
             return Ok(None);
         }
 
-        if let Some((value, tier, memory_outcome)) = probe {
+        if let Some((value, tier, hit_outcome)) = probe {
             let length = value.len();
             match tier {
                 CacheReadTier::Memory => {
-                    let outcome = memory_outcome
+                    let outcome = hit_outcome
                         .expect("the memory probe always records its hit outcome");
                     match outcome {
                         HitOutcome::Accounted => {}
@@ -3656,6 +3675,25 @@ impl MultiLayerCache {
                     }
                 }
                 CacheReadTier::Pmem => {
+                    if let Some(outcome) = hit_outcome {
+                        match outcome {
+                            HitOutcome::Accounted => {}
+                            HitOutcome::NeedsAccessOrderRefresh => {
+                                let mut inner = self.inner.write().expect("cache lock poisoned");
+                                inner.refresh_access_order(key);
+                            }
+                            HitOutcome::NeedsMetadata => {
+                                let mut inner = self.inner.write().expect("cache lock poisoned");
+                                if inner
+                                    .pmem_value(key)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &value))
+                                {
+                                    inner.record_hit(key, length);
+                                }
+                            }
+                        }
+                        return Ok(Some(value));
+                    }
                     let mut inner = self.inner.write().expect("cache lock poisoned");
                     inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
                     inner
@@ -3778,7 +3816,7 @@ impl MultiLayerCache {
         // outlives the whole read, so there is nothing for a copy to protect
         // against -- and a key copy allocates for each of its two `Cow` fields
         // that is computed rather than a literal.
-        let mut needs_exclusive = Vec::<(usize, HitOutcome, usize)>::new();
+        let mut needs_exclusive = Vec::<(usize, HitOutcome, usize, CacheReadTier)>::new();
         let mut pmem_refills = Vec::<(usize, Arc<[u8]>, HitOutcome, Instant)>::new();
         let mut ssd_candidates = Vec::<(usize, Instant)>::new();
         let mut expired_keys = Vec::<(usize, Instant)>::new();
@@ -3813,7 +3851,12 @@ impl MultiLayerCache {
                             hit_epoch,
                         );
                         if !matches!(outcome, HitOutcome::Accounted) {
-                            needs_exclusive.push((unique_position, outcome, value.len()));
+                            needs_exclusive.push((
+                                unique_position,
+                                outcome,
+                                value.len(),
+                                CacheReadTier::Memory,
+                            ));
                         }
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros(micros);
@@ -3829,7 +3872,26 @@ impl MultiLayerCache {
                             1,
                             hit_epoch,
                         );
-                        pmem_refills.push((unique_position, value, outcome, started));
+                        if inner.pmem_should_refill_memory(value.len()) {
+                            pmem_refills.push((unique_position, value, outcome, started));
+                        } else {
+                            inner
+                                .read_counters
+                                .pmem_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            if !matches!(outcome, HitOutcome::Accounted) {
+                                needs_exclusive.push((
+                                    unique_position,
+                                    outcome,
+                                    value.len(),
+                                    CacheReadTier::Pmem,
+                                ));
+                            }
+                            let micros = elapsed_micros(started);
+                            inner.record_get_latency_micros(micros);
+                            inner.record_read_through_latency_micros(micros);
+                            unique_values[unique_position] = Some(value);
+                        }
                         continue;
                     }
                 }
@@ -3839,13 +3901,18 @@ impl MultiLayerCache {
 
         if !needs_exclusive.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
-            for (unique_position, outcome, len) in needs_exclusive {
+            for (unique_position, outcome, len, tier) in needs_exclusive {
                 let key = unique_keys[unique_position];
                 match outcome {
                     HitOutcome::Accounted => {}
                     HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
                     HitOutcome::NeedsMetadata => {
-                        if inner.memory.contains_key(key) {
+                        let resident = match tier {
+                            CacheReadTier::Memory => inner.memory.contains_key(key),
+                            CacheReadTier::Pmem => inner.pmem.contains_key(key),
+                            CacheReadTier::Ssd => false,
+                        };
+                        if resident {
                             inner.record_hit(key, len);
                         }
                     }
