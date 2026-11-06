@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Unique all-memory shared batches use one clock sample and batched atomic
+  accounting while preserving per-key hit and latency sample counts.
+
 - Shared resident reads update latency and batch-hit counters after releasing
   the cache lock, and unique resident batches now count every returned hit.
 

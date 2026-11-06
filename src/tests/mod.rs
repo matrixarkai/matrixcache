@@ -13912,6 +13912,12 @@ mod tests {
         assert_eq!(values[1].as_deref(), Some(&b"other"[..]));
         assert_eq!(
             after_unique
+                .memory_hits
+                .saturating_sub(before_unique.memory_hits),
+            2
+        );
+        assert_eq!(
+            after_unique
                 .shared_buffer_hits
                 .saturating_sub(before_unique.shared_buffer_hits),
             2
