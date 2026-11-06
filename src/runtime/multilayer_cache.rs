@@ -4079,6 +4079,19 @@ impl MultiLayerCache {
                         }
                     }
                 }
+            } else if decoded
+                .iter()
+                .all(|(_, _, decoded_block)| decoded_block.is_none())
+            {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                if !inner.started {
+                    return Err(CacheError::Stopped);
+                }
+                for (_, started, _) in decoded {
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                    inner.record_get_latency(started);
+                    inner.record_read_through_latency(started);
+                }
             } else {
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 if !inner.started {
@@ -5779,14 +5792,32 @@ impl MultiLayerCache {
         }
 
         let mut ssd_candidates = Vec::<(&CacheKey, BatchPositions, Instant)>::new();
+        let mut exclusive_remaining = Vec::<(&CacheKey, BatchPositions)>::new();
         let mut needs_eviction_drain = false;
         {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (key, positions) in remaining {
+                if inner.entry_expired(key, now_millis)
+                    || inner.resident_value(key).is_some()
+                    || inner.pmem_value(key).is_some()
+                {
+                    exclusive_remaining.push((key, positions));
+                } else {
+                    ssd_candidates.push((key, positions, Instant::now()));
+                }
+            }
+        }
+
+        if !exclusive_remaining.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
-            for (key, positions) in remaining {
+            for (key, positions) in exclusive_remaining {
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
                     inner.remove_expired_entry(key);
@@ -5876,7 +5907,27 @@ impl MultiLayerCache {
                 decoded.push((key, positions, started, value));
             }
 
-            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if decoded.iter().all(|(_, _, _, value)| value.is_none()) {
+                let inner = self.inner.read().expect("cache lock poisoned");
+                if !inner.started {
+                    return Err(CacheError::Stopped);
+                }
+                for (_, positions, started, _) in decoded {
+                    let occurrences = positions.len();
+                    inner
+                        .read_counters
+                        .zero_copy_handle_misses
+                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    inner
+                        .read_counters
+                        .misses
+                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    let micros = elapsed_micros(started);
+                    inner.record_get_latency_micros_many(micros, occurrences);
+                    inner.record_read_through_latency_micros_many(micros, occurrences);
+                }
+            } else {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
@@ -5933,6 +5984,7 @@ impl MultiLayerCache {
                 }
             }
             inner.increment_pin_handle_counts(&pin_counts);
+            }
         }
         if needs_eviction_drain {
             self.drain_eviction_records();
