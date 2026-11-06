@@ -1412,6 +1412,10 @@ struct PickedEvictionVictim {
 #[derive(Debug, Clone)]
 pub struct MultiLayerCache {
     inner: Arc<RwLock<CacheInner>>,
+    /// Read counters are shared outside the cache lock so a completed hit can
+    /// record its end-to-end latency without reacquiring the cache merely to
+    /// reach atomics.
+    read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
     /// Whether an access-record callback is registered.
     ///
@@ -1673,7 +1677,7 @@ struct CacheInner {
     expected_entry_bytes: usize,
     /// Read-path statistics, updated through `&self` so a read can count
     /// itself while holding the cache lock shared.
-    read_counters: ReadPathCounters,
+    read_counters: Arc<ReadPathCounters>,
     stats: CacheStats,
 }
 
@@ -2565,6 +2569,7 @@ impl MultiLayerCache {
         let mut ssd_store =
             SsdTierStore::new(&disk_dir, &ssd_paths, tiering_policy.ssd_capacity_bytes);
         let _ = ssd_store.start();
+        let read_counters = Arc::new(ReadPathCounters::default());
         Self {
             inner: Arc::new(RwLock::new(CacheInner {
                 started: true,
@@ -2639,9 +2644,10 @@ impl MultiLayerCache {
                 admission_filter_enabled: false,
                 sketch_sized_from_what_is_resident: false,
                 expected_entry_bytes: DEFAULT_EXPECTED_ENTRY_BYTES,
-                read_counters: ReadPathCounters::default(),
+                read_counters: Arc::clone(&read_counters),
                 stats: CacheStats::default(),
             })),
+            read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
             access_record_registered: Arc::new(AtomicBool::new(false)),
             eviction_callbacks_registered: Arc::new(AtomicBool::new(false)),
@@ -4514,17 +4520,29 @@ impl MultiLayerCache {
             expired = inner.entry_expired(key, now_millis);
             if inner.ssd_instance_only || expired {
                 None
+            } else if let Some(resident) = inner.memory.get(key) {
+                inner
+                    .read_counters
+                    .memory_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                let epoch = CoarseClock::now_millis();
+                inner.reconfigure_refresh_window(epoch);
+                let outcome = inner.record_known_hit_shared_occurrences_at(
+                    key,
+                    resident.meta.as_ref(),
+                    1,
+                    epoch,
+                );
+                Some((
+                    Arc::clone(&resident.value),
+                    CacheReadTier::Memory,
+                    Some(outcome),
+                ))
             } else {
                 inner
-                    .resident_value(key)
+                    .pmem_value(key)
                     .cloned()
-                    .map(|value| (value, CacheReadTier::Memory))
-                    .or_else(|| {
-                        inner
-                            .pmem_value(key)
-                            .cloned()
-                            .map(|value| (value, CacheReadTier::Pmem))
-                    })
+                    .map(|value| (value, CacheReadTier::Pmem, None))
             }
         };
 
@@ -4546,7 +4564,7 @@ impl MultiLayerCache {
             return Ok(None);
         }
 
-        if let Some((value, tier)) = probe {
+        if let Some((value, tier, memory_outcome)) = probe {
             // The copy that turns the shared buffer into the returned `Vec` is
             // the expensive part of a hit, and it is done here with no lock
             // held at all. It used to run inside the exclusive section, so
@@ -4560,23 +4578,18 @@ impl MultiLayerCache {
             // hit for an entry eviction has removed would reinsert metadata
             // that nothing removes again.
             if matches!(tier, CacheReadTier::Memory) {
-                let outcome = {
-                    let inner = self.inner.read().expect("cache lock poisoned");
-                    inner
-                        .read_counters
-                        .memory_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    let outcome = if inner.memory.contains_key(key) {
-                        inner.record_hit_shared(key)
-                    } else {
-                        HitOutcome::Accounted
-                    };
-                    // One interval, two histograms: read the clock once.
-                    let micros = elapsed_micros(started);
-                    inner.record_get_latency_micros(micros);
-                    inner.record_read_through_latency_micros(micros);
-                    outcome
-                };
+                let outcome = memory_outcome
+                    .expect("a memory probe records its hit while the entry is borrowed");
+                // One interval, two histograms. These counters live behind a
+                // shared handle, so completing the latency sample does not
+                // take the cache lock a second time.
+                let micros = elapsed_micros(started);
+                self.read_counters
+                    .get_latency
+                    .observe_with_total(micros);
+                self.read_counters
+                    .read_through_latency
+                    .observe_with_total(micros);
                 // Only these two cases need the cache exclusively, and a hit
                 // on a recently-read entry is neither.
                 match outcome {

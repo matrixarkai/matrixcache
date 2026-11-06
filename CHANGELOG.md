@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Memory-resident copied reads complete latency accounting through shared
+  counters, avoiding a second cache lock and redundant resident-key probe.
+
 - PMEM reads revalidate captured values before deferred memory promotion, so
   concurrent replacement, invalidation, expiry, or stop cannot restore stale data.
 
