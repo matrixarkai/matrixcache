@@ -7,7 +7,7 @@ shown. This file is provided to satisfy the attribution requirements of those
 licenses. All listed licenses are permissive (MIT / BSD / ISC / Apache-2.0 /
 Unicode-3.0 / Unlicense-family).
 
-Crate inventory generated from `cargo metadata --all-features`: **56 third-party crates** across **12 distinct license expressions**.
+Crate inventory generated from `cargo metadata --all-features`: **60 third-party crates** across **13 distinct license expressions**.
 
 Where a crate is offered under a choice of licenses (`A OR B`), this project takes it
 under a compatible permissive option.
@@ -46,6 +46,11 @@ under a compatible permissive option.
 - zstd-safe 8.2.0
 - zstd-sys 2.1.2+zstd.1.5.7
 
+### BSD-2-Clause OR Apache-2.0 OR MIT
+
+- zerocopy 0.8.63
+- zerocopy-derive 0.8.63
+
 ### MIT
 
 - nom 7.1.3
@@ -53,6 +58,7 @@ under a compatible permissive option.
 
 ### MIT OR Apache-2.0
 
+- ahash 0.8.12
 - bitflags 2.13.0
 - cc 1.2.66
 - cfg-if 1.0.4
@@ -95,6 +101,7 @@ under a compatible permissive option.
 
 - bzip2-sys 0.1.13+1.0.8
 - minimal-lexical 0.2.1
+- version_check 0.9.5
 - vcpkg 0.2.15
 
 ### MIT/Apache-2.0/BSD-3-Clause

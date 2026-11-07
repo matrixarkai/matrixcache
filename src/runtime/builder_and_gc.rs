@@ -1436,7 +1436,7 @@ impl CacheInner {
         #[cfg(feature = "rocksdb-ssd")]
         {
             let mut report = CacheRecoverReport::default();
-            let mut recovered_index = HashMap::new();
+            let mut recovered_index = AHashMap::new();
             let mut recovered_order = VecDeque::new();
             let mut recovered_bytes = 0u64;
             let mut recovered = Vec::new();
@@ -1492,7 +1492,7 @@ impl CacheInner {
             let file = File::open(manifest_path)?;
             let reader = BufReader::new(file);
             let mut report = CacheRecoverReport::default();
-            let mut recovered_index = HashMap::new();
+            let mut recovered_index = AHashMap::new();
             let mut recovered_order = VecDeque::new();
             let mut recovered_bytes = 0u64;
 
@@ -1785,7 +1785,7 @@ impl CacheInner {
         // 20,000 entries down to 1,000 -- the capacity-based predicate fired
         // once and left the table four times too large, this one halves it
         // four times and lands exactly where a map that never grew would be.
-        fn sparse<K, V>(map: &HashMap<K, V>) -> bool {
+        fn sparse<K, V, S>(map: &HashMap<K, V, S>) -> bool {
             let buckets = estimated_buckets(map.capacity());
             buckets > SHRINK_FLOOR && map.len().saturating_mul(4) <= buckets
         }

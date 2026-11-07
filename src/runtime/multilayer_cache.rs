@@ -1625,7 +1625,7 @@ struct CacheInner {
     /// An absent key is what no expiry looks like, so a value in here is
     /// always non-zero. Nothing is persisted: a restart loses expiries exactly
     /// as it did when they lived on the metadata struct.
-    expiries: HashMap<Arc<CacheKey>, u64>,
+    expiries: AHashMap<Arc<CacheKey>, u64>,
     tiering_policy: CacheTieringPolicy,
     block_options: CacheBlockOptions,
     /// Keyed on a shared handle, not on the key itself.
@@ -1639,9 +1639,9 @@ struct CacheInner {
     /// The memory and PMEM tiers hold entry metadata beside their bytes -- see
     /// [`MemoryResident`] and [`PmemResident`]. The metadata map below is only
     /// for entries held by neither resident tier.
-    memory: HashMap<Arc<CacheKey>, MemoryResident>,
-    pmem: HashMap<Arc<CacheKey>, PmemResident>,
-    disk_index: HashMap<Arc<CacheKey>, u64>,
+    memory: AHashMap<Arc<CacheKey>, MemoryResident>,
+    pmem: AHashMap<Arc<CacheKey>, PmemResident>,
+    disk_index: AHashMap<Arc<CacheKey>, u64>,
     disk_order: CacheKeyOrder,
     /// Everything about which entries are pinned, behind its own lock.
     ///
@@ -1676,7 +1676,7 @@ struct CacheInner {
     /// A sequence number, not an index: popping from the front of the queue
     /// would shift every index, and re-deriving them meant rebuilding this
     /// whole map on every drain. The current index is `sequence - head`.
-    async_writeback_positions: HashMap<Arc<CacheKey>, u64>,
+    async_writeback_positions: AHashMap<Arc<CacheKey>, u64>,
     /// How many write-back jobs have ever been popped.
     async_writeback_head: u64,
     /// The floor for the refresh window, in milliseconds. Zero always moves the
@@ -1718,7 +1718,7 @@ struct CacheInner {
     /// transitions between them are [`CacheInner::make_resident`] and
     /// [`CacheInner::take_resident`], and a test asserts the exclusion after
     /// a churn that moves entries both ways.
-    metadata: HashMap<Arc<CacheKey>, CacheEntryMeta>,
+    metadata: AHashMap<Arc<CacheKey>, CacheEntryMeta>,
     /// How often keys have been asked for recently, including keys that are
     /// not resident. Consulted at admission; see `admission_filter_enabled`.
     access_frequency: FrequencySketch,
@@ -2053,7 +2053,7 @@ struct PinnedEntry {
 
 #[derive(Debug, Default)]
 struct CachePinState {
-    entries: HashMap<Arc<CacheKey>, PinnedEntry>,
+    entries: AHashMap<Arc<CacheKey>, PinnedEntry>,
     pin_operations: u64,
     unpin_operations: u64,
     /// Reads answered with a handle rather than a copy. Kept here because it
@@ -2672,12 +2672,12 @@ impl MultiLayerCache {
                 pinned_removals_seen: AtomicBool::new(false),
                 #[cfg(not(feature = "rocksdb-ssd"))]
                 manifest_appends: AtomicU64::new(0),
-                expiries: HashMap::new(),
+                expiries: AHashMap::new(),
                 tiering_policy,
                 block_options,
-                memory: HashMap::new(),
-                pmem: HashMap::new(),
-                disk_index: HashMap::new(),
+                memory: AHashMap::new(),
+                pmem: AHashMap::new(),
+                disk_index: AHashMap::new(),
                 disk_order: CacheKeyOrder::new(),
                 pins: (0..PIN_STRIPES)
                     .map(|_| Mutex::new(CachePinState::default()))
@@ -2687,7 +2687,7 @@ impl MultiLayerCache {
                 memory_order: CacheKeyOrder::new(),
                 pmem_order: CacheKeyOrder::new(),
                 async_writeback_queue: VecDeque::new(),
-                async_writeback_positions: HashMap::new(),
+                async_writeback_positions: AHashMap::new(),
                 async_writeback_head: 0,
                 lru_refresh_floor_millis: DEFAULT_LRU_REFRESH.as_millis() as u64,
                 lru_refresh_ratio: 0.0,
@@ -2707,7 +2707,7 @@ impl MultiLayerCache {
                 memory_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 pmem_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 ssd_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
-                metadata: HashMap::new(),
+                metadata: AHashMap::new(),
                 // Not sized until the admission filter is turned on. A full
                 // sketch is `next_power_of_two(capacity / 2)` bytes -- half a
                 // gibibyte for a gibibyte of capacity -- and the filter is off
