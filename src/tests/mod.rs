@@ -13934,6 +13934,14 @@ mod tests {
                 .saturating_sub(before_unique.read_through_latency_samples),
             2
         );
+
+        let missing = CacheKey::string(7, "shared-batch-into-missing");
+        cache
+            .get_shared_batch_into(&[repeated, missing], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_deref(), Some(&b"repeated"[..]));
+        assert!(values[1].is_none());
     }
 
     #[test]

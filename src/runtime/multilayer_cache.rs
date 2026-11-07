@@ -4566,8 +4566,6 @@ impl MultiLayerCache {
         results: &mut [Option<Arc<[u8]>>],
     ) -> Result<bool, CacheError> {
         let started = Instant::now();
-        let mut resident_hits =
-            Vec::<(&CacheKey, Arc<[u8]>, CacheReadTier)>::with_capacity(keys.len());
         let mut needs_exclusive =
             Vec::<(CacheKey, HitOutcome, usize, CacheReadTier)>::new();
         let mut memory_hits = 0u64;
@@ -4580,42 +4578,57 @@ impl MultiLayerCache {
             if inner.ssd_instance_only {
                 return Ok(false);
             }
-            for key in keys {
+            for (position, key) in keys.iter().enumerate() {
                 if inner.entry_expired(key, now_millis) {
+                    results.iter_mut().for_each(|result| *result = None);
                     return Ok(false);
                 }
                 if let Some(resident) = inner.memory.get(key) {
-                    resident_hits.push((key, Arc::clone(&resident.value), CacheReadTier::Memory));
+                    results[position] = Some(Arc::clone(&resident.value));
                     memory_hits += 1;
                     continue;
                 }
                 if let Some(resident) = inner.pmem.get(key) {
                     if inner.pmem_should_refill_memory(resident.value.len()) {
+                        results.iter_mut().for_each(|result| *result = None);
                         return Ok(false);
                     }
-                    resident_hits.push((key, Arc::clone(&resident.value), CacheReadTier::Pmem));
+                    results[position] = Some(Arc::clone(&resident.value));
                     pmem_hits += 1;
                     continue;
                 }
+                results.iter_mut().for_each(|result| *result = None);
                 return Ok(false);
             }
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (key, value, tier) in &resident_hits {
-                let metadata = match tier {
-                    CacheReadTier::Memory => {
-                        inner.memory.get(*key).and_then(|entry| entry.meta.as_ref())
-                    }
-                    CacheReadTier::Pmem => {
-                        inner.pmem.get(*key).and_then(|entry| entry.meta.as_ref())
-                    }
-                    CacheReadTier::Ssd => None,
+            for (position, key) in keys.iter().enumerate() {
+                let (metadata, tier) = if let Some(entry) = inner.memory.get(key) {
+                    (entry.meta.as_ref(), CacheReadTier::Memory)
+                } else {
+                    (
+                        inner
+                            .pmem
+                            .get(key)
+                            .expect("the resident batch was validated under the same guard")
+                            .meta
+                            .as_ref(),
+                        CacheReadTier::Pmem,
+                    )
                 };
                 let outcome =
                     inner.record_known_hit_shared_occurrences_at(key, metadata, 1, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
-                    needs_exclusive.push(((*key).clone(), outcome, value.len(), *tier));
+                    needs_exclusive.push((
+                        key.clone(),
+                        outcome,
+                        results[position]
+                            .as_ref()
+                            .expect("a validated resident batch position has a value")
+                            .len(),
+                        tier,
+                    ));
                 }
             }
         }
@@ -4661,9 +4674,6 @@ impl MultiLayerCache {
             }
         }
 
-        for (position, (_, value, _)) in resident_hits.into_iter().enumerate() {
-            results[position] = Some(value);
-        }
         Ok(true)
     }
 

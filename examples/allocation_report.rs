@@ -145,6 +145,13 @@ fn main() {
     rows.push(measure("get_shared_batch", BATCH, || {
         let _ = cache.get_shared_batch(&batch).expect("get_shared_batch");
     }));
+    let mut reused_shared_batch = Vec::with_capacity(BATCH);
+    rows.push(measure("get_shared_batch_into, resident", BATCH, || {
+        cache
+            .get_shared_batch_into(&batch, &mut reused_shared_batch)
+            .expect("get_shared_batch_into");
+        assert!(reused_shared_batch.iter().all(Option::is_some));
+    }));
     rows.push(measure("acquire_batch_no_promotion", BATCH, || {
         let handles = cache
             .acquire_batch_no_promotion(&batch)
@@ -492,6 +499,7 @@ fn main() {
         "get_batch, copying",
         "get_batch_into, resident",
         "get_shared_batch",
+        "get_shared_batch_into, resident",
         "acquire_batch_no_promotion",
         "acquire_batch",
         "acquire_batch, 2 duplicated",
@@ -533,6 +541,7 @@ fn main() {
         ("get_batch_into, resident", 0.5, 128.0),
         ("get_batch, mixed hits and misses", 38.5, 9_000.0),
         ("get_shared_batch", 2.5, 500.0),
+        ("get_shared_batch_into, resident", 0.5, 128.0),
         ("acquire_batch_no_promotion", 7.5, 3_000.0),
         ("acquire_batch", 7.5, 3_100.0),
         ("acquire_batch, 2 duplicated", 9.5, 4_300.0),

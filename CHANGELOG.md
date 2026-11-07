@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reusable shared-buffer batches place resident handles directly into caller
+  output storage without a temporary hit vector.
+
 - Small resident copied batches avoid temporary shared-buffer clones and batch
   bookkeeping while keeping large payload copies outside the cache guard.
 
