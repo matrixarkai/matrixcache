@@ -1543,21 +1543,61 @@ pub type PoolBasedMemoryAllocator = PoolBasedMemoryAllocatorBase;
 pub type PoolBasedMemoryAllocatorDram = PoolBasedMemoryAllocatorBase;
 pub type PoolBasedMemoryAllocatorPmem = PoolBasedMemoryAllocatorBase;
 
-#[derive(Debug)]
 pub struct CacheExecutorHandle {
     name: String,
     thread_count: usize,
     numa_id: Option<usize>,
     submitted_tasks: Mutex<u64>,
+    queue: Mutex<Option<std::sync::mpsc::SyncSender<CacheExecutorJob>>>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+type CacheExecutorJob = Box<dyn FnOnce() + Send + 'static>;
+
+impl std::fmt::Debug for CacheExecutorHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheExecutorHandle")
+            .field("name", &self.name)
+            .field("thread_count", &self.thread_count)
+            .field("numa_id", &self.numa_id)
+            .field("submitted_tasks", &self.submitted_tasks())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CacheExecutorHandle {
     pub fn new(name: impl Into<String>, thread_count: usize, numa_id: Option<usize>) -> Self {
+        let name = name.into();
+        let thread_count = thread_count.max(1);
+        let queue_capacity = thread_count.saturating_mul(4).max(1);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<CacheExecutorJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let workers = (0..thread_count)
+            .map(|worker_index| {
+                let receiver = Arc::clone(&receiver);
+                std::thread::Builder::new()
+                    .name(format!("{name}-{worker_index}"))
+                    .spawn(move || loop {
+                        let job = receiver
+                            .lock()
+                            .expect("executor queue lock poisoned")
+                            .recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    })
+                    .expect("cache executor worker spawn failed")
+            })
+            .collect();
         Self {
-            name: name.into(),
-            thread_count: thread_count.max(1),
+            name,
+            thread_count,
             numa_id,
             submitted_tasks: Mutex::new(0),
+            queue: Mutex::new(Some(sender)),
+            workers: Mutex::new(workers),
         }
     }
 
@@ -1570,6 +1610,35 @@ impl CacheExecutorHandle {
             .lock()
             .expect("executor submitted task counter lock poisoned") += 1;
         func();
+    }
+
+    /// Schedule work on the persistent worker set and return its result handle.
+    ///
+    /// The bounded queue applies backpressure to producers instead of creating
+    /// one operating-system thread per task. [`Self::add`] remains synchronous
+    /// for source compatibility with callers that use it as an inline hook.
+    pub fn submit<F, T>(&self, func: F) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        *self
+            .submitted_tasks
+            .lock()
+            .expect("executor submitted task counter lock poisoned") += 1;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let job = Box::new(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)).ok();
+            let _ = sender.send(outcome);
+        });
+        self.queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .as_ref()
+            .expect("cache executor is shutting down")
+            .send(job)
+            .expect("cache executor workers stopped unexpectedly");
+        CacheExecutorTask { receiver }
     }
 
     pub fn name(&self) -> &str {
@@ -1597,6 +1666,39 @@ impl CacheExecutorHandle {
         F: FnOnce() + Send + 'static,
     {
         self.add(func);
+    }
+}
+
+impl Drop for CacheExecutorHandle {
+    fn drop(&mut self) {
+        self.queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .take();
+        for worker in self
+            .workers
+            .lock()
+            .expect("executor worker lock poisoned")
+            .drain(..)
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CacheExecutorTask<T> {
+    receiver: std::sync::mpsc::Receiver<Option<T>>,
+}
+
+impl<T> CacheExecutorTask<T> {
+    pub fn try_join(self) -> Option<T> {
+        self.receiver.recv().ok().flatten()
+    }
+
+    pub fn join(self) -> T {
+        self.try_join()
+            .expect("cache executor task stopped before returning a result")
     }
 }
 
