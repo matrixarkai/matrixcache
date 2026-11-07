@@ -527,8 +527,8 @@ fn main() {
     // arms (only the SSD row differs between arms, and it is bounded
     // separately below), so there is nothing to tolerate but a change.
     //
-    //   pinned batch of 8        15 -> 7 allocations
-    //   mixed owned batch of 8   42 -> 8 allocations, 12,632 -> 4,896 bytes
+    //   pinned batch of 8        15 -> 4 allocations
+    //   mixed owned batch of 8   42 -> 5 allocations, 12,632 -> 4,288 bytes
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
     //   a promoting read         13.00 -> 12.00 allocations, 25,334.0 -> 24,310.0 bytes
@@ -539,12 +539,12 @@ fn main() {
         ("get, copying", 1.5, 1_100.0),
         ("get_batch, copying", 11.5, 9_400.0),
         ("get_batch_into, resident", 0.5, 128.0),
-        ("get_batch, mixed hits and misses", 9.0, 5_200.0),
+        ("get_batch, mixed hits and misses", 5.5, 4_500.0),
         ("get_shared_batch", 2.5, 500.0),
         ("get_shared_batch_into, resident", 0.5, 128.0),
-        ("acquire_batch_no_promotion", 7.5, 3_000.0),
-        ("acquire_batch", 7.5, 3_100.0),
-        ("acquire_batch, 2 duplicated", 9.5, 4_300.0),
+        ("acquire_batch_no_promotion", 4.5, 2_500.0),
+        ("acquire_batch", 4.5, 2_600.0),
+        ("acquire_batch, 2 duplicated", 6.5, 3_800.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
         ("get, promoting from a lower tier", 13.0, 25_500.0),
@@ -656,9 +656,9 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 40.5;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 34.5;
     #[cfg(feature = "rocksdb-ssd")]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 54.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 48.0;
     match find("get_batch, promoting from a lower tier") {
         Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 190_000.0 => {}
         Some(row) => failures.push(format!(

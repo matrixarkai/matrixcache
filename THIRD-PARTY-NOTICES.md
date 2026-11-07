@@ -7,7 +7,7 @@ shown. This file is provided to satisfy the attribution requirements of those
 licenses. All listed licenses are permissive (MIT / BSD / ISC / Apache-2.0 /
 Unicode-3.0 / Unlicense-family).
 
-Crate inventory generated from `cargo metadata --all-features`: **65 third-party crates** across **13 distinct license expressions**.
+Crate inventory generated from `cargo metadata --all-features`: **56 third-party crates** across **12 distinct license expressions**.
 
 Where a crate is offered under a choice of licenses (`A OR B`), this project takes it
 under a compatible permissive option.
@@ -21,36 +21,35 @@ under a compatible permissive option.
 ### Apache-2.0
 
 - clang-sys 1.8.1
-- rocksdb 0.22.0
+- rocksdb 0.25.0
 
 ### Apache-2.0 OR MIT
 
 - fastrand 2.4.1
+- rustc-hash 2.1.3
 
 ### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 
-- linux-raw-sys 0.4.15
-- rustix 0.38.44
+- linux-raw-sys 0.12.1
+- rustix 1.1.4
 - wasip2 1.0.4+wasi-0.2.12
 - wit-bindgen 0.57.1
 
 ### Apache-2.0/MIT
 
 - cexpr 0.6.0
-- rustc-hash 1.1.0
 
 ### BSD-3-Clause
 
-- bindgen 0.69.5
-
-### ISC
-
-- libloading 0.8.9
+- bindgen 0.72.1
+- zstd 0.14.3
+- zstd-safe 8.2.0
+- zstd-sys 2.1.2+zstd.1.5.7
 
 ### MIT
 
 - nom 7.1.3
-- zstd 0.13.3
+- stats_alloc 0.1.10
 
 ### MIT OR Apache-2.0
 
@@ -64,38 +63,29 @@ under a compatible permissive option.
 - glob 0.3.3
 - itertools 0.12.1
 - jobserver 0.1.34
-- lazy_static 1.5.0
 - libc 0.2.186
 - libz-sys 1.1.29
+- once_cell 1.21.4
 - pkg-config 0.3.33
 - proc-macro2 1.0.106
 - quote 1.0.46
 - regex 1.12.4
 - regex-automata 0.4.14
 - regex-syntax 0.8.11
-- serde 1.0.228
-- serde_core 1.0.228
-- serde_derive 1.0.228
+- rustflags 0.1.7
+- serde 1.0.229
+- serde_core 1.0.229
+- serde_derive 1.0.229
 - shlex 1.3.0
 - shlex 2.0.1
+- smallvec 1.16.5
 - syn 2.0.118
-- tempfile 3.10.1
-- thiserror 1.0.69
-- thiserror-impl 1.0.69
+- syn 3.0.3
+- tempfile 3.27.0
+- thiserror 2.0.21
+- thiserror-impl 2.0.21
 - windows-link 0.2.1
-- windows-sys 0.52.0
-- windows-sys 0.59.0
 - windows-sys 0.61.2
-- windows-targets 0.52.6
-- windows_aarch64_gnullvm 0.52.6
-- windows_aarch64_msvc 0.52.6
-- windows_i686_gnu 0.52.6
-- windows_i686_gnullvm 0.52.6
-- windows_i686_msvc 0.52.6
-- windows_x86_64_gnu 0.52.6
-- windows_x86_64_gnullvm 0.52.6
-- windows_x86_64_msvc 0.52.6
-- zstd-safe 7.2.4
 
 ### MIT OR Apache-2.0 OR LGPL-2.1-or-later
 
@@ -104,14 +94,12 @@ under a compatible permissive option.
 ### MIT/Apache-2.0
 
 - bzip2-sys 0.1.13+1.0.8
-- lazycell 1.3.0
 - minimal-lexical 0.2.1
 - vcpkg 0.2.15
-- zstd-sys 2.0.16+zstd.1.5.7
 
 ### MIT/Apache-2.0/BSD-3-Clause
 
-- librocksdb-sys 0.16.0+8.10.0
+- librocksdb-sys 0.19.0+11.8.1
 
 ### Unlicense OR MIT
 

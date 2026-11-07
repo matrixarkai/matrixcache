@@ -47,6 +47,7 @@ fn latency_percentile_us(
 }
 
 const SMALL_BATCH_DEDUP_LIMIT: usize = 64;
+const INLINE_BATCH_KEYS: usize = 16;
 
 fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
     let mut results = Vec::with_capacity(len);
@@ -448,8 +449,9 @@ const MAX_SHARED_GUARD_COPY_KEYS: usize = 1024;
 /// which ones are duplicates.
 fn coalesce_batch_positions_borrowed<'a>(
     keys: &'a [CacheKey],
-) -> Vec<(&'a CacheKey, BatchPositions)> {
-    let mut positions_by_key = Vec::<(&'a CacheKey, BatchPositions)>::new();
+) -> SmallVec<[(&'a CacheKey, BatchPositions); INLINE_BATCH_KEYS]> {
+    let mut positions_by_key =
+        SmallVec::<[(&'a CacheKey, BatchPositions); INLINE_BATCH_KEYS]>::new();
     if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
         for (position, key) in keys.iter().enumerate() {
             if let Some((_, positions)) = positions_by_key
@@ -4935,7 +4937,9 @@ impl MultiLayerCache {
         }
         self.emit_access_records(CacheAccessRecordKind::Get, keys.iter());
 
-        let mut ssd_candidates = Vec::new();
+        let mut ssd_candidates = SmallVec::<
+            [(&CacheKey, BatchPositions, Instant); INLINE_BATCH_KEYS],
+        >::new();
         let mut needs_eviction_drain = false;
         // One clock read for the batch. `get` reads it once per call for the
         // same reason: the published value moves in milliseconds, and an entry
@@ -4959,9 +4963,13 @@ impl MultiLayerCache {
         // Only what genuinely needs the cache exclusively is deferred: entries
         // past their time to live, entries whose access order needs moving,
         // entries with no metadata yet, and everything below the memory tier.
-        let mut deferred: Vec<(&CacheKey, BatchPositions, Instant)> = Vec::new();
-        let mut memory_hits: Vec<(BatchPositions, Arc<[u8]>)> = Vec::new();
-        let mut needs_exclusive: Vec<(&CacheKey, HitOutcome, usize)> = Vec::new();
+        let mut deferred = SmallVec::<
+            [(&CacheKey, BatchPositions, Instant); INLINE_BATCH_KEYS],
+        >::new();
+        let mut memory_hits =
+            SmallVec::<[(BatchPositions, Arc<[u8]>); INLINE_BATCH_KEYS]>::new();
+        let mut needs_exclusive =
+            SmallVec::<[(&CacheKey, HitOutcome, usize); INLINE_BATCH_KEYS]>::new();
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
         {
             let inner = self.inner.read().expect("cache lock poisoned");
@@ -5137,7 +5145,7 @@ impl MultiLayerCache {
         let candidate_keys = ssd_candidates
             .iter()
             .map(|(key, _, _)| *key)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[&CacheKey; INLINE_BATCH_KEYS]>>();
         let refill_started = Instant::now();
         // The flag is read with the blocks rather than later because it
         // decides which decode is the cheap one, and this lock is already
@@ -5150,7 +5158,18 @@ impl MultiLayerCache {
                 inner.ssd_batch_probe_epoch(&candidate_keys),
             )
         };
-        let mut ssd_reads = Vec::with_capacity(ssd_candidates.len());
+        let mut ssd_reads = SmallVec::<
+            [
+                (
+                    &CacheKey,
+                    BatchPositions,
+                    Instant,
+                    Instant,
+                    Option<(CacheDecodedBlock, bool)>,
+                );
+                INLINE_BATCH_KEYS
+            ],
+        >::new();
         for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
             let decoded = match block {
                 Some(block) => Some((
@@ -5167,7 +5186,8 @@ impl MultiLayerCache {
             .unwrap_or_else(Instant::now);
 
         if !refill_wanted {
-            let mut deferred = Vec::new();
+            let mut deferred =
+                SmallVec::<[(&CacheKey, HitOutcome, usize); INLINE_BATCH_KEYS]>::new();
             {
                 let inner = self.inner.read().expect("cache lock poisoned");
                 if inner.ssd_instance_only {

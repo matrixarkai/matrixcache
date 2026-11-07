@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Short batch reads keep grouping, deferred-probe, hit, candidate, and decoded
+  result control data inline while larger batches spill to the heap.
+
 - SSD promotion batches carry their already-unique keys through the storage
   boundary without a second deduplication and result-expansion pass.
 
