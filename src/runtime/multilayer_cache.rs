@@ -4447,7 +4447,8 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
         now_millis: u64,
-    ) -> Result<Option<Vec<Option<Vec<u8>>>>, CacheError> {
+        results: &mut [Option<Vec<u8>>],
+    ) -> Result<bool, CacheError> {
         let started = Instant::now();
         let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>)>::with_capacity(keys.len());
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
@@ -4457,14 +4458,14 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             if inner.ssd_instance_only {
-                return Ok(None);
+                return Ok(false);
             }
             for key in keys {
                 if inner.entry_expired(key, now_millis) {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let Some(value) = inner.resident_value(key).cloned() else {
-                    return Ok(None);
+                    return Ok(false);
                 };
                 memory_hits.push((key, value));
             }
@@ -4508,11 +4509,10 @@ impl MultiLayerCache {
             }
         }
 
-        let mut results = Vec::with_capacity(keys.len());
-        for (_, value) in memory_hits {
-            results.push(Some(value.to_vec()));
+        for (position, (_, value)) in memory_hits.into_iter().enumerate() {
+            results[position] = Some(value.to_vec());
         }
-        Ok(Some(results))
+        Ok(true)
     }
 
     fn try_get_shared_resident_batch(
@@ -4851,9 +4851,27 @@ impl MultiLayerCache {
     }
 
     pub fn get_batch(&self, keys: &[CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        let mut results = Vec::with_capacity(keys.len());
+        self.get_batch_into(keys, &mut results)?;
+        Ok(results)
+    }
+
+    /// Batched copied reads into a caller-owned result buffer.
+    ///
+    /// Retrieval loops can retain the outer allocation across calls. Payload
+    /// ownership and duplicate-key behavior are identical to [`Self::get_batch`].
+    pub fn get_batch_into(
+        &self,
+        keys: &[CacheKey],
+        results: &mut Vec<Option<Vec<u8>>>,
+    ) -> Result<(), CacheError> {
+        results.clear();
+        results.resize_with(keys.len(), || None);
+        if keys.is_empty() {
+            return Ok(());
+        }
         self.emit_access_records(CacheAccessRecordKind::Get, keys.iter());
 
-        let mut results = empty_batch_results(keys.len());
         let mut ssd_candidates = Vec::new();
         let mut needs_eviction_drain = false;
         // One clock read for the batch. `get` reads it once per call for the
@@ -4861,8 +4879,8 @@ impl MultiLayerCache {
         // judged live at the top of a batch cannot expire far enough through
         // it to matter.
         let now_millis = CoarseClock::now_millis();
-        if let Some(results) = self.try_get_memory_batch(keys, now_millis)? {
-            return Ok(results);
+        if self.try_get_memory_batch(keys, now_millis, results)? {
+            return Ok(());
         }
 
         // The memory hits are served under a *shared* lock, the way a single
@@ -4922,7 +4940,7 @@ impl MultiLayerCache {
         // The copy that turns the shared buffer into the returned `Vec` is the
         // expensive part of a hit, and it is done here with no lock held.
         for (positions, value) in memory_hits {
-            fill_owned_batch_positions(&mut results, positions, value.as_ref());
+            fill_owned_batch_positions(results, positions, value.as_ref());
         }
 
         // One exclusive acquisition for the whole batch's leftovers, rather
@@ -4943,7 +4961,7 @@ impl MultiLayerCache {
         }
 
         if deferred.is_empty() {
-            return Ok(results);
+            return Ok(());
         }
 
         // Missing keys have no resident state to mutate. Classify them under
@@ -5002,7 +5020,7 @@ impl MultiLayerCache {
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
-                        fill_owned_batch_positions(&mut results, positions, value.as_ref());
+                        fill_owned_batch_positions(results, positions, value.as_ref());
                         continue;
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
@@ -5020,7 +5038,7 @@ impl MultiLayerCache {
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(started);
-                        fill_owned_batch_positions(&mut results, positions, value.as_ref());
+                        fill_owned_batch_positions(results, positions, value.as_ref());
                         needs_eviction_drain = true;
                         continue;
                     }
@@ -5033,7 +5051,7 @@ impl MultiLayerCache {
             if needs_eviction_drain {
                 self.drain_eviction_records();
             }
-            return Ok(results);
+            return Ok(());
         }
 
         // Pointers, not copies: these keys are read and nothing more.
@@ -5097,7 +5115,7 @@ impl MultiLayerCache {
                                     deferred.push((key, outcome, value.len()));
                                 }
                                 refill_samples = refill_samples.saturating_add(1);
-                                fill_decoded_batch_positions(&mut results, positions, value);
+                                fill_decoded_batch_positions(results, positions, value);
                             }
                             None => {
                                 misses = misses.saturating_add(occurrences as u64);
@@ -5140,7 +5158,7 @@ impl MultiLayerCache {
                             }
                         }
                     }
-                    return Ok(results);
+                    return Ok(());
                 }
             }
         }
@@ -5213,7 +5231,7 @@ impl MultiLayerCache {
         if needs_eviction_drain {
             self.drain_eviction_records();
         }
-        Ok(results)
+        Ok(())
     }
 
     /// The memory tier's bytes, shared rather than copied.
@@ -9046,6 +9064,35 @@ impl ShardedMultiLayerCache {
 
     pub fn get_batch(&self, keys: &[CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         self.get_batch_with_shard_reader(keys, MultiLayerCache::get_batch)
+    }
+
+    /// Batched copied reads into a caller-owned result buffer.
+    ///
+    /// Colocated batches retain the caller's outer allocation and delegate
+    /// directly to the owning shard. Cross-shard batches preserve ordering and
+    /// duplicate positions through the ordinary merge path.
+    pub fn get_batch_into(
+        &self,
+        keys: &[CacheKey],
+        results: &mut Vec<Option<Vec<u8>>>,
+    ) -> Result<(), CacheError> {
+        results.clear();
+        let started = Instant::now();
+        if keys.is_empty() {
+            self.sharded_stats.record_latency(started);
+            return Ok(());
+        }
+        if let Some(shard_index) = self.single_shard_for_keys(keys) {
+            self.sharded_stats.record_local();
+            let result = self.shards[shard_index].get_batch_into(keys, results);
+            self.sharded_stats.record_latency(started);
+            return result;
+        }
+
+        let values = self.get_batch(keys)?;
+        results.reserve(values.len());
+        results.extend(values);
+        Ok(())
     }
 
     pub fn get_no_promotion(&self, key: &CacheKey) -> Result<Option<CacheReadResult>, CacheError> {

@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Copied batch reads can reuse caller-owned result buffers on single caches
+  and colocated sharded-cache reads.
+
 - Batch operations snapshot access-record callback state once and dispatch
   each intended event without repeated cache-lock acquisition.
 

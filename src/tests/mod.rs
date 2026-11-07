@@ -13937,6 +13937,36 @@ mod tests {
     }
 
     #[test]
+    fn get_batch_into_reuses_result_buffer() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let first = CacheKey::string(7, "owned-batch-into-first");
+        let second = CacheKey::string(7, "owned-batch-into-second");
+        cache.put(first.clone(), b"first".to_vec()).unwrap();
+        cache.put(second.clone(), b"second".to_vec()).unwrap();
+
+        let mut values = Vec::with_capacity(16);
+        let original_capacity = values.capacity();
+        let original_storage = values.as_ptr();
+        cache
+            .get_batch_into(&[second.clone(), first.clone(), second.clone()], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values.as_ptr(), original_storage);
+        assert_eq!(values[0].as_deref(), Some(&b"second"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"first"[..]));
+        assert_eq!(values[2].as_deref(), Some(&b"second"[..]));
+
+        cache
+            .get_batch_into(std::slice::from_ref(&first), &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values.as_ptr(), original_storage);
+        assert_eq!(values[0].as_deref(), Some(&b"first"[..]));
+    }
+
+    #[test]
     fn sharded_get_shared_batch_preserves_order() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
         let first = CacheKey::string(1, "shared-sharded-a");
@@ -13984,6 +14014,27 @@ mod tests {
         assert_eq!(values[0].as_deref(), Some(&b"c"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"a"[..]));
         assert_eq!(values[2].as_deref(), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn sharded_get_batch_into_reuses_colocated_result_buffer() {
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
+        let first = CacheKey::string(11, "owned-sharded-into-a");
+        let second = CacheKey::string(11, "owned-sharded-into-b");
+        cache.put(first.clone(), b"a".to_vec()).unwrap();
+        cache.put(second.clone(), b"b".to_vec()).unwrap();
+
+        let mut values = Vec::with_capacity(16);
+        let original_capacity = values.capacity();
+        let original_storage = values.as_ptr();
+        cache
+            .get_batch_into(&[second, first], &mut values)
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.capacity(), original_capacity);
+        assert_eq!(values.as_ptr(), original_storage);
+        assert_eq!(values[0].as_deref(), Some(&b"b"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"a"[..]));
     }
 
     #[test]
