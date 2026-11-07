@@ -13019,6 +13019,20 @@ mod tests {
                 "every requested position has to be grouped"
             );
         }
+
+        let unique_keys = (0..=INLINE_BATCH_KEYS)
+            .map(|index| CacheKey::page(7, index as u64, 4096, 512))
+            .collect::<Vec<_>>();
+        let grouped = coalesce_batch_positions_borrowed(&unique_keys);
+        assert_eq!(grouped.len(), INLINE_BATCH_KEYS + 1);
+        assert!(
+            grouped.spilled(),
+            "a batch larger than the inline capacity must spill rather than truncate"
+        );
+        for (index, (key, positions)) in grouped.iter().enumerate() {
+            assert!(std::ptr::eq(*key, &unique_keys[index]));
+            assert_eq!(positions.first(), index);
+        }
     }
 
     #[test]
