@@ -531,8 +531,8 @@ fn main() {
     //   mixed owned batch of 8   42 -> 5 allocations, 12,632 -> 4,288 bytes
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
-    //   a promoting read          6 -> 5 allocations, 3,282 -> 2,258 bytes
-    //   compressed promotion      7 -> 6 allocations, 3,300 -> 2,276 bytes
+    //   a promoting read          6 -> 5 -> 4 allocations
+    //   compressed promotion      7 -> 6 -> 5 allocations
     //   Rust batch promotion  33.27 -> 25.51 -> 18.73 allocations
     //   RocksDB batch promotion 46.94 -> 39.17 -> 32.41 allocations
     //
@@ -550,7 +550,7 @@ fn main() {
         ("acquire_batch, 2 duplicated", 6.5, 3_800.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
-        ("get, promoting from a lower tier", 6.5, 3_000.0),
+        ("get, promoting from a lower tier", 4.5, 2_300.0),
     ] {
         match find(path) {
             Some(row) if row.allocations <= max_allocations && row.bytes <= max_bytes => {}
@@ -628,23 +628,23 @@ fn main() {
     // the per-call context removes that allocation too, and no figure here
     // counts it either before or after.
     match find("get, promoting a compressed block") {
-        Some(row) if row.allocations <= 7.5 && row.bytes <= 3_200.0 => {}
+        Some(row) if row.allocations <= 5.5 && row.bytes <= 2_400.0 => {}
         Some(row) => failures.push(format!(
-            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 7.5 \
-             and 3,200 -- the decoder is allocating an extra payload buffer",
+            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 5.5 \
+             and 2,400 -- the decoder is allocating an extra payload buffer",
             row.allocations, row.bytes
         )),
         None => failures.push("the compressed read is missing from the table".to_string()),
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 24.5;
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 23.0;
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const COMPRESSING_WRITE_BYTES: f64 = 17_500.0;
+    const COMPRESSING_WRITE_BYTES: f64 = 4_300.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 9.5;
+    const COMPRESSING_WRITE_ALLOCATIONS: f64 = 8.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const COMPRESSING_WRITE_BYTES: f64 = 16_300.0;
+    const COMPRESSING_WRITE_BYTES: f64 = 3_100.0;
     match find("put, compressing a block") {
         Some(row)
             if row.allocations <= COMPRESSING_WRITE_ALLOCATIONS
@@ -673,13 +673,13 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_ALLOCATIONS: f64 = 26.0;
+    const SSD_WRITE_ALLOCATIONS: f64 = 24.0;
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const SSD_WRITE_BYTES: f64 = 25_200.0;
+    const SSD_WRITE_BYTES: f64 = 7_500.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_ALLOCATIONS: f64 = 10.0;
+    const SSD_WRITE_ALLOCATIONS: f64 = 8.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const SSD_WRITE_BYTES: f64 = 21_800.0;
+    const SSD_WRITE_BYTES: f64 = 4_200.0;
     match find("put, reaching the SSD tier") {
         Some(row) if row.allocations <= SSD_WRITE_ALLOCATIONS && row.bytes <= SSD_WRITE_BYTES => {}
         Some(row) => failures.push(format!(
