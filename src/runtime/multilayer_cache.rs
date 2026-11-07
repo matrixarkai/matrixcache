@@ -4839,8 +4839,9 @@ impl MultiLayerCache {
             }
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
+            let ssd_only_started = inner.ssd_instance_only.then(Instant::now);
             for (key, positions) in positions_by_key {
-                let started = Instant::now();
+                let started = ssd_only_started.unwrap_or_else(Instant::now);
                 // Checked under the same shared lock as the lookup, so an
                 // entry cannot be judged live and then read after it expired.
                 if inner.entry_expired(key, now_millis) || inner.ssd_instance_only {
@@ -5013,6 +5014,10 @@ impl MultiLayerCache {
             };
             ssd_reads.push((key, positions, started, refill_started, decoded));
         }
+        let ssd_batch_started = ssd_reads
+            .first()
+            .map(|(_, _, started, _, _)| *started)
+            .unwrap_or_else(Instant::now);
 
         if !refill_wanted {
             let mut deferred = Vec::new();
@@ -5024,52 +5029,56 @@ impl MultiLayerCache {
                     }
                     let hit_epoch = CoarseClock::now_millis();
                     inner.reconfigure_refresh_window(hit_epoch);
-                    for (key, positions, started, refill_started, decoded) in ssd_reads {
+                    let mut disk_hits = 0u64;
+                    let mut misses = 0u64;
+                    let mut compressed_hits = 0u64;
+                    let mut refill_samples = 0usize;
+                    for (key, positions, _, _, decoded) in ssd_reads {
                         let occurrences = positions.len();
                         match decoded {
                             Some((value, compressed)) => {
-                                inner
-                                    .read_counters
-                                    .disk_hits
-                                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                                disk_hits = disk_hits.saturating_add(occurrences as u64);
                                 if compressed {
-                                    inner
-                                        .read_counters
-                                        .compressed_hits
-                                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                                    compressed_hits =
+                                        compressed_hits.saturating_add(occurrences as u64);
                                 }
                                 let outcome = inner.record_hit_shared_at(key, hit_epoch);
                                 if !matches!(outcome, HitOutcome::Accounted) {
                                     deferred.push((key, outcome, value.len()));
                                 }
-                                let micros = elapsed_micros(started);
-                                inner
-                                    .record_get_latency_micros_many(micros, occurrences);
-                                inner.record_read_through_latency_micros_many(
-                                    micros,
-                                    occurrences,
-                                );
-                                inner.record_refill_latency(refill_started);
+                                refill_samples = refill_samples.saturating_add(1);
                                 for index in positions {
                                     results[index] = Some(value.to_vec());
                                 }
                             }
                             None => {
-                                inner
-                                    .read_counters
-                                    .misses
-                                    .fetch_add(occurrences as u64, Ordering::Relaxed);
-                                let micros = elapsed_micros(started);
-                                inner
-                                    .record_get_latency_micros_many(micros, occurrences);
-                                inner.record_read_through_latency_micros_many(
-                                    micros,
-                                    occurrences,
-                                );
+                                misses = misses.saturating_add(occurrences as u64);
                             }
                         }
                     }
                     drop(inner);
+
+                    let samples = disk_hits.saturating_add(misses) as usize;
+                    let micros = elapsed_micros(ssd_batch_started);
+                    self.read_counters
+                        .disk_hits
+                        .fetch_add(disk_hits, Ordering::Relaxed);
+                    self.read_counters
+                        .misses
+                        .fetch_add(misses, Ordering::Relaxed);
+                    self.read_counters
+                        .compressed_hits
+                        .fetch_add(compressed_hits, Ordering::Relaxed);
+                    self.read_counters
+                        .get_latency
+                        .observe_many_with_total(micros, samples);
+                    self.read_counters
+                        .read_through_latency
+                        .observe_many_with_total(micros, samples);
+                    self.read_counters.refill_latency.observe_many_with_total(
+                        elapsed_micros(refill_started),
+                        refill_samples,
+                    );
 
                     if !deferred.is_empty() {
                         let mut inner = self.inner.write().expect("cache lock poisoned");
