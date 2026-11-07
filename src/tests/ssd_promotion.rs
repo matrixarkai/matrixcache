@@ -301,7 +301,17 @@ fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
     assert_eq!(after.memory_fills, before.memory_fills);
     assert_eq!(after.pmem_fills, before.pmem_fills);
     assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.disk_hits - before.disk_hits, 5);
     assert_eq!(after.compressed_hits - before.compressed_hits, 5);
+    assert_eq!(after.get_latency_samples - before.get_latency_samples, 5);
+    assert_eq!(
+        after.read_through_latency_samples - before.read_through_latency_samples,
+        5
+    );
+    assert_eq!(
+        after.refill_latency_samples - before.refill_latency_samples,
+        5
+    );
     assert!(keys
         .iter()
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));

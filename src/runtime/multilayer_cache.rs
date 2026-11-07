@@ -3935,12 +3935,13 @@ impl MultiLayerCache {
             }
             let hit_epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(hit_epoch);
+            let ssd_only_started = inner.ssd_instance_only.then(Instant::now);
             for (unique_position, key) in unique_keys.iter().enumerate() {
                 // The unique keys are borrowed from the caller's slice now, so
                 // iterating them yields a double reference. Rebound once here
                 // rather than dereferenced at each of the dozen uses below.
                 let key: &CacheKey = key;
-                let started = Instant::now();
+                let started = ssd_only_started.unwrap_or_else(Instant::now);
                 if inner.entry_expired(key, now_millis) {
                     expired_keys.push((unique_position, started));
                     continue;
@@ -4063,10 +4064,18 @@ impl MultiLayerCache {
                 .iter()
                 .map(|(unique_position, _)| unique_keys[*unique_position])
                 .collect::<Vec<_>>();
+            let ssd_batch_started = ssd_candidates
+                .first()
+                .map(|(_, started)| *started)
+                .unwrap_or_else(Instant::now);
             let refill_started = Instant::now();
-            let (blocks, probe_epoch) = {
+            let (blocks, probe_epoch, ssd_only) = {
                 let inner = self.inner.read().expect("cache lock poisoned");
-                (inner.read_ssd_blocks(&candidate_keys)?, inner.ssd_batch_probe_epoch(&candidate_keys))
+                (
+                    inner.read_ssd_blocks(&candidate_keys)?,
+                    inner.ssd_batch_probe_epoch(&candidate_keys),
+                    inner.ssd_instance_only,
+                )
             };
             let mut decoded = Vec::with_capacity(ssd_candidates.len());
             for ((unique_position, started), block) in ssd_candidates.into_iter().zip(blocks) {
@@ -4079,13 +4088,10 @@ impl MultiLayerCache {
                 };
                 decoded.push((unique_position, started, decoded_block));
             }
-            let ssd_only = self
-                .inner
-                .read()
-                .expect("cache lock poisoned")
-                .ssd_instance_only;
             if ssd_only {
                 let mut deferred = Vec::new();
+                let mut disk_hits = 0u64;
+                let mut misses = 0u64;
                 let mut compressed_hits = 0u64;
                 {
                     let inner = self.inner.read().expect("cache lock poisoned");
@@ -4094,40 +4100,51 @@ impl MultiLayerCache {
                     }
                     let hit_epoch = CoarseClock::now_millis();
                     inner.reconfigure_refresh_window(hit_epoch);
-                    for (unique_position, started, decoded_block) in decoded {
+                    for (unique_position, _, decoded_block) in decoded {
                         let key = unique_keys[unique_position];
                         match decoded_block {
                             Some((value, compressed)) => {
-                                inner
-                                    .read_counters
-                                    .disk_hits
-                                    .fetch_add(1, Ordering::Relaxed);
+                                disk_hits += 1;
                                 compressed_hits += u64::from(compressed);
                                 let outcome = inner.record_hit_shared_at(key, hit_epoch);
                                 if !matches!(outcome, HitOutcome::Accounted) {
                                     deferred.push((unique_position, outcome, value.len()));
                                 }
-                                let micros = elapsed_micros(started);
-                                inner.record_get_latency_micros(micros);
-                                inner.record_read_through_latency_micros(micros);
-                                inner.record_refill_latency(refill_started);
                                 unique_values[unique_position] = Some(value);
                             }
                             None => {
-                                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-                                let micros = elapsed_micros(started);
-                                inner.record_get_latency_micros(micros);
-                                inner.record_read_through_latency_micros(micros);
+                                misses += 1;
                             }
                         }
                     }
-                    if compressed_hits != 0 {
-                        inner
-                            .read_counters
-                            .compressed_hits
-                            .fetch_add(compressed_hits, Ordering::Relaxed);
-                    }
                 }
+                if disk_hits != 0 {
+                    self.read_counters
+                        .disk_hits
+                        .fetch_add(disk_hits, Ordering::Relaxed);
+                    self.read_counters.refill_latency.observe_many_with_total(
+                        elapsed_micros(refill_started),
+                        disk_hits as usize,
+                    );
+                }
+                if misses != 0 {
+                    self.read_counters
+                        .misses
+                        .fetch_add(misses, Ordering::Relaxed);
+                }
+                if compressed_hits != 0 {
+                    self.read_counters
+                        .compressed_hits
+                        .fetch_add(compressed_hits, Ordering::Relaxed);
+                }
+                let samples = disk_hits.saturating_add(misses) as usize;
+                let micros = elapsed_micros(ssd_batch_started);
+                self.read_counters
+                    .get_latency
+                    .observe_many_with_total(micros, samples);
+                self.read_counters
+                    .read_through_latency
+                    .observe_many_with_total(micros, samples);
                 if !deferred.is_empty() {
                     let mut inner = self.inner.write().expect("cache lock poisoned");
                     for (unique_position, outcome, len) in deferred {
