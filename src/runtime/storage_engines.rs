@@ -2623,6 +2623,41 @@ impl StorageEngineRocksDb {
         self.get_batch_refs(&key_refs)
     }
 
+    pub(crate) fn get_unique_batch(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        self.get_unique_batch_iter(keys.iter().map(String::as_str), keys.len())
+    }
+
+    fn get_unique_batch_iter<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+        len: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        if !self.initialized {
+            return Err(CacheError::Stopped);
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            self.rocksdb()?
+                .multi_get(keys.into_iter().map(str::as_bytes))
+                .into_iter()
+                .map(|result| result.map_err(|err| CacheError::RocksDb(err.to_string())))
+                .collect()
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        {
+            Ok(keys
+                .into_iter()
+                .map(|key| self.records.get(key).cloned())
+                .collect())
+        }
+    }
+
     fn get_batch_refs(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.initialized {
             return Err(CacheError::Stopped);
@@ -3317,6 +3352,41 @@ impl StorageEngineMultiSsd {
         }
 
         Ok(expand_storage_batch_values(unique_values, output_positions))
+    }
+
+    pub(crate) fn get_unique_batch(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        if !self.initialized || self.storages.is_empty() {
+            return Err(CacheError::Stopped);
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut routed = vec![Vec::<(usize, &str)>::new(); self.storages.len()];
+        for (index, key) in keys.iter().enumerate() {
+            let storage_index = Self::hash(key) as usize % self.storages.len();
+            routed[storage_index].push((index, key));
+        }
+
+        let mut values = Vec::with_capacity(keys.len());
+        values.resize_with(keys.len(), || None);
+        for (storage_index, entries) in routed.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let entry_count = entries.len();
+            let storage_values = self.storages[storage_index].get_unique_batch_iter(
+                entries.iter().map(|(_, key)| *key),
+                entry_count,
+            )?;
+            for ((index, _), value) in entries.into_iter().zip(storage_values) {
+                values[index] = value;
+            }
+        }
+        Ok(values)
     }
 
     /// Write without building a `CacheBuffer` around the value.

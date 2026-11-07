@@ -853,7 +853,7 @@ impl CacheInner {
             .iter()
             .map(|key| Self::ssd_store_key(key))
             .collect::<Vec<_>>();
-        let mut blocks = self.ssd_store.get_batch(&store_keys)?;
+        let mut blocks = self.ssd_store.get_unique_batch(&store_keys)?;
         for (block, key) in blocks.iter_mut().zip(keys.iter()) {
             if block.is_some() {
                 continue;

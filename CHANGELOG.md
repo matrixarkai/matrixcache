@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- SSD promotion batches carry their already-unique keys through the storage
+  boundary without a second deduplication and result-expansion pass.
+
 - Memory-only misses skip SSD key construction and legacy disk probes when the
   lower tier is disabled, and mixed batches finish those misses during shared
   classification without persistent-tier work buffers.

@@ -656,9 +656,9 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 65.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 40.5;
     #[cfg(feature = "rocksdb-ssd")]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 80.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 54.0;
     match find("get_batch, promoting from a lower tier") {
         Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 190_000.0 => {}
         Some(row) => failures.push(format!(
