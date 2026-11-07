@@ -14017,6 +14017,22 @@ mod tests {
     }
 
     #[test]
+    fn disabled_lower_tier_does_not_probe_legacy_files() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::string(7, "disabled-lower-tier");
+        let disk_path = cache
+            .inner
+            .read()
+            .expect("cache lock poisoned")
+            .disk_path(&key);
+        std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
+        std::fs::write(&disk_path, b"stray legacy bytes").unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), None);
+        assert_eq!(cache.get_batch(std::slice::from_ref(&key)).unwrap(), vec![None]);
+    }
+
+    #[test]
     fn sharded_get_shared_batch_preserves_order() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
         let first = CacheKey::string(1, "shared-sharded-a");

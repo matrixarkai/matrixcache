@@ -528,7 +528,7 @@ fn main() {
     // separately below), so there is nothing to tolerate but a change.
     //
     //   pinned batch of 8        15 -> 7 allocations
-    //   mixed owned batch of 8   42 -> 38 allocations, 12,632 -> 8,536 bytes
+    //   mixed owned batch of 8   42 -> 12 allocations, 12,632 -> 5,600 bytes
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
     //   a promoting read         13.00 -> 12.00 allocations, 25,334.0 -> 24,310.0 bytes
@@ -539,7 +539,7 @@ fn main() {
         ("get, copying", 1.5, 1_100.0),
         ("get_batch, copying", 11.5, 9_400.0),
         ("get_batch_into, resident", 0.5, 128.0),
-        ("get_batch, mixed hits and misses", 38.5, 9_000.0),
+        ("get_batch, mixed hits and misses", 13.0, 6_000.0),
         ("get_shared_batch", 2.5, 500.0),
         ("get_shared_batch_into, resident", 0.5, 128.0),
         ("acquire_batch_no_promotion", 7.5, 3_000.0),
