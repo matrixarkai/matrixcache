@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- SSD-only shared batches use one clock sample, one storage-mode lookup, and
+  batched hit, miss, compression, and latency accounting.
+
 - Unique shared batches already resident in memory or PMEM bypass generic
   coalescing when no promotion is required.
 
