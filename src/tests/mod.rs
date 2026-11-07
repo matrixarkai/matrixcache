@@ -24910,6 +24910,12 @@ fn the_ssd_store_key_is_byte_for_byte_the_line_the_old_encoding_produced() {
             expected,
             "the SSD tier's key for {key:?} changed"
         );
+        let inline = CacheInner::inline_ssd_store_key(key);
+        assert_eq!(
+            CacheInner::inline_ssd_store_key_str(&inline),
+            expected,
+            "the inline SSD key for {key:?} changed"
+        );
         assert_eq!(manifest_line_for_key_len(key, 0), expected.len());
         let mut appended = String::with_capacity(manifest_line_for_key_len(key, 0));
         append_manifest_line_for_key(&mut appended, key, 0);

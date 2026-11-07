@@ -308,6 +308,7 @@ impl MatrixCacheBuilder {
 
 const CACHE_BLOCK_MAGIC: &[u8; 8] = b"TSBCACHE";
 const CACHE_BLOCK_VERSION: u8 = 1;
+const INLINE_SSD_STORE_KEY_BYTES: usize = 256;
 const CACHE_CODEC_RAW: u8 = 0;
 const CACHE_CODEC_ZSTD: u8 = 1;
 const CACHE_HEADER_LEN: usize = 8 + 1 + 1 + 8 + 8;
@@ -807,15 +808,39 @@ impl CacheInner {
         manifest_line_for_key(key, 0)
     }
 
+    fn inline_ssd_store_key(key: &CacheKey) -> SmallVec<[u8; INLINE_SSD_STORE_KEY_BYTES]> {
+        let mut line = SmallVec::new();
+        line.extend_from_slice(b"v1\t");
+        push_decimal_bytes(&mut line, key.shard_id);
+        line.push(b'\t');
+        push_manifest_field_bytes(&mut line, &key.record_key);
+        line.push(b'\t');
+        push_manifest_field_bytes(&mut line, &key.namespace);
+        line.push(b'\t');
+        push_manifest_field_bytes(&mut line, &key.selector);
+        line.extend_from_slice(b"\t0");
+        line
+    }
+
+    fn inline_ssd_store_key_str(key: &[u8]) -> &str {
+        std::str::from_utf8(key).expect("SSD store keys are ASCII manifest lines")
+    }
+
     fn ssd_block_exists(&self, key: &CacheKey) -> bool {
-        self.ssd_store.peek(&Self::ssd_store_key(key))
+        let store_key = Self::inline_ssd_store_key(key);
+        self.ssd_store
+            .peek(Self::inline_ssd_store_key_str(&store_key))
     }
 
     fn read_ssd_block(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
         if !self.ssd_store.holds_blocks() {
             return Ok(None);
         }
-        match self.ssd_store.get_owned(&Self::ssd_store_key(key)) {
+        let store_key = Self::inline_ssd_store_key(key);
+        match self
+            .ssd_store
+            .get_owned(Self::inline_ssd_store_key_str(&store_key))
+        {
             Ok(block) => Ok(Some(block)),
             Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
                 Ok(block) => Ok(Some(block)),
@@ -891,8 +916,9 @@ impl CacheInner {
                 write_cache_block_atomic(&path, &block, durable)
             })?;
         }
+        let store_key = Self::inline_ssd_store_key(key);
         self.ssd_store
-            .put(&Self::ssd_store_key(key), block)
+            .put(Self::inline_ssd_store_key_str(&store_key), block)
             .map(|_| ())
     }
 
@@ -979,7 +1005,11 @@ impl CacheInner {
     fn delete_ssd_block(&mut self, key: &CacheKey) -> Result<(), CacheError> {
         self.note_ssd_probe_mutation(key);
         let _ = fs::remove_file(self.disk_path(key));
-        match self.ssd_store.delete(&Self::ssd_store_key(key)) {
+        let store_key = Self::inline_ssd_store_key(key);
+        match self
+            .ssd_store
+            .delete(Self::inline_ssd_store_key_str(&store_key))
+        {
             Ok(()) | Err(CacheError::NotFound) => Ok(()),
             Err(err) => Err(err),
         }
@@ -4126,6 +4156,33 @@ fn push_decimal(line: &mut String, value: u64) {
     }
     for &digit in &digits[index..] {
         line.push(digit as char);
+    }
+}
+
+fn push_decimal_bytes(line: &mut SmallVec<[u8; INLINE_SSD_STORE_KEY_BYTES]>, value: u64) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut rest = value;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    line.extend_from_slice(&digits[index..]);
+}
+
+fn push_manifest_field_bytes(
+    line: &mut SmallVec<[u8; INLINE_SSD_STORE_KEY_BYTES]>,
+    value: &str,
+) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    line.reserve(value.len() * 2);
+    for byte in value.bytes() {
+        line.push(HEX[(byte >> 4) as usize]);
+        line.push(HEX[(byte & 15) as usize]);
     }
 }
 
