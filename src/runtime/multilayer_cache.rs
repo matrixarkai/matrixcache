@@ -3541,6 +3541,13 @@ impl MultiLayerCache {
     }
 
     fn emit_access_record(&self, record_type: CacheAccessRecordKind, key: &CacheKey) {
+        self.emit_access_records(record_type, std::iter::once(key));
+    }
+
+    fn emit_access_records<'a, I>(&self, record_type: CacheAccessRecordKind, keys: I)
+    where
+        I: IntoIterator<Item = &'a CacheKey>,
+    {
         // Every get, put and delete starts here. Reading one bit is cheaper
         // than taking the cache lock to learn the same thing.
         if !self.access_record_registered.load(Ordering::Relaxed) {
@@ -3554,10 +3561,12 @@ impl MultiLayerCache {
                 .clone()
         };
         if let Some(callback) = callback {
-            callback.call(CacheAccessRecord {
-                record_type,
-                key: key.clone(),
-            });
+            for key in keys {
+                callback.call(CacheAccessRecord {
+                    record_type,
+                    key: key.clone(),
+                });
+            }
         }
     }
 
@@ -3947,10 +3956,9 @@ impl MultiLayerCache {
         }
 
         let now_millis = CoarseClock::now_millis();
-        if !has_duplicate_batch_keys(keys) {
-            for key in keys {
-                self.emit_access_record(CacheAccessRecordKind::Get, key);
-            }
+        let has_duplicates = has_duplicate_batch_keys(keys);
+        if !has_duplicates {
+            self.emit_access_records(CacheAccessRecordKind::Get, keys.iter());
             if self.try_get_shared_resident_batch(keys, now_millis, results)? {
                 return Ok(());
             }
@@ -3958,8 +3966,8 @@ impl MultiLayerCache {
 
         let (unique_keys, requested_positions) = coalesce_batch_keys(keys);
 
-        for key in &unique_keys {
-            self.emit_access_record(CacheAccessRecordKind::Get, key);
+        if has_duplicates {
+            self.emit_access_records(CacheAccessRecordKind::Get, unique_keys.iter().copied());
         }
 
         let mut unique_values = empty_batch_results(unique_keys.len());
@@ -4843,9 +4851,7 @@ impl MultiLayerCache {
     }
 
     pub fn get_batch(&self, keys: &[CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        for key in keys {
-            self.emit_access_record(CacheAccessRecordKind::Get, key);
-        }
+        self.emit_access_records(CacheAccessRecordKind::Get, keys.iter());
 
         let mut results = empty_batch_results(keys.len());
         let mut ssd_candidates = Vec::new();
@@ -6404,9 +6410,7 @@ impl MultiLayerCache {
             inserted
         };
         self.drain_eviction_records();
-        for key in &inserted_keys {
-            self.emit_access_record(CacheAccessRecordKind::Put, key);
-        }
+        self.emit_access_records(CacheAccessRecordKind::Put, inserted_keys.iter());
         Ok(inserted)
     }
 
@@ -6974,9 +6978,7 @@ impl MultiLayerCache {
             inner.shrink_tables_if_sparse();
             keys.len()
         };
-        for key in keys {
-            self.emit_access_record(CacheAccessRecordKind::Delete, key);
-        }
+        self.emit_access_records(CacheAccessRecordKind::Delete, keys.iter());
         Ok(removed)
     }
 

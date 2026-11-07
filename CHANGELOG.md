@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Batch operations snapshot access-record callback state once and dispatch
+  each intended event without repeated cache-lock acquisition.
+
 - SSD-only copied batches move each decoded allocation into its result and
   copy payload bytes only for duplicate request positions.
 

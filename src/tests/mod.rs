@@ -24382,6 +24382,35 @@ fn shared_batch_coalesces_duplicate_ssd_reads() {
 }
 
 #[test]
+fn shared_ssd_batch_emits_each_unique_access_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    cache.start().unwrap();
+    let first = CacheKey::page_with_slot(1, 21, 0, 16, Some(7));
+    let second = CacheKey::page_with_slot(1, 22, 0, 16, Some(8));
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Ssd, first.clone(), b"first".to_vec())
+        .unwrap();
+    cache
+        .put_bypass_storage_for_tier(CacheTier::Ssd, second.clone(), b"second".to_vec())
+        .unwrap();
+
+    let gets = Arc::new(AtomicU64::new(0));
+    let callback_gets = Arc::clone(&gets);
+    cache.register_access_record_callback(move |record| {
+        if record.record_type == CacheAccessRecordKind::Get {
+            callback_gets.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let values = cache
+        .get_shared_batch(&[first, second])
+        .expect("shared SSD batch");
+    assert!(values.iter().all(Option::is_some));
+    assert_eq!(gets.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn shared_batch_coalesces_duplicate_memory_hits() {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::new(1 << 20, dir.path());
