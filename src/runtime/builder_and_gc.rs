@@ -617,14 +617,6 @@ impl CacheDecodedBlock {
         }
     }
 
-    /// One owned copy, for a read that needs several.
-    fn to_vec(&self) -> Vec<u8> {
-        match self {
-            Self::Shared(bytes) => bytes.to_vec(),
-            Self::Owned(bytes) => bytes.clone(),
-        }
-    }
-
     /// The owned copy, for a read that needs one.
     ///
     /// The owning form moves rather than copies here, which is why the two

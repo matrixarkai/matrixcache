@@ -5,8 +5,9 @@
 //!
 //! `get_batch` serves from the memory tier when it can, so a batch of resident
 //! keys should cost about what the same number of single gets costs and no
-//! more. `get_shared_batch` keeps the normal replacement bookkeeping while
-//! returning shared buffers instead of copying values. `get_batch_no_promotion`
+//! more. `get_batch_into` additionally retains the caller's outer and payload
+//! allocations across passes. `get_shared_batch` keeps the normal replacement
+//! bookkeeping while returning shared buffers instead of copying values. `get_batch_no_promotion`
 //! is the scan path: it answers without moving entries between tiers or
 //! updating replacement metadata. The pinned no-promotion column measures the
 //! same scan shape when the caller wants zero-copy handles and releases them in
@@ -54,8 +55,10 @@ struct BenchConfig {
 struct BatchReadRow {
     batch_size: usize,
     get_batch_ns: f64,
+    get_batch_into_ns: f64,
     sharded_get_ns: f64,
     sharded_colocated_ns: f64,
+    sharded_colocated_into_ns: f64,
     shared_batch_ns: f64,
     get_batch_no_promotion_ns: f64,
     acquire_no_promotion_ns: f64,
@@ -159,11 +162,13 @@ fn main() {
          median of {PASSES} passes\n"
     );
     println!(
-        "{:<16}{:>14}{:>18}{:>22}{:>18}{:>22}{:>24}{:>28}{:>28}",
+        "{:<12}{:>14}{:>18}{:>18}{:>22}{:>27}{:>18}{:>22}{:>24}{:>28}{:>28}",
         "batch size",
         "get_batch",
+        "get_batch_into",
         "sharded_get",
         "sharded_colocated",
+        "sharded_colocated_into",
         "shared_batch",
         "get_batch_no_prom",
         "acquire_no_prom",
@@ -180,6 +185,23 @@ fn main() {
                     let mut served = 0_usize;
                     for chunk in keys.chunks(batch) {
                         let values = cache.get_batch(chunk).expect("get_batch");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(served, RESIDENT, "every key should have hit memory");
+                    started.elapsed().as_nanos() as f64 / RESIDENT as f64
+                })
+                .collect(),
+        );
+        let regular_into_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    let mut values = Vec::with_capacity(batch);
+                    for chunk in keys.chunks(batch) {
+                        cache
+                            .get_batch_into(chunk, &mut values)
+                            .expect("get_batch_into");
                         served += values.iter().filter(|value| value.is_some()).count();
                     }
                     assert_eq!(served, RESIDENT, "every key should have hit memory");
@@ -270,6 +292,26 @@ fn main() {
                 })
                 .collect(),
         );
+        let sharded_colocated_into_ns = median(
+            (0..PASSES)
+                .map(|_| {
+                    let started = Instant::now();
+                    let mut served = 0_usize;
+                    let mut values = Vec::with_capacity(batch);
+                    for chunk in colocated_keys.chunks(batch) {
+                        sharded_colocated
+                            .get_batch_into(chunk, &mut values)
+                            .expect("sharded_colocated_into");
+                        served += values.iter().filter(|value| value.is_some()).count();
+                    }
+                    assert_eq!(
+                        served, COLOCATED_RESIDENT,
+                        "every colocated key should hit sharded memory"
+                    );
+                    started.elapsed().as_nanos() as f64 / COLOCATED_RESIDENT as f64
+                })
+                .collect(),
+        );
         let sharded_acquire_no_promotion_ns = median(
             (0..PASSES)
                 .map(|_| {
@@ -308,13 +350,15 @@ fn main() {
                 .collect(),
         );
         println!(
-            "{batch:<16}{regular_ns:>14.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{shared_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
+            "{batch:<12}{regular_ns:>14.1}{regular_into_ns:>18.1}{sharded_regular_ns:>18.1}{sharded_colocated_ns:>22.1}{sharded_colocated_into_ns:>27.1}{shared_ns:>18.1}{no_promotion_ns:>22.1}{acquire_no_promotion_ns:>24.1}{sharded_acquire_colocated_ns:>28.1}{sharded_acquire_no_promotion_ns:>28.1}"
         );
         rows.push(BatchReadRow {
             batch_size: batch,
             get_batch_ns: regular_ns,
+            get_batch_into_ns: regular_into_ns,
             sharded_get_ns: sharded_regular_ns,
             sharded_colocated_ns,
+            sharded_colocated_into_ns,
             shared_batch_ns: shared_ns,
             get_batch_no_promotion_ns: no_promotion_ns,
             acquire_no_promotion_ns,
@@ -369,6 +413,12 @@ fn render_json_report(rows: &[BatchReadRow]) -> String {
         .expect("format report");
         writeln!(
             &mut report,
+            "      \"get_batch_into_ns\": {:.1},",
+            row.get_batch_into_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
             "      \"sharded_get_ns\": {:.1},",
             row.sharded_get_ns
         )
@@ -377,6 +427,12 @@ fn render_json_report(rows: &[BatchReadRow]) -> String {
             &mut report,
             "      \"sharded_colocated_ns\": {:.1},",
             row.sharded_colocated_ns
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"sharded_colocated_into_ns\": {:.1},",
+            row.sharded_colocated_into_ns
         )
         .expect("format report");
         writeln!(

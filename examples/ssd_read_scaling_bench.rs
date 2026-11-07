@@ -155,14 +155,52 @@ fn owned_batch_read_qps(readers: usize) -> f64 {
     (readers * READS_PER_THREAD) as f64 / started.elapsed().as_secs_f64()
 }
 
+fn owned_batch_into_read_qps(readers: usize) -> f64 {
+    let (_directory, cache, keys) = cache();
+    let barrier = Arc::new(Barrier::new(readers + 1));
+    let started = std::thread::scope(|scope| {
+        let workers = (0..readers)
+            .map(|reader| {
+                let barrier = Arc::clone(&barrier);
+                let cache = &cache;
+                let keys = &keys;
+                scope.spawn(move || {
+                    let mut batch = Vec::with_capacity(BATCH);
+                    let mut values = Vec::with_capacity(BATCH);
+                    barrier.wait();
+                    for read in 0..(READS_PER_THREAD / BATCH) {
+                        batch.clear();
+                        let offset = (read * BATCH + reader) % keys.len();
+                        for position in 0..BATCH {
+                            batch.push(keys[(offset + position) % keys.len()].clone());
+                        }
+                        cache.get_batch_into(&batch, &mut values).unwrap();
+                        black_box(&values);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let started = Instant::now();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        started
+    });
+    (readers * READS_PER_THREAD) as f64 / started.elapsed().as_secs_f64()
+}
+
 fn main() {
-    println!("readers,owned_read_qps,shared_read_qps,owned_batch_item_qps,shared_batch_item_qps");
+    println!(
+        "readers,owned_read_qps,shared_read_qps,owned_batch_item_qps,owned_batch_into_item_qps,shared_batch_item_qps"
+    );
     for readers in [1, 2, 4, 8] {
         println!(
-            "{readers},{:.0},{:.0},{:.0},{:.0}",
+            "{readers},{:.0},{:.0},{:.0},{:.0},{:.0}",
             owned_read_qps(readers),
             shared_read_qps(readers),
             owned_batch_read_qps(readers),
+            owned_batch_into_read_qps(readers),
             batch_read_qps(readers)
         );
     }
