@@ -22061,6 +22061,69 @@ mod tests {
         assert!(writeback.write_through_admissions >= 12);
     }
     #[test]
+    fn sharded_large_writeback_batches_preserve_queue_and_fallback_results() {
+        let cache = MatrixCacheBuilder::build_sharded_cache(
+            CacheOptions::new(1 << 20, 0, 0),
+            16,
+        );
+        cache.set_async_writeback_queue_limit_for_test(1024);
+        let queued_keys = (0..512)
+            .map(|index| {
+                CacheKey::string(
+                    (index % 16) as ShardId,
+                    &format!("large-writeback-queued-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let before = cache.stats().sharded_batch_fanout_operations;
+        assert_eq!(
+            cache
+                .enqueue_async_writeback_batch(
+                    queued_keys
+                        .iter()
+                        .cloned()
+                        .map(|key| (key, vec![b'q'; 32]))
+                        .collect(),
+                )
+                .unwrap(),
+            queued_keys.len()
+        );
+        let flushed = cache.flush_async_writeback().unwrap();
+        assert_eq!(flushed.drained, queued_keys.len());
+        assert!(cache
+            .get_batch(&queued_keys)
+            .unwrap()
+            .iter()
+            .all(|value| value.as_deref() == Some(&[b'q'; 32])));
+
+        cache.set_async_writeback_queue_limit_for_test(0);
+        let fallback_keys = (0..512)
+            .map(|index| {
+                CacheKey::string(
+                    (index % 16) as ShardId,
+                    &format!("large-writeback-fallback-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = cache
+            .submit_async_writeback_batch_or_write_through(
+                fallback_keys
+                    .iter()
+                    .cloned()
+                    .map(|key| (key, vec![b'f'; 32]))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(report.queued, 0);
+        assert_eq!(report.write_through, fallback_keys.len());
+        assert!(cache
+            .get_batch(&fallback_keys)
+            .unwrap()
+            .iter()
+            .all(|value| value.as_deref() == Some(&[b'f'; 32])));
+        assert!(cache.stats().sharded_batch_fanout_operations >= before + 2);
+    }
+    #[test]
     fn sharded_async_writeback_workers_drain_each_shard() {
         let cache = MatrixCacheBuilder::build_sharded_cache(
             CacheOptions::new(512, 0, 4096)

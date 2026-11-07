@@ -6911,13 +6911,27 @@ impl MultiLayerCache {
         &self,
         entries: Vec<(CacheKey, Vec<u8>)>,
     ) -> Result<CacheWritebackSubmitReport, CacheError> {
-        let mut report = CacheWritebackSubmitReport::default();
-        for (key, value) in entries {
-            let submitted = self.submit_async_writeback_or_write_through(key, value)?;
-            report.queued = report.queued.saturating_add(submitted.queued);
-            report.write_through = report.write_through.saturating_add(submitted.write_through);
+        let requested = entries.len();
+        match self.enqueue_async_writeback_batch(entries) {
+            Ok(queued) => Ok(CacheWritebackSubmitReport {
+                queued,
+                write_through: 0,
+            }),
+            Err(rejected) => {
+                let write_through = rejected.len();
+                let queued = requested.saturating_sub(write_through);
+                self.put_batch(
+                    rejected
+                        .into_iter()
+                        .map(|job| (job.key, job.value))
+                        .collect(),
+                )?;
+                Ok(CacheWritebackSubmitReport {
+                    queued,
+                    write_through,
+                })
+            }
         }
-        Ok(report)
     }
 
     pub fn drain_async_writeback(
@@ -8315,38 +8329,36 @@ impl ShardedMultiLayerCache {
         }
 
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
-        let result = std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(fanout);
-            for (index, group) in groups.into_iter().enumerate() {
-                if !group.is_empty() {
-                    let shard = &self.shards[index];
-                    workers.push(scope.spawn(move || shard.enqueue_async_writeback_batch(group)));
-                }
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || shard.enqueue_async_writeback_batch(group)));
             }
+        }
 
-            let mut enqueued = 0usize;
-            let mut rejected = Vec::new();
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(count)) => enqueued = enqueued.saturating_add(count),
-                    Ok(Err(mut jobs)) => rejected.append(&mut jobs),
-                    Err(_) => {
-                        return Err(vec![CacheWritebackJob {
-                            key: CacheKey::string(
-                                0,
-                                "sharded-async-writeback-enqueue-worker-panicked",
-                            ),
-                            value: Vec::new(),
-                        }]);
-                    }
-                }
+        let mut enqueued = 0usize;
+        let mut rejected = Vec::new();
+        let mut worker_panicked = false;
+        for worker in workers {
+            match worker.try_join() {
+                Some(Ok(count)) => enqueued = enqueued.saturating_add(count),
+                Some(Err(mut jobs)) => rejected.append(&mut jobs),
+                None => worker_panicked = true,
             }
-            if rejected.is_empty() {
-                Ok(enqueued)
-            } else {
-                Err(rejected)
-            }
-        });
+        }
+        if worker_panicked {
+            rejected.push(CacheWritebackJob {
+                key: CacheKey::string(0, "sharded-async-writeback-enqueue-worker-panicked"),
+                value: Vec::new(),
+            });
+        }
+        let result = if rejected.is_empty() {
+            Ok(enqueued)
+        } else {
+            Err(rejected)
+        };
         finish_sharded_fanout_batch(&self.sharded_stats, started, fanout, result)
     }
 
@@ -8363,39 +8375,119 @@ impl ShardedMultiLayerCache {
         &self,
         entries: Vec<(CacheKey, Vec<u8>)>,
     ) -> Result<CacheWritebackSubmitReport, CacheError> {
-        let mut report = CacheWritebackSubmitReport::default();
-        for (key, value) in entries {
-            let submitted = self.submit_async_writeback_or_write_through(key, value)?;
-            report.queued = report.queued.saturating_add(submitted.queued);
-            report.write_through = report.write_through.saturating_add(submitted.write_through);
+        let started = Instant::now();
+        if entries.is_empty() {
+            return finish_sharded_local_batch(
+                &self.sharded_stats,
+                started,
+                Ok(CacheWritebackSubmitReport::default()),
+            );
         }
-        Ok(report)
+        if let Some(shard_index) = self.single_shard_for_writeback_entries(&entries) {
+            return finish_sharded_local_batch(
+                &self.sharded_stats,
+                started,
+                self.shards[shard_index]
+                    .submit_async_writeback_batch_or_write_through(entries),
+            );
+        }
+
+        let mut groups = vec![Vec::new(); self.shard_count()];
+        for (key, value) in entries {
+            let index = self.shard_index_for_key(&key);
+            groups[index].push((key, value));
+        }
+        let requested = groups.iter().map(Vec::len).sum::<usize>();
+        if requested < Self::BATCH_FANOUT_THRESHOLD {
+            let mut report = CacheWritebackSubmitReport::default();
+            for (index, group) in groups.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let submitted = self.shards[index]
+                    .submit_async_writeback_batch_or_write_through(group)?;
+                report.queued = report.queued.saturating_add(submitted.queued);
+                report.write_through = report
+                    .write_through
+                    .saturating_add(submitted.write_through);
+            }
+            return finish_sharded_local_batch(&self.sharded_stats, started, Ok(report));
+        }
+
+        let fanout = groups.iter().filter(|group| !group.is_empty()).count();
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || {
+                    shard.submit_async_writeback_batch_or_write_through(group)
+                }));
+            }
+        }
+
+        let mut report = CacheWritebackSubmitReport::default();
+        let mut first_error = None;
+        for worker in workers {
+            match worker.try_join() {
+                Some(Ok(submitted)) => {
+                    report.queued = report.queued.saturating_add(submitted.queued);
+                    report.write_through = report
+                        .write_through
+                        .saturating_add(submitted.write_through);
+                }
+                Some(Err(err)) => {
+                    first_error.get_or_insert(err);
+                }
+                None => {
+                    first_error.get_or_insert_with(|| {
+                        CacheError::CorruptBlock(
+                            "sharded async writeback submit worker panicked".to_string(),
+                        )
+                    });
+                }
+            };
+        }
+        let result = first_error.map_or(Ok(report), Err);
+        finish_sharded_fanout_batch(&self.sharded_stats, started, fanout, result)
     }
 
     pub fn drain_async_writeback(
         &self,
         max_jobs_per_shard: usize,
     ) -> Result<CacheWritebackDrainReport, CacheError> {
-        let reports = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for shard in self.shards.iter() {
-                workers.push(scope.spawn(move || shard.drain_async_writeback(max_jobs_per_shard)));
-            }
-
-            let mut reports = Vec::with_capacity(workers.len());
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(report)) => reports.push(report),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded async writeback drain worker panicked".to_string(),
-                        ));
-                    }
+        if self.shard_count() == 1 {
+            return self.shards[0].drain_async_writeback(max_jobs_per_shard);
+        }
+        let executor = self.batch_executor();
+        let workers = self
+            .shards
+            .iter()
+            .cloned()
+            .map(|shard| {
+                executor.submit(move || shard.drain_async_writeback(max_jobs_per_shard))
+            })
+            .collect::<Vec<_>>();
+        let mut reports = Vec::with_capacity(workers.len());
+        let mut first_error = None;
+        for worker in workers {
+            match worker.try_join() {
+                Some(Ok(report)) => reports.push(report),
+                Some(Err(err)) => {
+                    first_error.get_or_insert(err);
                 }
-            }
-            Ok(reports)
-        })?;
+                None => {
+                    first_error.get_or_insert_with(|| {
+                        CacheError::CorruptBlock(
+                            "sharded async writeback drain worker panicked".to_string(),
+                        )
+                    });
+                }
+            };
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
 
         Ok(CacheWritebackDrainReport {
             requested: max_jobs_per_shard.saturating_mul(self.shard_count()),
@@ -8405,26 +8497,36 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn flush_async_writeback(&self) -> Result<CacheWritebackDrainReport, CacheError> {
-        let reports = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for shard in self.shards.iter() {
-                workers.push(scope.spawn(move || shard.flush_async_writeback()));
-            }
-
-            let mut reports = Vec::with_capacity(workers.len());
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(report)) => reports.push(report),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded async writeback flush worker panicked".to_string(),
-                        ));
-                    }
+        if self.shard_count() == 1 {
+            return self.shards[0].flush_async_writeback();
+        }
+        let executor = self.batch_executor();
+        let workers = self
+            .shards
+            .iter()
+            .cloned()
+            .map(|shard| executor.submit(move || shard.flush_async_writeback()))
+            .collect::<Vec<_>>();
+        let mut reports = Vec::with_capacity(workers.len());
+        let mut first_error = None;
+        for worker in workers {
+            match worker.try_join() {
+                Some(Ok(report)) => reports.push(report),
+                Some(Err(err)) => {
+                    first_error.get_or_insert(err);
                 }
-            }
-            Ok(reports)
-        })?;
+                None => {
+                    first_error.get_or_insert_with(|| {
+                        CacheError::CorruptBlock(
+                            "sharded async writeback flush worker panicked".to_string(),
+                        )
+                    });
+                }
+            };
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
 
         Ok(CacheWritebackDrainReport {
             requested: reports.iter().map(|report| report.requested).sum(),
