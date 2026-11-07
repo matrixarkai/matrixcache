@@ -2311,10 +2311,10 @@ impl SsdTierStore {
         }
     }
 
-    fn get_unique_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+    fn get_unique_batch(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         match self {
             Self::Disabled { .. } => Ok(vec![None; keys.len()]),
-            Self::Single(storage) => storage.get_unique_batch(keys),
+            Self::Single(storage) => storage.get_unique_batch_refs(keys),
             Self::Multi(storage) => storage.get_unique_batch(keys),
         }
     }

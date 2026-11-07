@@ -533,8 +533,8 @@ fn main() {
     //   a batch of 8 shared      2 allocations for 8 keys
     //   a promoting read          6 -> 5 allocations, 3,282 -> 2,258 bytes
     //   compressed promotion      7 -> 6 allocations, 3,300 -> 2,276 bytes
-    //   Rust batch promotion  33.27 -> 25.51 allocations
-    //   RocksDB batch promotion 46.94 -> 39.17 allocations
+    //   Rust batch promotion  33.27 -> 25.51 -> 18.73 allocations
+    //   RocksDB batch promotion 46.94 -> 39.17 -> 32.41 allocations
     //
     // Raising one is a deliberate act, and the number that replaced it goes
     // in the table beside it.
@@ -659,9 +659,9 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 27.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 20.5;
     #[cfg(feature = "rocksdb-ssd")]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 41.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 34.5;
     match find("get_batch, promoting from a lower tier") {
         Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 30_000.0 => {}
         Some(row) => failures.push(format!(
