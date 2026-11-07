@@ -12815,6 +12815,39 @@ mod tests {
     }
 
     #[test]
+    fn sharded_large_pinned_reads_fan_out_and_release_every_handle() {
+        let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
+        let keys = (0..ShardedMultiLayerCache::READ_BATCH_FANOUT_THRESHOLD)
+            .map(|index| CacheKey::string(index as u64, &format!("pinned-fanout-{index:04}")))
+            .collect::<Vec<_>>();
+        assert!(cache.batch_shard_fanout(&keys) > 1);
+        for key in &keys {
+            cache.put(key.clone(), vec![7; 16]).unwrap();
+        }
+
+        let before = cache.stats();
+        for promoting in [false, true] {
+            let handles = if promoting {
+                cache.acquire_batch(&keys)
+            } else {
+                cache.acquire_batch_no_promotion(&keys)
+            }
+            .expect("large pinned fanout read");
+            assert!(handles.iter().all(Option::is_some));
+            assert_eq!(
+                cache.release_batch_iter(handles.into_iter().flatten()),
+                keys.len()
+            );
+        }
+        let after = cache.stats();
+        assert_eq!(after.pinned_entries, 0);
+        assert_eq!(
+            after.sharded_batch_fanout_operations,
+            before.sharded_batch_fanout_operations + 4
+        );
+    }
+
+    #[test]
     fn a_computed_selector_reserves_exactly_what_it_writes() {
         // Two of the key constructors compute their selector, and a computed
         // selector is an allocation that stays resident for as long as the
@@ -17114,6 +17147,37 @@ mod tests {
         assert_eq!(gc.name(), "CacheGCThreadPool");
         assert_eq!(gc.thread_count(), 2);
         assert!(!Arc::ptr_eq(&common, &gc));
+    }
+
+    #[test]
+    fn cache_executor_submit_runs_jobs_on_persistent_workers() {
+        let executor = CacheExecutorHandle::new("persistent-worker", 2, None);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first = executor.submit(move || {
+            first_barrier.wait();
+            std::thread::current().name().unwrap().to_string()
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = executor.submit(move || {
+            second_barrier.wait();
+            std::thread::current().name().unwrap().to_string()
+        });
+
+        barrier.wait();
+        let first_name = first.join();
+        let second_name = second.join();
+        assert_ne!(first_name, second_name);
+        assert!(first_name.starts_with("persistent-worker-"));
+        assert!(second_name.starts_with("persistent-worker-"));
+        assert_eq!(executor.submitted_tasks(), 2);
+    }
+
+    #[test]
+    fn cache_executor_reports_a_worker_panic_to_the_joiner() {
+        let executor = CacheExecutorHandle::new("panic-worker", 1, None);
+        let task = executor.submit(|| -> () { panic!("planted worker panic") });
+        assert!(task.try_join().is_none());
     }
 
     #[test]

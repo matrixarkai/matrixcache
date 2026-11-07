@@ -177,7 +177,7 @@ fn main() {
     );
 
     let mut rows = Vec::new();
-    for batch in [64_usize, 1024] {
+    for batch in [64_usize, 1024, RESIDENT] {
         let regular_ns = median(
             (0..PASSES)
                 .map(|_| {

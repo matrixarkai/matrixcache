@@ -7981,6 +7981,7 @@ mod sharded_stats_fold_tests {
 pub struct ShardedMultiLayerCache {
     shards: Arc<Vec<MultiLayerCache>>,
     sharded_stats: Arc<ShardedBatchStats>,
+    batch_executor: Arc<OnceLock<SharedCacheExecutor>>,
 }
 
 #[derive(Debug, Default)]
@@ -8037,10 +8038,9 @@ fn finish_sharded_fanout_batch<T, E>(
 
 impl ShardedMultiLayerCache {
     const BATCH_FANOUT_THRESHOLD: usize = 256;
-    // Spawning one short-lived worker per active shard costs more than the
-    // resident read itself for medium batches. Keep those reads inline while
-    // preserving parallel fanout for larger batches and the lower write
-    // crossover.
+    // Queue dispatch and result merging cost more than the resident read for
+    // medium batches. Keep those reads inline while preserving parallel
+    // fanout for larger batches and the lower write crossover.
     const READ_BATCH_FANOUT_THRESHOLD: usize = 2_048;
 
     /// Build a sharded cache, refusing a configuration it cannot honour.
@@ -8082,6 +8082,7 @@ impl ShardedMultiLayerCache {
         Self {
             shards: Arc::new(shards),
             sharded_stats: Arc::new(ShardedBatchStats::default()),
+            batch_executor: Arc::new(OnceLock::new()),
         }
     }
 
@@ -8124,6 +8125,19 @@ impl ShardedMultiLayerCache {
 
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    fn batch_executor(&self) -> &SharedCacheExecutor {
+        self.batch_executor.get_or_init(|| {
+            let available = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1);
+            Arc::new(CacheExecutorHandle::new(
+                "CacheReadFanout",
+                self.shard_count().min(available).max(1),
+                None,
+            ))
+        })
     }
 
     #[doc(hidden)]
@@ -9073,8 +9087,11 @@ impl ShardedMultiLayerCache {
         reader: F,
     ) -> Result<Vec<Option<T>>, CacheError>
     where
-        F: Fn(&MultiLayerCache, &[CacheKey]) -> Result<Vec<Option<T>>, CacheError> + Copy + Send,
-        T: Clone + Send,
+        F: Fn(&MultiLayerCache, &[CacheKey]) -> Result<Vec<Option<T>>, CacheError>
+            + Copy
+            + Send
+            + 'static,
+        T: Clone + Send + 'static,
     {
         let started = Instant::now();
         if keys.is_empty() {
@@ -9107,39 +9124,33 @@ impl ShardedMultiLayerCache {
         }
         self.sharded_stats.record_fanout(self.batch_shard_fanout(keys));
         let grouped = self.group_keys_by_shard(keys);
-        let shard_results = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for (index, group) in grouped.into_iter().enumerate() {
-                if group.is_empty() {
-                    continue;
-                }
-                let shard = &self.shards[index];
-                workers.push(scope.spawn(move || {
-                    let (unique_keys, requested_positions) =
-                        own_unique_positioned_batch_keys(group);
-                    let values = reader(shard, &unique_keys)?;
-                    let mut expanded = Vec::with_capacity(requested_positions.len());
-                    visit_batch_values(values, requested_positions, |position, value| {
-                        expanded.push((position, value));
-                    });
-                    Ok::<_, CacheError>(expanded)
-                }));
+        let executor = self.batch_executor();
+        let mut workers = Vec::new();
+        for (index, group) in grouped.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
             }
+            let shard = self.shards[index].clone();
+            let (unique_keys, requested_positions) = own_unique_positioned_batch_keys(group);
+            workers.push(executor.submit(move || {
+                let values = reader(&shard, &unique_keys)?;
+                let mut expanded = Vec::with_capacity(requested_positions.len());
+                visit_batch_values(values, requested_positions, |position, value| {
+                    expanded.push((position, value));
+                });
+                Ok::<_, CacheError>(expanded)
+            }));
+        }
 
-            let mut merged = Vec::new();
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(values)) => merged.extend(values),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch get worker panicked".to_string(),
-                        ));
-                    }
-                }
-            }
-            Ok(merged)
-        })?;
+        let mut shard_results = Vec::new();
+        for worker in workers {
+            let batch = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock(
+                    "sharded cache batch get worker panicked".to_string(),
+                )
+            })??;
+            shard_results.extend(batch);
+        }
 
         let mut results = empty_batch_results(keys.len());
         for (position, value) in shard_results {
@@ -9411,47 +9422,32 @@ impl ShardedMultiLayerCache {
         self.sharded_stats.record_fanout(fanout);
         let mut results = empty_batch_results(keys.len());
         let groups = self.group_keys_by_shard(keys);
-        let batches = std::thread::scope(|scope| {
-            let workers = groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(shard_index, group)| {
-                    if group.is_empty() {
-                        None
-                    } else {
-                        let shard = &self.shards[shard_index];
-                        Some(scope.spawn(move || {
-                            let (unique_keys, requested_positions) =
-                                own_unique_positioned_batch_keys(group);
-                            let handles = shard.acquire_batch_no_promotion(&unique_keys)?;
-                            let mut expanded = Vec::with_capacity(requested_positions.len());
-                            visit_batch_values_with(
-                                handles,
-                                requested_positions,
-                                |handle| shard.clone_handle(handle),
-                                |position, handle| expanded.push((position, handle)),
-                            );
-                            Ok::<_, CacheError>(expanded)
-                        }))
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let mut batches = Vec::with_capacity(workers.len());
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(batch)) => batches.push(batch),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch no-promotion worker panicked".to_string(),
-                        ));
-                    }
-                }
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
             }
-            Ok(batches)
-        })?;
-        for batch in batches {
+            let shard = self.shards[shard_index].clone();
+            let (unique_keys, requested_positions) = own_unique_positioned_batch_keys(group);
+            workers.push(executor.submit(move || {
+                let handles = shard.acquire_batch_no_promotion(&unique_keys)?;
+                let mut expanded = Vec::with_capacity(requested_positions.len());
+                visit_batch_values_with(
+                    handles,
+                    requested_positions,
+                    |handle| shard.clone_handle(handle),
+                    |position, handle| expanded.push((position, handle)),
+                );
+                Ok::<_, CacheError>(expanded)
+            }));
+        }
+        for worker in workers {
+            let batch = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock(
+                    "sharded cache batch no-promotion worker panicked".to_string(),
+                )
+            })??;
             for (position, handle) in batch {
                 results[position] = handle;
             }
@@ -9505,47 +9501,32 @@ impl ShardedMultiLayerCache {
         self.sharded_stats.record_fanout(fanout);
         let mut results = empty_batch_results(keys.len());
         let groups = self.group_keys_by_shard(keys);
-        let batches = std::thread::scope(|scope| {
-            let workers = groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(shard_index, group)| {
-                    if group.is_empty() {
-                        None
-                    } else {
-                        let shard = &self.shards[shard_index];
-                        Some(scope.spawn(move || {
-                            let (unique_keys, requested_positions) =
-                                own_unique_positioned_batch_keys(group);
-                            let handles = shard.acquire_batch(&unique_keys)?;
-                            let mut expanded = Vec::with_capacity(requested_positions.len());
-                            visit_batch_values_with(
-                                handles,
-                                requested_positions,
-                                |handle| shard.clone_handle(handle),
-                                |position, handle| expanded.push((position, handle)),
-                            );
-                            Ok::<_, CacheError>(expanded)
-                        }))
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let mut batches = Vec::with_capacity(workers.len());
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(batch)) => batches.push(batch),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch acquire worker panicked".to_string(),
-                        ));
-                    }
-                }
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
             }
-            Ok(batches)
-        })?;
-        for batch in batches {
+            let shard = self.shards[shard_index].clone();
+            let (unique_keys, requested_positions) = own_unique_positioned_batch_keys(group);
+            workers.push(executor.submit(move || {
+                let handles = shard.acquire_batch(&unique_keys)?;
+                let mut expanded = Vec::with_capacity(requested_positions.len());
+                visit_batch_values_with(
+                    handles,
+                    requested_positions,
+                    |handle| shard.clone_handle(handle),
+                    |position, handle| expanded.push((position, handle)),
+                );
+                Ok::<_, CacheError>(expanded)
+            }));
+        }
+        for worker in workers {
+            let batch = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock(
+                    "sharded cache batch acquire worker panicked".to_string(),
+                )
+            })??;
             for (position, handle) in batch {
                 results[position] = handle;
             }
