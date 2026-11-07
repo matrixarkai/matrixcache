@@ -3367,7 +3367,7 @@ struct CacheOrderNode {
 pub struct CacheKeyOrder {
     nodes: Vec<CacheOrderNode>,
     free: Vec<u32>,
-    index: HashMap<Arc<CacheKey>, u32>,
+    index: AHashMap<Arc<CacheKey>, u32>,
     head: u32,
     tail: u32,
     access_head: u32,
@@ -3417,7 +3417,7 @@ impl CacheKeyOrder {
         Self {
             nodes: Vec::new(),
             free: Vec::new(),
-            index: HashMap::new(),
+            index: AHashMap::new(),
             head: CACHE_ORDER_NIL,
             tail: CACHE_ORDER_NIL,
             access_head: CACHE_ORDER_NIL,
