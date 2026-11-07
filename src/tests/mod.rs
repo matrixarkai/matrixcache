@@ -26220,6 +26220,31 @@ fn the_shared_block_decode_answers_exactly_what_the_owning_one_does() {
         if raw {
             assert_eq!(consumed.as_ref().unwrap().as_ptr(), allocation, "raw buffer copied: {what}");
         }
+        let copied_read_input = block.clone();
+        let copied_read_allocation = copied_read_input.as_ptr();
+        let copied_read = CacheDecodedBlock::decode(copied_read_input, true);
+        assert_eq!(
+            copied_read
+                .as_ref()
+                .map(|decoded| decoded.value.as_slice())
+                .map_err(ToString::to_string),
+            owning.as_ref().map(Vec::as_slice).map_err(ToString::to_string),
+            "copied read decode differs for {what}",
+        );
+        if let Ok(decoded) = &copied_read {
+            assert_eq!(
+                decoded.refill.as_deref(),
+                Some(decoded.value.as_slice()),
+                "refill bytes differ for {what}",
+            );
+            if raw {
+                assert_eq!(
+                    decoded.value.as_ptr(),
+                    copied_read_allocation,
+                    "copied read discarded the raw storage buffer for {what}",
+                );
+            }
+        }
         let shared = decode_cache_block_shared(&block);
         match (owning, shared) {
             (Ok(owning), Ok(shared)) => assert_eq!(

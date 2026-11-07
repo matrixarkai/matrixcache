@@ -531,7 +531,10 @@ fn main() {
     //   mixed owned batch of 8   42 -> 5 allocations, 12,632 -> 4,288 bytes
     //   a write that evicts      11.48 -> 5.93 allocations, 44,140.8 -> 19,537.3 bytes
     //   a batch of 8 shared      2 allocations for 8 keys
-    //   a promoting read         13.00 -> 12.00 allocations, 25,334.0 -> 24,310.0 bytes
+    //   a promoting read          6 -> 5 allocations, 3,282 -> 2,258 bytes
+    //   compressed promotion      7 -> 6 allocations, 3,300 -> 2,276 bytes
+    //   Rust batch promotion  33.27 -> 25.51 allocations
+    //   RocksDB batch promotion 46.94 -> 39.17 allocations
     //
     // Raising one is a deliberate act, and the number that replaced it goes
     // in the table beside it.
@@ -547,7 +550,7 @@ fn main() {
         ("acquire_batch, 2 duplicated", 6.5, 3_800.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
-        ("get, promoting from a lower tier", 13.0, 25_500.0),
+        ("get, promoting from a lower tier", 6.5, 3_000.0),
     ] {
         match find(path) {
             Some(row) if row.allocations <= max_allocations && row.bytes <= max_bytes => {}
@@ -625,10 +628,10 @@ fn main() {
     // the per-call context removes that allocation too, and no figure here
     // counts it either before or after.
     match find("get, promoting a compressed block") {
-        Some(row) if row.allocations <= 14.0 && row.bytes <= 23_500.0 => {}
+        Some(row) if row.allocations <= 7.5 && row.bytes <= 3_200.0 => {}
         Some(row) => failures.push(format!(
-            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 14 \
-             and 23,500 -- the decompressor is building a context per call again",
+            "a read of a compressed block allocates {:.2} times and {:.1} bytes, against 7.5 \
+             and 3,200 -- the decoder is allocating an extra payload buffer",
             row.allocations, row.bytes
         )),
         None => failures.push("the compressed read is missing from the table".to_string()),
@@ -656,14 +659,14 @@ fn main() {
     }
 
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 34.5;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 27.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const BATCH_PROMOTION_ALLOCATIONS: f64 = 48.0;
+    const BATCH_PROMOTION_ALLOCATIONS: f64 = 41.0;
     match find("get_batch, promoting from a lower tier") {
-        Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 190_000.0 => {}
+        Some(row) if row.allocations <= BATCH_PROMOTION_ALLOCATIONS && row.bytes <= 30_000.0 => {}
         Some(row) => failures.push(format!(
             "a batch of {BATCH} promoting reads allocates {:.2} times and {:.1} bytes, against \
-             {BATCH_PROMOTION_ALLOCATIONS:.0} and 190,000",
+             {BATCH_PROMOTION_ALLOCATIONS:.0} and 30,000",
             row.allocations, row.bytes
         )),
         None => failures.push("the promoting batch read is missing from the table".to_string()),
