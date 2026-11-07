@@ -14020,6 +14020,8 @@ mod tests {
     fn disabled_lower_tier_does_not_probe_legacy_files() {
         let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
         let key = CacheKey::string(7, "disabled-lower-tier");
+        let resident = CacheKey::string(7, "resident");
+        cache.put(resident.clone(), b"resident".to_vec()).unwrap();
         let disk_path = cache
             .inner
             .read()
@@ -14029,7 +14031,21 @@ mod tests {
         std::fs::write(&disk_path, b"stray legacy bytes").unwrap();
 
         assert_eq!(cache.get(&key).unwrap(), None);
-        assert_eq!(cache.get_batch(std::slice::from_ref(&key)).unwrap(), vec![None]);
+        let before = cache.stats();
+        assert_eq!(
+            cache
+                .get_batch(&[resident, key.clone(), key])
+                .unwrap(),
+            vec![Some(b"resident".to_vec()), None, None]
+        );
+        let after = cache.stats();
+        assert_eq!(after.memory_hits - before.memory_hits, 1);
+        assert_eq!(after.misses - before.misses, 2);
+        assert_eq!(after.get_latency_samples - before.get_latency_samples, 3);
+        assert_eq!(
+            after.read_through_latency_samples - before.read_through_latency_samples,
+            3
+        );
     }
 
     #[test]

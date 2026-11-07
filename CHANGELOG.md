@@ -9,7 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Memory-only misses skip SSD key construction and legacy disk probes when the
-  lower tier is disabled.
+  lower tier is disabled, and mixed batches finish those misses during shared
+  classification without persistent-tier work buffers.
 
 - Reusable shared-buffer batches place resident handles directly into caller
   output storage without a temporary hit vector.
