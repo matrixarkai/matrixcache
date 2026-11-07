@@ -24904,11 +24904,16 @@ fn the_ssd_store_key_is_byte_for_byte_the_line_the_old_encoding_produced() {
         shapes.len()
     );
     for key in &shapes {
+        let expected = v1_line_as_it_was(key, 0);
         assert_eq!(
             CacheInner::ssd_store_key(key),
-            v1_line_as_it_was(key, 0),
+            expected,
             "the SSD tier's key for {key:?} changed"
         );
+        assert_eq!(manifest_line_for_key_len(key, 0), expected.len());
+        let mut appended = String::with_capacity(manifest_line_for_key_len(key, 0));
+        append_manifest_line_for_key(&mut appended, key, 0);
+        assert_eq!(appended, expected, "the borrowed batch key for {key:?} changed");
         for block_len in [0u64, 1, 9, 10, 4096, u64::MAX] {
             assert_eq!(
                 CacheInner::pmem_manifest_key(key, block_len),

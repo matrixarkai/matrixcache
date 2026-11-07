@@ -835,10 +835,21 @@ impl CacheInner {
         if !self.ssd_store.holds_blocks() {
             return Ok(empty_batch_results(keys.len()));
         }
-        let store_keys = keys
+        let mut store_key_buffer = String::with_capacity(
+            keys.iter()
+                .map(|key| manifest_line_for_key_len(key, 0))
+                .sum(),
+        );
+        let mut store_key_ranges = SmallVec::<[std::ops::Range<usize>; INLINE_BATCH_KEYS]>::new();
+        for key in keys {
+            let start = store_key_buffer.len();
+            append_manifest_line_for_key(&mut store_key_buffer, key, 0);
+            store_key_ranges.push(start..store_key_buffer.len());
+        }
+        let store_keys = store_key_ranges
             .iter()
-            .map(|key| Self::ssd_store_key(key))
-            .collect::<SmallVec<[String; INLINE_BATCH_KEYS]>>();
+            .map(|range| &store_key_buffer[range.clone()])
+            .collect::<SmallVec<[&str; INLINE_BATCH_KEYS]>>();
         let mut blocks = self.ssd_store.get_unique_batch(&store_keys)?;
         for (block, key) in blocks.iter_mut().zip(keys.iter()) {
             if block.is_some() {
@@ -4151,33 +4162,62 @@ fn manifest_line(
     selector: &str,
     block_len: Option<u64>,
 ) -> String {
-    let mut line = String::with_capacity(
-        tag.len()
-            + 1
-            + decimal_width(shard_id)
-            + 1
-            + record_key.len() * 2
-            + 1
-            + namespace.len() * 2
-            + 1
-            + selector.len() * 2
-            + block_len.map_or(0, |len| 1 + decimal_width(len))
-            + 1,
+    let mut line = String::with_capacity(manifest_line_len(
+        tag,
+        shard_id,
+        record_key,
+        namespace,
+        selector,
+        block_len,
+    ) + 1);
+    append_manifest_line(
+        &mut line, tag, shard_id, record_key, namespace, selector, block_len,
     );
+    line
+}
+
+fn manifest_line_len(
+    tag: &str,
+    shard_id: ShardId,
+    record_key: &str,
+    namespace: &str,
+    selector: &str,
+    block_len: Option<u64>,
+) -> usize {
+    tag.len()
+        + 1
+        + decimal_width(shard_id)
+        + 1
+        + record_key.len() * 2
+        + 1
+        + namespace.len() * 2
+        + 1
+        + selector.len() * 2
+        + block_len.map_or(0, |len| 1 + decimal_width(len))
+}
+
+fn append_manifest_line(
+    line: &mut String,
+    tag: &str,
+    shard_id: ShardId,
+    record_key: &str,
+    namespace: &str,
+    selector: &str,
+    block_len: Option<u64>,
+) {
     line.push_str(tag);
     line.push('\t');
-    push_decimal(&mut line, shard_id);
+    push_decimal(line, shard_id);
     line.push('\t');
-    push_manifest_field(&mut line, record_key);
+    push_manifest_field(line, record_key);
     line.push('\t');
-    push_manifest_field(&mut line, namespace);
+    push_manifest_field(line, namespace);
     line.push('\t');
-    push_manifest_field(&mut line, selector);
+    push_manifest_field(line, selector);
     if let Some(len) = block_len {
         line.push('\t');
-        push_decimal(&mut line, len);
+        push_decimal(line, len);
     }
-    line
 }
 
 /// Hash the existing manifest-key representation without allocating its text.
@@ -4223,6 +4263,29 @@ fn manifest_line_for_key(key: &CacheKey, block_len: u64) -> String {
         &key.selector,
         Some(block_len),
     )
+}
+
+fn manifest_line_for_key_len(key: &CacheKey, block_len: u64) -> usize {
+    manifest_line_len(
+        "v1",
+        key.shard_id,
+        &key.record_key,
+        &key.namespace,
+        &key.selector,
+        Some(block_len),
+    )
+}
+
+fn append_manifest_line_for_key(line: &mut String, key: &CacheKey, block_len: u64) {
+    append_manifest_line(
+        line,
+        "v1",
+        key.shard_id,
+        &key.record_key,
+        &key.namespace,
+        &key.selector,
+        Some(block_len),
+    );
 }
 
 fn decode_manifest_field(value: &str) -> Option<String> {

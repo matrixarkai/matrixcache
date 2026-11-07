@@ -2623,11 +2623,11 @@ impl StorageEngineRocksDb {
         self.get_batch_refs(&key_refs)
     }
 
-    pub(crate) fn get_unique_batch(
+    pub(crate) fn get_unique_batch_refs(
         &self,
-        keys: &[String],
+        keys: &[&str],
     ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        self.get_unique_batch_iter(keys.iter().map(String::as_str), keys.len())
+        self.get_unique_batch_iter(keys.iter().copied(), keys.len())
     }
 
     fn get_unique_batch_iter<'a>(
@@ -3356,7 +3356,7 @@ impl StorageEngineMultiSsd {
 
     pub(crate) fn get_unique_batch(
         &self,
-        keys: &[String],
+        keys: &[&str],
     ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.initialized || self.storages.is_empty() {
             return Err(CacheError::Stopped);
@@ -3366,7 +3366,7 @@ impl StorageEngineMultiSsd {
         }
 
         let mut routed = vec![Vec::<(usize, &str)>::new(); self.storages.len()];
-        for (index, key) in keys.iter().enumerate() {
+        for (index, key) in keys.iter().copied().enumerate() {
             let storage_index = Self::hash(key) as usize % self.storages.len();
             routed[storage_index].push((index, key));
         }
