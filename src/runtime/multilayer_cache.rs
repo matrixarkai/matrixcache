@@ -130,8 +130,9 @@ fn own_unique_positioned_batch_keys(
 #[cfg(test)]
 mod batch_value_expansion_tests {
     use super::{
-        fill_owned_batch_positions, own_unique_positioned_batch_keys, visit_batch_values,
-        BatchPositions, CacheKey,
+        fill_decoded_batch_positions, fill_owned_batch_positions,
+        own_unique_positioned_batch_keys, visit_batch_values, BatchPositions, CacheDecodedBlock,
+        CacheKey,
     };
 
     #[test]
@@ -193,6 +194,25 @@ mod batch_value_expansion_tests {
             results[2].as_ref().unwrap().as_ptr(),
             results[3].as_ref().unwrap().as_ptr()
         );
+    }
+
+    #[test]
+    fn decoded_batch_positions_move_the_owned_buffer() {
+        let source = vec![11u8; 4_096];
+        let source_ptr = source.as_ptr();
+        let mut results = super::empty_batch_results(4);
+        fill_decoded_batch_positions(
+            &mut results,
+            BatchPositions::Many(vec![3, 1, 2]),
+            CacheDecodedBlock::Owned(source),
+        );
+
+        assert!(results[0].is_none());
+        assert_eq!(results[1].as_ref().unwrap(), &vec![11u8; 4_096]);
+        assert_eq!(results[2].as_ref().unwrap().as_ptr(), source_ptr);
+        assert_eq!(results[3].as_ref().unwrap(), &vec![11u8; 4_096]);
+        assert_ne!(results[1].as_ref().unwrap().as_ptr(), source_ptr);
+        assert_ne!(results[3].as_ref().unwrap().as_ptr(), source_ptr);
     }
 }
 
@@ -367,6 +387,30 @@ fn fill_owned_batch_positions(
                 .pop()
                 .expect("a multi-position batch has at least two positions");
             let value = value.to_vec();
+            for position in positions {
+                results[position] = Some(value.clone());
+            }
+            results[final_position] = Some(value);
+        }
+    }
+}
+
+/// Move a decoded value into one output position and copy it only for
+/// duplicate requests. SSD-only reads decode into an owned buffer, so the
+/// common unique-key case transfers that allocation without another payload
+/// copy.
+fn fill_decoded_batch_positions(
+    results: &mut [Option<Vec<u8>>],
+    positions: BatchPositions,
+    value: CacheDecodedBlock,
+) {
+    match positions {
+        BatchPositions::One(position) => results[position] = Some(value.into_vec()),
+        BatchPositions::Many(mut positions) => {
+            let final_position = positions
+                .pop()
+                .expect("a multi-position batch has at least two positions");
+            let value = value.into_vec();
             for position in positions {
                 results[position] = Some(value.clone());
             }
@@ -5047,9 +5091,7 @@ impl MultiLayerCache {
                                     deferred.push((key, outcome, value.len()));
                                 }
                                 refill_samples = refill_samples.saturating_add(1);
-                                for index in positions {
-                                    results[index] = Some(value.to_vec());
-                                }
+                                fill_decoded_batch_positions(&mut results, positions, value);
                             }
                             None => {
                                 misses = misses.saturating_add(occurrences as u64);
