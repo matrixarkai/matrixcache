@@ -1968,12 +1968,6 @@ impl CacheInner {
     /// hotness threshold being crossed and count two promotions where the
     /// exclusive path counted one. That is a reporting counter, nothing
     /// branches on it, and the alternative is the lock this exists to avoid.
-    fn record_hit_shared(&self, key: &CacheKey) -> HitOutcome {
-        let epoch = CoarseClock::now_millis();
-        self.reconfigure_refresh_window(epoch);
-        self.record_hit_shared_occurrences_at(key, 1, epoch)
-    }
-
     fn record_hit_shared_at(&self, key: &CacheKey, epoch: u64) -> HitOutcome {
         self.record_hit_shared_occurrences_at(key, 1, epoch)
     }
