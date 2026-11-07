@@ -826,6 +826,9 @@ impl CacheInner {
     }
 
     fn read_ssd_block(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+        if !self.ssd_store.holds_blocks() {
+            return Ok(None);
+        }
         match self.ssd_store.get_owned(&Self::ssd_store_key(key)) {
             Ok(block) => Ok(Some(block)),
             Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
@@ -843,6 +846,9 @@ impl CacheInner {
     /// already and only their contents are read here, so cloning every one to
     /// build the argument copied three `String`s per candidate for nothing.
     fn read_ssd_blocks(&self, keys: &[&CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        if !self.ssd_store.holds_blocks() {
+            return Ok(empty_batch_results(keys.len()));
+        }
         let store_keys = keys
             .iter()
             .map(|key| Self::ssd_store_key(key))
