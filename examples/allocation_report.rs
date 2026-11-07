@@ -116,6 +116,13 @@ fn main() {
     rows.push(measure("get_batch, copying", BATCH, || {
         let _ = cache.get_batch(&batch).expect("get_batch");
     }));
+    let mut reused_batch = Vec::with_capacity(BATCH);
+    rows.push(measure("get_batch_into, resident", BATCH, || {
+        cache
+            .get_batch_into(&batch, &mut reused_batch)
+            .expect("get_batch_into");
+        assert!(reused_batch.iter().all(Option::is_some));
+    }));
     // Half resident and half absent. This bypasses the all-memory fast path
     // and exercises the mixed owned-value expansion without changing cache
     // state between samples.
@@ -483,6 +490,7 @@ fn main() {
     // goes back to copying its keys.
     for path in [
         "get_batch, copying",
+        "get_batch_into, resident",
         "get_shared_batch",
         "acquire_batch_no_promotion",
         "acquire_batch",
@@ -522,6 +530,7 @@ fn main() {
     for (path, max_allocations, max_bytes) in [
         ("get, copying", 1.5, 1_100.0),
         ("get_batch, copying", 11.5, 9_400.0),
+        ("get_batch_into, resident", 0.5, 128.0),
         ("get_batch, mixed hits and misses", 38.5, 9_000.0),
         ("get_shared_batch", 2.5, 500.0),
         ("acquire_batch_no_promotion", 7.5, 3_000.0),

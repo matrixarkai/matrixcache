@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Small resident copied batches avoid temporary shared-buffer clones and batch
+  bookkeeping while keeping large payload copies outside the cache guard.
+
 - Reusable copied batch reads retain per-position payload allocations for
   memory, PMEM, and shared-decoded hits.
 
