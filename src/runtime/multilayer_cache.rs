@@ -113,7 +113,7 @@ fn own_unique_positioned_batch_keys(
         return (unique_keys, requested_positions);
     }
 
-    let mut unique_positions = HashMap::<&CacheKey, usize>::new();
+    let mut unique_positions = AHashMap::<&CacheKey, usize>::with_capacity(group.len());
     for (position, key) in group {
         let unique_position = if let Some(position) = unique_positions.get(key).copied() {
             position
@@ -248,7 +248,7 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<&CacheKey>, Vec<(usize, usize)
         return (unique_keys, requested_positions);
     }
 
-    let mut unique_positions = HashMap::<&CacheKey, usize>::new();
+    let mut unique_positions = AHashMap::<&CacheKey, usize>::with_capacity(keys.len());
     for (position, key) in keys.iter().enumerate() {
         let unique_position = if let Some(position) = unique_positions.get(key).copied() {
             position
@@ -270,7 +270,7 @@ fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
             .enumerate()
             .any(|(position, key)| keys[..position].iter().any(|existing| existing == key));
     }
-    let mut seen = HashSet::with_capacity(keys.len());
+    let mut seen = AHashSet::with_capacity(keys.len());
     keys.iter().any(|key| !seen.insert(key))
 }
 
@@ -465,7 +465,7 @@ fn coalesce_batch_positions_borrowed<'a>(
         return positions_by_key;
     }
 
-    let mut unique_positions = HashMap::<&'a CacheKey, usize>::new();
+    let mut unique_positions = AHashMap::<&'a CacheKey, usize>::with_capacity(keys.len());
     for (position, key) in keys.iter().enumerate() {
         if let Some(unique_position) = unique_positions.get(key).copied() {
             positions_by_key[unique_position].1.push(position);
@@ -503,7 +503,7 @@ where
         return (released, counts);
     }
 
-    let mut counts_by_key = HashMap::<CacheKey, usize>::with_capacity(lower_bound);
+    let mut counts_by_key = AHashMap::<CacheKey, usize>::with_capacity(lower_bound);
     for handle in handles {
         released = released.saturating_add(1);
         *counts_by_key.entry(handle.key).or_default() += 1;
@@ -533,7 +533,7 @@ fn coalesce_key_indexes<'a>(
         return grouped;
     }
 
-    let mut positions_by_key = HashMap::<&'a CacheKey, usize>::new();
+    let mut positions_by_key = AHashMap::<&'a CacheKey, usize>::with_capacity(entries.len());
     let mut grouped = Vec::<(&'a CacheKey, Vec<usize>)>::new();
     for (index, key) in entries {
         if let Some(position) = positions_by_key.get(key).copied() {
@@ -2473,7 +2473,7 @@ enum CacheManifestOp {
 }
 
 fn unique_cache_keys(keys: &[CacheKey]) -> Vec<CacheKey> {
-    let mut seen = HashSet::with_capacity(keys.len());
+    let mut seen = AHashSet::with_capacity(keys.len());
     let mut unique = Vec::with_capacity(keys.len());
     for key in keys {
         if seen.insert(key.clone()) {
@@ -6959,7 +6959,7 @@ impl MultiLayerCache {
         };
         let drained = jobs.len();
         let mut coalesced = Vec::<(CacheKey, Vec<u8>)>::new();
-        let mut coalesced_positions = HashMap::<CacheKey, usize>::new();
+        let mut coalesced_positions = AHashMap::<CacheKey, usize>::with_capacity(jobs.len());
         for job in jobs {
             if let Some(index) = coalesced_positions.get(&job.key).copied() {
                 coalesced[index].1 = job.value;
