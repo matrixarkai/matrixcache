@@ -372,26 +372,29 @@ impl IntoIterator for BatchPositions {
     }
 }
 
-/// Copy one shared value into every owned result position without creating a
-/// throwaway buffer. The final position takes the first allocation; only
-/// additional duplicate positions require a clone.
+/// Copy one shared value into every owned result position, retaining any
+/// allocation the caller supplied from an earlier batch.
 fn fill_owned_batch_positions(
     results: &mut [Option<Vec<u8>>],
     positions: BatchPositions,
     value: &[u8],
 ) {
     match positions {
-        BatchPositions::One(position) => results[position] = Some(value.to_vec()),
-        BatchPositions::Many(mut positions) => {
-            let final_position = positions
-                .pop()
-                .expect("a multi-position batch has at least two positions");
-            let value = value.to_vec();
+        BatchPositions::One(position) => fill_owned_batch_position(&mut results[position], value),
+        BatchPositions::Many(positions) => {
             for position in positions {
-                results[position] = Some(value.clone());
+                fill_owned_batch_position(&mut results[position], value);
             }
-            results[final_position] = Some(value);
         }
+    }
+}
+
+fn fill_owned_batch_position(result: &mut Option<Vec<u8>>, value: &[u8]) {
+    if let Some(buffer) = result {
+        buffer.clear();
+        buffer.extend_from_slice(value);
+    } else {
+        *result = Some(value.to_vec());
     }
 }
 
@@ -404,18 +407,28 @@ fn fill_decoded_batch_positions(
     positions: BatchPositions,
     value: CacheDecodedBlock,
 ) {
-    match positions {
-        BatchPositions::One(position) => results[position] = Some(value.into_vec()),
-        BatchPositions::Many(mut positions) => {
-            let final_position = positions
-                .pop()
-                .expect("a multi-position batch has at least two positions");
-            let value = value.into_vec();
-            for position in positions {
-                results[position] = Some(value.clone());
+    match value {
+        CacheDecodedBlock::Owned(value) => match positions {
+            BatchPositions::One(position) => results[position] = Some(value),
+            BatchPositions::Many(mut positions) => {
+                let final_position = positions
+                    .pop()
+                    .expect("a multi-position batch has at least two positions");
+                for position in positions {
+                    fill_owned_batch_position(&mut results[position], &value);
+                }
+                results[final_position] = Some(value);
             }
-            results[final_position] = Some(value);
+        },
+        CacheDecodedBlock::Shared(value) => {
+            fill_owned_batch_positions(results, positions, value.as_ref())
         }
+    }
+}
+
+fn clear_owned_batch_positions(results: &mut [Option<Vec<u8>>], positions: BatchPositions) {
+    for position in positions {
+        results[position] = None;
     }
 }
 
@@ -4510,7 +4523,7 @@ impl MultiLayerCache {
         }
 
         for (position, (_, value)) in memory_hits.into_iter().enumerate() {
-            results[position] = Some(value.to_vec());
+            fill_owned_batch_position(&mut results[position], value.as_ref());
         }
         Ok(true)
     }
@@ -4865,7 +4878,7 @@ impl MultiLayerCache {
         keys: &[CacheKey],
         results: &mut Vec<Option<Vec<u8>>>,
     ) -> Result<(), CacheError> {
-        results.clear();
+        results.truncate(keys.len());
         results.resize_with(keys.len(), || None);
         if keys.is_empty() {
             return Ok(());
@@ -5007,6 +5020,7 @@ impl MultiLayerCache {
                     let micros = elapsed_micros(started);
                     inner.record_get_latency_micros_many(micros, occurrences);
                     inner.record_read_through_latency_micros_many(micros, occurrences);
+                    clear_owned_batch_positions(results, positions);
                     continue;
                 }
                 if !inner.ssd_instance_only {
@@ -5119,6 +5133,7 @@ impl MultiLayerCache {
                             }
                             None => {
                                 misses = misses.saturating_add(occurrences as u64);
+                                clear_owned_batch_positions(results, positions);
                             }
                         }
                     }
@@ -5180,6 +5195,7 @@ impl MultiLayerCache {
                 let micros = elapsed_micros(started);
                 inner.record_get_latency_micros_many(micros, occurrences);
                 inner.record_read_through_latency_micros_many(micros, occurrences);
+                clear_owned_batch_positions(results, positions);
             }
         } else {
             let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -5210,9 +5226,7 @@ impl MultiLayerCache {
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
                         inner.record_refill_latency(refill_started);
-                        for index in positions {
-                            results[index] = Some(value.to_vec());
-                        }
+                        fill_decoded_batch_positions(results, positions, value);
                         needs_eviction_drain = true;
                     }
                     None => {
@@ -5224,6 +5238,7 @@ impl MultiLayerCache {
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
                         inner.record_read_through_latency_micros_many(micros, occurrences);
+                        clear_owned_batch_positions(results, positions);
                     }
                 }
             }

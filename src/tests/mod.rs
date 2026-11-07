@@ -13956,6 +13956,21 @@ mod tests {
         assert_eq!(values[0].as_deref(), Some(&b"second"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"first"[..]));
         assert_eq!(values[2].as_deref(), Some(&b"second"[..]));
+        let payload_storage = values
+            .iter()
+            .map(|value| value.as_ref().unwrap().as_ptr())
+            .collect::<Vec<_>>();
+
+        cache
+            .get_batch_into(&[second.clone(), first.clone(), second.clone()], &mut values)
+            .unwrap();
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_ref().unwrap().as_ptr())
+                .collect::<Vec<_>>(),
+            payload_storage
+        );
 
         cache
             .get_batch_into(std::slice::from_ref(&first), &mut values)
@@ -13964,6 +13979,12 @@ mod tests {
         assert_eq!(values.capacity(), original_capacity);
         assert_eq!(values.as_ptr(), original_storage);
         assert_eq!(values[0].as_deref(), Some(&b"first"[..]));
+
+        cache.invalidate(&first).unwrap();
+        cache
+            .get_batch_into(std::slice::from_ref(&first), &mut values)
+            .unwrap();
+        assert_eq!(values, vec![None]);
     }
 
     #[test]

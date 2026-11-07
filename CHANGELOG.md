@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reusable copied batch reads retain per-position payload allocations for
+  memory, PMEM, and shared-decoded hits.
+
 - Copied batch reads can reuse caller-owned result buffers on single caches
   and colocated sharded-cache reads.
 
