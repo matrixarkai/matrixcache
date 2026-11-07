@@ -4480,9 +4480,8 @@ impl MultiLayerCache {
         results: &mut [Option<Vec<u8>>],
     ) -> Result<bool, CacheError> {
         let started = Instant::now();
-        let mut memory_hits = Vec::<(usize, &CacheKey, Arc<[u8]>)>::new();
+        let mut memory_hits = Vec::<(usize, Arc<[u8]>)>::new();
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
-        let copied_positions;
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -4493,41 +4492,36 @@ impl MultiLayerCache {
             }
             let mut copied_bytes = 0usize;
             let mut copy_under_shared_guard = keys.len() <= MAX_SHARED_GUARD_COPY_KEYS;
-            let mut copied_prefix_len = 0usize;
+            let mut resident_hits = SmallVec::<
+                [(&CacheKey, Option<&CacheEntryMeta>, usize); INLINE_BATCH_KEYS],
+            >::with_capacity(keys.len());
             for (position, key) in keys.iter().enumerate() {
                 if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
-                let Some(value) = inner.resident_value(key) else {
+                let Some(resident) = inner.memory.get(key) else {
                     return Ok(false);
                 };
+                let value = &resident.value;
                 let next_copied_bytes = copied_bytes.saturating_add(value.len());
                 if copy_under_shared_guard && next_copied_bytes <= MAX_SHARED_GUARD_COPY_BYTES {
                     fill_owned_batch_position(&mut results[position], value.as_ref());
                     copied_bytes = next_copied_bytes;
-                    copied_prefix_len += 1;
                 } else {
                     if copy_under_shared_guard {
                         copy_under_shared_guard = false;
                         memory_hits.reserve(keys.len() - position);
                     }
-                    memory_hits.push((position, key, Arc::clone(value)));
+                    memory_hits.push((position, Arc::clone(value)));
                 }
+                resident_hits.push((key, resident.meta.as_ref(), value.len()));
             }
-            copied_positions = copied_prefix_len;
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (position, key) in keys.iter().enumerate() {
-                let value_len = if position < copied_positions {
-                    results[position]
-                        .as_ref()
-                        .expect("a copied resident position has an output")
-                        .len()
-                } else {
-                    memory_hits[position - copied_positions].2.len()
-                };
-                let outcome = inner.record_hit_shared_at(key, epoch);
+            for (key, metadata, value_len) in resident_hits {
+                let outcome =
+                    inner.record_known_hit_shared_occurrences_at(key, metadata, 1, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
                     needs_exclusive.push((key.clone(), outcome, value_len));
                 }
@@ -4563,7 +4557,7 @@ impl MultiLayerCache {
             }
         }
 
-        for (position, _, value) in memory_hits {
+        for (position, value) in memory_hits {
             fill_owned_batch_position(&mut results[position], value.as_ref());
         }
         Ok(true)
@@ -4588,6 +4582,12 @@ impl MultiLayerCache {
             if inner.ssd_instance_only {
                 return Ok(false);
             }
+            let mut resident_hits = SmallVec::<
+                [
+                    (&CacheKey, Option<&CacheEntryMeta>, usize, CacheReadTier);
+                    INLINE_BATCH_KEYS
+                ],
+            >::with_capacity(keys.len());
             for (position, key) in keys.iter().enumerate() {
                 if inner.entry_expired(key, now_millis) {
                     results.iter_mut().for_each(|result| *result = None);
@@ -4596,6 +4596,12 @@ impl MultiLayerCache {
                 if let Some(resident) = inner.memory.get(key) {
                     results[position] = Some(Arc::clone(&resident.value));
                     memory_hits += 1;
+                    resident_hits.push((
+                        key,
+                        resident.meta.as_ref(),
+                        resident.value.len(),
+                        CacheReadTier::Memory,
+                    ));
                     continue;
                 }
                 if let Some(resident) = inner.pmem.get(key) {
@@ -4605,6 +4611,12 @@ impl MultiLayerCache {
                     }
                     results[position] = Some(Arc::clone(&resident.value));
                     pmem_hits += 1;
+                    resident_hits.push((
+                        key,
+                        resident.meta.as_ref(),
+                        resident.value.len(),
+                        CacheReadTier::Pmem,
+                    ));
                     continue;
                 }
                 results.iter_mut().for_each(|result| *result = None);
@@ -4613,32 +4625,11 @@ impl MultiLayerCache {
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (position, key) in keys.iter().enumerate() {
-                let (metadata, tier) = if let Some(entry) = inner.memory.get(key) {
-                    (entry.meta.as_ref(), CacheReadTier::Memory)
-                } else {
-                    (
-                        inner
-                            .pmem
-                            .get(key)
-                            .expect("the resident batch was validated under the same guard")
-                            .meta
-                            .as_ref(),
-                        CacheReadTier::Pmem,
-                    )
-                };
+            for (key, metadata, value_len, tier) in resident_hits {
                 let outcome =
                     inner.record_known_hit_shared_occurrences_at(key, metadata, 1, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
-                    needs_exclusive.push((
-                        key.clone(),
-                        outcome,
-                        results[position]
-                            .as_ref()
-                            .expect("a validated resident batch position has a value")
-                            .len(),
-                        tier,
-                    ));
+                    needs_exclusive.push((key.clone(), outcome, value_len, tier));
                 }
             }
         }
