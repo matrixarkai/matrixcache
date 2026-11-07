@@ -8133,7 +8133,7 @@ impl ShardedMultiLayerCache {
                 .map(usize::from)
                 .unwrap_or(1);
             Arc::new(CacheExecutorHandle::new(
-                "CacheReadFanout",
+                "CacheBatchFanout",
                 self.shard_count().min(available).max(1),
                 None,
             ))
@@ -8980,29 +8980,24 @@ impl ShardedMultiLayerCache {
             return finish_sharded_local_batch(&self.sharded_stats, started, Ok(inserted));
         }
         let fanout = grouped.iter().filter(|group| !group.is_empty()).count();
-        let result = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for (index, group) in grouped.into_iter().enumerate() {
-                if !group.is_empty() {
-                    let shard = &self.shards[index];
-                    workers.push(scope.spawn(move || shard.put_batch_sized(group)));
-                }
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in grouped.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || shard.put_batch_sized(group)));
             }
+        }
 
-            let mut inserted = 0usize;
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(count)) => inserted = inserted.saturating_add(count),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch put worker panicked".to_string(),
-                        ));
-                    }
-                }
-            }
-            Ok(inserted)
+        let mut inserted = 0usize;
+        let result = workers.into_iter().try_for_each(|worker| {
+            let count = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock("sharded cache batch put worker panicked".to_string())
+            })??;
+            inserted = inserted.saturating_add(count);
+            Ok::<_, CacheError>(())
         });
+        let result = result.map(|()| inserted);
         finish_sharded_fanout_batch(&self.sharded_stats, started, fanout, result)
     }
 
@@ -9623,25 +9618,17 @@ impl ShardedMultiLayerCache {
             return released;
         }
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
-        std::thread::scope(|scope| {
-            let workers = groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, group)| {
-                    if group.is_empty() {
-                        None
-                    } else {
-                        let shard = &self.shards[index];
-                        Some(scope.spawn(move || shard.release_batch(group)))
-                    }
-                })
-                .collect::<Vec<_>>();
-            for worker in workers {
-                worker
-                    .join()
-                    .expect("sharded cache batch release worker panicked");
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || shard.release_batch(group)));
             }
-        });
+        }
+        for worker in workers {
+            worker.join();
+        }
         self.sharded_stats.record_fanout(fanout);
         self.sharded_stats.record_latency(started);
         released
@@ -9692,29 +9679,21 @@ impl ShardedMultiLayerCache {
             return pinned;
         }
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
-        std::thread::scope(|scope| {
-            let workers = groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, group)| {
-                    if group.is_empty() {
-                        None
-                    } else {
-                        let shard = &self.shards[index];
-                        Some(scope.spawn(move || {
-                            for key in group {
-                                shard.pin(key);
-                            }
-                        }))
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || {
+                    for key in group {
+                        shard.pin(key);
                     }
-                })
-                .collect::<Vec<_>>();
-            for worker in workers {
-                worker
-                    .join()
-                    .expect("sharded cache batch pin worker panicked");
+                }));
             }
-        });
+        }
+        for worker in workers {
+            worker.join();
+        }
         self.sharded_stats.record_fanout(fanout);
         self.sharded_stats.record_latency(started);
         pinned
@@ -9756,29 +9735,21 @@ impl ShardedMultiLayerCache {
             return unpinned;
         }
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
-        std::thread::scope(|scope| {
-            let workers = groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, group)| {
-                    if group.is_empty() {
-                        None
-                    } else {
-                        let shard = &self.shards[index];
-                        Some(scope.spawn(move || {
-                            for key in group {
-                                shard.unpin(&key);
-                            }
-                        }))
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || {
+                    for key in group {
+                        shard.unpin(&key);
                     }
-                })
-                .collect::<Vec<_>>();
-            for worker in workers {
-                worker
-                    .join()
-                    .expect("sharded cache batch unpin worker panicked");
+                }));
             }
-        });
+        }
+        for worker in workers {
+            worker.join();
+        }
         self.sharded_stats.record_fanout(fanout);
         self.sharded_stats.record_latency(started);
         unpinned
@@ -9850,38 +9821,32 @@ impl ShardedMultiLayerCache {
         }
 
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || {
+                    let mut handles = Vec::with_capacity(group.len());
+                    for (position, key, value, size) in group {
+                        handles.push((position, shard.insert_pinned_sized(key, value, size)?));
+                    }
+                    Ok::<_, CacheError>(handles)
+                }));
+            }
+        }
         let shard_results = finish_sharded_fanout_batch(
             &self.sharded_stats,
             started,
             fanout,
-            std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(fanout);
-            for (index, group) in groups.into_iter().enumerate() {
-                if !group.is_empty() {
-                    let shard = &self.shards[index];
-                    workers.push(scope.spawn(move || {
-                        let mut handles = Vec::with_capacity(group.len());
-                        for (position, key, value, size) in group {
-                            handles.push((position, shard.insert_pinned_sized(key, value, size)?));
-                        }
-                        Ok::<_, CacheError>(handles)
-                    }));
-                }
-            }
-
-            let mut merged = Vec::new();
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(handles)) => merged.extend(handles),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch pinned insert worker panicked".to_string(),
-                        ));
-                    }
-                }
-            }
-            Ok(merged)
+            workers.into_iter().try_fold(Vec::new(), |mut merged, worker| {
+                let handles = worker.try_join().ok_or_else(|| {
+                    CacheError::CorruptBlock(
+                        "sharded cache batch pinned insert worker panicked".to_string(),
+                    )
+                })??;
+                merged.extend(handles);
+                Ok::<_, CacheError>(merged)
             }),
         )?;
 
@@ -9944,29 +9909,28 @@ impl ShardedMultiLayerCache {
             return finish_sharded_local_batch(&self.sharded_stats, started, Ok(keys.len()));
         }
         let fanout = groups.iter().filter(|group| !group.is_empty()).count();
-        let result = std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(fanout);
-            for (index, group) in groups.into_iter().enumerate() {
-                if !group.is_empty() {
-                    let shard = &self.shards[index];
-                    workers.push(scope.spawn(move || shard.remove_batch(&group)));
-                }
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (index, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let shard = self.shards[index].clone();
+                workers.push(executor.submit(move || shard.remove_batch(&group)));
             }
+        }
 
-            let mut removed = 0usize;
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(count)) => removed = removed.saturating_add(count),
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => {
-                        return Err(CacheError::CorruptBlock(
-                            "sharded cache batch remove worker panicked".to_string(),
-                        ));
-                    }
-                }
-            }
-            Ok(removed)
-        })
+        let mut removed = 0usize;
+        let result = workers
+            .into_iter()
+            .try_for_each(|worker| {
+                let count = worker.try_join().ok_or_else(|| {
+                    CacheError::CorruptBlock(
+                        "sharded cache batch remove worker panicked".to_string(),
+                    )
+                })??;
+                removed = removed.saturating_add(count);
+                Ok::<_, CacheError>(())
+            })
+            .map(|()| removed)
         .map(|_| keys.len());
         finish_sharded_fanout_batch(&self.sharded_stats, started, fanout, result)
     }

@@ -24770,6 +24770,8 @@ fn sharded_batch_fanout_metrics_are_exported() {
     assert_eq!(cache.put_batch(large_write_entries).unwrap(), large.len());
     assert_eq!(cache.pin_batch(small.clone()), small.len());
     assert_eq!(cache.unpin_batch(&small), small.len());
+    assert_eq!(cache.pin_batch(large.clone()), large.len());
+    assert_eq!(cache.unpin_batch(&large), large.len());
     let pinned_entries = small
         .iter()
         .take(4)
@@ -24778,7 +24780,21 @@ fn sharded_batch_fanout_metrics_are_exported() {
         .collect::<Vec<_>>();
     let pinned = cache.insert_pinned_batch_sized(pinned_entries).unwrap();
     cache.release_batch(pinned.into_iter().flatten().collect());
+    let large_pinned_entries = large
+        .iter()
+        .cloned()
+        .map(|key| (key, vec![11; 16], 16))
+        .collect::<Vec<_>>();
+    let large_pinned = cache
+        .insert_pinned_batch_sized(large_pinned_entries)
+        .unwrap();
+    assert!(large_pinned.iter().all(Option::is_some));
+    assert_eq!(
+        cache.release_batch(large_pinned.into_iter().flatten().collect()),
+        large.len()
+    );
     assert_eq!(cache.remove_batch(&small[..4]).unwrap(), 4);
+    assert_eq!(cache.remove_batch(&large).unwrap(), large.len());
     let after_write_stats = cache.stats();
     assert!(
         after_write_stats.sharded_batch_local_operations
