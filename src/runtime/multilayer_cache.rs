@@ -5026,19 +5026,34 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut exclusive_deferred = Vec::new();
-            for item @ (key, _, _) in deferred.drain(..) {
+            let persistent_tier_enabled = inner.ssd_store.holds_blocks();
+            let mut position = 0;
+            while position < deferred.len() {
+                let key = deferred[position].0;
                 if inner.entry_expired(key, now_millis)
                     || (!inner.ssd_instance_only
                         && (inner.resident_value(key).is_some()
                             || inner.pmem_value(key).is_some()))
                 {
-                    exclusive_deferred.push(item);
+                    position += 1;
+                    continue;
+                }
+
+                let (key, positions, started) = deferred.swap_remove(position);
+                if persistent_tier_enabled {
+                    ssd_candidates.push((key, positions, started));
                 } else {
-                    ssd_candidates.push(item);
+                    let occurrences = positions.len();
+                    inner
+                        .read_counters
+                        .misses
+                        .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    let micros = elapsed_micros(started);
+                    inner.record_get_latency_micros_many(micros, occurrences);
+                    inner.record_read_through_latency_micros_many(micros, occurrences);
+                    clear_owned_batch_positions(results, positions);
                 }
             }
-            deferred = exclusive_deferred;
         }
 
         if !deferred.is_empty() {
