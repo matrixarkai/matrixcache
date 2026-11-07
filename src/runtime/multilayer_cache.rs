@@ -432,6 +432,13 @@ fn clear_owned_batch_positions(results: &mut [Option<Vec<u8>>], positions: Batch
     }
 }
 
+// Copying small resident batches while the shared cache guard is held avoids
+// one atomic Arc clone per key and a temporary hit vector. Larger copies stay
+// outside the guard so a large payload batch cannot hold writers off for an
+// unbounded amount of work.
+const MAX_SHARED_GUARD_COPY_BYTES: usize = 256 * 1024;
+const MAX_SHARED_GUARD_COPY_KEYS: usize = 1024;
+
 /// The distinct keys of a batch and which requested positions each answers,
 /// **borrowing** the keys from `keys`.
 ///
@@ -4463,8 +4470,9 @@ impl MultiLayerCache {
         results: &mut [Option<Vec<u8>>],
     ) -> Result<bool, CacheError> {
         let started = Instant::now();
-        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>)>::with_capacity(keys.len());
+        let mut memory_hits = Vec::<(usize, &CacheKey, Arc<[u8]>)>::new();
         let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
+        let copied_positions;
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -4473,22 +4481,45 @@ impl MultiLayerCache {
             if inner.ssd_instance_only {
                 return Ok(false);
             }
-            for key in keys {
+            let mut copied_bytes = 0usize;
+            let mut copy_under_shared_guard = keys.len() <= MAX_SHARED_GUARD_COPY_KEYS;
+            let mut copied_prefix_len = 0usize;
+            for (position, key) in keys.iter().enumerate() {
                 if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
-                let Some(value) = inner.resident_value(key).cloned() else {
+                let Some(value) = inner.resident_value(key) else {
                     return Ok(false);
                 };
-                memory_hits.push((key, value));
+                let next_copied_bytes = copied_bytes.saturating_add(value.len());
+                if copy_under_shared_guard && next_copied_bytes <= MAX_SHARED_GUARD_COPY_BYTES {
+                    fill_owned_batch_position(&mut results[position], value.as_ref());
+                    copied_bytes = next_copied_bytes;
+                    copied_prefix_len += 1;
+                } else {
+                    if copy_under_shared_guard {
+                        copy_under_shared_guard = false;
+                        memory_hits.reserve(keys.len() - position);
+                    }
+                    memory_hits.push((position, key, Arc::clone(value)));
+                }
             }
+            copied_positions = copied_prefix_len;
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (key, value) in &memory_hits {
+            for (position, key) in keys.iter().enumerate() {
+                let value_len = if position < copied_positions {
+                    results[position]
+                        .as_ref()
+                        .expect("a copied resident position has an output")
+                        .len()
+                } else {
+                    memory_hits[position - copied_positions].2.len()
+                };
                 let outcome = inner.record_hit_shared_at(key, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
-                    needs_exclusive.push(((*key).clone(), outcome, value.len()));
+                    needs_exclusive.push((key.clone(), outcome, value_len));
                 }
             }
         }
@@ -4522,7 +4553,7 @@ impl MultiLayerCache {
             }
         }
 
-        for (position, (_, value)) in memory_hits.into_iter().enumerate() {
+        for (position, _, value) in memory_hits {
             fill_owned_batch_position(&mut results[position], value.as_ref());
         }
         Ok(true)

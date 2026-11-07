@@ -13988,6 +13988,27 @@ mod tests {
     }
 
     #[test]
+    fn get_batch_into_keeps_large_resident_copies_correct() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(2 << 20, directory.path());
+        let first = CacheKey::string(0, "large-resident-first");
+        let second = CacheKey::string(0, "large-resident-second");
+        let first_value = vec![3; 192 << 10];
+        let second_value = vec![7; 192 << 10];
+        cache.put(first.clone(), first_value.clone()).unwrap();
+        cache.put(second.clone(), second_value.clone()).unwrap();
+
+        let mut values = Vec::new();
+        cache
+            .get_batch_into(&[second, first], &mut values)
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_deref(), Some(second_value.as_slice()));
+        assert_eq!(values[1].as_deref(), Some(first_value.as_slice()));
+    }
+
+    #[test]
     fn sharded_get_shared_batch_preserves_order() {
         let cache = ShardedMultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0), 4);
         let first = CacheKey::string(1, "shared-sharded-a");
