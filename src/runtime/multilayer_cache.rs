@@ -3907,7 +3907,7 @@ impl MultiLayerCache {
             for key in keys {
                 self.emit_access_record(CacheAccessRecordKind::Get, key);
             }
-            if self.try_get_shared_memory_batch(keys, now_millis, results)? {
+            if self.try_get_shared_resident_batch(keys, now_millis, results)? {
                 return Ok(());
             }
         }
@@ -4446,15 +4446,19 @@ impl MultiLayerCache {
         Ok(Some(results))
     }
 
-    fn try_get_shared_memory_batch(
+    fn try_get_shared_resident_batch(
         &self,
         keys: &[CacheKey],
         now_millis: u64,
         results: &mut [Option<Arc<[u8]>>],
     ) -> Result<bool, CacheError> {
         let started = Instant::now();
-        let mut memory_hits = Vec::<(&CacheKey, Arc<[u8]>)>::with_capacity(keys.len());
-        let mut needs_exclusive = Vec::<(CacheKey, HitOutcome, usize)>::new();
+        let mut resident_hits =
+            Vec::<(&CacheKey, Arc<[u8]>, CacheReadTier)>::with_capacity(keys.len());
+        let mut needs_exclusive =
+            Vec::<(CacheKey, HitOutcome, usize, CacheReadTier)>::new();
+        let mut memory_hits = 0u64;
+        let mut pmem_hits = 0u64;
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -4467,25 +4471,52 @@ impl MultiLayerCache {
                 if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
-                let Some(value) = inner.resident_value(key).cloned() else {
-                    return Ok(false);
-                };
-                memory_hits.push((key, value));
+                if let Some(resident) = inner.memory.get(key) {
+                    resident_hits.push((key, Arc::clone(&resident.value), CacheReadTier::Memory));
+                    memory_hits += 1;
+                    continue;
+                }
+                if let Some(resident) = inner.pmem.get(key) {
+                    if inner.pmem_should_refill_memory(resident.value.len()) {
+                        return Ok(false);
+                    }
+                    resident_hits.push((key, Arc::clone(&resident.value), CacheReadTier::Pmem));
+                    pmem_hits += 1;
+                    continue;
+                }
+                return Ok(false);
             }
 
             let epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(epoch);
-            for (key, value) in &memory_hits {
-                let outcome = inner.record_hit_shared_at(key, epoch);
+            for (key, value, tier) in &resident_hits {
+                let metadata = match tier {
+                    CacheReadTier::Memory => {
+                        inner.memory.get(*key).and_then(|entry| entry.meta.as_ref())
+                    }
+                    CacheReadTier::Pmem => {
+                        inner.pmem.get(*key).and_then(|entry| entry.meta.as_ref())
+                    }
+                    CacheReadTier::Ssd => None,
+                };
+                let outcome =
+                    inner.record_known_hit_shared_occurrences_at(key, metadata, 1, epoch);
                 if !matches!(outcome, HitOutcome::Accounted) {
-                    needs_exclusive.push(((*key).clone(), outcome, value.len()));
+                    needs_exclusive.push(((*key).clone(), outcome, value.len(), *tier));
                 }
             }
         }
 
-        self.read_counters
-            .memory_hits
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        if memory_hits != 0 {
+            self.read_counters
+                .memory_hits
+                .fetch_add(memory_hits, Ordering::Relaxed);
+        }
+        if pmem_hits != 0 {
+            self.read_counters
+                .pmem_hits
+                .fetch_add(pmem_hits, Ordering::Relaxed);
+        }
         self.read_counters
             .shared_buffer_hits
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
@@ -4499,12 +4530,17 @@ impl MultiLayerCache {
 
         if !needs_exclusive.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
-            for (key, outcome, len) in needs_exclusive {
+            for (key, outcome, len, tier) in needs_exclusive {
                 match outcome {
                     HitOutcome::Accounted => {}
                     HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(&key),
                     HitOutcome::NeedsMetadata => {
-                        if inner.memory.contains_key(&key) {
+                        let resident = match tier {
+                            CacheReadTier::Memory => inner.memory.contains_key(&key),
+                            CacheReadTier::Pmem => inner.pmem.contains_key(&key),
+                            CacheReadTier::Ssd => false,
+                        };
+                        if resident {
                             inner.record_hit(&key, len);
                         }
                     }
@@ -4512,7 +4548,7 @@ impl MultiLayerCache {
             }
         }
 
-        for (position, (_, value)) in memory_hits.into_iter().enumerate() {
+        for (position, (_, value, _)) in resident_hits.into_iter().enumerate() {
             results[position] = Some(value);
         }
         Ok(true)
