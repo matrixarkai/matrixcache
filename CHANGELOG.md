@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Unique shared batches already resident in memory or PMEM bypass generic
+  coalescing when no promotion is required.
+
 - Unique all-memory copied batches use one clock sample and batched atomic
   accounting while preserving per-key hit and latency sample counts.
 

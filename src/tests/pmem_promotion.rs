@@ -169,13 +169,28 @@ fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
     for key in &keys {
         assert!(cache.get_shared(key).unwrap().is_some());
     }
+    let before_batch = cache.stats();
     assert!(cache
         .get_shared_batch(&keys)
         .unwrap()
         .iter()
         .all(Option::is_some));
+    let after_batch = cache.stats();
+    assert_eq!(after_batch.pmem_hits - before_batch.pmem_hits, 4);
+    assert_eq!(
+        after_batch.shared_buffer_hits - before_batch.shared_buffer_hits,
+        4
+    );
+    assert_eq!(
+        after_batch.get_latency_samples - before_batch.get_latency_samples,
+        4
+    );
+    assert_eq!(
+        after_batch.read_through_latency_samples - before_batch.read_through_latency_samples,
+        4
+    );
 
-    let after = cache.stats();
+    let after = after_batch;
     assert_eq!(after.refill_failures, before.refill_failures);
     assert_eq!(
         after.memory_admission_rejected,
