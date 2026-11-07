@@ -5417,8 +5417,26 @@ impl MultiLayerCache {
             expired = inner.entry_expired(key, now_millis);
             if expired {
                 None
+            } else if let Some(resident) = inner.memory.get(key) {
+                let value = Arc::clone(&resident.value);
+                inner.increment_pin_for_handle(key, value.len());
+                inner
+                    .read_counters
+                    .memory_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                inner.reconfigure_refresh_window(now_millis);
+                let outcome = inner.record_known_hit_shared_occurrences_at(
+                    key,
+                    resident.meta.as_ref(),
+                    1,
+                    now_millis,
+                );
+                let micros = elapsed_micros(started);
+                inner.record_get_latency_micros(micros);
+                inner.record_read_through_latency_micros(micros);
+                Some((value, outcome))
             } else {
-                inner.resident_value(key).cloned()
+                None
             }
         };
 
@@ -5444,28 +5462,7 @@ impl MultiLayerCache {
             return Ok(None);
         }
 
-        if let Some(value) = probe {
-            let outcome = {
-                let inner = self.inner.read().expect("cache lock poisoned");
-                inner.increment_pin_for_handle(key, value.len());
-                inner
-                    .read_counters
-                    .memory_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                // An entry can be evicted between the probe and here. What was
-                // read was resident when it was read, so it is still a hit;
-                // only the per-entry bookkeeping is conditional on it still
-                // being there.
-                let outcome = if inner.memory.contains_key(key) {
-                    inner.record_hit_shared(key)
-                } else {
-                    HitOutcome::Accounted
-                };
-                let micros = elapsed_micros(started);
-                inner.record_get_latency_micros(micros);
-                inner.record_read_through_latency_micros(micros);
-                outcome
-            };
+        if let Some((value, outcome)) = probe {
             // Only these two need the cache exclusively, and a hit on a
             // recently-read entry is neither.
             match outcome {
