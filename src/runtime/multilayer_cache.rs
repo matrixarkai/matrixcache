@@ -205,7 +205,10 @@ mod batch_value_expansion_tests {
         fill_decoded_batch_positions(
             &mut results,
             BatchPositions::Many(vec![3, 1, 2]),
-            CacheDecodedBlock::Owned(source),
+            CacheDecodedBlock {
+                value: source,
+                refill: None,
+            },
         );
 
         assert!(results[0].is_none());
@@ -408,21 +411,17 @@ fn fill_decoded_batch_positions(
     positions: BatchPositions,
     value: CacheDecodedBlock,
 ) {
-    match value {
-        CacheDecodedBlock::Owned(value) => match positions {
-            BatchPositions::One(position) => results[position] = Some(value),
-            BatchPositions::Many(mut positions) => {
-                let final_position = positions
-                    .pop()
-                    .expect("a multi-position batch has at least two positions");
-                for position in positions {
-                    fill_owned_batch_position(&mut results[position], &value);
-                }
-                results[final_position] = Some(value);
+    let value = value.into_vec();
+    match positions {
+        BatchPositions::One(position) => results[position] = Some(value),
+        BatchPositions::Many(mut positions) => {
+            let final_position = positions
+                .pop()
+                .expect("a multi-position batch has at least two positions");
+            for position in positions {
+                fill_owned_batch_position(&mut results[position], &value);
             }
-        },
-        CacheDecodedBlock::Shared(value) => {
-            fill_owned_batch_positions(results, positions, value.as_ref())
+            results[final_position] = Some(value);
         }
     }
 }
@@ -4828,8 +4827,8 @@ impl MultiLayerCache {
         };
         match block {
             Some(block) => {
-                let decoded = CacheDecodedBlock::decode(&block, refill_wanted)?;
                 let compressed = is_encoded_compressed_block(&block);
+                let decoded = CacheDecodedBlock::decode(block, refill_wanted)?;
                 if !refill_wanted {
                     let outcome = {
                         let inner = self.inner.read().expect("cache lock poisoned");
@@ -5172,10 +5171,10 @@ impl MultiLayerCache {
         >::new();
         for ((key, positions, started), block) in ssd_candidates.into_iter().zip(blocks) {
             let decoded = match block {
-                Some(block) => Some((
-                    CacheDecodedBlock::decode(&block, refill_wanted)?,
-                    is_encoded_compressed_block(&block),
-                )),
+                Some(block) => {
+                    let compressed = is_encoded_compressed_block(&block);
+                    Some((CacheDecodedBlock::decode(block, refill_wanted)?, compressed))
+                }
                 None => None,
             };
             ssd_reads.push((key, positions, started, refill_started, decoded));

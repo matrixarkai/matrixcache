@@ -571,61 +571,47 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 /// Decoded block bytes, in the form the read that asked for them needs.
 ///
 /// A read that refills hands the bytes to **two** holders: the tier it refills
-/// and the caller. Decoding into the handle the tier wants costs one
-/// allocation for the tier and one copy for the caller.
+/// and the caller. The caller keeps the storage engine's allocation while the
+/// tier gets one independent shared handle.
 ///
 /// A read that cannot refill -- an SSD-only instance, which never puts
 /// anything back into memory -- has one holder, and a handle would have to be
 /// copied again to hand back an owned value. That read decodes into the value
 /// it is going to return.
 ///
-/// Both of those used to be the same thing: decode into a `Vec`, clone the
-/// `Vec` for the tier, and let the tier build an `Arc` from the clone. Three
-/// payload-sized allocations to serve two holders, and the extra one grew with
-/// the payload.
-enum CacheDecodedBlock {
-    /// Shared with the tier this read refills.
-    Shared(Arc<[u8]>),
-    /// Owned by the read, because nothing else wants these bytes.
-    Owned(Vec<u8>),
+/// Both of those used to decode from a borrowed storage buffer into a shared
+/// handle and then copy that handle for the caller. Together with the storage
+/// buffer, that was three payload-sized allocations to serve two holders.
+struct CacheDecodedBlock {
+    /// The storage engine's allocation, stripped to the decoded value in
+    /// place for raw blocks. The copied read returns this allocation.
+    value: Vec<u8>,
+    /// The independent handle retained by an upper tier after a refill.
+    refill: Option<Arc<[u8]>>,
 }
 
 impl CacheDecodedBlock {
-    fn decode(block: &[u8], refilling: bool) -> Result<Self, CacheError> {
-        if refilling {
-            Ok(Self::Shared(decode_cache_block_shared(block)?))
-        } else {
-            Ok(Self::Owned(decode_cache_block(block)?))
-        }
+    fn decode(block: Vec<u8>, refilling: bool) -> Result<Self, CacheError> {
+        let value = decode_cache_block_owned(block)?;
+        let refill = refilling.then(|| Arc::<[u8]>::from(value.as_slice()));
+        Ok(Self { value, refill })
     }
 
     fn len(&self) -> usize {
-        match self {
-            Self::Shared(bytes) => bytes.len(),
-            Self::Owned(bytes) => bytes.len(),
-        }
+        self.value.len()
     }
 
-    /// A handle to refill a tier with, or `None` from the form that has none.
+    /// A handle to refill a tier with, or `None` when no refill was requested.
     ///
     /// A read that asked for the owning form is a read that said it would not
     /// refill, so there is nothing to hand over.
     fn to_refill(&self) -> Option<Arc<[u8]>> {
-        match self {
-            Self::Shared(bytes) => Some(Arc::clone(bytes)),
-            Self::Owned(_) => None,
-        }
+        self.refill.as_ref().map(Arc::clone)
     }
 
-    /// The owned copy, for a read that needs one.
-    ///
-    /// The owning form moves rather than copies here, which is why the two
-    /// forms are worth telling apart at all.
+    /// Move the storage engine's allocation to the copied read result.
     fn into_vec(self) -> Vec<u8> {
-        match self {
-            Self::Shared(bytes) => bytes.to_vec(),
-            Self::Owned(bytes) => bytes,
-        }
+        self.value
     }
 }
 
