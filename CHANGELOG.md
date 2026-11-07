@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- SSD-only copied batches move each decoded allocation into its result and
+  copy payload bytes only for duplicate request positions.
+
 - SSD-only copied batches use one clock sample and batched hit, miss,
   compression, and latency accounting.
 
