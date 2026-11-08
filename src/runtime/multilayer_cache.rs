@@ -135,10 +135,12 @@ fn own_unique_positioned_batch_keys(
 #[cfg(test)]
 mod batch_value_expansion_tests {
     use super::{
-        fill_decoded_batch_positions, fill_owned_batch_positions,
-        has_duplicate_batch_keys, own_unique_positioned_batch_keys, visit_batch_values,
-        BatchPositions, CacheDecodedBlock, CacheKey,
+        coalesce_batch_positions_borrowed, coalesce_release_counts,
+        fill_decoded_batch_positions, fill_owned_batch_positions, has_duplicate_batch_keys,
+        own_unique_positioned_batch_keys, visit_batch_values, BatchPositions, CacheDecodedBlock,
+        CacheKey, CachePinnedHandle, CacheReadTier,
     };
+    use std::sync::Arc;
 
     #[test]
     fn medium_duplicate_preflight_distinguishes_unique_and_repeated_keys() {
@@ -149,6 +151,57 @@ mod batch_value_expansion_tests {
 
         keys[63] = keys[17].clone();
         assert!(has_duplicate_batch_keys(&keys));
+    }
+
+    #[test]
+    fn medium_position_grouping_keeps_unique_keys_and_coalesces_duplicates() {
+        let mut keys = (0..64)
+            .map(|index| CacheKey::string(1, &format!("group-{index:02}")))
+            .collect::<Vec<_>>();
+        let grouped = coalesce_batch_positions_borrowed(&keys);
+        assert_eq!(grouped.len(), 64);
+        assert!(grouped.iter().all(|(_, positions)| positions.len() == 1));
+        drop(grouped);
+
+        keys[63] = keys[17].clone();
+        let grouped = coalesce_batch_positions_borrowed(&keys);
+        assert_eq!(grouped.len(), 63);
+        assert_eq!(
+            grouped
+                .iter()
+                .find(|(key, _)| *key == &keys[17])
+                .expect("duplicated key is grouped")
+                .1
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn medium_release_grouping_coalesces_duplicate_handles() {
+        let mut keys = (0..64)
+            .map(|index| CacheKey::string(1, &format!("release-{index:02}")))
+            .collect::<Vec<_>>();
+        let duplicate = keys[17].clone();
+        keys[63] = duplicate.clone();
+        let value = Arc::<[u8]>::from(vec![1u8]);
+        let handles = keys.into_iter().map(|key| CachePinnedHandle {
+            key,
+            value: Arc::clone(&value),
+            tier: CacheReadTier::Memory,
+        });
+
+        let (released, counts) = coalesce_release_counts(handles);
+        assert_eq!(released, 64);
+        assert_eq!(counts.len(), 63);
+        assert_eq!(
+            counts
+                .iter()
+                .find(|(key, _)| key == &duplicate)
+                .expect("duplicated handle is grouped")
+                .1,
+            2
+        );
     }
 
     #[test]
@@ -480,10 +533,10 @@ const MAX_SHARED_GUARD_COPY_KEYS: usize = 1024;
 /// which ones are duplicates.
 fn coalesce_batch_positions_borrowed<'a>(
     keys: &'a [CacheKey],
-) -> SmallVec<[(&'a CacheKey, BatchPositions); INLINE_BATCH_KEYS]> {
+) -> SmallVec<[(&'a CacheKey, BatchPositions); SMALL_BATCH_DEDUP_LIMIT]> {
     let mut positions_by_key =
-        SmallVec::<[(&'a CacheKey, BatchPositions); INLINE_BATCH_KEYS]>::new();
-    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        SmallVec::<[(&'a CacheKey, BatchPositions); SMALL_BATCH_DEDUP_LIMIT]>::new();
+    if keys.len() <= INLINE_BATCH_KEYS {
         for (position, key) in keys.iter().enumerate() {
             if let Some((_, positions)) = positions_by_key
                 .iter_mut()
@@ -492,6 +545,31 @@ fn coalesce_batch_positions_borrowed<'a>(
                 positions.push(position);
             } else {
                 positions_by_key.push((key, BatchPositions::new(position)));
+            }
+        }
+        return positions_by_key;
+    }
+
+    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut unique_positions = [u8::MAX; SMALL_BATCH_DEDUP_SLOTS];
+        let slot_mask = unique_positions.len() - 1;
+        for (position, key) in keys.iter().enumerate() {
+            let mut hasher = ahash::AHasher::default();
+            key.hash(&mut hasher);
+            let mut slot = hasher.finish() as usize & slot_mask;
+            loop {
+                let unique_position = unique_positions[slot];
+                if unique_position == u8::MAX {
+                    unique_positions[slot] = positions_by_key.len() as u8;
+                    positions_by_key.push((key, BatchPositions::new(position)));
+                    break;
+                }
+                let unique_position = unique_position as usize;
+                if positions_by_key[unique_position].0 == key {
+                    positions_by_key[unique_position].1.push(position);
+                    break;
+                }
+                slot = (slot + 1) & slot_mask;
             }
         }
         return positions_by_key;
@@ -509,18 +587,24 @@ fn coalesce_batch_positions_borrowed<'a>(
     positions_by_key
 }
 
-fn coalesce_release_counts<I>(handles: I) -> (usize, Vec<(CacheKey, usize)>)
+fn coalesce_release_counts<I>(
+    handles: I,
+) -> (
+    usize,
+    SmallVec<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>,
+)
 where
     I: IntoIterator<Item = CachePinnedHandle>,
 {
     let handles = handles.into_iter();
     let (lower_bound, upper_bound) = handles.size_hint();
     if upper_bound == Some(0) {
-        return (0, Vec::new());
+        return (0, SmallVec::new());
     }
     let mut released = 0usize;
-    if upper_bound.unwrap_or(usize::MAX) <= SMALL_BATCH_DEDUP_LIMIT {
-        let mut counts = Vec::<(CacheKey, usize)>::with_capacity(lower_bound);
+    if upper_bound.unwrap_or(usize::MAX) <= INLINE_BATCH_KEYS {
+        let mut counts =
+            SmallVec::<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
         for handle in handles {
             released = released.saturating_add(1);
             if let Some((_, count)) = counts
@@ -530,6 +614,34 @@ where
                 *count = count.saturating_add(1);
             } else {
                 counts.push((handle.key, 1));
+            }
+        }
+        return (released, counts);
+    }
+
+    if upper_bound.unwrap_or(usize::MAX) <= SMALL_BATCH_DEDUP_LIMIT {
+        let mut counts =
+            SmallVec::<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+        let mut unique_positions = [u8::MAX; SMALL_BATCH_DEDUP_SLOTS];
+        let slot_mask = unique_positions.len() - 1;
+        for handle in handles {
+            released = released.saturating_add(1);
+            let mut hasher = ahash::AHasher::default();
+            handle.key.hash(&mut hasher);
+            let mut slot = hasher.finish() as usize & slot_mask;
+            loop {
+                let unique_position = unique_positions[slot];
+                if unique_position == u8::MAX {
+                    unique_positions[slot] = counts.len() as u8;
+                    counts.push((handle.key, 1));
+                    break;
+                }
+                let unique_position = unique_position as usize;
+                if counts[unique_position].0 == handle.key {
+                    counts[unique_position].1 = counts[unique_position].1.saturating_add(1);
+                    break;
+                }
+                slot = (slot + 1) & slot_mask;
             }
         }
         return (released, counts);
@@ -5744,7 +5856,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut pin_counts = Vec::<(&CacheKey, usize, usize)>::new();
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in positions_by_key {
                 if inner.entry_expired(key, now_millis) {
                     expired_keys.push(key);
@@ -5959,7 +6072,8 @@ impl MultiLayerCache {
 
             let hit_epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(hit_epoch);
-            let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions, started, value) in decoded {
                 let occurrences = positions.len();
                 match value {
@@ -6074,7 +6188,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in positions_by_key {
                 let started = Instant::now();
                 if inner.ssd_instance_only || inner.entry_expired(key, now_millis) {
@@ -6156,7 +6271,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in exclusive_remaining {
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
@@ -6271,7 +6387,8 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            let mut pin_counts = Vec::<(&CacheKey, usize, usize, usize)>::new();
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions, started, value) in decoded {
                 let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match value {
