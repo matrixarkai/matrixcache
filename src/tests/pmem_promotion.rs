@@ -248,6 +248,60 @@ fn owned_pmem_batch_refills_memory_in_one_batch_path() {
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Memory)));
 }
 
+// rust-internal: mixed resident batches use one path while preserving tier accounting.
+#[test]
+fn owned_mixed_memory_pmem_batch_refills_and_preserves_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(8192, 8192, 0)
+            .with_pmem_paths([dir.path().join("pmem")])
+            .with_dram_pmem_data_placement(CacheDataPlacement::SideBySide, usize::MAX),
+    );
+    cache.start().unwrap();
+    let keys = (0..8)
+        .map(|index| CacheKey::string(0, &format!("mixed-owned-batch-{index}")))
+        .collect::<Vec<_>>();
+    for (index, key) in keys.iter().enumerate() {
+        cache.set_data_placement_threshold_bytes(if index % 2 == 0 { usize::MAX } else { 0 });
+        cache.put(key.clone(), vec![index as u8; 64]).unwrap();
+    }
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            cache.peek_tier(key),
+            Some(if index % 2 == 0 {
+                CacheReadTier::Memory
+            } else {
+                CacheReadTier::Pmem
+            })
+        );
+    }
+    cache.set_data_placement_threshold_bytes(usize::MAX);
+
+    let before = cache.stats();
+    let values = cache.get_batch(&keys).unwrap();
+    for (index, value) in values.iter().enumerate() {
+        let value = value.as_ref().expect("mixed resident value");
+        assert_eq!(value.len(), 64);
+        assert!(value.iter().all(|byte| *byte == index as u8));
+    }
+
+    let after = cache.stats();
+    assert_eq!(after.memory_hits - before.memory_hits, 4);
+    assert_eq!(after.pmem_hits - before.pmem_hits, 4);
+    assert_eq!(after.shared_buffer_hits - before.shared_buffer_hits, 8);
+    assert_eq!(after.memory_fills - before.memory_fills, 4);
+    assert_eq!(after.misses, before.misses);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.get_latency_samples - before.get_latency_samples, 8);
+    assert_eq!(
+        after.refill_latency_samples - before.refill_latency_samples,
+        4
+    );
+    assert!(keys
+        .iter()
+        .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Memory)));
+}
+
 // rust-internal: deterministically interleave mutations between probe and refill.
 #[test]
 fn stale_pmem_probe_does_not_replace_a_new_value() {

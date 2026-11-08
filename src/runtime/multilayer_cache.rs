@@ -4930,13 +4930,13 @@ impl MultiLayerCache {
         Ok(true)
     }
 
-    /// Serve a distinct-key batch resident entirely in PMEM and refill memory.
+    /// Serve a distinct-key batch resident in memory and PMEM.
     ///
-    /// PMEM values are immutable shared buffers, so the caller copies them
-    /// without holding the cache exclusively. Promotion then revalidates each
-    /// captured buffer before installing it in memory, preserving the same
-    /// overwrite and invalidation safety as a single-key PMEM read.
-    fn try_get_owned_batch_pmem_refill(
+    /// Values are immutable shared buffers, so caller-owned copies are made
+    /// without holding the cache exclusively. PMEM promotion and deferred hit
+    /// bookkeeping then revalidate every captured buffer before mutating the
+    /// cache, preserving overwrite and invalidation safety.
+    fn try_get_owned_batch_resident(
         &self,
         keys: &[CacheKey],
         results: &mut [Option<Vec<u8>>],
@@ -4944,6 +4944,9 @@ impl MultiLayerCache {
     ) -> Result<bool, CacheError> {
         let started = Instant::now();
         let refill_started = Instant::now();
+        let mut memory_hits = 0u64;
+        let mut pmem_hits = 0u64;
+        let mut pmem_refills = 0usize;
         let values = {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -4952,38 +4955,85 @@ impl MultiLayerCache {
             if inner.ssd_instance_only {
                 return Ok(false);
             }
-            let mut values = SmallVec::<[Arc<[u8]>; INLINE_BATCH_KEYS]>::new();
+            let epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(epoch);
+            let mut values = SmallVec::<
+                [(Arc<[u8]>, CacheReadTier, HitOutcome); INLINE_BATCH_KEYS],
+            >::new();
             for key in keys {
-                if inner.entry_expired(key, now_millis) || inner.memory.contains_key(key) {
+                if inner.entry_expired(key, now_millis) {
                     return Ok(false);
                 }
-                let Some(value) = inner.pmem_value(key) else {
+                let (value, metadata, tier) = if let Some(resident) = inner.memory.get(key) {
+                    memory_hits = memory_hits.saturating_add(1);
+                    (
+                        &resident.value,
+                        resident.meta.as_ref(),
+                        CacheReadTier::Memory,
+                    )
+                } else if let Some(resident) = inner.pmem.get(key) {
+                    pmem_hits = pmem_hits.saturating_add(1);
+                    pmem_refills += usize::from(inner.pmem_should_refill_memory(resident.value.len()));
+                    (
+                        &resident.value,
+                        resident.meta.as_ref(),
+                        CacheReadTier::Pmem,
+                    )
+                } else {
                     return Ok(false);
                 };
-                if !inner.pmem_should_refill_memory(value.len()) {
-                    return Ok(false);
-                }
-                values.push(Arc::clone(value));
+                let outcome =
+                    inner.record_known_hit_shared_occurrences_at(key, metadata, 1, epoch);
+                values.push((Arc::clone(value), tier, outcome));
             }
             values
         };
 
-        for (result, value) in results.iter_mut().zip(values.iter()) {
+        for (result, (value, _, _)) in results.iter_mut().zip(values.iter()) {
             fill_owned_batch_position(result, value.as_ref());
         }
 
+        if pmem_hits != 0
+            || values
+                .iter()
+                .any(|(_, _, outcome)| !matches!(outcome, HitOutcome::Accounted))
         {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (key, value) in keys.iter().zip(values.iter()) {
-                inner.promote_pmem_probe_if_current(key, value);
+            for (key, (value, tier, outcome)) in keys.iter().zip(values.iter()) {
+                match tier {
+                    CacheReadTier::Memory => {
+                        let current = inner
+                            .memory
+                            .get(key)
+                            .is_some_and(|resident| Arc::ptr_eq(&resident.value, value));
+                        if !current {
+                            continue;
+                        }
+                        match outcome {
+                            HitOutcome::Accounted => {}
+                            HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
+                            HitOutcome::NeedsMetadata => inner.record_hit(key, value.len()),
+                        }
+                    }
+                    CacheReadTier::Pmem => {
+                        inner.promote_accounted_pmem_probe_if_current(key, value, *outcome)
+                    }
+                    CacheReadTier::Ssd => unreachable!("resident batch never captures SSD"),
+                }
             }
         }
 
         self.read_counters
+            .memory_hits
+            .fetch_add(memory_hits, Ordering::Relaxed);
+        self.read_counters
             .pmem_hits
+            .fetch_add(pmem_hits, Ordering::Relaxed);
+        self.read_counters
+            .shared_buffer_hits
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
         let micros = elapsed_micros(started);
         self.read_counters
@@ -4992,11 +5042,13 @@ impl MultiLayerCache {
         self.read_counters
             .read_through_latency
             .observe_many_with_total(micros, keys.len());
-        self.read_counters.refill_latency.observe_many_with_total(
-            elapsed_micros(refill_started),
-            keys.len(),
-        );
-        self.drain_eviction_records();
+        if pmem_refills != 0 {
+            self.read_counters.refill_latency.observe_many_with_total(
+                elapsed_micros(refill_started),
+                pmem_refills,
+            );
+            self.drain_eviction_records();
+        }
         Ok(true)
     }
 
@@ -5488,7 +5540,7 @@ impl MultiLayerCache {
             return Ok(());
         }
         if !has_duplicate_batch_keys(keys) {
-            if self.try_get_owned_batch_pmem_refill(keys, results, now_millis)? {
+            if self.try_get_owned_batch_resident(keys, results, now_millis)? {
                 return Ok(());
             }
             if self.try_get_owned_batch_ssd_refill(keys, results, now_millis)? {
