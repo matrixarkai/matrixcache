@@ -724,6 +724,55 @@ fn ssd_only_pinned_batch_misses_stay_on_the_shared_lock_path() {
     );
 }
 
+// rust-internal: distinct cold batches refill shared buffers without changing results or counters.
+#[test]
+fn multi_tier_shared_batch_refill_preserves_mixed_results_and_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(8192, 0, 8192)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_instance_only(true),
+    );
+    let keys = (0..8)
+        .map(|index| CacheKey::string(0, &format!("multi-tier-shared-refill-{index}")))
+        .collect::<Vec<_>>();
+    for index in (0..keys.len()).step_by(2) {
+        cache
+            .put(keys[index].clone(), vec![index as u8; 64])
+            .unwrap();
+    }
+    cache.set_ssd_instance_only(false);
+
+    let before = cache.stats();
+    let results = cache.get_shared_batch(&keys).unwrap();
+    for (index, value) in results.iter().enumerate() {
+        assert_eq!(value.is_some(), index % 2 == 0);
+        if let Some(value) = value {
+            assert!(value.iter().all(|byte| *byte == index as u8));
+        }
+    }
+
+    let after = cache.stats();
+    assert_eq!(after.disk_hits - before.disk_hits, 4);
+    assert_eq!(after.misses - before.misses, 4);
+    assert_eq!(after.shared_buffer_hits - before.shared_buffer_hits, 4);
+    assert_eq!(after.shared_buffer_misses - before.shared_buffer_misses, 4);
+    assert_eq!(after.memory_fills - before.memory_fills, 4);
+    assert_eq!(after.refill_failures, before.refill_failures);
+    assert_eq!(after.get_latency_samples - before.get_latency_samples, 8);
+    assert_eq!(
+        after.read_through_latency_samples - before.read_through_latency_samples,
+        8
+    );
+    assert_eq!(
+        after.refill_latency_samples - before.refill_latency_samples,
+        4
+    );
+    for index in (0..keys.len()).step_by(2) {
+        assert_eq!(cache.peek_tier(&keys[index]), Some(CacheReadTier::Memory));
+    }
+}
+
 // rust-internal: absent multi-tier shared batches do not request the cache write lock.
 #[test]
 fn multi_tier_shared_batch_misses_stay_on_the_shared_lock_path() {
