@@ -13454,10 +13454,9 @@ mod tests {
         // cache where that has never happened.
         //
         // The flag is safe because it is never cleared: the worst it can do is
-        // stay true and cost the walk that used to be unconditional. What it
-        // cannot survive is a *fifth* write site added without raising it,
-        // because then `size()` would answer zero when the real total is not.
-        // That is what this checks, by reading the source.
+        // stay true and cost the walk that used to be unconditional. Removed
+        // bytes have one authority so its live-handle check and update cannot
+        // race with release.
         const RUNTIME: [&str; 2] = [
             include_str!("../runtime/multilayer_cache.rs"),
             include_str!("../runtime/builder_and_gc.rs"),
@@ -13469,22 +13468,26 @@ mod tests {
             .sum();
         let raises: usize = RUNTIME
             .iter()
-            .map(|source| {
-                source
-                    .matches("pinned_removals_seen.store(true")
-                    .count()
-            })
+            .map(|source| source.matches("mark_removed_seen();").count())
+            .sum();
+        let helper_uses: usize = RUNTIME
+            .iter()
+            .map(|source| source.matches("record_removed_bytes_if_pinned(").count())
             .sum();
 
         // The parser has to be shown to work, or a rename turns this into a
         // test that counts nothing twice and passes.
         assert!(
-            writes >= 4,
-            "only {writes} writes of `removed_bytes` found, so this test is not reading the              source properly and would pass whatever the code did"
+            writes == 1,
+            "removed bytes must have one authority, found {writes} write sites"
         );
         assert_eq!(
             raises, writes,
-            "{writes} places record bytes for a pinned entry removed from its tier but only              {raises} raise the flag `size()` trusts; a write without the flag makes `size()`              answer zero when it should not"
+            "the removed-byte authority must raise the flag `size()` trusts"
+        );
+        assert!(
+            helper_uses >= 5,
+            "only {helper_uses} helper definition/call sites found; a removal path may bypass              the atomic pin check"
         );
     }
 
@@ -16517,39 +16520,64 @@ mod tests {
         let key = CacheKey::string(0, "pin-count");
         cache.put(key.clone(), b"value".to_vec()).unwrap();
 
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
         let first = cache.acquire(&key).unwrap().unwrap();
         let second = cache.clone_handle(&first);
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 2);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 2);
 
         cache.invalidate_memory_only(&key);
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 2);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 2);
         assert_eq!(cache.release_batch(vec![second]), 1);
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 1);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 1);
         cache.release(first);
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
 
         cache.put(key.clone(), b"value".to_vec()).unwrap();
         let held_during_clear = cache.acquire(&key).unwrap().unwrap();
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 1);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 1);
         cache.reset().unwrap();
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
         cache.release(held_during_clear);
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
 
         let bucket_key = CacheKey::page_with_slot(7, 1, 0, 5, Some(11));
         cache.put(bucket_key.clone(), b"block".to_vec()).unwrap();
         let held_during_bucket_invalidation = cache.acquire(&bucket_key).unwrap().unwrap();
         cache.invalidate_slot(7, 11).unwrap();
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
         cache.release(held_during_bucket_invalidation);
 
         let shard_key = CacheKey::string(9, "shard-pin-count");
         cache.put(shard_key.clone(), b"value".to_vec()).unwrap();
         let held_during_shard_invalidation = cache.acquire(&shard_key).unwrap().unwrap();
         cache.invalidate_shard(9).unwrap();
-        assert_eq!(cache.inner.read().unwrap().pin_handles.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
         cache.release(held_during_shard_invalidation);
+    }
+
+    // rust-internal: returning an ordinary pinned handle must not wait for the cache-wide lock.
+    #[test]
+    fn release_fast_path_does_not_take_cache_wide_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1 << 20, dir.path());
+        let key = CacheKey::string(0, "independent-release");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        let handle = cache.acquire(&key).unwrap().unwrap();
+
+        let held_cache_lock = cache.inner.write().unwrap();
+        let releasing_cache = cache.clone();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            releasing_cache.release(handle);
+            released_tx.send(()).unwrap();
+        });
+
+        released_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release waited for the cache-wide lock");
+        drop(held_cache_lock);
+        worker.join().unwrap();
+        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -20843,7 +20871,13 @@ mod tests {
             fields.len(),
             fields
         );
-        for expected in ["memory", "metadata", "memory_order", "pins", "access_frequency"] {
+        for expected in [
+            "memory",
+            "metadata",
+            "memory_order",
+            "pin_registry",
+            "access_frequency",
+        ] {
             assert!(
                 fields.iter().any(|field| field == expected),
                 "the parser missed the {expected} field, so it is not reading the struct properly"
