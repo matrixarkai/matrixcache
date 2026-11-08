@@ -9750,16 +9750,17 @@ impl ShardedMultiLayerCache {
     ///
     /// Colocated batches delegate straight to the owning shard, so scan and
     /// retrieval loops that route by shard avoid an extra merge allocation.
-    /// Cross-shard batches preserve the same behavior as `get_shared_batch`
-    /// while still letting the caller keep the output buffer across calls.
+    /// Cross-shard batches fill the caller's buffer directly from shard-local
+    /// reads while preserving the ordering and duplicate behavior of
+    /// `get_shared_batch`.
     pub fn get_shared_batch_into(
         &self,
         keys: &[CacheKey],
         results: &mut Vec<Option<std::sync::Arc<[u8]>>>,
     ) -> Result<(), CacheError> {
-        results.clear();
         let started = Instant::now();
         if keys.is_empty() {
+            results.clear();
             self.sharded_stats.record_latency(started);
             return Ok(());
         }
@@ -9770,9 +9771,64 @@ impl ShardedMultiLayerCache {
             return result;
         }
 
-        let values = self.get_shared_batch(keys)?;
-        results.reserve(values.len());
-        results.extend(values);
+        results.clear();
+        results.resize_with(keys.len(), || None);
+        let groups = self.group_keys_by_shard(keys);
+        if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
+            self.sharded_stats.record_local();
+            for (shard_index, group) in groups.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let mut shard_keys = Vec::with_capacity(group.len());
+                let mut positions = Vec::with_capacity(group.len());
+                for (position, key) in group {
+                    shard_keys.push(key.clone());
+                    positions.push(position);
+                }
+                let mut shard_values = Vec::with_capacity(shard_keys.len());
+                self.shards[shard_index]
+                    .get_shared_batch_into(&shard_keys, &mut shard_values)?;
+                for (position, value) in positions.into_iter().zip(shard_values) {
+                    results[position] = value;
+                }
+            }
+            self.sharded_stats.record_latency(started);
+            return Ok(());
+        }
+
+        let fanout = groups.iter().filter(|group| !group.is_empty()).count();
+        self.sharded_stats.record_fanout(fanout);
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_index].clone();
+            let mut shard_keys = Vec::with_capacity(group.len());
+            let mut positions = Vec::with_capacity(group.len());
+            for (position, key) in group {
+                shard_keys.push(key.clone());
+                positions.push(position);
+            }
+            workers.push(executor.submit(move || {
+                let mut shard_values = Vec::with_capacity(shard_keys.len());
+                shard.get_shared_batch_into(&shard_keys, &mut shard_values)?;
+                Ok::<_, CacheError>((positions, shard_values))
+            }));
+        }
+        for worker in workers {
+            let (positions, shard_values) = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock(
+                    "sharded cache shared batch get-into worker panicked".to_string(),
+                )
+            })??;
+            for (position, value) in positions.into_iter().zip(shard_values) {
+                results[position] = value;
+            }
+        }
+        self.sharded_stats.record_latency(started);
         Ok(())
     }
 
