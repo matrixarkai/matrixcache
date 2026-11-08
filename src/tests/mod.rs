@@ -22554,6 +22554,79 @@ mod tests {
         assert_eq!(cache.stats().async_writeback_drained, 2);
     }
 
+    // rust-internal: validates queue accounting and duplicate-key replacement.
+    #[test]
+    fn async_writeback_enforces_entry_and_byte_limits_without_losing_queued_value() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1024, 0, 0).with_async_writeback_limits(2, 8),
+        );
+        let first = CacheKey::string(17, "writeback-limit-first");
+        let second = CacheKey::string(17, "writeback-limit-second");
+
+        cache
+            .enqueue_async_writeback(first.clone(), b"four".to_vec())
+            .unwrap();
+        assert!(cache
+            .enqueue_async_writeback(second.clone(), vec![b's'; 5])
+            .is_err());
+        assert!(cache
+            .enqueue_async_writeback(first.clone(), vec![b'x'; 9])
+            .is_err());
+        assert_eq!(cache.async_writeback_queue_depth(), 1);
+        assert_eq!(cache.async_writeback_queue_bytes(), 4);
+
+        cache
+            .enqueue_async_writeback(second.clone(), vec![b's'; 4])
+            .unwrap();
+        cache.set_async_writeback_limits(2, 5);
+        cache
+            .enqueue_async_writeback(first.clone(), b"ok".to_vec())
+            .unwrap();
+        assert_eq!(cache.async_writeback_queue_bytes(), 6);
+        cache
+            .enqueue_async_writeback(second.clone(), vec![b's'; 1])
+            .unwrap();
+        assert_eq!(cache.async_writeback_limits(), (2, 5));
+        assert_eq!(cache.async_writeback_queue_bytes(), 3);
+
+        cache.flush_async_writeback().unwrap();
+        assert_eq!(cache.get(&first).unwrap(), Some(b"ok".to_vec()));
+        assert_eq!(cache.get(&second).unwrap(), Some(vec![b's'; 1]));
+    }
+
+    // rust-internal: validates disabled queue fallback at the public submit API.
+    #[test]
+    fn async_writeback_zero_entry_limit_writes_through() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1024, 0, 0).with_async_writeback_limits(0, 64),
+        );
+        let key = CacheKey::string(17, "writeback-disabled");
+        let report = cache
+            .submit_async_writeback_or_write_through(key.clone(), b"value".to_vec())
+            .unwrap();
+
+        assert_eq!(report.queued, 0);
+        assert_eq!(report.write_through, 1);
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+    }
+
+    // rust-internal: validates global queue limits are divided across shards.
+    #[test]
+    fn sharded_async_writeback_limits_preserve_global_budget() {
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 0).with_async_writeback_limits(9, 101),
+            4,
+        );
+        assert_eq!(cache.async_writeback_limits(), (9, 101));
+
+        cache.set_async_writeback_limits(5, 73);
+        assert_eq!(cache.async_writeback_limits(), (5, 73));
+
+        cache.set_async_writeback_limits(5, 3);
+        assert_eq!(cache.async_writeback_limits(), (5, 3));
+    }
+
     #[test]
     fn async_writeback_position_index_survives_partial_drain() {
         let cache = MultiLayerCache::with_tiering_policy(

@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+fn default_async_writeback_queue_capacity() -> usize {
+    1024
+}
+
+fn default_async_writeback_queue_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
 /// Everything a cache can be configured with.
 ///
 /// Tier capacities and paths are typed; the policy and engine choices are
@@ -56,6 +64,16 @@ pub struct CacheOptions {
     /// Bytes per second the SSD tier may absorb. Zero, the default, is no cap.
     #[serde(default)]
     pub ssd_write_bytes_per_sec: u64,
+    /// Maximum number of pending asynchronous write-back jobs.
+    ///
+    /// Zero disables queueing and makes submit operations write through.
+    #[serde(default = "default_async_writeback_queue_capacity")]
+    pub async_writeback_queue_capacity: usize,
+    /// Maximum payload bytes held by pending asynchronous write-back jobs.
+    ///
+    /// Zero means unlimited bytes; the entry limit still applies.
+    #[serde(default = "default_async_writeback_queue_bytes")]
+    pub async_writeback_queue_bytes: u64,
     #[serde(default)]
     pub cache_ssd_instance_only: bool,
     #[serde(default)]
@@ -107,6 +125,8 @@ impl Default for CacheOptions {
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
             ssd_write_bytes_per_sec: 0,
+            async_writeback_queue_capacity: default_async_writeback_queue_capacity(),
+            async_writeback_queue_bytes: default_async_writeback_queue_bytes(),
             cache_dram_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_pmem_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_ssd_replacement_policy: "WeightedHotnessLru".to_string(),
@@ -142,6 +162,21 @@ impl CacheOptions {
     pub fn with_ssd_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.ssd_paths = paths.into_iter().collect();
         self
+    }
+
+    /// Configure asynchronous write-back queue limits.
+    ///
+    /// `max_entries == 0` disables queueing. `max_bytes == 0` leaves payload
+    /// bytes unlimited while preserving the entry limit.
+    pub fn with_async_writeback_limits(mut self, max_entries: usize, max_bytes: u64) -> Self {
+        self.async_writeback_queue_capacity = max_entries;
+        self.async_writeback_queue_bytes = max_bytes;
+        self
+    }
+
+    #[allow(non_snake_case)]
+    pub fn WithAsyncWritebackLimits(self, max_entries: usize, max_bytes: u64) -> Self {
+        self.with_async_writeback_limits(max_entries, max_bytes)
     }
 
     pub fn with_replacement_policy(mut self, policy: CacheReplacementPolicy) -> Self {
