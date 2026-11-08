@@ -14177,6 +14177,52 @@ mod tests {
     }
 
     #[test]
+    fn sharded_get_batch_into_reuses_cross_shard_pmem_payload_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(0, 1 << 20, 0)
+                .with_pmem_paths([directory.path().join("pmem")]),
+            4,
+        );
+        let keys = (0..128)
+            .map(|index| CacheKey::string(index, &format!("sharded-pmem-into-{index:03}")))
+            .collect::<Vec<_>>();
+        assert!(cache.batch_shard_fanout(&keys) > 1);
+        for (index, key) in keys.iter().enumerate() {
+            cache.put(key.clone(), vec![index as u8; 128]).unwrap();
+        }
+
+        let mut values = Vec::with_capacity(keys.len());
+        let outer_storage = values.as_ptr();
+        cache.get_batch_into(&keys, &mut values).unwrap();
+        assert_eq!(values.as_ptr(), outer_storage);
+        let payload_storage = values
+            .iter()
+            .map(|value| value.as_ref().expect("PMEM value").as_ptr())
+            .collect::<Vec<_>>();
+
+        let before = cache.stats();
+        cache.get_batch_into(&keys, &mut values).unwrap();
+        let after = cache.stats();
+        assert_eq!(values.as_ptr(), outer_storage);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_ref().expect("PMEM value").as_ptr())
+                .collect::<Vec<_>>(),
+            payload_storage
+        );
+        assert_eq!(after.pmem_hits - before.pmem_hits, keys.len() as u64);
+        for (index, value) in values.iter().enumerate() {
+            assert!(value
+                .as_ref()
+                .expect("PMEM value")
+                .iter()
+                .all(|byte| *byte == index as u8));
+        }
+    }
+
+    #[test]
     fn acquire_batch_counts_duplicate_positions_as_reads() {
         let memory_cache =
             MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
