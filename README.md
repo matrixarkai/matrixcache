@@ -22,7 +22,8 @@ invalidation, and asynchronous writeback with backpressure accounting.
 - Asynchronous writeback with backpressure counters and cache-pressure helpers.
 - Shared bounded executors with asynchronous fire-and-forget and joined work,
   priority scheduling, queued-task expiration, runtime worker resizing, and
-  live pool and queue statistics.
+  live pool and queue statistics. Shutdown can either drain accepted work or
+  cancel queued work while allowing active tasks to finish.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
 
