@@ -17340,6 +17340,113 @@ mod tests {
     }
 
     #[test]
+    fn cache_executor_orders_queued_work_by_priority() {
+        let executor = CacheExecutorHandle::with_queue_capacity("priority-worker", 1, None, 8);
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait()
+        });
+        started_rx.recv().unwrap();
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let low_order = Arc::clone(&order);
+        let low = executor.submit_with_priority(-10, move || low_order.lock().unwrap().push("low"));
+        let high_order = Arc::clone(&order);
+        let high =
+            executor.submit_with_priority(10, move || high_order.lock().unwrap().push("high"));
+        assert_eq!(executor.queue_depth(), 2);
+        assert_eq!(executor.queue_capacity(), 8);
+
+        blocker.wait();
+        occupied.join();
+        high.join();
+        low.join();
+        assert_eq!(*order.lock().unwrap(), ["high", "low"]);
+        assert_eq!(executor.completed_tasks(), 3);
+    }
+
+    #[test]
+    fn cache_executor_expires_queued_work_before_running_it() {
+        let executor = CacheExecutorHandle::new("expiry-worker", 1, None);
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait()
+        });
+        started_rx.recv().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_capture = Arc::clone(&ran);
+        let expired_callback = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expired_callback_capture = Arc::clone(&expired_callback);
+        let expiring = executor.submit_with_deadline_callback(
+            0,
+            Instant::now() + Duration::from_millis(5),
+            move || ran_capture.store(true, Ordering::SeqCst),
+            move || expired_callback_capture.store(true, Ordering::SeqCst),
+        );
+
+        std::thread::sleep(Duration::from_millis(15));
+        blocker.wait();
+        occupied.join();
+        assert_eq!(expiring.join_outcome(), CacheExecutorTaskOutcome::Expired);
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(expired_callback.load(Ordering::SeqCst));
+        assert_eq!(executor.expired_tasks(), 1);
+    }
+
+    #[test]
+    fn cache_executor_resizes_its_persistent_worker_set() {
+        let executor = CacheExecutorHandle::new("resizable-worker", 1, None);
+        executor.resize(3);
+        assert_eq!(executor.thread_count(), 3);
+        assert_eq!(executor.active_thread_count(), 3);
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let barrier = Arc::clone(&barrier);
+            tasks.push(executor.submit(move || {
+                barrier.wait();
+                std::thread::current().name().unwrap().to_string()
+            }));
+        }
+        barrier.wait();
+        let names = tasks
+            .into_iter()
+            .map(CacheExecutorTask::join)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), 3);
+
+        executor.resize(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while executor.active_thread_count() != 1 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(executor.active_thread_count(), 1);
+    }
+
+    #[test]
+    fn cache_executor_drop_drains_work_already_accepted() {
+        let executor = CacheExecutorHandle::with_queue_capacity("draining-worker", 1, None, 8);
+        let mut tasks = Vec::new();
+        for value in 0..8 {
+            tasks.push(executor.submit(move || value * 2));
+        }
+        drop(executor);
+
+        let values = tasks
+            .into_iter()
+            .map(CacheExecutorTask::join)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    }
+
+    #[test]
     fn cache_executor_creates_pmem_numa_executors_and_destroy_resets() {
         let _registry = exclusive_executor_registry();
         CacheExecutor::DestroyAllExecutors();

@@ -1545,71 +1545,228 @@ pub type PoolBasedMemoryAllocatorPmem = PoolBasedMemoryAllocatorBase;
 
 pub struct CacheExecutorHandle {
     name: String,
-    thread_count: usize,
     numa_id: Option<usize>,
-    submitted_tasks: Mutex<u64>,
-    queue: Mutex<Option<std::sync::mpsc::SyncSender<CacheExecutorJob>>>,
+    runtime: Arc<CacheExecutorRuntime>,
+    metrics: Arc<CacheExecutorMetrics>,
+    next_worker_id: std::sync::atomic::AtomicUsize,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
-type CacheExecutorJob = Box<dyn FnOnce() + Send + 'static>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheExecutorTaskOutcome<T> {
+    Completed(T),
+    Panicked,
+    Expired,
+}
+
+struct CacheExecutorJob {
+    priority: i32,
+    sequence: u64,
+    expires_at: Option<Instant>,
+    run: Option<Box<dyn FnOnce() + Send + 'static>>,
+    expire: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl PartialEq for CacheExecutorJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.sequence == other.sequence
+    }
+}
+
+impl Eq for CacheExecutorJob {}
+
+impl PartialOrd for CacheExecutorJob {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CacheExecutorJob {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+struct CacheExecutorQueue {
+    jobs: std::collections::BinaryHeap<CacheExecutorJob>,
+    capacity: usize,
+    desired_workers: usize,
+    live_workers: usize,
+    next_sequence: u64,
+    shutting_down: bool,
+}
+
+struct CacheExecutorRuntime {
+    queue: Mutex<CacheExecutorQueue>,
+    work_ready: std::sync::Condvar,
+    queue_space: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CacheExecutorMetrics {
+    submitted: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    expired: std::sync::atomic::AtomicU64,
+}
 
 impl std::fmt::Debug for CacheExecutorHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CacheExecutorHandle")
             .field("name", &self.name)
-            .field("thread_count", &self.thread_count)
+            .field("thread_count", &self.thread_count())
             .field("numa_id", &self.numa_id)
             .field("submitted_tasks", &self.submitted_tasks())
+            .field("queue_depth", &self.queue_depth())
             .finish_non_exhaustive()
     }
 }
 
 impl CacheExecutorHandle {
     pub fn new(name: impl Into<String>, thread_count: usize, numa_id: Option<usize>) -> Self {
-        let name = name.into();
         let thread_count = thread_count.max(1);
-        let queue_capacity = thread_count.saturating_mul(4).max(1);
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<CacheExecutorJob>(queue_capacity);
-        let receiver = Arc::new(Mutex::new(receiver));
-        let workers = (0..thread_count)
-            .map(|worker_index| {
-                let receiver = Arc::clone(&receiver);
-                std::thread::Builder::new()
-                    .name(format!("{name}-{worker_index}"))
-                    .spawn(move || loop {
-                        let job = receiver
-                            .lock()
-                            .expect("executor queue lock poisoned")
-                            .recv();
-                        match job {
-                            Ok(job) => job(),
-                            Err(_) => break,
-                        }
-                    })
-                    .expect("cache executor worker spawn failed")
-            })
-            .collect();
-        Self {
+        Self::with_queue_capacity(
             name,
             thread_count,
             numa_id,
-            submitted_tasks: Mutex::new(0),
-            queue: Mutex::new(Some(sender)),
-            workers: Mutex::new(workers),
+            thread_count.saturating_mul(4).max(1),
+        )
+    }
+
+    pub fn with_queue_capacity(
+        name: impl Into<String>,
+        thread_count: usize,
+        numa_id: Option<usize>,
+        queue_capacity: usize,
+    ) -> Self {
+        let name = name.into();
+        let thread_count = thread_count.max(1);
+        let runtime = Arc::new(CacheExecutorRuntime {
+            queue: Mutex::new(CacheExecutorQueue {
+                jobs: std::collections::BinaryHeap::new(),
+                capacity: queue_capacity.max(1),
+                desired_workers: thread_count,
+                live_workers: 0,
+                next_sequence: 0,
+                shutting_down: false,
+            }),
+            work_ready: std::sync::Condvar::new(),
+            queue_space: std::sync::Condvar::new(),
+        });
+        let metrics = Arc::new(CacheExecutorMetrics::default());
+        let handle = Self {
+            name,
+            numa_id,
+            runtime,
+            metrics,
+            next_worker_id: std::sync::atomic::AtomicUsize::new(0),
+            workers: Mutex::new(Vec::with_capacity(thread_count)),
+        };
+        handle.spawn_workers(thread_count);
+        handle
+    }
+
+    fn spawn_workers(&self, count: usize) {
+        for _ in 0..count {
+            let worker_index = self
+                .next_worker_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let runtime = Arc::clone(&self.runtime);
+            let metrics = Arc::clone(&self.metrics);
+            {
+                let mut queue = runtime
+                    .queue
+                    .lock()
+                    .expect("executor queue lock poisoned");
+                queue.live_workers += 1;
+            }
+            let worker = std::thread::Builder::new()
+                .name(format!("{}-{worker_index}", self.name))
+                .spawn(move || Self::worker_loop(runtime, metrics))
+                .expect("cache executor worker spawn failed");
+            self.workers
+                .lock()
+                .expect("executor worker lock poisoned")
+                .push(worker);
         }
+    }
+
+    fn worker_loop(runtime: Arc<CacheExecutorRuntime>, metrics: Arc<CacheExecutorMetrics>) {
+        loop {
+            let mut job = {
+                let mut queue = runtime
+                    .queue
+                    .lock()
+                    .expect("executor queue lock poisoned");
+                loop {
+                    if queue.shutting_down && queue.jobs.is_empty() {
+                        queue.live_workers = queue.live_workers.saturating_sub(1);
+                        return;
+                    }
+                    if !queue.shutting_down && queue.live_workers > queue.desired_workers {
+                        queue.live_workers -= 1;
+                        return;
+                    }
+                    if let Some(job) = queue.jobs.pop() {
+                        runtime.queue_space.notify_one();
+                        break job;
+                    }
+                    queue = runtime
+                        .work_ready
+                        .wait(queue)
+                        .expect("executor queue lock poisoned while waiting");
+                }
+            };
+
+            if job.expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                metrics
+                    .expired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(expire) = job.expire.take() {
+                    expire();
+                }
+            } else if let Some(run) = job.run.take() {
+                run();
+            }
+        }
+    }
+
+    fn enqueue(&self, mut job: CacheExecutorJob) {
+        self.metrics
+            .submitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut queue = self
+            .runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned");
+        while queue.jobs.len() >= queue.capacity && !queue.shutting_down {
+            queue = self
+                .runtime
+                .queue_space
+                .wait(queue)
+                .expect("executor queue lock poisoned while applying backpressure");
+        }
+        assert!(!queue.shutting_down, "cache executor is shutting down");
+        job.sequence = queue.next_sequence;
+        queue.next_sequence = queue.next_sequence.wrapping_add(1);
+        queue.jobs.push(job);
+        self.runtime.work_ready.notify_one();
     }
 
     pub fn add<F>(&self, func: F)
     where
         F: FnOnce() + Send + 'static,
     {
-        *self
-            .submitted_tasks
-            .lock()
-            .expect("executor submitted task counter lock poisoned") += 1;
+        self.metrics
+            .submitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         func();
+        self.metrics
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Schedule work on the persistent worker set and return its result handle.
@@ -1622,22 +1779,94 @@ impl CacheExecutorHandle {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        *self
-            .submitted_tasks
-            .lock()
-            .expect("executor submitted task counter lock poisoned") += 1;
+        self.submit_with_priority(0, func)
+    }
+
+    pub fn submit_with_priority<F, T>(&self, priority: i32, func: F) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_scheduled(priority, None, func, || {})
+    }
+
+    pub fn submit_with_deadline<F, T>(
+        &self,
+        priority: i32,
+        deadline: Instant,
+        func: F,
+    ) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_scheduled(priority, Some(deadline), func, || {})
+    }
+
+    pub fn submit_with_deadline_callback<F, T, E>(
+        &self,
+        priority: i32,
+        deadline: Instant,
+        func: F,
+        on_expire: E,
+    ) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
+        self.submit_scheduled(priority, Some(deadline), func, on_expire)
+    }
+
+    pub fn submit_with_expiration<F, T>(
+        &self,
+        priority: i32,
+        ttl: Duration,
+        func: F,
+    ) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_deadline(priority, Instant::now() + ttl, func)
+    }
+
+    fn submit_scheduled<F, T, E>(
+        &self,
+        priority: i32,
+        expires_at: Option<Instant>,
+        func: F,
+        on_expire: E,
+    ) -> CacheExecutorTask<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let job = Box::new(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)).ok();
+        let expire_sender = sender.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let run = Box::new(move || {
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
+                Ok(value) => CacheExecutorTaskOutcome::Completed(value),
+                Err(_) => CacheExecutorTaskOutcome::Panicked,
+            };
+            metrics
+                .completed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sender.send(outcome);
         });
-        self.queue
-            .lock()
-            .expect("executor queue lock poisoned")
-            .as_ref()
-            .expect("cache executor is shutting down")
-            .send(job)
-            .expect("cache executor workers stopped unexpectedly");
+        let expire = Box::new(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_expire));
+            let _ = expire_sender.send(CacheExecutorTaskOutcome::Expired);
+        });
+        self.enqueue(CacheExecutorJob {
+            priority,
+            sequence: 0,
+            expires_at,
+            run: Some(run),
+            expire: Some(expire),
+        });
         CacheExecutorTask { receiver }
     }
 
@@ -1646,7 +1875,55 @@ impl CacheExecutorHandle {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.thread_count
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .desired_workers
+    }
+
+    pub fn active_thread_count(&self) -> usize {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .live_workers
+    }
+
+    pub fn resize(&self, thread_count: usize) {
+        let thread_count = thread_count.max(1);
+        let current = {
+            let mut queue = self
+                .runtime
+                .queue
+                .lock()
+                .expect("executor queue lock poisoned");
+            let current = queue.desired_workers;
+            queue.desired_workers = thread_count;
+            current
+        };
+        if thread_count > current {
+            self.spawn_workers(thread_count - current);
+        } else if thread_count < current {
+            self.runtime.work_ready.notify_all();
+        }
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .jobs
+            .len()
+    }
+
+    pub fn queue_capacity(&self) -> usize {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .capacity
     }
 
     pub fn numa_id(&self) -> Option<usize> {
@@ -1654,10 +1931,21 @@ impl CacheExecutorHandle {
     }
 
     pub fn submitted_tasks(&self) -> u64 {
-        *self
-            .submitted_tasks
-            .lock()
-            .expect("executor submitted task counter lock poisoned")
+        self.metrics
+            .submitted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn completed_tasks(&self) -> u64 {
+        self.metrics
+            .completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn expired_tasks(&self) -> u64 {
+        self.metrics
+            .expired
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[allow(non_snake_case)]
@@ -1671,10 +1959,16 @@ impl CacheExecutorHandle {
 
 impl Drop for CacheExecutorHandle {
     fn drop(&mut self) {
-        self.queue
-            .lock()
-            .expect("executor queue lock poisoned")
-            .take();
+        {
+            let mut queue = self
+                .runtime
+                .queue
+                .lock()
+                .expect("executor queue lock poisoned");
+            queue.shutting_down = true;
+        }
+        self.runtime.work_ready.notify_all();
+        self.runtime.queue_space.notify_all();
         for worker in self
             .workers
             .lock()
@@ -1688,12 +1982,21 @@ impl Drop for CacheExecutorHandle {
 
 #[derive(Debug)]
 pub struct CacheExecutorTask<T> {
-    receiver: std::sync::mpsc::Receiver<Option<T>>,
+    receiver: std::sync::mpsc::Receiver<CacheExecutorTaskOutcome<T>>,
 }
 
 impl<T> CacheExecutorTask<T> {
     pub fn try_join(self) -> Option<T> {
-        self.receiver.recv().ok().flatten()
+        match self.receiver.recv().ok()? {
+            CacheExecutorTaskOutcome::Completed(value) => Some(value),
+            CacheExecutorTaskOutcome::Panicked | CacheExecutorTaskOutcome::Expired => None,
+        }
+    }
+
+    pub fn join_outcome(self) -> CacheExecutorTaskOutcome<T> {
+        self.receiver
+            .recv()
+            .expect("cache executor task stopped before returning an outcome")
     }
 
     pub fn join(self) -> T {
