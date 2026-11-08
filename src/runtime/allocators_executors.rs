@@ -1598,12 +1598,16 @@ struct CacheExecutorQueue {
     live_workers: usize,
     next_sequence: u64,
     shutting_down: bool,
+    cpu_affinity: Vec<usize>,
+    affinity_generation: u64,
+    affinity_workers: std::collections::BTreeMap<usize, bool>,
 }
 
 struct CacheExecutorRuntime {
     queue: Mutex<CacheExecutorQueue>,
     work_ready: std::sync::Condvar,
     queue_space: std::sync::Condvar,
+    state_changed: std::sync::Condvar,
 }
 
 #[derive(Default)]
@@ -1625,6 +1629,9 @@ pub struct CacheExecutorPoolStats {
     pub completed_task_count: u64,
     pub expired_task_count: u64,
     pub cancelled_task_count: u64,
+    pub affinity_generation: u64,
+    pub affinity_applied_thread_count: usize,
+    pub affinity_failed_thread_count: usize,
 }
 
 impl std::fmt::Debug for CacheExecutorHandle {
@@ -1667,9 +1674,13 @@ impl CacheExecutorHandle {
                 live_workers: 0,
                 next_sequence: 0,
                 shutting_down: false,
+                cpu_affinity: Vec::new(),
+                affinity_generation: 0,
+                affinity_workers: std::collections::BTreeMap::new(),
             }),
             work_ready: std::sync::Condvar::new(),
             queue_space: std::sync::Condvar::new(),
+            state_changed: std::sync::Condvar::new(),
         });
         let metrics = Arc::new(CacheExecutorMetrics::default());
         let handle = Self {
@@ -1681,6 +1692,14 @@ impl CacheExecutorHandle {
             workers: Mutex::new(Vec::with_capacity(thread_count)),
         };
         handle.spawn_workers(thread_count);
+        if let Some(numa_id) = numa_id {
+            let cpu_ids = Self::cpu_ids_for_numa_node(numa_id).unwrap_or_else(|error| {
+                panic!("cache executor NUMA placement is invalid: {error}")
+            });
+            handle
+                .set_cpu_affinity(&cpu_ids)
+                .unwrap_or_else(|error| panic!("cache executor NUMA placement failed: {error}"));
+        }
         handle
     }
 
@@ -1701,7 +1720,7 @@ impl CacheExecutorHandle {
             }
             let worker = std::thread::Builder::new()
                 .name(format!("{}-{worker_index}", self.name))
-                .spawn(move || Self::worker_loop(runtime, metrics))
+                .spawn(move || Self::worker_loop(runtime, metrics, worker_index))
                 .expect("cache executor worker spawn failed");
             self.workers
                 .lock()
@@ -1710,7 +1729,12 @@ impl CacheExecutorHandle {
         }
     }
 
-    fn worker_loop(runtime: Arc<CacheExecutorRuntime>, metrics: Arc<CacheExecutorMetrics>) {
+    fn worker_loop(
+        runtime: Arc<CacheExecutorRuntime>,
+        metrics: Arc<CacheExecutorMetrics>,
+        worker_index: usize,
+    ) {
+        let mut affinity_generation = 0;
         loop {
             let mut job = {
                 let mut queue = runtime
@@ -1718,12 +1742,30 @@ impl CacheExecutorHandle {
                     .lock()
                     .expect("executor queue lock poisoned");
                 loop {
+                    if queue.affinity_generation != affinity_generation {
+                        let applied = queue
+                            .cpu_affinity
+                            .get(worker_index % queue.cpu_affinity.len().max(1))
+                            .is_some_and(|cpu_id| {
+                                core_affinity::set_for_current(core_affinity::CoreId {
+                                    id: *cpu_id,
+                                })
+                            });
+                        affinity_generation = queue.affinity_generation;
+                        queue.affinity_workers.insert(worker_index, applied);
+                        runtime.state_changed.notify_all();
+                        continue;
+                    }
                     if queue.shutting_down && queue.jobs.is_empty() {
                         queue.live_workers = queue.live_workers.saturating_sub(1);
+                        queue.affinity_workers.remove(&worker_index);
+                        runtime.state_changed.notify_all();
                         return;
                     }
                     if !queue.shutting_down && queue.live_workers > queue.desired_workers {
                         queue.live_workers -= 1;
+                        queue.affinity_workers.remove(&worker_index);
+                        runtime.state_changed.notify_all();
                         return;
                     }
                     if let Some(job) = queue.jobs.pop() {
@@ -2020,6 +2062,174 @@ impl CacheExecutorHandle {
             .capacity
     }
 
+    pub fn available_cpu_ids() -> Vec<usize> {
+        core_affinity::get_core_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|core| core.id)
+            .collect()
+    }
+
+    pub fn available_numa_node_ids() -> Vec<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut node_ids = std::fs::read_dir("/sys/devices/system/node")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.strip_prefix("node"))
+                        .and_then(|id| id.parse::<usize>().ok())
+                })
+                .collect::<Vec<_>>();
+            node_ids.sort_unstable();
+            node_ids.dedup();
+            node_ids
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (!Self::available_cpu_ids().is_empty())
+                .then_some(0)
+                .into_iter()
+                .collect()
+        }
+    }
+
+    pub fn cpu_ids_for_numa_node(numa_id: usize) -> Result<Vec<usize>, CacheError> {
+        #[cfg(target_os = "linux")]
+        let cpu_ids = {
+            let path = format!("/sys/devices/system/node/node{numa_id}/cpulist");
+            let cpu_list = std::fs::read_to_string(&path).map_err(|error| {
+                CacheError::InvalidConfig(format!(
+                    "NUMA node {numa_id} is unavailable: {error}"
+                ))
+            })?;
+            Self::parse_cpu_list(cpu_list.trim())?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let cpu_ids = if numa_id == 0 {
+            Self::available_cpu_ids()
+        } else {
+            return Err(CacheError::InvalidConfig(format!(
+                "NUMA node {numa_id} is unavailable on this host"
+            )));
+        };
+
+        let available = Self::available_cpu_ids();
+        let cpu_ids = cpu_ids
+            .into_iter()
+            .filter(|cpu_id| available.contains(cpu_id))
+            .collect::<Vec<_>>();
+        if cpu_ids.is_empty() {
+            return Err(CacheError::InvalidConfig(format!(
+                "NUMA node {numa_id} has no CPU available to this process"
+            )));
+        }
+        Ok(cpu_ids)
+    }
+
+    fn parse_cpu_list(cpu_list: &str) -> Result<Vec<usize>, CacheError> {
+        let mut cpu_ids = Vec::new();
+        for part in cpu_list.split(',').filter(|part| !part.is_empty()) {
+            if let Some((first, last)) = part.split_once('-') {
+                let first = first.parse::<usize>().map_err(|_| {
+                    CacheError::InvalidConfig(format!("invalid CPU list: {cpu_list}"))
+                })?;
+                let last = last.parse::<usize>().map_err(|_| {
+                    CacheError::InvalidConfig(format!("invalid CPU list: {cpu_list}"))
+                })?;
+                if first > last {
+                    return Err(CacheError::InvalidConfig(format!(
+                        "invalid CPU list: {cpu_list}"
+                    )));
+                }
+                cpu_ids.extend(first..=last);
+            } else {
+                cpu_ids.push(part.parse::<usize>().map_err(|_| {
+                    CacheError::InvalidConfig(format!("invalid CPU list: {cpu_list}"))
+                })?);
+            }
+        }
+        if cpu_ids.is_empty() {
+            return Err(CacheError::InvalidConfig("CPU list is empty".to_string()));
+        }
+        cpu_ids.sort_unstable();
+        cpu_ids.dedup();
+        Ok(cpu_ids)
+    }
+
+    pub fn set_cpu_affinity(&self, cpu_ids: &[usize]) -> Result<(), CacheError> {
+        if cpu_ids.is_empty() {
+            return Err(CacheError::InvalidConfig(
+                "executor CPU affinity requires at least one CPU".to_string(),
+            ));
+        }
+        let available = Self::available_cpu_ids();
+        if available.is_empty() {
+            return Err(CacheError::InvalidConfig(
+                "executor CPU affinity is unavailable on this host".to_string(),
+            ));
+        }
+        if let Some(cpu_id) = cpu_ids.iter().find(|cpu_id| !available.contains(cpu_id)) {
+            return Err(CacheError::InvalidConfig(format!(
+                "CPU {cpu_id} is not available to this process"
+            )));
+        }
+
+        let mut queue = self
+            .runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned");
+        if queue.shutting_down {
+            return Err(CacheError::Stopped);
+        }
+        queue.cpu_affinity.clear();
+        queue.cpu_affinity.extend_from_slice(cpu_ids);
+        queue.affinity_generation = queue.affinity_generation.wrapping_add(1).max(1);
+        queue.affinity_workers.clear();
+        let generation = queue.affinity_generation;
+        self.runtime.work_ready.notify_all();
+
+        while queue.affinity_generation == generation
+            && !queue.shutting_down
+            && queue.affinity_workers.len() < queue.live_workers
+        {
+            queue = self
+                .runtime
+                .state_changed
+                .wait(queue)
+                .expect("executor queue lock poisoned while applying CPU affinity");
+        }
+        if queue.shutting_down {
+            return Err(CacheError::Stopped);
+        }
+        let failed_workers = queue
+            .affinity_workers
+            .values()
+            .filter(|applied| !**applied)
+            .count();
+        if failed_workers > 0 {
+            return Err(CacheError::InvalidConfig(format!(
+                "failed to apply CPU affinity to {} executor workers",
+                failed_workers
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn cpu_affinity(&self) -> Vec<usize> {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .cpu_affinity
+            .clone()
+    }
+
     pub fn numa_id(&self) -> Option<usize> {
         self.numa_id
     }
@@ -2049,13 +2259,25 @@ impl CacheExecutorHandle {
     }
 
     pub fn pool_stats(&self) -> CacheExecutorPoolStats {
-        let (thread_count, pending_task_count) = {
+        let (
+            thread_count,
+            pending_task_count,
+            affinity_generation,
+            affinity_applied_thread_count,
+            affinity_failed_thread_count,
+        ) = {
             let queue = self
                 .runtime
                 .queue
                 .lock()
                 .expect("executor queue lock poisoned");
-            (queue.live_workers, queue.jobs.len())
+            (
+                queue.live_workers,
+                queue.jobs.len(),
+                queue.affinity_generation,
+                queue.affinity_workers.values().filter(|applied| **applied).count(),
+                queue.affinity_workers.values().filter(|applied| !**applied).count(),
+            )
         };
         let active_thread_count = self
             .metrics
@@ -2071,6 +2293,9 @@ impl CacheExecutorHandle {
             completed_task_count: self.completed_tasks(),
             expired_task_count: self.expired_tasks(),
             cancelled_task_count: self.cancelled_tasks(),
+            affinity_generation,
+            affinity_applied_thread_count,
+            affinity_failed_thread_count,
         }
     }
 
