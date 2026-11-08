@@ -15096,16 +15096,84 @@ mod tests {
     #[test]
     fn disk_cache_can_read_legacy_raw_blocks() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = MultiLayerCache::new(1024, dir.path());
         let key = CacheKey::string(1, "legacy");
-        let legacy_path = {
-            let inner = cache.inner.read().expect("cache lock poisoned");
-            inner.disk_path(&key)
-        };
+        let legacy_path = legacy_block_path_in(dir.path(), &key);
         fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         fs::write(&legacy_path, b"legacy-value").unwrap();
+        // The file is there before the cache starts, which is when the cache
+        // decides whether block files can exist.
+        let cache = MultiLayerCache::new(1024, dir.path());
+        assert!(cache.inner.read().unwrap().legacy_block_files_possible());
 
         assert_eq!(cache.get(&key).unwrap(), Some(b"legacy-value".to_vec()));
+        assert_eq!(
+            cache.get_batch(std::slice::from_ref(&key)).unwrap(),
+            vec![Some(b"legacy-value".to_vec())]
+        );
+
+        // And an invalidation still removes it, so it cannot be served again.
+        cache.invalidate(&key).unwrap();
+        assert!(!legacy_path.exists());
+        assert_eq!(cache.get(&key).unwrap(), None);
+    }
+
+    /// Where a raw block file for `key` would sit under `root`.
+    ///
+    /// Taken from a cache over a scratch directory and re-rooted, so the file can be
+    /// planted before the cache under test exists and opens its own store there.
+    fn legacy_block_path_in(root: &Path, key: &CacheKey) -> PathBuf {
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(1024, scratch.path());
+        let path = cache.inner.read().unwrap().disk_path(key);
+        root.join(path.strip_prefix(scratch.path()).unwrap())
+    }
+
+    #[test]
+    fn a_directory_without_block_files_skips_the_file_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::new(8, dir.path());
+        let embedded_store = cfg!(feature = "rocksdb-ssd");
+        assert_eq!(
+            cache.inner.read().unwrap().legacy_block_files_possible(),
+            !embedded_store
+        );
+        let key = CacheKey::string(3, "no-files");
+        cache.put(key.clone(), b"stored-value".to_vec()).unwrap();
+        cache.clear_memory_for_test();
+        assert_eq!(cache.get(&key).unwrap(), Some(b"stored-value".to_vec()));
+        assert_eq!(
+            cache.get_batch(std::slice::from_ref(&key)).unwrap(),
+            vec![Some(b"stored-value".to_vec())]
+        );
+        cache.invalidate(&key).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), None);
+        assert_eq!(cache.get_batch(std::slice::from_ref(&key)).unwrap(), vec![None]);
+        cache.put(key.clone(), b"again".to_vec()).unwrap();
+        assert_eq!(cache.invalidate_batch(std::slice::from_ref(&key)).unwrap(), 1);
+        assert_eq!(cache.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_shard_entry_in_the_directory_keeps_the_file_probes() {
+        let embedded_store = cfg!(feature = "rocksdb-ssd");
+        // Something else in the directory is not a block file.
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("unrelated"), b"x").unwrap();
+        let cache = MultiLayerCache::new(8, other.path());
+        assert_eq!(
+            cache.inner.read().unwrap().legacy_block_files_possible(),
+            !embedded_store
+        );
+        // A `shard-*` entry is, whatever it holds.
+        let marked = tempfile::tempdir().unwrap();
+        fs::create_dir_all(marked.path().join("shard-0")).unwrap();
+        let cache = MultiLayerCache::new(8, marked.path());
+        assert!(cache.inner.read().unwrap().legacy_block_files_possible());
+        // A directory that is not there cannot hold one.
+        assert_eq!(
+            CacheInner::probe_legacy_block_files(&marked.path().join("absent")),
+            !embedded_store
+        );
     }
     #[test]
     fn rocksdb_ssd_default_does_not_write_raw_shadow_blocks() {

@@ -40,6 +40,9 @@ jobs:
       - name: Test (default / RocksDB SSD backend)
         run: cargo test --locked
 
+      - name: Block file probe allocation guard
+        run: cargo run --locked --example legacy_block_file_probes
+
       - name: Test (no default features / compatibility store)
         run: cargo test --locked --no-default-features
 
