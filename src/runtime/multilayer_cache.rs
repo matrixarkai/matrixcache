@@ -5860,7 +5860,8 @@ impl MultiLayerCache {
 
         let now_millis = CoarseClock::now_millis();
         let mut expired_keys = Vec::new();
-        let mut ssd_candidates = Vec::<(&CacheKey, BatchPositions)>::new();
+        let mut ssd_candidates =
+            SmallVec::<[(&CacheKey, BatchPositions); INLINE_BATCH_KEYS]>::new();
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
@@ -5931,12 +5932,13 @@ impl MultiLayerCache {
         let candidate_keys = ssd_candidates
             .iter()
             .map(|(key, _)| *key)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[&CacheKey; INLINE_BATCH_KEYS]>>();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
             inner.read_ssd_blocks(&candidate_keys)?
         };
-        let mut decoded_hits = Vec::<(&CacheKey, BatchPositions, Arc<[u8]>)>::new();
+        let mut decoded_hits =
+            SmallVec::<[(&CacheKey, BatchPositions, Arc<[u8]>); INLINE_BATCH_KEYS]>::new();
         for ((key, positions), block) in ssd_candidates.into_iter().zip(blocks) {
             let Some(block) = block else {
                 continue;
@@ -5954,7 +5956,7 @@ impl MultiLayerCache {
         let pin_counts = decoded_hits
             .iter()
             .map(|(key, positions, value)| (*key, value.len(), positions.len()))
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[(&CacheKey, usize, usize); INLINE_BATCH_KEYS]>>();
         inner.increment_pin_with_size_counts(&pin_counts);
         for (key, positions, value) in decoded_hits {
             for position in positions {
@@ -6053,23 +6055,30 @@ impl MultiLayerCache {
                 return Ok(None);
             }
 
-            let mut candidates = Vec::<(&CacheKey, &BatchPositions, Instant)>::new();
+            let started = Instant::now();
+            let mut candidate_keys = SmallVec::<[&CacheKey; INLINE_BATCH_KEYS]>::new();
             for (key, positions) in positions_by_key {
-                let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
                     expired.push((*key, positions.len(), started));
                 } else {
-                    candidates.push((*key, positions, started));
+                    candidate_keys.push(*key);
                 }
             }
 
-            let candidate_keys = candidates
-                .iter()
-                .map(|(key, _, _)| *key)
-                .collect::<Vec<_>>();
             let blocks = inner.read_ssd_blocks(&candidate_keys)?;
-            let mut decoded = Vec::with_capacity(candidates.len());
-            for ((key, positions, started), block) in candidates.into_iter().zip(blocks) {
+            let mut blocks = blocks.into_iter();
+            let hit_epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(hit_epoch);
+            let mut pin_counts =
+                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+            for (key, positions) in positions_by_key {
+                let key = *key;
+                if inner.entry_expired(key, now_millis) {
+                    continue;
+                }
+                let block = blocks
+                    .next()
+                    .expect("every SSD candidate has one batch result");
                 let value = match block {
                     Some(block) => Some((
                         decode_cache_block_shared(&block)?,
@@ -6077,14 +6086,6 @@ impl MultiLayerCache {
                     )),
                     None => None,
                 };
-                decoded.push((key, positions, started, value));
-            }
-
-            let hit_epoch = CoarseClock::now_millis();
-            inner.reconfigure_refresh_window(hit_epoch);
-            let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
-            for (key, positions, started, value) in decoded {
                 let occurrences = positions.len();
                 match value {
                     Some((value, compressed)) => {

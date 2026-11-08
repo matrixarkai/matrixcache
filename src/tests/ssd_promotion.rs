@@ -505,7 +505,7 @@ fn ssd_only_pinned_batches_stay_on_the_shared_lock_path() {
         },
     );
     cache.set_ssd_instance_only(true);
-    let keys = (0..8)
+    let keys = (0..64)
         .map(|index| CacheKey::string(0, &format!("ssd-only-pinned-batch-{index}")))
         .collect::<Vec<_>>();
     for (index, key) in keys.iter().enumerate() {
@@ -537,13 +537,13 @@ fn ssd_only_pinned_batches_stay_on_the_shared_lock_path() {
         .all(|handle| handle.tier() == CacheReadTier::Ssd));
     assert_eq!(
         cache.release_batch(handles.into_iter().flatten().collect()),
-        8
+        64
     );
     let after = cache.stats();
     assert_eq!(after.memory_fills, before.memory_fills);
     assert_eq!(after.pmem_fills, before.pmem_fills);
     assert_eq!(after.refill_failures, before.refill_failures);
-    assert_eq!(after.compressed_hits - before.compressed_hits, 8);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 64);
     assert_eq!(after.pinned_entries, 0);
     assert!(keys
         .iter()
