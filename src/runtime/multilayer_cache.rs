@@ -5278,6 +5278,111 @@ impl MultiLayerCache {
         Ok(results)
     }
 
+    /// Serve a distinct-key cold batch directly from SSD and refill memory.
+    ///
+    /// An owned read needs two payload holders: the `Vec` returned to the
+    /// caller and the shared buffer installed in the cache. The caller's
+    /// result slots already identify every distinct key, so no additional
+    /// key, position, or decoded-value staging is needed around those two
+    /// required holders.
+    fn try_get_owned_batch_ssd_refill(
+        &self,
+        keys: &[CacheKey],
+        results: &mut [Option<Vec<u8>>],
+        now_millis: u64,
+    ) -> Result<bool, CacheError> {
+        let started = Instant::now();
+        let refill_started = Instant::now();
+        let (blocks, probe_epoch) = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if inner.ssd_instance_only
+                || keys.iter().any(|key| {
+                    inner.entry_expired(key, now_millis)
+                        || inner.memory.contains_key(key)
+                        || inner.pmem.contains_key(key)
+                })
+            {
+                return Ok(false);
+            }
+            let candidate_keys = keys
+                .iter()
+                .collect::<SmallVec<[&CacheKey; INLINE_BATCH_KEYS]>>();
+            (
+                inner.read_ssd_blocks(&candidate_keys)?,
+                inner.ssd_batch_probe_epoch(&candidate_keys),
+            )
+        };
+
+        for result in results.iter_mut() {
+            *result = None;
+        }
+        let mut refills = SmallVec::<[(usize, Arc<[u8]>); INLINE_BATCH_KEYS]>::new();
+        let mut compressed_hits = 0u64;
+        for (position, block) in blocks.into_iter().enumerate() {
+            let Some(block) = block else {
+                continue;
+            };
+            compressed_hits = compressed_hits
+                .saturating_add(u64::from(is_encoded_compressed_block(&block)));
+            let decoded = CacheDecodedBlock::decode(block, true)?;
+            let refill = decoded
+                .to_refill()
+                .expect("a refilling decode always builds a shared buffer");
+            results[position] = Some(decoded.into_vec());
+            refills.push((position, refill));
+        }
+        let disk_hits = refills.len() as u64;
+        let misses = keys.len() as u64 - disk_hits;
+
+        if refills.is_empty() {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+        } else {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (position, refill) in refills {
+                let key = &keys[position];
+                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
+                if !inner.refill_ssd_probe(key, Arc::clone(&refill), current) {
+                    inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
+                }
+                inner.record_hit_metadata(key, refill.len());
+            }
+        }
+
+        self.read_counters
+            .disk_hits
+            .fetch_add(disk_hits, Ordering::Relaxed);
+        self.read_counters
+            .misses
+            .fetch_add(misses, Ordering::Relaxed);
+        self.read_counters
+            .compressed_hits
+            .fetch_add(compressed_hits, Ordering::Relaxed);
+        let micros = elapsed_micros(started);
+        self.read_counters
+            .get_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters
+            .read_through_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters.refill_latency.observe_many_with_total(
+            elapsed_micros(refill_started),
+            disk_hits as usize,
+        );
+        if disk_hits != 0 {
+            self.drain_eviction_records();
+        }
+        Ok(true)
+    }
+
     /// Batched copied reads into a caller-owned result buffer.
     ///
     /// Retrieval loops can retain the outer allocation across calls. Payload
@@ -5304,6 +5409,11 @@ impl MultiLayerCache {
         // it to matter.
         let now_millis = CoarseClock::now_millis();
         if self.try_get_memory_batch(keys, now_millis, results)? {
+            return Ok(());
+        }
+        if !has_duplicate_batch_keys(keys)
+            && self.try_get_owned_batch_ssd_refill(keys, results, now_millis)?
+        {
             return Ok(());
         }
 
