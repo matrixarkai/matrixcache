@@ -17296,9 +17296,12 @@ mod tests {
 
         let ran = Arc::new(std::sync::Mutex::new(false));
         let ran_capture = Arc::clone(&ran);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         common.Add(move || {
             *ran_capture.lock().unwrap() = true;
+            finished_tx.send(()).unwrap();
         });
+        finished_rx.recv().unwrap();
         assert!(*ran.lock().unwrap());
         assert_eq!(common.submitted_tasks(), 1);
 
@@ -17444,6 +17447,109 @@ mod tests {
             .map(CacheExecutorTask::join)
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    }
+
+    #[test]
+    fn cache_executor_add_is_fire_and_forget_work() {
+        let executor = CacheExecutorHandle::new("detached-worker", 1, None);
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait()
+        });
+        started_rx.recv().unwrap();
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_capture = Arc::clone(&ran);
+        executor.add(move || ran_capture.store(true, Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(executor.queue_depth(), 1);
+
+        blocker.wait();
+        occupied.join();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (!ran.load(Ordering::SeqCst) || executor.completed_tasks() != 2)
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(executor.completed_tasks(), 2);
+    }
+
+    #[test]
+    fn cache_executor_pool_stats_describe_running_and_pending_work() {
+        let executor = CacheExecutorHandle::new("stats-worker", 1, None);
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait()
+        });
+        started_rx.recv().unwrap();
+        let pending = executor.submit(|| 42);
+
+        assert_eq!(
+            executor.pool_stats(),
+            CacheExecutorPoolStats {
+                thread_count: 1,
+                idle_thread_count: 0,
+                active_thread_count: 1,
+                pending_task_count: 1,
+                total_task_count: 2,
+                completed_task_count: 0,
+                expired_task_count: 0,
+            }
+        );
+
+        blocker.wait();
+        occupied.join();
+        assert_eq!(pending.join(), 42);
+        let stats = executor.pool_stats();
+        assert_eq!(stats.thread_count, 1);
+        assert_eq!(stats.idle_thread_count, 1);
+        assert_eq!(stats.active_thread_count, 0);
+        assert_eq!(stats.pending_task_count, 0);
+        assert_eq!(stats.completed_task_count, 2);
+    }
+
+    #[test]
+    fn cache_executor_expires_detached_work_and_runs_cleanup() {
+        let executor = CacheExecutorHandle::new("detached-expiry-worker", 1, None);
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait()
+        });
+        started_rx.recv().unwrap();
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_capture = Arc::clone(&ran);
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleaned_capture = Arc::clone(&cleaned);
+        executor.add_with_deadline_callback(
+            0,
+            Instant::now() + Duration::from_millis(5),
+            move || ran_capture.store(true, Ordering::SeqCst),
+            move || cleaned_capture.store(true, Ordering::SeqCst),
+        );
+        std::thread::sleep(Duration::from_millis(15));
+        blocker.wait();
+        occupied.join();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !cleaned.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(executor.expired_tasks(), 1);
+        assert_eq!(executor.completed_tasks(), 1);
     }
 
     #[test]
