@@ -17503,6 +17503,9 @@ mod tests {
                 completed_task_count: 0,
                 expired_task_count: 0,
                 cancelled_task_count: 0,
+                affinity_generation: 0,
+                affinity_applied_thread_count: 0,
+                affinity_failed_thread_count: 0,
             }
         );
 
@@ -17515,6 +17518,61 @@ mod tests {
         assert_eq!(stats.active_thread_count, 0);
         assert_eq!(stats.pending_task_count, 0);
         assert_eq!(stats.completed_task_count, 2);
+    }
+
+    #[test]
+    fn cache_executor_rejects_invalid_cpu_affinity() {
+        let executor = CacheExecutorHandle::new("affinity-validation-worker", 1, None);
+        assert!(matches!(
+            executor.set_cpu_affinity(&[]),
+            Err(CacheError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            executor.set_cpu_affinity(&[usize::MAX]),
+            Err(CacheError::InvalidConfig(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_executor_applies_cpu_affinity_to_workers_and_resized_workers() {
+        fn current_cpu_list() -> String {
+            std::fs::read_to_string("/proc/thread-self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        let Some(cpu_id) = CacheExecutorHandle::available_cpu_ids().into_iter().next() else {
+            return;
+        };
+        let executor = CacheExecutorHandle::new("affinity-worker", 1, None);
+        executor.set_cpu_affinity(&[cpu_id]).unwrap();
+        executor.resize(2);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            tasks.push(executor.submit(move || {
+                let cpu_list = current_cpu_list();
+                barrier.wait();
+                cpu_list
+            }));
+        }
+        barrier.wait();
+
+        assert_eq!(executor.cpu_affinity(), vec![cpu_id]);
+        for task in tasks {
+            assert_eq!(task.join(), cpu_id.to_string());
+        }
+        let stats = executor.pool_stats();
+        assert!(stats.affinity_generation > 0);
+        assert_eq!(stats.affinity_applied_thread_count, 2);
+        assert_eq!(stats.affinity_failed_thread_count, 0);
     }
 
     #[test]
@@ -17606,24 +17664,37 @@ mod tests {
     fn cache_executor_creates_pmem_numa_executors_and_destroy_resets() {
         let _registry = exclusive_executor_registry();
         CacheExecutor::DestroyAllExecutors();
+        let available_numa_nodes = CacheExecutorHandle::available_numa_node_ids();
+        let numa_count = (0..available_numa_nodes.len())
+            .take_while(|numa_id| available_numa_nodes.contains(numa_id))
+            .count();
+        if numa_count == 0 {
+            return;
+        }
         CacheExecutor::Configure(CacheExecutorConfig {
             common_executor_num_threads: 1,
             num_gc_workers: 1,
-            used_num_numa_nodes: 3,
+            used_num_numa_nodes: numa_count,
             num_pmem_cache_per_numa_writer_threads: 5,
         });
 
         let pmem = CacheExecutor::GetPmemExecutors();
-        assert_eq!(pmem.len(), 3);
+        assert_eq!(pmem.len(), numa_count);
         assert_eq!(pmem[0].name(), "PmemNuma0");
-        assert_eq!(pmem[1].numa_id(), Some(1));
-        assert_eq!(pmem[2].thread_count(), 5);
+        for (numa_id, executor) in pmem.iter().enumerate() {
+            assert_eq!(executor.numa_id(), Some(numa_id));
+            assert_eq!(executor.thread_count(), 5);
+            assert_eq!(
+                executor.cpu_affinity(),
+                CacheExecutorHandle::cpu_ids_for_numa_node(numa_id).unwrap()
+            );
+        }
         let pmem_again = CacheExecutor::GetPmemExecutors();
         assert!(Arc::ptr_eq(&pmem[0], &pmem_again[0]));
-        assert_eq!(CacheExecutor::initialized_executor_count(), 3);
+        assert_eq!(CacheExecutor::initialized_executor_count(), numa_count);
 
         let common_before_destroy = CacheExecutor::GetCommonExecutor();
-        assert_eq!(CacheExecutor::initialized_executor_count(), 4);
+        assert_eq!(CacheExecutor::initialized_executor_count(), numa_count + 1);
         CacheExecutor::DestroyAllExecutors();
         assert_eq!(CacheExecutor::initialized_executor_count(), 0);
         let common_after_destroy = CacheExecutor::GetCommonExecutor();

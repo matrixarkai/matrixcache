@@ -24,6 +24,7 @@ smallvec = "1"
 thiserror = "2"
 zstd = "0.14"
 rocksdb = { version = "0.25", default-features = false, optional = true }
+core_affinity = "0.8.3"
 
 [dev-dependencies]
 # A counting allocator, so the allocation claims in this crate can be measured
