@@ -14148,11 +14148,46 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert!(
             values.capacity() >= original_capacity,
-            "cross-shard fallback should keep the caller-owned allocation available"
+            "cross-shard fill should keep the caller-owned allocation available"
         );
         assert_eq!(values[0].as_deref(), Some(&b"c"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"a"[..]));
         assert_eq!(values[2].as_deref(), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn sharded_get_shared_batch_into_fills_cross_shard_pmem_results_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(0, 1 << 20, 0)
+                .with_pmem_paths([directory.path().join("pmem")]),
+            4,
+        );
+        let keys = (0..128)
+            .map(|index| CacheKey::string(index, &format!("shared-sharded-pmem-{index:03}")))
+            .collect::<Vec<_>>();
+        assert!(cache.batch_shard_fanout(&keys) > 1);
+        for (index, key) in keys.iter().enumerate() {
+            cache.put(key.clone(), vec![index as u8; 128]).unwrap();
+        }
+
+        let mut values = Vec::with_capacity(keys.len());
+        let outer_storage = values.as_ptr();
+        cache.get_shared_batch_into(&keys, &mut values).unwrap();
+        assert_eq!(values.as_ptr(), outer_storage);
+        let first_values = values.clone();
+
+        let before = cache.stats();
+        cache.get_shared_batch_into(&keys, &mut values).unwrap();
+        let after = cache.stats();
+        assert_eq!(values.as_ptr(), outer_storage);
+        assert_eq!(after.pmem_hits - before.pmem_hits, keys.len() as u64);
+        for (index, (first, current)) in first_values.iter().zip(&values).enumerate() {
+            let first = first.as_ref().expect("first PMEM value");
+            let current = current.as_ref().expect("current PMEM value");
+            assert!(Arc::ptr_eq(first, current));
+            assert!(current.iter().all(|byte| *byte == index as u8));
+        }
     }
 
     #[test]
