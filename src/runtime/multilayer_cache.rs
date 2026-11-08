@@ -46,12 +46,11 @@ fn latency_percentile_us(
     max_us
 }
 
-// Grouping scans farther because it replaces a hash-table allocation. The
-// duplicate-only preflight is followed by the real lookup, so cap its linear
-// scan at the inline batch size instead of paying quadratic key comparisons
-// before every medium-sized resident read.
+// Medium-batch duplicate preflight uses an inline open-address table. Slots
+// hold positions into the caller's key slice, so hash collisions still check
+// exact keys without copying them or allocating a temporary hash table.
 const SMALL_BATCH_DEDUP_LIMIT: usize = 64;
-const SMALL_BATCH_DUPLICATE_SCAN_LIMIT: usize = 16;
+const SMALL_BATCH_DEDUP_SLOTS: usize = SMALL_BATCH_DEDUP_LIMIT * 2;
 const INLINE_BATCH_KEYS: usize = 16;
 
 fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
@@ -137,9 +136,20 @@ fn own_unique_positioned_batch_keys(
 mod batch_value_expansion_tests {
     use super::{
         fill_decoded_batch_positions, fill_owned_batch_positions,
-        own_unique_positioned_batch_keys, visit_batch_values, BatchPositions, CacheDecodedBlock,
-        CacheKey,
+        has_duplicate_batch_keys, own_unique_positioned_batch_keys, visit_batch_values,
+        BatchPositions, CacheDecodedBlock, CacheKey,
     };
+
+    #[test]
+    fn medium_duplicate_preflight_distinguishes_unique_and_repeated_keys() {
+        let mut keys = (0..64)
+            .map(|index| CacheKey::string(1, &format!("medium-{index:02}")))
+            .collect::<Vec<_>>();
+        assert!(!has_duplicate_batch_keys(&keys));
+
+        keys[63] = keys[17].clone();
+        assert!(has_duplicate_batch_keys(&keys));
+    }
 
     #[test]
     fn unique_values_move_and_duplicates_copy_only_extra_outputs() {
@@ -269,11 +279,28 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<&CacheKey>, Vec<(usize, usize)
 }
 
 fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
-    if keys.len() <= SMALL_BATCH_DUPLICATE_SCAN_LIMIT {
-        return keys
-            .iter()
-            .enumerate()
-            .any(|(position, key)| keys[..position].iter().any(|existing| existing == key));
+    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+        debug_assert!(SMALL_BATCH_DEDUP_LIMIT < u8::MAX as usize);
+        debug_assert!(SMALL_BATCH_DEDUP_SLOTS.is_power_of_two());
+        let mut positions = [u8::MAX; SMALL_BATCH_DEDUP_SLOTS];
+        let slot_mask = positions.len() - 1;
+        for (position, key) in keys.iter().enumerate() {
+            let mut hasher = ahash::AHasher::default();
+            key.hash(&mut hasher);
+            let mut slot = hasher.finish() as usize & slot_mask;
+            loop {
+                let existing_position = positions[slot];
+                if existing_position == u8::MAX {
+                    positions[slot] = position as u8;
+                    break;
+                }
+                if &keys[existing_position as usize] == key {
+                    return true;
+                }
+                slot = (slot + 1) & slot_mask;
+            }
+        }
+        return false;
     }
     let mut seen = AHashSet::with_capacity(keys.len());
     keys.iter().any(|key| !seen.insert(key))
@@ -4590,7 +4617,7 @@ impl MultiLayerCache {
             let mut resident_hits = SmallVec::<
                 [
                     (&CacheKey, Option<&CacheEntryMeta>, usize, CacheReadTier);
-                    INLINE_BATCH_KEYS
+                    SMALL_BATCH_DEDUP_LIMIT
                 ],
             >::with_capacity(keys.len());
             for (position, key) in keys.iter().enumerate() {

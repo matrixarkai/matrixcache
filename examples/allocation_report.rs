@@ -35,6 +35,7 @@ const VALUE_BYTES: usize = 1024;
 const RESIDENT: usize = 4096;
 const REPEATS: usize = 200;
 const BATCH: usize = 8;
+const MEDIUM_BATCH: usize = 64;
 /// Entries resident in the cache that evicts on every write.
 const EVICTING_RESIDENT: usize = 256;
 
@@ -95,6 +96,7 @@ fn main() {
 
     let probe = key(7);
     let batch: Vec<CacheKey> = (0..BATCH).map(key).collect();
+    let medium_batch: Vec<CacheKey> = (0..MEDIUM_BATCH).map(key).collect();
     // Every position a distinct key, so the per-key column below is about the
     // bookkeeping rather than about duplicate coalescing.
     let mut rows = Vec::new();
@@ -152,6 +154,17 @@ fn main() {
             .expect("get_shared_batch_into");
         assert!(reused_shared_batch.iter().all(Option::is_some));
     }));
+    let mut reused_medium_shared_batch = Vec::with_capacity(MEDIUM_BATCH);
+    rows.push(measure(
+        "get_shared_batch_into, 64 resident",
+        MEDIUM_BATCH,
+        || {
+            cache
+                .get_shared_batch_into(&medium_batch, &mut reused_medium_shared_batch)
+                .expect("medium get_shared_batch_into");
+            assert!(reused_medium_shared_batch.iter().all(Option::is_some));
+        },
+    ));
     rows.push(measure("acquire_batch_no_promotion", BATCH, || {
         let handles = cache
             .acquire_batch_no_promotion(&batch)
@@ -500,6 +513,7 @@ fn main() {
         "get_batch_into, resident",
         "get_shared_batch",
         "get_shared_batch_into, resident",
+        "get_shared_batch_into, 64 resident",
         "acquire_batch_no_promotion",
         "acquire_batch",
         "acquire_batch, 2 duplicated",
@@ -545,6 +559,7 @@ fn main() {
         ("get_batch, mixed hits and misses", 5.5, 4_500.0),
         ("get_shared_batch", 2.5, 500.0),
         ("get_shared_batch_into, resident", 0.5, 128.0),
+        ("get_shared_batch_into, 64 resident", 0.5, 128.0),
         ("acquire_batch_no_promotion", 4.5, 2_500.0),
         ("acquire_batch", 4.5, 2_600.0),
         ("acquire_batch, 2 duplicated", 6.5, 3_800.0),
