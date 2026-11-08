@@ -1637,6 +1637,9 @@ pub struct MultiLayerCache {
     /// this says whether there can be anything to drain -- which lets the
     /// drain after every put and delete skip taking the lock exclusively.
     eviction_callbacks_registered: Arc<AtomicBool>,
+    /// Pin ownership lives outside the cache-wide lock so returning a handle
+    /// does not serialize with unrelated reads and writes.
+    pin_registry: Arc<CachePinRegistry>,
 }
 
 #[derive(Debug)]
@@ -1725,21 +1728,6 @@ struct CacheInner {
     /// use expiry, and this is what keeps it costing nothing: one bool test on
     /// the write path, and the sweep is never entered.
     ttl_in_use: bool,
-    /// Whether any entry has ever been removed from its tier while pinned.
-    ///
-    /// Such an entry still occupies memory and is no longer counted in
-    /// `memory_bytes`, so `size()` has to add its bytes back -- which it does
-    /// by locking every pin stripe and walking every pinned entry. For a cache
-    /// where that has never happened the answer is provably zero, and this
-    /// says so without taking a lock.
-    ///
-    /// **Set and never cleared.** That is what makes it safe rather than a
-    /// derived counter: the only error it can make is staying true after the
-    /// last such entry has gone, and that costs exactly the walk that used to
-    /// happen unconditionally. A counter that could drift *down* would make
-    /// `size()` silently wrong, and maintaining one correctly means touching
-    /// four write sites and thirteen removal sites.
-    pinned_removals_seen: AtomicBool,
     /// Lines appended to the disk manifest since it was last written whole.
     ///
     /// The manifest is append-only: one line per block written, and the line
@@ -1787,31 +1775,9 @@ struct CacheInner {
     pmem: AHashMap<Arc<CacheKey>, PmemResident>,
     disk_index: AHashMap<Arc<CacheKey>, u64>,
     disk_order: CacheKeyOrder,
-    /// Everything about which entries are pinned, behind its own lock.
-    ///
-    /// It used to be three maps and two counters directly on the cache, which
-    /// meant taking a pinned handle needed the cache **exclusively** -- and so
-    /// did giving one back. Every reader serialised against every other twice
-    /// per zero-copy read, and it showed: `acquire` did not scale at all and
-    /// went backwards past two threads, while `get` scaled, leaving the
-    /// zero-copy read about eighteen times slower than the copying one it
-    /// exists to beat.
-    ///
-    /// Behind its own lock, a read takes the cache **shared** and holds this
-    /// only for the counter update. The model this crate follows goes further
-    /// and keeps the refcount on the item itself; this is the same idea with
-    /// the accounting kept where it already was.
-    ///
-    /// **Lock order is cache, then pins, always.** It can only be reached
-    /// through a borrow of the cache, so nothing can take it the other way
-    /// round.
-    pins: Vec<Mutex<CachePinState>>,
-    /// Total live handles across every pin stripe.
-    ///
-    /// Eviction usually runs with no handles in the process. Keeping that
-    /// common fact separately avoids a mutex acquisition and hash probe for
-    /// every candidate while the striped maps remain the exact authority.
-    pin_handles: AtomicU64,
+    /// Shared with `MultiLayerCache`, allowing handle release to update pin
+    /// ownership without opening the cache-wide lock.
+    pin_registry: Arc<CachePinRegistry>,
     memory_order: CacheKeyOrder,
     pmem_order: CacheKeyOrder,
     async_writeback_queue: VecDeque<CacheWritebackJob>,
@@ -2207,6 +2173,135 @@ struct CachePinState {
     /// is counted at the moment a pin is taken, under this lock, and a counter
     /// anywhere else would need the cache exclusively to update.
     zero_copy_handle_hits: u64,
+}
+
+#[derive(Debug)]
+struct CachePinRegistry {
+    stripes: Vec<Mutex<CachePinState>>,
+    handle_count: AtomicU64,
+    removed_seen: AtomicBool,
+    /// Set only when pinned entries keep a tier above a reduced capacity.
+    /// The normal release path is one atomic load and never opens `inner`.
+    reclaim_needed: AtomicBool,
+}
+
+impl CachePinRegistry {
+    fn new() -> Self {
+        Self {
+            stripes: (0..PIN_STRIPES)
+                .map(|_| Mutex::new(CachePinState::default()))
+                .collect(),
+            handle_count: AtomicU64::new(0),
+            removed_seen: AtomicBool::new(false),
+            reclaim_needed: AtomicBool::new(false),
+        }
+    }
+
+    fn stripe_index(&self, key: &CacheKey) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.stripes.len()
+    }
+
+    fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
+        self.stripes[self.stripe_index(key)]
+            .lock()
+            .expect("pin lock poisoned")
+    }
+
+    fn remove_handles(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.handle_count.fetch_sub(count, Ordering::Release);
+        debug_assert!(previous >= count, "pin handle count underflow");
+    }
+
+    fn mark_removed_seen(&self) {
+        self.removed_seen.store(true, Ordering::Relaxed);
+    }
+
+    /// Keep removed bytes attached to a handle only while that handle is
+    /// still live. The check and update share one stripe lock so release
+    /// cannot remove the last pin between them and leave a zero-handle entry.
+    fn record_removed_bytes_if_pinned(&self, key: &CacheKey, bytes: usize) -> bool {
+        let mut pins = self.pins_for(key);
+        let Some(entry) = pins.entries.get_mut(key) else {
+            return false;
+        };
+        if entry.handles == 0 {
+            pins.entries.remove(key);
+            CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
+            return false;
+        }
+        if bytes > 0 {
+            entry.removed_bytes = Some(entry.removed_bytes.unwrap_or_default().max(bytes));
+            self.mark_removed_seen();
+        }
+        true
+    }
+
+    fn decrement(&self, key: &CacheKey, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut pins = self.pins_for(key);
+        let Some(entry) = pins.entries.get_mut(key) else {
+            return;
+        };
+        let count = count as u64;
+        let removed = entry.handles.min(count);
+        if entry.handles > count {
+            entry.handles -= count;
+        } else {
+            pins.entries.remove(key);
+            CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
+        }
+        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+        drop(pins);
+        self.remove_handles(removed);
+    }
+
+    fn decrement_many(&self, counts: &[(CacheKey, usize)]) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut removed_handles = 0u64;
+        with_sorted_pin_updates(
+            counts.len(),
+            counts
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, count))| *count != 0)
+                .map(|(index, (key, _))| (self.stripe_index(key), index)),
+            |updates| {
+                let mut cursor = 0;
+                while cursor < updates.len() {
+                    let stripe = updates[cursor].0;
+                    let mut pins = self.stripes[stripe].lock().expect("pin lock poisoned");
+                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                        let index = updates[cursor].1;
+                        let (key, count) = &counts[index];
+                        let Some(entry) = pins.entries.get_mut(key) else {
+                            cursor += 1;
+                            continue;
+                        };
+                        let count = *count as u64;
+                        removed_handles = removed_handles.saturating_add(entry.handles.min(count));
+                        if entry.handles > count {
+                            entry.handles -= count;
+                        } else {
+                            pins.entries.remove(key);
+                            CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
+                        }
+                        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
+                        cursor += 1;
+                    }
+                }
+            },
+        );
+        self.remove_handles(removed_handles);
+    }
 }
 
 /// Per-entry bookkeeping.
@@ -2793,6 +2888,7 @@ impl MultiLayerCache {
         let legacy_block_files_possible =
             AtomicBool::new(CacheInner::probe_legacy_block_files(&disk_dir));
         let read_counters = Arc::new(ReadPathCounters::default());
+        let pin_registry = Arc::new(CachePinRegistry::new());
         Self {
             inner: Arc::new(RwLock::new(CacheInner {
                 started: true,
@@ -2818,7 +2914,6 @@ impl MultiLayerCache {
                 ssd_write_budget: SsdWriteBudget::unlimited(),
                 default_ttl_millis: 0,
                 ttl_in_use: false,
-                pinned_removals_seen: AtomicBool::new(false),
                 #[cfg(not(feature = "rocksdb-ssd"))]
                 manifest_appends: AtomicU64::new(0),
                 expiries: AHashMap::new(),
@@ -2828,10 +2923,7 @@ impl MultiLayerCache {
                 pmem: AHashMap::new(),
                 disk_index: AHashMap::new(),
                 disk_order: CacheKeyOrder::new(),
-                pins: (0..PIN_STRIPES)
-                    .map(|_| Mutex::new(CachePinState::default()))
-                    .collect(),
-                pin_handles: AtomicU64::new(0),
+                pin_registry: Arc::clone(&pin_registry),
                 cold_eviction_share_pct: COLD_EVICTION_SHARE_PCT_DEFAULT,
                 memory_order: CacheKeyOrder::new(),
                 pmem_order: CacheKeyOrder::new(),
@@ -2875,6 +2967,7 @@ impl MultiLayerCache {
             async_writeback_worker: Arc::new(Mutex::new(None)),
             access_record_registered: Arc::new(AtomicBool::new(false)),
             eviction_callbacks_registered: Arc::new(AtomicBool::new(false)),
+            pin_registry,
         }
     }
 
@@ -3065,6 +3158,10 @@ impl MultiLayerCache {
             inner.remove_expired_entry(key);
         }
         inner.shrink_tables_if_sparse();
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(inner.over_a_capacity(), Ordering::Release);
         drop(inner);
         // Every other path that evicts hands its records to the handler before
         // returning. This one did not: a cache whose only activity was expiry
@@ -3109,6 +3206,13 @@ impl MultiLayerCache {
 
     pub fn set_capacity_for_tier(&self, tier: CacheTier, capacity_bytes: usize) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
+        // Publish before testing pins. A concurrent final release either sees
+        // this and waits to reclaim, or finishes first and lets this pass
+        // evict the now-unpinned entry itself.
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(true, Ordering::Release);
         match tier {
             CacheTier::Memory => {
                 inner.memory_capacity_bytes = capacity_bytes;
@@ -3131,6 +3235,10 @@ impl MultiLayerCache {
             CacheTier::Reject => {}
         }
         inner.shrink_tables_if_sparse();
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(inner.over_a_capacity(), Ordering::Release);
         drop(inner);
         self.drain_eviction_records();
     }
@@ -3148,6 +3256,10 @@ impl MultiLayerCache {
 
     pub fn set_capacity(&self, capacity_bytes: usize) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(true, Ordering::Release);
         let old_memory_capacity = inner.memory_capacity_bytes;
         let old_pmem_capacity = inner.pmem_capacity_bytes;
         let volatile_capacity = old_memory_capacity.saturating_add(old_pmem_capacity);
@@ -3180,6 +3292,10 @@ impl MultiLayerCache {
         inner.evict_memory_to_capacity();
         inner.evict_pmem_to_capacity();
         inner.evict_ssd_to_capacity();
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(inner.over_a_capacity(), Ordering::Release);
         drop(inner);
         self.drain_eviction_records();
     }
@@ -6448,6 +6564,9 @@ impl MultiLayerCache {
             inner.evict_memory_to_capacity();
             inner.evict_pmem_to_capacity();
             inner.evict_ssd_to_capacity();
+            self.pin_registry
+                .reclaim_needed
+                .store(inner.over_a_capacity(), Ordering::Release);
         }
         // An eviction here reaches a handler exactly as one from a write does.
         self.drain_eviction_records();
@@ -6465,12 +6584,8 @@ impl MultiLayerCache {
         if released == 0 {
             return 0;
         }
-        let over = {
-            let inner = self.inner.read().expect("cache lock poisoned");
-            inner.decrement_pin_counts(&counts);
-            inner.over_a_capacity()
-        };
-        if over {
+        self.pin_registry.decrement_many(&counts);
+        if self.pin_registry.reclaim_needed.load(Ordering::Acquire) {
             self.reclaim_after_release();
         }
         released
@@ -7669,16 +7784,12 @@ impl MultiLayerCache {
 
     /// Give back a handle.
     ///
-    /// Takes the cache **shared**. Dropping a pin changes only the pin state,
-    /// which has its own lock, so one reader releasing a handle no longer
-    /// stops every other reader from taking one.
+    /// Dropping a pin changes only the pin state. The common path does not
+    /// open the cache-wide lock; only a capacity shrink blocked by pins asks
+    /// the final release to reclaim the tiers.
     pub fn unpin(&self, key: &CacheKey) {
-        let over = {
-            let inner = self.inner.read().expect("cache lock poisoned");
-            inner.decrement_pin(key);
-            inner.over_a_capacity()
-        };
-        if over {
+        self.pin_registry.decrement(key, 1);
+        if self.pin_registry.reclaim_needed.load(Ordering::Acquire) {
             self.reclaim_after_release();
         }
     }
@@ -8061,7 +8172,6 @@ impl MultiLayerCache {
         if !inner.started {
             return;
         }
-        let key_pinned = inner.is_pinned(key);
         let mut removed_pinned_bytes = 0usize;
         if let Some(value) = inner.take_resident(key) {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
@@ -8071,18 +8181,9 @@ impl MultiLayerCache {
             removed_pinned_bytes = removed_pinned_bytes.max(value.len());
             inner.pmem_bytes = inner.pmem_bytes.saturating_sub(value.len());
         }
-        {
-            let mut pins = inner.pins_for(key);
-            if key_pinned && removed_pinned_bytes > 0 {
-                inner.pinned_removals_seen.store(true, Ordering::Relaxed);
-                pins.entries
-                    .entry(inner.shared_key(key))
-                    .or_default()
-                    .removed_bytes = Some(removed_pinned_bytes);
-            } else {
-                pins.entries.remove(key);
-            }
-        }
+        inner
+            .pin_registry
+            .record_removed_bytes_if_pinned(key, removed_pinned_bytes);
         inner.stats.invalidations += 1;
         drop(inner);
         self.emit_access_record(CacheAccessRecordKind::Delete, key);
@@ -8164,6 +8265,10 @@ impl MultiLayerCache {
 
     pub fn update_production_tiering_policy(&self, policy: CacheTieringPolicy) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(true, Ordering::Release);
         inner.memory_capacity_bytes = policy.memory_capacity_bytes;
         inner.pmem_capacity_bytes = policy.pmem_capacity_bytes;
         inner.ssd_capacity_bytes = policy.ssd_capacity_bytes;
@@ -8171,6 +8276,10 @@ impl MultiLayerCache {
         inner.evict_memory_to_capacity();
         inner.evict_pmem_to_capacity();
         inner.evict_ssd_to_capacity();
+        inner
+            .pin_registry
+            .reclaim_needed
+            .store(inner.over_a_capacity(), Ordering::Release);
         drop(inner);
         self.drain_eviction_records();
     }
@@ -11678,7 +11787,8 @@ impl CacheInner {
                 map_table_bytes(&pins.entries)
             })
             .sum::<usize>()
-            + self.pins.capacity() * std::mem::size_of::<Mutex<CachePinState>>();
+            + self.pin_registry.stripes.capacity()
+                * std::mem::size_of::<Mutex<CachePinState>>();
 
         // `async_writeback_queue` and `async_writeback_positions`: the values
         // waiting to be written, their keys, and the index that finds them.
@@ -11726,7 +11836,7 @@ impl CacheInner {
         //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,
-        //   `pinned_removals_seen`, `pin_handles`, `manifest_appends`,
+        //   pin-registry atomics, `manifest_appends`,
         //   `pmem_manifest_appends`, `pmem_manifest_compact_after`, `ssd_probe_epoch`,
         //   `ssd_probe_global_epoch`, `ssd_probe_mutations`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
@@ -12486,28 +12596,16 @@ impl CacheInner {
             CacheTier::Memory => {
                 if let Some(value) = self.take_resident(key) {
                     self.memory_bytes = self.memory_bytes.saturating_sub(value.len());
-                    if self.is_pinned(key) {
-                        self.pinned_removals_seen.store(true, Ordering::Relaxed);
-                        self.pins_for(key)
-                            .entries
-                            .entry(self.shared_key(key))
-                            .or_default()
-                            .removed_bytes = Some(value.len());
-                    }
+                    self.pin_registry
+                        .record_removed_bytes_if_pinned(key, value.len());
                 }
                 self.memory_order.remove(key);
             }
             CacheTier::Pmem => {
                 if let Some(value) = self.take_pmem_resident(key) {
                     self.pmem_bytes = self.pmem_bytes.saturating_sub(value.len());
-                    if self.is_pinned(key) {
-                        self.pinned_removals_seen.store(true, Ordering::Relaxed);
-                        self.pins_for(key)
-                            .entries
-                            .entry(self.shared_key(key))
-                            .or_default()
-                            .removed_bytes = Some(value.len());
-                    }
+                    self.pin_registry
+                        .record_removed_bytes_if_pinned(key, value.len());
                 }
                 self.pmem_order.remove(key);
                 self.persist_pmem_delete(key)?;

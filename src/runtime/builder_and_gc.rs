@@ -3408,7 +3408,6 @@ impl CacheInner {
             .then(|| keys.iter().collect::<HashSet<_>>());
         let mut disk_keys = Vec::new();
         for key in keys {
-            let key_pinned = self.is_pinned(key);
             let mut removed_pinned_bytes = 0usize;
             if let Some(value) = self.take_resident(key) {
                 removed_pinned_bytes = removed_pinned_bytes.max(value.len());
@@ -3441,21 +3440,8 @@ impl CacheInner {
             // caller passes `remove_disk`. With it false the disk index keeps
             // the key and the entry stays servable.
             self.forget_metadata_unless_resident(key);
-            {
-                let mut pins = self.pins_for(key);
-                if key_pinned && removed_pinned_bytes > 0 {
-                    // Still held, so remember what the handle is worth now the
-                    // tier no longer has it.
-                    self.pinned_removals_seen.store(true, Ordering::Relaxed);
-                    pins.entries
-                        .entry(self.shared_key(key))
-                        .or_default()
-                        .removed_bytes = Some(removed_pinned_bytes);
-                } else {
-                    pins.entries.remove(key);
-                    Self::shrink_pin_stripe_if_sparse(&mut pins);
-                }
-            }
+            self.pin_registry
+                .record_removed_bytes_if_pinned(key, removed_pinned_bytes);
             self.stats.invalidations += 1;
         }
         if remove_disk {
@@ -3494,7 +3480,10 @@ impl CacheInner {
                 pins.zero_copy_handle_hits = 0;
             }
         }
-        self.pin_handles.store(0, Ordering::Release);
+        self.pin_registry.handle_count.store(0, Ordering::Release);
+        self.pin_registry
+            .reclaim_needed
+            .store(false, Ordering::Release);
         self.clear_metadata();
         self.expiries.clear();
         self.async_writeback_queue.clear();
@@ -3535,11 +3524,11 @@ impl CacheInner {
     fn pin_stripe_index(&self, key: &CacheKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.pins.len()
+        (hasher.finish() as usize) % self.pin_registry.stripes.len()
     }
 
     fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
-        self.pins[self.pin_stripe_index(key)]
+        self.pin_registry.stripes[self.pin_stripe_index(key)]
             .lock()
             .expect("pin lock poisoned")
     }
@@ -3550,14 +3539,15 @@ impl CacheInner {
     /// them. Always in index order, so two of these can never deadlock against
     /// each other.
     fn all_pins(&self) -> Vec<std::sync::MutexGuard<'_, CachePinState>> {
-        self.pins
+        self.pin_registry
+            .stripes
             .iter()
             .map(|stripe| stripe.lock().expect("pin lock poisoned"))
             .collect()
     }
 
     fn is_pinned(&self, key: &CacheKey) -> bool {
-        if self.pin_handles.load(Ordering::Acquire) == 0 {
+        if self.pin_registry.handle_count.load(Ordering::Acquire) == 0 {
             return false;
         }
         self.pins_for(key).entries.contains_key(key)
@@ -3567,7 +3557,10 @@ impl CacheInner {
         if count == 0 {
             return;
         }
-        let previous = self.pin_handles.fetch_add(count, Ordering::Release);
+        let previous = self
+            .pin_registry
+            .handle_count
+            .fetch_add(count, Ordering::Release);
         debug_assert!(previous <= u64::MAX - count, "pin handle count overflow");
     }
 
@@ -3575,7 +3568,10 @@ impl CacheInner {
         if count == 0 {
             return;
         }
-        let previous = self.pin_handles.fetch_sub(count, Ordering::Release);
+        let previous = self
+            .pin_registry
+            .handle_count
+            .fetch_sub(count, Ordering::Release);
         debug_assert!(previous >= count, "pin handle count underflow");
     }
 
@@ -3631,7 +3627,9 @@ impl CacheInner {
                 let mut cursor = 0;
                 while cursor < updates.len() {
                     let stripe = updates[cursor].0;
-                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+                    let mut pins = self.pin_registry.stripes[stripe]
+                        .lock()
+                        .expect("pin lock poisoned");
                     while cursor < updates.len() && updates[cursor].0 == stripe {
                         let index = updates[cursor].1;
                         let (key, bytes, count) = &counts[index];
@@ -3667,7 +3665,9 @@ impl CacheInner {
                 let mut cursor = 0;
                 while cursor < updates.len() {
                     let stripe = updates[cursor].0;
-                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
+                    let mut pins = self.pin_registry.stripes[stripe]
+                        .lock()
+                        .expect("pin lock poisoned");
                     while cursor < updates.len() && updates[cursor].0 == stripe {
                         let index = updates[cursor].1;
                         let (key, bytes, handles, handle_hits) = &counts[index];
@@ -3734,80 +3734,12 @@ impl CacheInner {
             || self.ssd_bytes > self.ssd_capacity_bytes as u64
     }
 
-    fn decrement_pin(&self, key: &CacheKey) {
-        self.decrement_pin_count(key, 1);
-    }
-
-    fn decrement_pin_count(&self, key: &CacheKey, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let mut pins = self.pins_for(key);
-        let Some(entry) = pins.entries.get_mut(key) else {
-            return;
-        };
-        let count = count as u64;
-        let removed = entry.handles.min(count);
-        if entry.handles > count {
-            entry.handles -= count;
-        } else {
-            // The last handle takes everything known about the key with it, in
-            // one removal.
-            pins.entries.remove(key);
-            Self::shrink_pin_stripe_if_sparse(&mut pins);
-        }
-        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
-        drop(pins);
-        self.remove_pin_handles(removed);
-    }
-
-    fn decrement_pin_counts(&self, counts: &[(CacheKey, usize)]) {
-        if counts.is_empty() {
-            return;
-        }
-        let mut removed_handles = 0u64;
-        with_sorted_pin_updates(
-            counts.len(),
-            counts
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, count))| *count != 0)
-                .map(|(index, (key, _))| (self.pin_stripe_index(key), index)),
-            |updates| {
-                let mut cursor = 0;
-                while cursor < updates.len() {
-                    let stripe = updates[cursor].0;
-                    let mut pins = self.pins[stripe].lock().expect("pin lock poisoned");
-                    while cursor < updates.len() && updates[cursor].0 == stripe {
-                        let index = updates[cursor].1;
-                        let (key, count) = &counts[index];
-                        let Some(entry) = pins.entries.get_mut(key) else {
-                            cursor += 1;
-                            continue;
-                        };
-                        let count = *count as u64;
-                        removed_handles = removed_handles.saturating_add(entry.handles.min(count));
-                        if entry.handles > count {
-                            entry.handles -= count;
-                        } else {
-                            pins.entries.remove(key);
-                            Self::shrink_pin_stripe_if_sparse(&mut pins);
-                        }
-                        pins.unpin_operations = pins.unpin_operations.saturating_add(count);
-                        cursor += 1;
-                    }
-                }
-            }
-        );
-        self.remove_pin_handles(removed_handles);
-    }
-
     fn pinned_removed_bytes_total(&self) -> usize {
         // Nothing has ever been removed from a tier while pinned, so every
         // entry's `removed_bytes` is `None` and the sum is zero. Answered
         // without locking a single stripe, which is what `size()` was doing
         // on every call -- and on a sharded cache, once per shard.
-        if !self.pinned_removals_seen.load(Ordering::Relaxed) {
+        if !self.pin_registry.removed_seen.load(Ordering::Relaxed) {
             return 0;
         }
         self.all_pins()
