@@ -5319,10 +5319,12 @@ impl MultiLayerCache {
         for result in results.iter_mut() {
             *result = None;
         }
-        let mut refills = SmallVec::<[(usize, Arc<[u8]>); INLINE_BATCH_KEYS]>::new();
+        let mut refills = SmallVec::<[Option<Arc<[u8]>>; INLINE_BATCH_KEYS]>::new();
+        let mut disk_hits = 0u64;
         let mut compressed_hits = 0u64;
         for (position, block) in blocks.into_iter().enumerate() {
             let Some(block) = block else {
+                refills.push(None);
                 continue;
             };
             compressed_hits = compressed_hits
@@ -5332,12 +5334,12 @@ impl MultiLayerCache {
                 .to_refill()
                 .expect("a refilling decode always builds a shared buffer");
             results[position] = Some(decoded.into_vec());
-            refills.push((position, refill));
+            refills.push(Some(refill));
+            disk_hits = disk_hits.saturating_add(1);
         }
-        let disk_hits = refills.len() as u64;
         let misses = keys.len() as u64 - disk_hits;
 
-        if refills.is_empty() {
+        if disk_hits == 0 {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
@@ -5347,13 +5349,17 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            for (position, refill) in refills {
+            for (position, refill) in refills.into_iter().enumerate() {
+                let Some(refill) = refill else {
+                    continue;
+                };
                 let key = &keys[position];
                 let current = inner.ssd_probe_is_current_for(key, probe_epoch);
-                if !inner.refill_ssd_probe(key, Arc::clone(&refill), current) {
+                let refill_len = refill.len();
+                if !inner.refill_ssd_probe(key, refill, current) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
-                inner.record_hit_metadata(key, refill.len());
+                inner.record_hit_metadata(key, refill_len);
             }
         }
 

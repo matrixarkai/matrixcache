@@ -109,11 +109,11 @@ fn main() {
     #[cfg(feature = "rocksdb-ssd")]
     const MAX_ALLOCATIONS_PER_BATCH: f64 = 206.0;
     #[cfg(feature = "rocksdb-ssd")]
-    const MAX_BYTES_PER_BATCH: f64 = 36_000.0;
+    const MAX_BYTES_PER_BATCH: f64 = 34_500.0;
     #[cfg(not(feature = "rocksdb-ssd"))]
     const MAX_ALLOCATIONS_PER_BATCH: f64 = 136.0;
     #[cfg(not(feature = "rocksdb-ssd"))]
-    const MAX_BYTES_PER_BATCH: f64 = 27_000.0;
+    const MAX_BYTES_PER_BATCH: f64 = 25_600.0;
     let passed = allocations_per_batch <= MAX_ALLOCATIONS_PER_BATCH
         && bytes_per_batch <= MAX_BYTES_PER_BATCH;
 
