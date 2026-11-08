@@ -24505,6 +24505,20 @@ fn page_cache_keys_keep_their_exact_bytes() {
     assert_ne!(CacheKey::page(1, 8, 81, 92).selector, CacheKey::page(1, 8, 8192, 0).selector);
 }
 
+#[test]
+fn a_page_prefix_reuses_one_segment_key_without_changing_key_bytes() {
+    let prefix = PageCacheKeyPrefix::new(1, 8);
+    let first = prefix.key_with_slot(8192, 512, Some(3));
+    let second = prefix.key_with_slot_generation(16_384, 256, Some(3), Some(7));
+
+    assert_eq!(first, CacheKey::page_with_slot(1, 8, 8192, 512, Some(3)));
+    assert_eq!(
+        second,
+        CacheKey::page_with_slot_generation(1, 8, 16_384, 256, Some(3), Some(7))
+    );
+    assert!(Arc::ptr_eq(&first.record_key, &second.record_key));
+}
+
 
 /// A shared read returns exactly what a copying read returns, and keeps it.
 ///
