@@ -46,7 +46,12 @@ fn latency_percentile_us(
     max_us
 }
 
+// Grouping scans farther because it replaces a hash-table allocation. The
+// duplicate-only preflight is followed by the real lookup, so cap its linear
+// scan at the inline batch size instead of paying quadratic key comparisons
+// before every medium-sized resident read.
 const SMALL_BATCH_DEDUP_LIMIT: usize = 64;
+const SMALL_BATCH_DUPLICATE_SCAN_LIMIT: usize = 16;
 const INLINE_BATCH_KEYS: usize = 16;
 
 fn empty_batch_results<T>(len: usize) -> Vec<Option<T>> {
@@ -264,7 +269,7 @@ fn coalesce_batch_keys(keys: &[CacheKey]) -> (Vec<&CacheKey>, Vec<(usize, usize)
 }
 
 fn has_duplicate_batch_keys(keys: &[CacheKey]) -> bool {
-    if keys.len() <= SMALL_BATCH_DEDUP_LIMIT {
+    if keys.len() <= SMALL_BATCH_DUPLICATE_SCAN_LIMIT {
         return keys
             .iter()
             .enumerate()
