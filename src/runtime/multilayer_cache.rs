@@ -1848,6 +1848,9 @@ struct CacheInner {
     eviction_metric_callback: Option<CacheEvictionMetricCallback>,
     pending_eviction_metric_tiers: VecDeque<CacheTier>,
     ssd_instance_only: bool,
+    /// See `legacy_block_files_possible`: `false` only when no raw block file
+    /// can exist, so the miss and invalidation paths skip building a path for one.
+    legacy_block_files_possible: AtomicBool,
     /// Share of the access order, coldest first, an eviction may choose from.
     ///
     /// See [`MultiLayerCache::set_cold_eviction_share_pct`].
@@ -2787,6 +2790,8 @@ impl MultiLayerCache {
         let mut ssd_store =
             SsdTierStore::new(&disk_dir, &ssd_paths, tiering_policy.ssd_capacity_bytes);
         let _ = ssd_store.start();
+        let legacy_block_files_possible =
+            AtomicBool::new(CacheInner::probe_legacy_block_files(&disk_dir));
         let read_counters = Arc::new(ReadPathCounters::default());
         Self {
             inner: Arc::new(RwLock::new(CacheInner {
@@ -2848,6 +2853,7 @@ impl MultiLayerCache {
                 eviction_metric_callback: None,
                 pending_eviction_metric_tiers: VecDeque::new(),
                 ssd_instance_only: false,
+                legacy_block_files_possible,
                 memory_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 pmem_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
                 ssd_replacement_policy: CacheReplacementPolicy::WeightedHotnessLru,
@@ -2875,6 +2881,10 @@ impl MultiLayerCache {
     pub fn start(&self) -> Result<(), CacheError> {
         let mut inner = self.inner.write().expect("cache lock poisoned");
         fs::create_dir_all(&inner.disk_dir)?;
+        let legacy_files = CacheInner::probe_legacy_block_files(&inner.disk_dir);
+        inner
+            .legacy_block_files_possible
+            .store(legacy_files, Ordering::Relaxed);
         if !inner.ssd_store.is_started() && !inner.ssd_store.start() {
             return Err(CacheError::Stopped);
         }
@@ -11156,7 +11166,7 @@ impl CacheInner {
         //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
         //   `next_reconfigure_millis`, `eviction_handler_enabled`,
-        //   `ssd_instance_only`, `cold_eviction_share_pct`,
+        //   `ssd_instance_only`, `legacy_block_files_possible`, `cold_eviction_share_pct`,
         //   `admission_filter_enabled`, `expected_entry_bytes`,
         //   `sketch_sized_from_what_is_resident`,
         //   `memory_replacement_policy`,

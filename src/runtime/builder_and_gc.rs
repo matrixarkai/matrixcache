@@ -797,6 +797,33 @@ impl CacheInner {
             .join(key.disk_name())
     }
 
+    /// Whether a raw block file can be sitting at [`Self::disk_path`] for any key.
+    ///
+    /// A build with the embedded store writes no block files, so the only files
+    /// that can be there are ones an older layout left behind, and each of them
+    /// would otherwise cost every miss and every invalidation a path built from
+    /// a `format!`, two joins and a hashed name, plus a syscall that finds
+    /// nothing. This answers once, when the cache starts, and is conservative:
+    /// it is `false` only for a build with the embedded store whose directory
+    /// holds no `shard-*` entry. Any other build, and any directory that cannot
+    /// be read, answers `true` and keeps the file probes exactly as they were.
+    fn legacy_block_files_possible(&self) -> bool {
+        self.legacy_block_files_possible.load(Ordering::Relaxed)
+    }
+
+    fn probe_legacy_block_files(disk_dir: &Path) -> bool {
+        if !cfg!(feature = "rocksdb-ssd") {
+            return true;
+        }
+        match fs::read_dir(disk_dir) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_string_lossy().starts_with("shard-"),
+                Err(_) => true,
+            }),
+            Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
+
     /// The SSD tier's key for an entry: the entry's `v1` manifest line.
     ///
     /// This runs on every invalidation **and on every SSD read**, including the
@@ -842,6 +869,7 @@ impl CacheInner {
             .get_owned(Self::inline_ssd_store_key_str(&store_key))
         {
             Ok(block) => Ok(Some(block)),
+            Err(CacheError::NotFound) if !self.legacy_block_files_possible() => Ok(None),
             Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
                 Ok(block) => Ok(Some(block)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -876,6 +904,9 @@ impl CacheInner {
             .map(|range| &store_key_buffer[range.clone()])
             .collect::<SmallVec<[&str; INLINE_BATCH_KEYS]>>();
         let mut blocks = self.ssd_store.get_unique_batch(&store_keys)?;
+        if !self.legacy_block_files_possible() {
+            return Ok(blocks);
+        }
         for (block, key) in blocks.iter_mut().zip(keys.iter()) {
             if block.is_some() {
                 continue;
@@ -1004,7 +1035,9 @@ impl CacheInner {
 
     fn delete_ssd_block(&mut self, key: &CacheKey) -> Result<(), CacheError> {
         self.note_ssd_probe_mutation(key);
-        let _ = fs::remove_file(self.disk_path(key));
+        if self.legacy_block_files_possible() {
+            let _ = fs::remove_file(self.disk_path(key));
+        }
         let store_key = Self::inline_ssd_store_key(key);
         match self
             .ssd_store
@@ -1023,7 +1056,9 @@ impl CacheInner {
         }
         for key in keys {
             self.note_ssd_probe_mutation(key.borrow());
-            let _ = fs::remove_file(self.disk_path(key.borrow()));
+            if self.legacy_block_files_possible() {
+                let _ = fs::remove_file(self.disk_path(key.borrow()));
+            }
         }
         // A store with no capacity holds nothing and accepts nothing: its own
         // `delete_batch` returns `Ok(())` without looking at the keys. Encoding
