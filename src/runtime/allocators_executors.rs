@@ -1557,6 +1557,7 @@ pub enum CacheExecutorTaskOutcome<T> {
     Completed(T),
     Panicked,
     Expired,
+    Cancelled,
 }
 
 struct CacheExecutorJob {
@@ -1565,6 +1566,7 @@ struct CacheExecutorJob {
     expires_at: Option<Instant>,
     run: Option<Box<dyn FnOnce() + Send + 'static>>,
     expire: Option<Box<dyn FnOnce() + Send + 'static>>,
+    cancel: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl PartialEq for CacheExecutorJob {
@@ -1609,6 +1611,7 @@ struct CacheExecutorMetrics {
     submitted: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
     expired: std::sync::atomic::AtomicU64,
+    cancelled: std::sync::atomic::AtomicU64,
     active: std::sync::atomic::AtomicUsize,
 }
 
@@ -1621,6 +1624,7 @@ pub struct CacheExecutorPoolStats {
     pub total_task_count: u64,
     pub completed_task_count: u64,
     pub expired_task_count: u64,
+    pub cancelled_task_count: u64,
 }
 
 impl std::fmt::Debug for CacheExecutorHandle {
@@ -1692,6 +1696,7 @@ impl CacheExecutorHandle {
                     .queue
                     .lock()
                     .expect("executor queue lock poisoned");
+                assert!(!queue.shutting_down, "cache executor is shutting down");
                 queue.live_workers += 1;
             }
             let worker = std::thread::Builder::new()
@@ -1825,12 +1830,19 @@ impl CacheExecutorHandle {
                 .active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
+        let cancel_metrics = Arc::clone(&self.metrics);
+        let cancel = Box::new(move || {
+            cancel_metrics
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         self.enqueue(CacheExecutorJob {
             priority,
             sequence: 0,
             expires_at,
             run: Some(run),
             expire: Some(expire),
+            cancel: Some(cancel),
         });
     }
 
@@ -1910,6 +1922,7 @@ impl CacheExecutorHandle {
     {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let expire_sender = sender.clone();
+        let cancel_sender = sender.clone();
         let run_metrics = Arc::clone(&self.metrics);
         let run = Box::new(move || {
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
@@ -1932,12 +1945,20 @@ impl CacheExecutorHandle {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let _ = expire_sender.send(CacheExecutorTaskOutcome::Expired);
         });
+        let cancel_metrics = Arc::clone(&self.metrics);
+        let cancel = Box::new(move || {
+            cancel_metrics
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = cancel_sender.send(CacheExecutorTaskOutcome::Cancelled);
+        });
         self.enqueue(CacheExecutorJob {
             priority,
             sequence: 0,
             expires_at,
             run: Some(run),
             expire: Some(expire),
+            cancel: Some(cancel),
         });
         CacheExecutorTask { receiver }
     }
@@ -1970,6 +1991,7 @@ impl CacheExecutorHandle {
                 .queue
                 .lock()
                 .expect("executor queue lock poisoned");
+            assert!(!queue.shutting_down, "cache executor is shutting down");
             let current = queue.desired_workers;
             queue.desired_workers = thread_count;
             current
@@ -2020,6 +2042,12 @@ impl CacheExecutorHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn cancelled_tasks(&self) -> u64 {
+        self.metrics
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn pool_stats(&self) -> CacheExecutorPoolStats {
         let (thread_count, pending_task_count) = {
             let queue = self
@@ -2042,7 +2070,62 @@ impl CacheExecutorHandle {
             total_task_count: self.submitted_tasks(),
             completed_task_count: self.completed_tasks(),
             expired_task_count: self.expired_tasks(),
+            cancelled_task_count: self.cancelled_tasks(),
         }
+    }
+
+    fn begin_shutdown(&self, drain: bool) -> Vec<CacheExecutorJob> {
+        let mut queue = self
+            .runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned");
+        queue.shutting_down = true;
+        let cancelled = if drain {
+            Vec::new()
+        } else {
+            queue.jobs.drain().collect()
+        };
+        drop(queue);
+        self.runtime.work_ready.notify_all();
+        self.runtime.queue_space.notify_all();
+        cancelled
+    }
+
+    fn join_workers(&self) {
+        for worker in self
+            .workers
+            .lock()
+            .expect("executor worker lock poisoned")
+            .drain(..)
+        {
+            let _ = worker.join();
+        }
+    }
+
+    /// Stop accepting work, finish every accepted task, and join all workers.
+    pub fn join_all(&self) {
+        self.begin_shutdown(true);
+        self.join_workers();
+    }
+
+    /// Stop accepting work, cancel queued tasks, finish active tasks, and join workers.
+    pub fn stop(&self) {
+        let mut cancelled = self.begin_shutdown(false);
+        for job in &mut cancelled {
+            if let Some(cancel) = job.cancel.take() {
+                cancel();
+            }
+        }
+        self.join_workers();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .shutting_down
     }
 
     #[allow(non_snake_case)]
@@ -2056,24 +2139,7 @@ impl CacheExecutorHandle {
 
 impl Drop for CacheExecutorHandle {
     fn drop(&mut self) {
-        {
-            let mut queue = self
-                .runtime
-                .queue
-                .lock()
-                .expect("executor queue lock poisoned");
-            queue.shutting_down = true;
-        }
-        self.runtime.work_ready.notify_all();
-        self.runtime.queue_space.notify_all();
-        for worker in self
-            .workers
-            .lock()
-            .expect("executor worker lock poisoned")
-            .drain(..)
-        {
-            let _ = worker.join();
-        }
+        self.join_all();
     }
 }
 
@@ -2086,7 +2152,9 @@ impl<T> CacheExecutorTask<T> {
     pub fn try_join(self) -> Option<T> {
         match self.receiver.recv().ok()? {
             CacheExecutorTaskOutcome::Completed(value) => Some(value),
-            CacheExecutorTaskOutcome::Panicked | CacheExecutorTaskOutcome::Expired => None,
+            CacheExecutorTaskOutcome::Panicked
+            | CacheExecutorTaskOutcome::Expired
+            | CacheExecutorTaskOutcome::Cancelled => None,
         }
     }
 

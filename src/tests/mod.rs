@@ -17502,6 +17502,7 @@ mod tests {
                 total_task_count: 2,
                 completed_task_count: 0,
                 expired_task_count: 0,
+                cancelled_task_count: 0,
             }
         );
 
@@ -17550,6 +17551,55 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         assert_eq!(executor.expired_tasks(), 1);
         assert_eq!(executor.completed_tasks(), 1);
+    }
+
+    #[test]
+    fn cache_executor_join_finishes_every_accepted_task() {
+        let executor = CacheExecutorHandle::with_queue_capacity("join-worker", 2, None, 16);
+        let tasks = (0..12)
+            .map(|value| executor.submit(move || value * 3))
+            .collect::<Vec<_>>();
+
+        executor.join_all();
+        assert!(executor.is_stopped());
+        let values = tasks
+            .into_iter()
+            .map(CacheExecutorTask::join)
+            .collect::<Vec<_>>();
+        assert_eq!(values, (0..12).map(|value| value * 3).collect::<Vec<_>>());
+        assert_eq!(executor.completed_tasks(), 12);
+        assert_eq!(executor.cancelled_tasks(), 0);
+    }
+
+    #[test]
+    fn cache_executor_stop_cancels_queued_work_and_finishes_active_work() {
+        let executor = Arc::new(CacheExecutorHandle::new("stop-worker", 1, None));
+        let blocker = Arc::new(std::sync::Barrier::new(2));
+        let worker_blocker = Arc::clone(&blocker);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let active = executor.submit(move || {
+            started_tx.send(()).unwrap();
+            worker_blocker.wait();
+            7
+        });
+        started_rx.recv().unwrap();
+        let pending = executor.submit(|| 42);
+
+        let stopping = Arc::clone(&executor);
+        let stop_thread = std::thread::spawn(move || stopping.stop());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !executor.is_stopped() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(executor.is_stopped());
+        assert_eq!(pending.join_outcome(), CacheExecutorTaskOutcome::Cancelled);
+
+        blocker.wait();
+        assert_eq!(active.join(), 7);
+        stop_thread.join().unwrap();
+        assert_eq!(executor.completed_tasks(), 1);
+        assert_eq!(executor.cancelled_tasks(), 1);
+        assert_eq!(executor.active_thread_count(), 0);
     }
 
     #[test]
