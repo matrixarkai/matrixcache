@@ -20,8 +20,9 @@ invalidation, and asynchronous writeback with backpressure accounting.
 - Shared-buffer reads for retrieval and scan paths that can consume cached
   bytes without copying them.
 - Asynchronous writeback with backpressure counters and cache-pressure helpers.
-- Shared bounded executors with priority scheduling, queued-task expiration,
-  runtime worker resizing, and queue-pressure visibility.
+- Shared bounded executors with asynchronous fire-and-forget and joined work,
+  priority scheduling, queued-task expiration, runtime worker resizing, and
+  live pool and queue statistics.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
 

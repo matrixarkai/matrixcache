@@ -1609,6 +1609,18 @@ struct CacheExecutorMetrics {
     submitted: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
     expired: std::sync::atomic::AtomicU64,
+    active: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheExecutorPoolStats {
+    pub thread_count: usize,
+    pub idle_thread_count: usize,
+    pub active_thread_count: usize,
+    pub pending_task_count: usize,
+    pub total_task_count: u64,
+    pub completed_task_count: u64,
+    pub expired_task_count: u64,
 }
 
 impl std::fmt::Debug for CacheExecutorHandle {
@@ -1720,6 +1732,9 @@ impl CacheExecutorHandle {
                 }
             };
 
+            metrics
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if job.expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
                 metrics
                     .expired
@@ -1760,13 +1775,63 @@ impl CacheExecutorHandle {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.metrics
-            .submitted
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        func();
-        self.metrics
-            .completed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.add_with_priority(0, func);
+    }
+
+    pub fn add_with_priority<F>(&self, priority: i32, func: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.add_scheduled(priority, None, func, || {});
+    }
+
+    pub fn add_with_deadline_callback<F, E>(
+        &self,
+        priority: i32,
+        deadline: Instant,
+        func: F,
+        on_expire: E,
+    ) where
+        F: FnOnce() + Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
+        self.add_scheduled(priority, Some(deadline), func, on_expire);
+    }
+
+    fn add_scheduled<F, E>(
+        &self,
+        priority: i32,
+        expires_at: Option<Instant>,
+        func: F,
+        on_expire: E,
+    ) where
+        F: FnOnce() + Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
+        let run_metrics = Arc::clone(&self.metrics);
+        let run = Box::new(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func));
+            run_metrics
+                .completed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            run_metrics
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let expire_metrics = Arc::clone(&self.metrics);
+        let expire = Box::new(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_expire));
+            expire_metrics
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        self.enqueue(CacheExecutorJob {
+            priority,
+            sequence: 0,
+            expires_at,
+            run: Some(run),
+            expire: Some(expire),
+        });
     }
 
     /// Schedule work on the persistent worker set and return its result handle.
@@ -1845,19 +1910,26 @@ impl CacheExecutorHandle {
     {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let expire_sender = sender.clone();
-        let metrics = Arc::clone(&self.metrics);
+        let run_metrics = Arc::clone(&self.metrics);
         let run = Box::new(move || {
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
                 Ok(value) => CacheExecutorTaskOutcome::Completed(value),
                 Err(_) => CacheExecutorTaskOutcome::Panicked,
             };
-            metrics
+            run_metrics
                 .completed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            run_metrics
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sender.send(outcome);
         });
+        let expire_metrics = Arc::clone(&self.metrics);
         let expire = Box::new(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_expire));
+            expire_metrics
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let _ = expire_sender.send(CacheExecutorTaskOutcome::Expired);
         });
         self.enqueue(CacheExecutorJob {
@@ -1946,6 +2018,31 @@ impl CacheExecutorHandle {
         self.metrics
             .expired
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn pool_stats(&self) -> CacheExecutorPoolStats {
+        let (thread_count, pending_task_count) = {
+            let queue = self
+                .runtime
+                .queue
+                .lock()
+                .expect("executor queue lock poisoned");
+            (queue.live_workers, queue.jobs.len())
+        };
+        let active_thread_count = self
+            .metrics
+            .active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(thread_count);
+        CacheExecutorPoolStats {
+            thread_count,
+            idle_thread_count: thread_count.saturating_sub(active_thread_count),
+            active_thread_count,
+            pending_task_count,
+            total_task_count: self.submitted_tasks(),
+            completed_task_count: self.completed_tasks(),
+            expired_task_count: self.expired_tasks(),
+        }
     }
 
     #[allow(non_snake_case)]
