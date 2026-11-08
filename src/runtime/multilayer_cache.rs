@@ -4123,6 +4123,108 @@ impl MultiLayerCache {
         Ok(results)
     }
 
+    /// Serve a distinct-key SSD-only batch without building the generic
+    /// unique-value and decode staging buffers. The output buffer already has
+    /// one position per key, so it is the natural place to keep decoded shared
+    /// values while uncommon metadata work is deferred.
+    fn try_get_shared_batch_ssd_only(
+        &self,
+        keys: &[CacheKey],
+        results: &mut [Option<Arc<[u8]>>],
+        now_millis: u64,
+    ) -> Result<bool, CacheError> {
+        let started = Instant::now();
+        let refill_started = Instant::now();
+        let (blocks, hit_epoch) = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if !inner.ssd_instance_only
+                || keys.iter().any(|key| inner.entry_expired(key, now_millis))
+            {
+                return Ok(false);
+            }
+            let candidate_keys = keys
+                .iter()
+                .collect::<SmallVec<[&CacheKey; INLINE_BATCH_KEYS]>>();
+            let blocks = inner.read_ssd_blocks(&candidate_keys)?;
+            let hit_epoch = CoarseClock::now_millis();
+            inner.reconfigure_refresh_window(hit_epoch);
+            (blocks, hit_epoch)
+        };
+
+        let mut disk_hits = 0u64;
+        let mut compressed_hits = 0u64;
+        for (position, block) in blocks.into_iter().enumerate() {
+            let Some(block) = block else {
+                continue;
+            };
+            compressed_hits = compressed_hits
+                .saturating_add(u64::from(is_encoded_compressed_block(&block)));
+            results[position] = Some(decode_cache_block_shared(&block)?);
+            disk_hits = disk_hits.saturating_add(1);
+        }
+        let misses = keys.len() as u64 - disk_hits;
+
+        let mut deferred = SmallVec::<[(usize, HitOutcome, usize); INLINE_BATCH_KEYS]>::new();
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (position, key) in keys.iter().enumerate() {
+                let Some(value) = results[position].as_ref() else {
+                    continue;
+                };
+                let outcome = inner.record_hit_shared_at(key, hit_epoch);
+                if !matches!(outcome, HitOutcome::Accounted) {
+                    deferred.push((position, outcome, value.len()));
+                }
+            }
+        }
+
+        self.read_counters
+            .disk_hits
+            .fetch_add(disk_hits, Ordering::Relaxed);
+        self.read_counters
+            .misses
+            .fetch_add(misses, Ordering::Relaxed);
+        self.read_counters
+            .shared_buffer_hits
+            .fetch_add(disk_hits, Ordering::Relaxed);
+        self.read_counters
+            .shared_buffer_misses
+            .fetch_add(misses, Ordering::Relaxed);
+        self.read_counters
+            .compressed_hits
+            .fetch_add(compressed_hits, Ordering::Relaxed);
+        let micros = elapsed_micros(started);
+        self.read_counters
+            .get_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters
+            .read_through_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters.refill_latency.observe_many_with_total(
+            elapsed_micros(refill_started),
+            disk_hits as usize,
+        );
+
+        if !deferred.is_empty() {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            for (position, outcome, len) in deferred {
+                let key = &keys[position];
+                match outcome {
+                    HitOutcome::Accounted => {}
+                    HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
+                    HitOutcome::NeedsMetadata => inner.record_hit(key, len),
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Batched shared reads into a caller-owned result buffer.
     ///
     /// This is the hot retrieval/scan variant: callers that issue many
@@ -4144,6 +4246,9 @@ impl MultiLayerCache {
         if !has_duplicates {
             self.emit_access_records(CacheAccessRecordKind::Get, keys.iter());
             if self.try_get_shared_resident_batch(keys, now_millis, results)? {
+                return Ok(());
+            }
+            if self.try_get_shared_batch_ssd_only(keys, results, now_millis)? {
                 return Ok(());
             }
         }
