@@ -4930,6 +4930,76 @@ impl MultiLayerCache {
         Ok(true)
     }
 
+    /// Serve a distinct-key batch resident entirely in PMEM and refill memory.
+    ///
+    /// PMEM values are immutable shared buffers, so the caller copies them
+    /// without holding the cache exclusively. Promotion then revalidates each
+    /// captured buffer before installing it in memory, preserving the same
+    /// overwrite and invalidation safety as a single-key PMEM read.
+    fn try_get_owned_batch_pmem_refill(
+        &self,
+        keys: &[CacheKey],
+        results: &mut [Option<Vec<u8>>],
+        now_millis: u64,
+    ) -> Result<bool, CacheError> {
+        let started = Instant::now();
+        let refill_started = Instant::now();
+        let values = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            if inner.ssd_instance_only {
+                return Ok(false);
+            }
+            let mut values = SmallVec::<[Arc<[u8]>; INLINE_BATCH_KEYS]>::new();
+            for key in keys {
+                if inner.entry_expired(key, now_millis) || inner.memory.contains_key(key) {
+                    return Ok(false);
+                }
+                let Some(value) = inner.pmem_value(key) else {
+                    return Ok(false);
+                };
+                if !inner.pmem_should_refill_memory(value.len()) {
+                    return Ok(false);
+                }
+                values.push(Arc::clone(value));
+            }
+            values
+        };
+
+        for (result, value) in results.iter_mut().zip(values.iter()) {
+            fill_owned_batch_position(result, value.as_ref());
+        }
+
+        {
+            let mut inner = self.inner.write().expect("cache lock poisoned");
+            if !inner.started {
+                return Err(CacheError::Stopped);
+            }
+            for (key, value) in keys.iter().zip(values.iter()) {
+                inner.promote_pmem_probe_if_current(key, value);
+            }
+        }
+
+        self.read_counters
+            .pmem_hits
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let micros = elapsed_micros(started);
+        self.read_counters
+            .get_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters
+            .read_through_latency
+            .observe_many_with_total(micros, keys.len());
+        self.read_counters.refill_latency.observe_many_with_total(
+            elapsed_micros(refill_started),
+            keys.len(),
+        );
+        self.drain_eviction_records();
+        Ok(true)
+    }
+
     fn try_get_shared_resident_batch(
         &self,
         keys: &[CacheKey],
@@ -5417,10 +5487,13 @@ impl MultiLayerCache {
         if self.try_get_memory_batch(keys, now_millis, results)? {
             return Ok(());
         }
-        if !has_duplicate_batch_keys(keys)
-            && self.try_get_owned_batch_ssd_refill(keys, results, now_millis)?
-        {
-            return Ok(());
+        if !has_duplicate_batch_keys(keys) {
+            if self.try_get_owned_batch_pmem_refill(keys, results, now_millis)? {
+                return Ok(());
+            }
+            if self.try_get_owned_batch_ssd_refill(keys, results, now_millis)? {
+                return Ok(());
+            }
         }
 
         // The memory hits are served under a *shared* lock, the way a single
