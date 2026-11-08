@@ -9885,9 +9885,9 @@ impl ShardedMultiLayerCache {
         keys: &[CacheKey],
         results: &mut Vec<Option<Vec<u8>>>,
     ) -> Result<(), CacheError> {
-        results.clear();
         let started = Instant::now();
         if keys.is_empty() {
+            results.clear();
             self.sharded_stats.record_latency(started);
             return Ok(());
         }
@@ -9898,9 +9898,65 @@ impl ShardedMultiLayerCache {
             return result;
         }
 
-        let values = self.get_batch(keys)?;
-        results.reserve(values.len());
-        results.extend(values);
+        results.truncate(keys.len());
+        results.resize_with(keys.len(), || None);
+        let groups = self.group_keys_by_shard(keys);
+        if keys.len() < Self::READ_BATCH_FANOUT_THRESHOLD {
+            self.sharded_stats.record_local();
+            for (shard_index, group) in groups.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let mut shard_keys = Vec::with_capacity(group.len());
+                let mut positions = Vec::with_capacity(group.len());
+                let mut shard_values = Vec::with_capacity(group.len());
+                for (position, key) in group {
+                    shard_keys.push(key.clone());
+                    positions.push(position);
+                    shard_values.push(results[position].take());
+                }
+                self.shards[shard_index].get_batch_into(&shard_keys, &mut shard_values)?;
+                for (position, value) in positions.into_iter().zip(shard_values) {
+                    results[position] = value;
+                }
+            }
+            self.sharded_stats.record_latency(started);
+            return Ok(());
+        }
+
+        let fanout = groups.iter().filter(|group| !group.is_empty()).count();
+        self.sharded_stats.record_fanout(fanout);
+        let executor = self.batch_executor();
+        let mut workers = Vec::with_capacity(fanout);
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_index].clone();
+            let mut shard_keys = Vec::with_capacity(group.len());
+            let mut positions = Vec::with_capacity(group.len());
+            let mut shard_values = Vec::with_capacity(group.len());
+            for (position, key) in group {
+                shard_keys.push(key.clone());
+                positions.push(position);
+                shard_values.push(results[position].take());
+            }
+            workers.push(executor.submit(move || {
+                shard.get_batch_into(&shard_keys, &mut shard_values)?;
+                Ok::<_, CacheError>((positions, shard_values))
+            }));
+        }
+        for worker in workers {
+            let (positions, shard_values) = worker.try_join().ok_or_else(|| {
+                CacheError::CorruptBlock(
+                    "sharded cache batch get-into worker panicked".to_string(),
+                )
+            })??;
+            for (position, value) in positions.into_iter().zip(shard_values) {
+                results[position] = value;
+            }
+        }
+        self.sharded_stats.record_latency(started);
         Ok(())
     }
 
