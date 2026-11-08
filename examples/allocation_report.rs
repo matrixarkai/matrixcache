@@ -171,6 +171,16 @@ fn main() {
             .expect("acquire_batch_no_promotion");
         cache.release_batch(handles.into_iter().flatten().collect());
     }));
+    rows.push(measure(
+        "acquire_batch_no_promotion, 64 resident",
+        MEDIUM_BATCH,
+        || {
+            let handles = cache
+                .acquire_batch_no_promotion(&medium_batch)
+                .expect("medium acquire_batch_no_promotion");
+            cache.release_batch_iter(handles.into_iter().flatten());
+        },
+    ));
     rows.push(measure("acquire_batch", BATCH, || {
         let handles = cache.acquire_batch(&batch).expect("acquire_batch");
         cache.release_batch(handles.into_iter().flatten().collect());
@@ -515,6 +525,7 @@ fn main() {
         "get_shared_batch_into, resident",
         "get_shared_batch_into, 64 resident",
         "acquire_batch_no_promotion",
+        "acquire_batch_no_promotion, 64 resident",
         "acquire_batch",
         "acquire_batch, 2 duplicated",
     ] {
@@ -560,9 +571,10 @@ fn main() {
         ("get_shared_batch", 2.5, 500.0),
         ("get_shared_batch_into, resident", 0.5, 128.0),
         ("get_shared_batch_into, 64 resident", 0.5, 128.0),
-        ("acquire_batch_no_promotion", 4.5, 2_500.0),
-        ("acquire_batch", 4.5, 2_600.0),
-        ("acquire_batch, 2 duplicated", 6.5, 3_800.0),
+        ("acquire_batch_no_promotion", 2.5, 1_700.0),
+        ("acquire_batch_no_promotion, 64 resident", 1.5, 8_000.0),
+        ("acquire_batch", 2.5, 1_700.0),
+        ("acquire_batch, 2 duplicated", 4.5, 2_700.0),
         ("put, overwriting", 2.5, 2_200.0),
         ("put, evicting", 6.5, 20_500.0),
         ("get, promoting from a lower tier", 4.5, 2_300.0),
