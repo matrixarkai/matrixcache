@@ -24,9 +24,11 @@ invalidation, and asynchronous writeback with backpressure accounting.
   priority scheduling, queued-task expiration, runtime worker resizing, and
   validated CPU placement for every persistent worker, including workers added
   by later resizing. PMEM writer pools automatically use the CPUs available to
-  their NUMA node. Live pool and queue statistics report placement success.
-  Shutdown can either drain accepted work or cancel queued work while allowing
-  active tasks to finish.
+  their NUMA node. Shared common and collection pools release idle workers and
+  recreate them as queued work arrives; NUMA-bound writer pools remain fixed.
+  Live pool and queue statistics report placement success. Shutdown can either
+  drain accepted work or cancel queued work while allowing active tasks to
+  finish.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
 

@@ -1543,12 +1543,15 @@ pub type PoolBasedMemoryAllocator = PoolBasedMemoryAllocatorBase;
 pub type PoolBasedMemoryAllocatorDram = PoolBasedMemoryAllocatorBase;
 pub type PoolBasedMemoryAllocatorPmem = PoolBasedMemoryAllocatorBase;
 
+pub const CACHE_EXECUTOR_DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
+
 pub struct CacheExecutorHandle {
     name: String,
     numa_id: Option<usize>,
     runtime: Arc<CacheExecutorRuntime>,
     metrics: Arc<CacheExecutorMetrics>,
     next_worker_id: std::sync::atomic::AtomicUsize,
+    worker_spawn_lock: Mutex<()>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -1595,7 +1598,10 @@ struct CacheExecutorQueue {
     jobs: std::collections::BinaryHeap<CacheExecutorJob>,
     capacity: usize,
     desired_workers: usize,
+    minimum_workers: usize,
     live_workers: usize,
+    dynamic_workers: bool,
+    idle_timeout: Duration,
     next_sequence: u64,
     shutting_down: bool,
     cpu_affinity: Vec<usize>,
@@ -1664,14 +1670,73 @@ impl CacheExecutorHandle {
         numa_id: Option<usize>,
         queue_capacity: usize,
     ) -> Self {
+        Self::with_runtime_options(
+            name,
+            thread_count,
+            numa_id,
+            queue_capacity,
+            false,
+            thread_count.max(1),
+            Duration::from_millis(CACHE_EXECUTOR_DEFAULT_IDLE_TIMEOUT_MS),
+        )
+    }
+
+    pub fn new_dynamic(
+        name: impl Into<String>,
+        thread_count: usize,
+        numa_id: Option<usize>,
+        idle_timeout: Duration,
+    ) -> Self {
+        let thread_count = thread_count.max(1);
+        Self::with_dynamic_queue_capacity(
+            name,
+            thread_count,
+            numa_id,
+            thread_count.saturating_mul(4).max(1),
+            idle_timeout,
+        )
+    }
+
+    pub fn with_dynamic_queue_capacity(
+        name: impl Into<String>,
+        thread_count: usize,
+        numa_id: Option<usize>,
+        queue_capacity: usize,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self::with_runtime_options(
+            name,
+            thread_count,
+            numa_id,
+            queue_capacity,
+            true,
+            0,
+            idle_timeout,
+        )
+    }
+
+    fn with_runtime_options(
+        name: impl Into<String>,
+        thread_count: usize,
+        numa_id: Option<usize>,
+        queue_capacity: usize,
+        dynamic_workers: bool,
+        minimum_workers: usize,
+        idle_timeout: Duration,
+    ) -> Self {
         let name = name.into();
         let thread_count = thread_count.max(1);
+        let minimum_workers = minimum_workers.min(thread_count);
+        let idle_timeout = idle_timeout.max(Duration::from_millis(1));
         let runtime = Arc::new(CacheExecutorRuntime {
             queue: Mutex::new(CacheExecutorQueue {
                 jobs: std::collections::BinaryHeap::new(),
                 capacity: queue_capacity.max(1),
                 desired_workers: thread_count,
+                minimum_workers,
                 live_workers: 0,
+                dynamic_workers,
+                idle_timeout,
                 next_sequence: 0,
                 shutting_down: false,
                 cpu_affinity: Vec::new(),
@@ -1689,9 +1754,10 @@ impl CacheExecutorHandle {
             runtime,
             metrics,
             next_worker_id: std::sync::atomic::AtomicUsize::new(0),
+            worker_spawn_lock: Mutex::new(()),
             workers: Mutex::new(Vec::with_capacity(thread_count)),
         };
-        handle.spawn_workers(thread_count);
+        handle.spawn_workers(minimum_workers);
         if let Some(numa_id) = numa_id {
             let cpu_ids = Self::cpu_ids_for_numa_node(numa_id).unwrap_or_else(|error| {
                 panic!("cache executor NUMA placement is invalid: {error}")
@@ -1704,6 +1770,27 @@ impl CacheExecutorHandle {
     }
 
     fn spawn_workers(&self, count: usize) {
+        let _spawn_guard = self
+            .worker_spawn_lock
+            .lock()
+            .expect("executor worker spawn lock poisoned");
+        self.spawn_workers_locked(count);
+    }
+
+    fn spawn_workers_locked(&self, count: usize) {
+        let count = {
+            let queue = self
+                .runtime
+                .queue
+                .lock()
+                .expect("executor queue lock poisoned");
+            assert!(!queue.shutting_down, "cache executor is shutting down");
+            count.min(queue.desired_workers.saturating_sub(queue.live_workers))
+        };
+        self.workers
+            .lock()
+            .expect("executor worker lock poisoned")
+            .retain(|worker| !worker.is_finished());
         for _ in 0..count {
             let worker_index = self
                 .next_worker_id
@@ -1772,10 +1859,29 @@ impl CacheExecutorHandle {
                         runtime.queue_space.notify_one();
                         break job;
                     }
-                    queue = runtime
-                        .work_ready
-                        .wait(queue)
-                        .expect("executor queue lock poisoned while waiting");
+                    if queue.dynamic_workers && queue.live_workers > queue.minimum_workers {
+                        let idle_timeout = queue.idle_timeout;
+                        let (waiting_queue, wait_result) = runtime
+                            .work_ready
+                            .wait_timeout(queue, idle_timeout)
+                            .expect("executor queue lock poisoned while waiting");
+                        queue = waiting_queue;
+                        if wait_result.timed_out()
+                            && queue.jobs.is_empty()
+                            && !queue.shutting_down
+                            && queue.live_workers > queue.minimum_workers
+                        {
+                            queue.live_workers -= 1;
+                            queue.affinity_workers.remove(&worker_index);
+                            runtime.state_changed.notify_all();
+                            return;
+                        }
+                    } else {
+                        queue = runtime
+                            .work_ready
+                            .wait(queue)
+                            .expect("executor queue lock poisoned while waiting");
+                    }
                 }
             };
 
@@ -1815,7 +1921,37 @@ impl CacheExecutorHandle {
         job.sequence = queue.next_sequence;
         queue.next_sequence = queue.next_sequence.wrapping_add(1);
         queue.jobs.push(job);
+        let should_scale = queue.dynamic_workers && queue.live_workers < queue.desired_workers;
         self.runtime.work_ready.notify_one();
+        drop(queue);
+        if should_scale {
+            self.ensure_dynamic_worker_for_pending_work();
+        }
+    }
+
+    fn ensure_dynamic_worker_for_pending_work(&self) {
+        let _spawn_guard = self
+            .worker_spawn_lock
+            .lock()
+            .expect("executor worker spawn lock poisoned");
+        let spawn_count = {
+            let queue = self
+                .runtime
+                .queue
+                .lock()
+                .expect("executor queue lock poisoned");
+            if !queue.dynamic_workers || queue.shutting_down {
+                0
+            } else {
+                usize::from(
+                    queue.live_workers < queue.desired_workers
+                        && !queue.jobs.is_empty(),
+                )
+            }
+        };
+        if spawn_count > 0 {
+            self.spawn_workers_locked(spawn_count);
+        }
     }
 
     pub fn add<F>(&self, func: F)
@@ -2027,7 +2163,7 @@ impl CacheExecutorHandle {
 
     pub fn resize(&self, thread_count: usize) {
         let thread_count = thread_count.max(1);
-        let current = {
+        let (current, spawn_count) = {
             let mut queue = self
                 .runtime
                 .queue
@@ -2036,10 +2172,20 @@ impl CacheExecutorHandle {
             assert!(!queue.shutting_down, "cache executor is shutting down");
             let current = queue.desired_workers;
             queue.desired_workers = thread_count;
-            current
+            let spawn_count = if thread_count > current {
+                let available = thread_count.saturating_sub(queue.live_workers);
+                if queue.dynamic_workers {
+                    available.min(queue.jobs.len())
+                } else {
+                    available
+                }
+            } else {
+                0
+            };
+            (current, spawn_count)
         };
-        if thread_count > current {
-            self.spawn_workers(thread_count - current);
+        if spawn_count > 0 {
+            self.spawn_workers(spawn_count);
         } else if thread_count < current {
             self.runtime.work_ready.notify_all();
         }
@@ -2060,6 +2206,22 @@ impl CacheExecutorHandle {
             .lock()
             .expect("executor queue lock poisoned")
             .capacity
+    }
+
+    pub fn uses_dynamic_workers(&self) -> bool {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .dynamic_workers
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        self.runtime
+            .queue
+            .lock()
+            .expect("executor queue lock poisoned")
+            .idle_timeout
     }
 
     pub fn available_cpu_ids() -> Vec<usize> {
@@ -2460,10 +2622,11 @@ impl CacheExecutor {
         if let Some(executor) = state.common_executor.as_ref() {
             return Arc::clone(executor);
         }
-        let executor = Arc::new(CacheExecutorHandle::new(
+        let executor = Arc::new(CacheExecutorHandle::new_dynamic(
             "CacheCommonThreadPool",
             state.config.common_executor_num_threads,
             None,
+            Duration::from_millis(CACHE_EXECUTOR_DEFAULT_IDLE_TIMEOUT_MS),
         ));
         state.common_executor = Some(Arc::clone(&executor));
         executor
@@ -2476,10 +2639,11 @@ impl CacheExecutor {
         if let Some(executor) = state.gc_executor.as_ref() {
             return Arc::clone(executor);
         }
-        let executor = Arc::new(CacheExecutorHandle::new(
+        let executor = Arc::new(CacheExecutorHandle::new_dynamic(
             "CacheGCThreadPool",
             state.config.num_gc_workers,
             None,
+            Duration::from_millis(CACHE_EXECUTOR_DEFAULT_IDLE_TIMEOUT_MS),
         ));
         state.gc_executor = Some(Arc::clone(&executor));
         executor

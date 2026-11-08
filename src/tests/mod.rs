@@ -17293,6 +17293,7 @@ mod tests {
         assert!(Arc::ptr_eq(&common, &common_again));
         assert_eq!(common.name(), "CacheCommonThreadPool");
         assert_eq!(common.thread_count(), 3);
+        assert!(common.uses_dynamic_workers());
 
         let ran = Arc::new(std::sync::Mutex::new(false));
         let ran_capture = Arc::clone(&ran);
@@ -17308,6 +17309,7 @@ mod tests {
         let gc = CacheExecutor::GetGCExecutor();
         assert_eq!(gc.name(), "CacheGCThreadPool");
         assert_eq!(gc.thread_count(), 2);
+        assert!(gc.uses_dynamic_workers());
         assert!(!Arc::ptr_eq(&common, &gc));
     }
 
@@ -17431,6 +17433,77 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(executor.active_thread_count(), 1);
+    }
+
+    #[test]
+    fn cache_executor_dynamic_workers_retire_and_restart_under_load() {
+        fn wait_for_workers(executor: &CacheExecutorHandle, expected: usize) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while executor.active_thread_count() != expected && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(executor.active_thread_count(), expected);
+        }
+
+        let executor = CacheExecutorHandle::new_dynamic(
+            "dynamic-worker",
+            2,
+            None,
+            Duration::from_millis(20),
+        );
+        assert!(executor.uses_dynamic_workers());
+        assert_eq!(executor.thread_count(), 2);
+        wait_for_workers(&executor, 0);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first = executor.submit(move || {
+            first_barrier.wait();
+            std::thread::current().name().unwrap().to_string()
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = executor.submit(move || {
+            second_barrier.wait();
+            std::thread::current().name().unwrap().to_string()
+        });
+        barrier.wait();
+        assert_ne!(first.join(), second.join());
+        assert_eq!(executor.completed_tasks(), 2);
+        wait_for_workers(&executor, 0);
+    }
+
+    #[test]
+    fn cache_executor_dynamic_resize_expands_for_pending_work_and_shrinks() {
+        let executor = CacheExecutorHandle::new_dynamic(
+            "dynamic-resize-worker",
+            1,
+            None,
+            Duration::from_secs(5),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let barrier = Arc::clone(&barrier);
+            tasks.push(executor.submit(move || {
+                barrier.wait();
+                std::thread::current().name().unwrap().to_string()
+            }));
+        }
+        executor.resize(3);
+        barrier.wait();
+        let worker_names = tasks
+            .into_iter()
+            .map(CacheExecutorTask::join)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(worker_names.len(), 3);
+
+        executor.resize(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while executor.active_thread_count() != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(executor.active_thread_count(), 1);
+        assert_eq!(executor.thread_count(), 1);
     }
 
     #[test]
@@ -17684,6 +17757,7 @@ mod tests {
         for (numa_id, executor) in pmem.iter().enumerate() {
             assert_eq!(executor.numa_id(), Some(numa_id));
             assert_eq!(executor.thread_count(), 5);
+            assert!(!executor.uses_dynamic_workers());
             assert_eq!(
                 executor.cpu_affinity(),
                 CacheExecutorHandle::cpu_ids_for_numa_node(numa_id).unwrap()
