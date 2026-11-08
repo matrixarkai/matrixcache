@@ -230,7 +230,7 @@ fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
         CacheTieringPolicy {
             memory_capacity_bytes: 128,
             pmem_capacity_bytes: 128,
-            ssd_capacity_bytes: 4096,
+            ssd_capacity_bytes: 64 << 20,
             ..CacheTieringPolicy::default()
         },
         CacheBlockOptions {
@@ -239,7 +239,7 @@ fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
         },
     );
     cache.set_ssd_instance_only(true);
-    let keys = (0..4)
+    let keys = (0..64)
         .map(|index| CacheKey::string(0, &format!("ssd-only-{index}")))
         .collect::<Vec<_>>();
     for (index, key) in keys.iter().enumerate() {
@@ -301,20 +301,73 @@ fn ssd_only_shared_reads_stay_on_the_shared_lock_path() {
     assert_eq!(after.memory_fills, before.memory_fills);
     assert_eq!(after.pmem_fills, before.pmem_fills);
     assert_eq!(after.refill_failures, before.refill_failures);
-    assert_eq!(after.disk_hits - before.disk_hits, 5);
-    assert_eq!(after.compressed_hits - before.compressed_hits, 5);
-    assert_eq!(after.get_latency_samples - before.get_latency_samples, 5);
+    assert_eq!(after.disk_hits - before.disk_hits, 65);
+    assert_eq!(after.compressed_hits - before.compressed_hits, 65);
+    assert_eq!(after.get_latency_samples - before.get_latency_samples, 65);
     assert_eq!(
         after.read_through_latency_samples - before.read_through_latency_samples,
-        5
+        65
     );
     assert_eq!(
         after.refill_latency_samples - before.refill_latency_samples,
-        5
+        65
     );
     assert!(keys
         .iter()
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Ssd)));
+}
+
+// rust-internal: the SSD-only shared fast path preserves mixed results and counters.
+#[test]
+fn ssd_only_shared_batch_preserves_mixed_results_and_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(0, 0, 64 << 20)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_ssd_instance_only(true),
+    );
+    let keys = (0..8)
+        .map(|index| CacheKey::string(0, &format!("ssd-only-shared-mixed-{index}")))
+        .collect::<Vec<_>>();
+    for index in (0..keys.len()).step_by(2) {
+        cache
+            .put(keys[index].clone(), vec![index as u8; 64])
+            .unwrap();
+    }
+
+    let _ = cache.get_shared_batch(&keys).unwrap();
+    let before = cache.stats();
+    let results = std::thread::scope(|scope| {
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache = &cache;
+        let keys = &keys;
+        let worker = scope.spawn(move || sender.send(cache.get_shared_batch(keys)).unwrap());
+        let results = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        results
+    })
+    .expect("SSD-only mixed shared batch requested the write lock")
+    .unwrap();
+
+    for (index, value) in results.iter().enumerate() {
+        assert_eq!(value.is_some(), index % 2 == 0);
+    }
+    let after = cache.stats();
+    assert_eq!(after.disk_hits - before.disk_hits, 4);
+    assert_eq!(after.misses - before.misses, 4);
+    assert_eq!(after.shared_buffer_hits - before.shared_buffer_hits, 4);
+    assert_eq!(after.shared_buffer_misses - before.shared_buffer_misses, 4);
+    assert_eq!(after.get_latency_samples - before.get_latency_samples, 8);
+    assert_eq!(
+        after.read_through_latency_samples - before.read_through_latency_samples,
+        8
+    );
+    assert_eq!(
+        after.refill_latency_samples - before.refill_latency_samples,
+        4
+    );
 }
 
 // rust-internal: warm SSD-only owned reads need no exclusive cache ownership.
