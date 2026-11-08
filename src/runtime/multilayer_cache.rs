@@ -1807,6 +1807,7 @@ struct CacheInner {
     next_reconfigure_millis: AtomicU64,
     async_writeback_queue_bytes: u64,
     max_async_writeback_queue: usize,
+    max_async_writeback_queue_bytes: Option<u64>,
     access_record_callback: Option<CacheAccessRecordCallback>,
     eviction_callback: Option<CacheEvictionCallback>,
     eviction_handler_enabled: bool,
@@ -2853,6 +2854,10 @@ impl MultiLayerCache {
         cache.set_ssd_instance_only(options.cache_ssd_instance_only);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
+        cache.set_async_writeback_limits(
+            options.async_writeback_queue_capacity,
+            options.async_writeback_queue_bytes,
+        );
         cache
             .inner
             .write()
@@ -2938,6 +2943,7 @@ impl MultiLayerCache {
                 next_reconfigure_millis: AtomicU64::new(0),
                 async_writeback_queue_bytes: 0,
                 max_async_writeback_queue: 1024,
+                max_async_writeback_queue_bytes: Some(64 * 1024 * 1024),
                 access_record_callback: None,
                 eviction_callback: None,
                 eviction_handler_enabled: true,
@@ -7566,21 +7572,35 @@ impl MultiLayerCache {
             let head = inner.async_writeback_head;
             if let Some(sequence) = inner.async_writeback_positions.get(&key).copied() {
                 let index = sequence.checked_sub(head).map(|offset| offset as usize);
-                if let Some(existing) =
-                    index.and_then(|index| inner.async_writeback_queue.get_mut(index))
-                {
-                    let old_len = existing.value.len() as u64;
-                    existing.value = value;
-                    inner.async_writeback_queue_bytes = inner
+                if let Some((index, old_len)) = index.and_then(|index| {
+                    inner
+                        .async_writeback_queue
+                        .get(index)
+                        .map(|existing| (index, existing.value.len() as u64))
+                }) {
+                    let next_bytes = inner
                         .async_writeback_queue_bytes
                         .saturating_sub(old_len)
                         .saturating_add(value_len);
-                    enqueued = enqueued.saturating_add(1);
+                    if inner
+                        .max_async_writeback_queue_bytes
+                        .is_none_or(|limit| next_bytes <= limit || value_len < old_len)
+                    {
+                        inner.async_writeback_queue[index].value = value;
+                        inner.async_writeback_queue_bytes = next_bytes;
+                        enqueued = enqueued.saturating_add(1);
+                    } else {
+                        rejected.push(CacheWritebackJob { key, value });
+                    }
                 } else {
                     inner.async_writeback_positions.remove(&key);
                     rejected.push(CacheWritebackJob { key, value });
                 }
-            } else if inner.async_writeback_queue.len() < inner.max_async_writeback_queue {
+            } else if inner.async_writeback_queue.len() < inner.max_async_writeback_queue
+                && inner.max_async_writeback_queue_bytes.is_none_or(|limit| {
+                    inner.async_writeback_queue_bytes.saturating_add(value_len) <= limit
+                })
+            {
                 let sequence =
                     inner.async_writeback_head + inner.async_writeback_queue.len() as u64;
                 inner.async_writeback_queue.push_back(CacheWritebackJob {
@@ -7740,8 +7760,52 @@ impl MultiLayerCache {
     }
 
     pub fn set_async_writeback_queue_limit_for_test(&self, limit: usize) {
+        let max_bytes = self.async_writeback_limits().1;
+        self.set_async_writeback_limits(limit, max_bytes);
+    }
+
+    /// Configure the pending asynchronous write-back queue.
+    ///
+    /// An entry limit of zero disables queueing. A byte limit of zero leaves
+    /// queued payload bytes unlimited while retaining the entry limit.
+    pub fn set_async_writeback_limits(&self, max_entries: usize, max_bytes: u64) {
+        self.set_async_writeback_limits_raw(
+            max_entries,
+            if max_bytes == 0 {
+                None
+            } else {
+                Some(max_bytes)
+            },
+        );
+    }
+
+    fn set_async_writeback_limits_raw(&self, max_entries: usize, max_bytes: Option<u64>) {
         let mut inner = self.inner.write().expect("cache lock poisoned");
-        inner.max_async_writeback_queue = limit;
+        inner.max_async_writeback_queue = max_entries;
+        inner.max_async_writeback_queue_bytes = max_bytes;
+    }
+
+    pub fn async_writeback_limits(&self) -> (usize, u64) {
+        let (max_entries, max_bytes) = self.async_writeback_limits_raw();
+        (max_entries, max_bytes.unwrap_or(0))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SetAsyncWritebackLimits(&self, max_entries: usize, max_bytes: u64) {
+        self.set_async_writeback_limits(max_entries, max_bytes);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn AsyncWritebackLimits(&self) -> (usize, u64) {
+        self.async_writeback_limits()
+    }
+
+    fn async_writeback_limits_raw(&self) -> (usize, Option<u64>) {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        (
+            inner.max_async_writeback_queue,
+            inner.max_async_writeback_queue_bytes,
+        )
     }
 
     pub fn record_compaction_latency_micros(&self, micros: u64) {
@@ -8811,16 +8875,22 @@ impl ShardedMultiLayerCache {
 
     pub fn with_options(options: CacheOptions, shard_count: usize) -> Self {
         let shard_count = shard_count.max(1);
+        let async_writeback_limits = (
+            options.async_writeback_queue_capacity,
+            options.async_writeback_queue_bytes,
+        );
         let shards = (0..shard_count)
             .map(|index| {
                 MultiLayerCache::with_options(Self::options_for_shard(&options, shard_count, index))
             })
             .collect::<Vec<_>>();
-        Self {
+        let cache = Self {
             shards: Arc::new(shards),
             sharded_stats: Arc::new(ShardedBatchStats::default()),
             batch_executor: Arc::new(OnceLock::new()),
-        }
+        };
+        cache.set_async_writeback_limits(async_writeback_limits.0, async_writeback_limits.1);
+        cache
     }
 
     pub fn new(options: CacheOptions, shard_count: usize) -> Self {
@@ -8831,6 +8901,13 @@ impl ShardedMultiLayerCache {
         let base = total / shard_count;
         let remainder = total % shard_count;
         base.saturating_add(usize::from(index < remainder))
+    }
+
+    fn split_capacity_u64(total: u64, shard_count: usize, index: usize) -> u64 {
+        let shard_count = shard_count as u64;
+        let base = total / shard_count;
+        let remainder = total % shard_count;
+        base.saturating_add(u64::from((index as u64) < remainder))
     }
 
     fn options_for_shard(options: &CacheOptions, shard_count: usize, index: usize) -> CacheOptions {
@@ -8997,9 +9074,54 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn set_async_writeback_queue_limit_for_test(&self, limit: usize) {
-        for shard in self.shards.iter() {
-            shard.set_async_writeback_queue_limit_for_test(limit);
+        let max_bytes = self.async_writeback_limits().1;
+        self.set_async_writeback_limits(limit, max_bytes);
+    }
+
+    pub fn set_async_writeback_limits(&self, max_entries: usize, max_bytes: u64) {
+        let shard_count = self.shard_count();
+        for (index, shard) in self.shards.iter().enumerate() {
+            let shard_entries = Self::split_capacity(max_entries, shard_count, index);
+            let shard_bytes = if max_bytes == 0 {
+                0
+            } else {
+                Self::split_capacity_u64(max_bytes, shard_count, index)
+            };
+            shard.set_async_writeback_limits_raw(
+                shard_entries,
+                if max_bytes == 0 {
+                    None
+                } else {
+                    Some(shard_bytes)
+                },
+            );
         }
+    }
+
+    pub fn async_writeback_limits(&self) -> (usize, u64) {
+        let mut total_entries = 0usize;
+        let mut total_bytes = 0u64;
+        let mut unlimited_bytes = false;
+        for shard in self.shards.iter() {
+            let limits = shard.async_writeback_limits_raw();
+            total_entries = total_entries.saturating_add(limits.0);
+            if let Some(limit) = limits.1 {
+                total_bytes = total_bytes.saturating_add(limit);
+            } else {
+                unlimited_bytes = true;
+            }
+        }
+        (total_entries, if unlimited_bytes { 0 } else { total_bytes })
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SetAsyncWritebackLimits(&self, max_entries: usize, max_bytes: u64) {
+        self.set_async_writeback_limits(max_entries, max_bytes);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn AsyncWritebackLimits(&self) -> (usize, u64) {
+        self.async_writeback_limits()
     }
 
     pub fn enqueue_async_writeback(
@@ -11840,7 +11962,8 @@ impl CacheInner {
         //   `pmem_manifest_appends`, `pmem_manifest_compact_after`, `ssd_probe_epoch`,
         //   `ssd_probe_global_epoch`, `ssd_probe_mutations`,
         //   `async_writeback_head`, `async_writeback_queue_bytes`,
-        //   `max_async_writeback_queue`, `lru_refresh_floor_millis`,
+        //   `max_async_writeback_queue`, `max_async_writeback_queue_bytes`,
+        //   `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
         //   `next_reconfigure_millis`, `eviction_handler_enabled`,
         //   `ssd_instance_only`, `legacy_block_files_possible`, `cold_eviction_share_pct`,
