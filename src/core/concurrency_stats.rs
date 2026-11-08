@@ -198,6 +198,68 @@ pub struct CacheKey {
     pub selector: std::borrow::Cow<'static, str>,
 }
 
+/// Reusable shard and segment identity for a batch of page keys.
+///
+/// Page selectors vary by offset, length, routing slot and generation, while every page in one
+/// segment carries the same allocated record key. Keeping that shared half here lets batch callers
+/// allocate it once and clone only its `Arc` for each page.
+#[derive(Debug, Clone)]
+pub struct PageCacheKeyPrefix {
+    shard_id: ShardId,
+    record_key: std::sync::Arc<str>,
+}
+
+impl PageCacheKeyPrefix {
+    pub fn new(shard_id: ShardId, page_segment_id: u64) -> Self {
+        Self {
+            shard_id,
+            record_key: std::sync::Arc::from(segment_record_key(page_segment_id).as_str()),
+        }
+    }
+
+    pub fn key(&self, offset: u64, length: u64) -> CacheKey {
+        self.key_with_slot(offset, length, None)
+    }
+
+    pub fn key_with_slot(
+        &self,
+        offset: u64,
+        length: u64,
+        routing_slot: Option<u32>,
+    ) -> CacheKey {
+        CacheKey {
+            shard_id: self.shard_id,
+            record_key: std::sync::Arc::clone(&self.record_key),
+            namespace: std::borrow::Cow::Borrowed("page"),
+            selector: std::borrow::Cow::Owned(page_selector(
+                routing_slot,
+                None,
+                offset,
+                length,
+            )),
+        }
+    }
+
+    pub fn key_with_slot_generation(
+        &self,
+        offset: u64,
+        length: u64,
+        routing_slot: Option<u32>,
+        generation: Option<u64>,
+    ) -> CacheKey {
+        let selector = match generation {
+            Some(generation) => page_selector(routing_slot, Some(generation), offset, length),
+            None => page_selector(routing_slot, None, offset, length),
+        };
+        CacheKey {
+            shard_id: self.shard_id,
+            record_key: std::sync::Arc::clone(&self.record_key),
+            namespace: std::borrow::Cow::Borrowed("page"),
+            selector: std::borrow::Cow::Owned(selector),
+        }
+    }
+}
+
 /// `segment-00000000000000000008`, built directly.
 ///
 /// `format!` allocates twice here: once for the returned String and once inside the padded-integer
