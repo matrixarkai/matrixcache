@@ -1636,6 +1636,7 @@ pub struct MultiLayerCache {
     read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
     cold_tier_migration_worker: Arc<Mutex<Option<CacheColdTierMigrationWorker>>>,
+    ssd_recovery_worker: Arc<Mutex<Option<CacheSsdRecoveryWorker>>>,
     async_writeback_jobs_per_round: Arc<AtomicU64>,
     async_writeback_interval_millis: Arc<AtomicU64>,
     async_promotion_worker: Arc<Mutex<Option<CacheAsyncPromotionWorker>>>,
@@ -1740,6 +1741,8 @@ impl AsRef<[u8]> for PmemResident {
 struct CacheInner {
     started: bool,
     auto_recover_on_start: bool,
+    ssd_recover_in_background: bool,
+    ssd_recovery_batch_size: usize,
     /// Whether an SSD block write also survives a machine crash. See
     /// [`CacheOptions::ssd_block_durability`].
     ssd_block_durability: bool,
@@ -2675,6 +2678,17 @@ impl SsdTierStore {
             Self::Multi(storage) => storage.recover_view_data(callback),
         }
     }
+
+    fn visit_recovery_view_data<F>(&self, callback: &mut F) -> Result<(), CacheError>
+    where
+        F: FnMut(&str, StringViewBuffer) -> bool,
+    {
+        match self {
+            Self::Disabled { .. } => Ok(()),
+            Self::Single(storage) => storage.visit_recovery_view_data(callback),
+            Self::Multi(storage) => storage.visit_recovery_view_data(callback),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2869,9 +2883,15 @@ impl MultiLayerCache {
             ));
         }
         let auto_recover_on_start = options.auto_recover_on_start;
+        let ssd_recover_in_background = options.ssd_recover_in_background;
         let cache = Self::build_with_options(options);
         if auto_recover_on_start {
-            cache.recover_persistent_tiers()?;
+            if ssd_recover_in_background {
+                cache.recover_pmem_index()?;
+                cache.start_configured_ssd_recovery_worker()?;
+            } else {
+                cache.recover_persistent_tiers()?;
+            }
         }
         Ok(cache)
     }
@@ -2899,6 +2919,8 @@ impl MultiLayerCache {
         cache.set_ssd_instance_only(options.cache_ssd_instance_only);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
+        cache.set_ssd_recovery_in_background(options.ssd_recover_in_background);
+        cache.set_ssd_recovery_batch_size(options.ssd_recovery_batch_size);
         cache.set_async_writeback_limits(
             options.async_writeback_queue_capacity,
             options.async_writeback_queue_bytes,
@@ -2953,6 +2975,8 @@ impl MultiLayerCache {
             inner: Arc::new(RwLock::new(CacheInner {
                 started: true,
                 auto_recover_on_start: false,
+                ssd_recover_in_background: false,
+                ssd_recovery_batch_size: default_ssd_recovery_batch_size(),
                 ssd_block_durability: true,
                 pmem_block_durability: false,
                 memory_capacity_bytes: tiering_policy.memory_capacity_bytes,
@@ -3027,6 +3051,7 @@ impl MultiLayerCache {
             read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
             cold_tier_migration_worker: Arc::new(Mutex::new(None)),
+            ssd_recovery_worker: Arc::new(Mutex::new(None)),
             async_writeback_jobs_per_round: Arc::new(AtomicU64::new(0)),
             async_writeback_interval_millis: Arc::new(AtomicU64::new(
                 default_async_writeback_interval_millis(),
@@ -3063,10 +3088,17 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         inner.started = true;
-        if inner.auto_recover_on_start {
-            inner.recover_persistent_tiers_locked()?;
-        }
+        let auto_recover_on_start = inner.auto_recover_on_start;
+        let ssd_recover_in_background = inner.ssd_recover_in_background;
         drop(inner);
+        if auto_recover_on_start {
+            if ssd_recover_in_background {
+                self.recover_pmem_index()?;
+                self.start_configured_ssd_recovery_worker()?;
+            } else {
+                self.recover_persistent_tiers()?;
+            }
+        }
         self.start_configured_async_writeback_worker();
         self.start_configured_async_promotion_worker();
         Ok(())
@@ -3077,6 +3109,7 @@ impl MultiLayerCache {
     }
 
     pub fn stop(&self) -> bool {
+        self.stop_ssd_recovery_worker();
         self.stop_cold_tier_migration_worker();
         self.stop_async_writeback_worker();
         self.stop_async_promotion_worker();
@@ -3103,6 +3136,34 @@ impl MultiLayerCache {
             .read()
             .expect("cache lock poisoned")
             .auto_recover_on_start
+    }
+
+    pub fn set_ssd_recovery_in_background(&self, enabled: bool) {
+        self.inner
+            .write()
+            .expect("cache lock poisoned")
+            .ssd_recover_in_background = enabled;
+    }
+
+    pub fn ssd_recovery_in_background(&self) -> bool {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .ssd_recover_in_background
+    }
+
+    pub fn set_ssd_recovery_batch_size(&self, batch_size: usize) {
+        self.inner
+            .write()
+            .expect("cache lock poisoned")
+            .ssd_recovery_batch_size = batch_size.max(1);
+    }
+
+    pub fn ssd_recovery_batch_size(&self) -> usize {
+        self.inner
+            .read()
+            .expect("cache lock poisoned")
+            .ssd_recovery_batch_size
     }
 
     pub fn is_started(&self) -> bool {
@@ -12681,7 +12742,8 @@ impl CacheInner {
         // it.
         //
         // Owns no heap -- a number, a flag, an atomic or an enum:
-        //   `started`, `auto_recover_on_start`, `ssd_block_durability`,
+        //   `started`, `auto_recover_on_start`, `ssd_recover_in_background`,
+        //   `ssd_recovery_batch_size`, `ssd_block_durability`,
         //   `pmem_block_durability`, `memory_capacity_bytes`, `memory_bytes`,
         //   `pmem_capacity_bytes`, `pmem_bytes`, `ssd_capacity_bytes`,
         //   `ssd_bytes`, `default_ttl_millis`, `ttl_in_use`,

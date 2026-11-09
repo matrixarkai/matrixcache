@@ -55,6 +55,7 @@ include!("core/storage_config.rs");
 include!("runtime/replacement.rs");
 include!("runtime/storage_engines.rs");
 include!("runtime/multilayer_cache.rs");
+include!("runtime/background_recovery.rs");
 include!("runtime/cold_tier_migration.rs");
 include!("runtime/cache_facades.rs");
 include!("runtime/builder_and_gc.rs");
@@ -76,3 +77,7 @@ mod pmem_promotion_tests;
 #[cfg(test)]
 #[path = "tests/ssd_promotion.rs"]
 mod ssd_promotion_tests;
+
+#[cfg(test)]
+#[path = "tests/background_recovery.rs"]
+mod background_recovery_tests;

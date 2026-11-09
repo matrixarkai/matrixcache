@@ -9,6 +9,16 @@ pub struct CacheRecoverReport {
     pub skipped_files: u64,
 }
 
+/// Current state of the lifecycle-managed SSD recovery worker.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSsdRecoveryStatus {
+    pub running: bool,
+    pub completed: bool,
+    pub cancelled: bool,
+    pub report: CacheRecoverReport,
+    pub error: Option<String>,
+}
+
 /// Where a value was placed, or that it was not placed at all.
 ///
 /// `Reject` is not a tier. It is the admission policy declining the value, and
