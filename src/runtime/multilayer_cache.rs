@@ -2501,6 +2501,7 @@ impl CachePinStripe {
 #[derive(Debug)]
 struct CachePinRegistry {
     stripes: Vec<CachePinStripe>,
+    hash_builder: RandomState,
     removed_seen: AtomicBool,
     /// Set only when pinned entries keep a tier above a reduced capacity.
     /// The normal release path is one atomic load and never opens `inner`.
@@ -2513,15 +2514,15 @@ impl CachePinRegistry {
             stripes: (0..PIN_STRIPES)
                 .map(|_| CachePinStripe::default())
                 .collect(),
+            hash_builder: RandomState::new(),
             removed_seen: AtomicBool::new(false),
             reclaim_needed: AtomicBool::new(false),
         }
     }
 
     fn stripe_index(&self, key: &CacheKey) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.stripes.len()
+        debug_assert!(self.stripes.len().is_power_of_two());
+        self.hash_builder.hash_one(key) as usize & (self.stripes.len() - 1)
     }
 
     fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
