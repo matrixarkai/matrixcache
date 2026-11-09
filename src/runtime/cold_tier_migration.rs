@@ -40,7 +40,7 @@ impl MultiLayerCache {
             return Ok(report);
         }
 
-        let candidates = {
+        let (candidates, block_options) = {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
@@ -70,11 +70,16 @@ impl MultiLayerCache {
                     selected.push((key.clone(), Arc::clone(value)));
                 }
             }
-            selected
+            (selected, inner.block_options)
         };
         report.selected = candidates.len();
 
         for (key, selected_value) in candidates {
+            // Compression and framing can dominate the migration cost for a
+            // large value. Prepare the immutable block before taking the
+            // cache-wide write lock, then revalidate the resident allocation
+            // below before publishing it.
+            let prepared_block = encode_cache_block(selected_value.as_ref(), block_options)?;
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
@@ -90,7 +95,15 @@ impl MultiLayerCache {
                 report.changed_before_write = report.changed_before_write.saturating_add(1);
                 continue;
             }
-            inner.put_bypass_storage_for_tier_shared(CacheTier::Ssd, key, selected_value)?;
+            let block_kind = infer_block_kind(&key);
+            let routing_slot = extract_routing_slot(&key);
+            inner.put_bypass_ssd_preencoded(
+                &key,
+                selected_value.as_ref(),
+                prepared_block,
+                block_kind,
+                routing_slot,
+            )?;
             report.migrated = report.migrated.saturating_add(1);
         }
         Ok(report)
@@ -329,13 +342,7 @@ mod cold_tier_migration_tests {
 
         {
             let mut inner = cache.inner.write().unwrap();
-            inner
-                .put_bypass_storage_for_tier_shared(
-                    CacheTier::Memory,
-                    key.clone(),
-                    Arc::clone(&value),
-                )
-                .unwrap();
+            assert!(inner.put_memory_shared(&key, Arc::clone(&value)));
         }
 
         let inner = cache.inner.read().unwrap();

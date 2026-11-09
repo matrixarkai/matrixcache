@@ -13342,49 +13342,6 @@ impl CacheInner {
         Ok(())
     }
 
-    fn put_bypass_storage_for_tier_shared(
-        &mut self,
-        tier: CacheTier,
-        key: CacheKey,
-        value: Arc<[u8]>,
-    ) -> Result<(), CacheError> {
-        let block_kind = infer_block_kind(&key);
-        let routing_slot = extract_routing_slot(&key);
-        match tier {
-            CacheTier::Memory => {
-                self.record_metadata(
-                    &key,
-                    block_kind,
-                    routing_slot,
-                    value.len(),
-                    0,
-                    CacheAdmissionReason::MemoryOnly,
-                );
-                if !self.put_memory_shared(&key, value) {
-                    self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
-                }
-            }
-            CacheTier::Pmem => {
-                self.record_metadata(
-                    &key,
-                    block_kind,
-                    routing_slot,
-                    value.len(),
-                    0,
-                    CacheAdmissionReason::MemoryOnly,
-                );
-                if !self.put_pmem_shared(&key, value) {
-                    self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
-                }
-            }
-            CacheTier::Ssd => {
-                self.put_bypass_ssd(&key, value.as_ref(), block_kind, routing_slot)?;
-            }
-            CacheTier::Reject => {}
-        }
-        Ok(())
-    }
-
     fn put_bypass_ssd(
         &mut self,
         key: &CacheKey,
@@ -13409,6 +13366,44 @@ impl CacheInner {
             self.write_ssd_block(key, block)?;
             block_len as u64
         };
+        self.finish_bypass_ssd_write(key, value.len(), block_len, block_kind, routing_slot)
+    }
+
+    fn put_bypass_ssd_preencoded(
+        &mut self,
+        key: &CacheKey,
+        value: &[u8],
+        prepared_block: Vec<u8>,
+        block_kind: CacheBlockKind,
+        routing_slot: Option<u32>,
+    ) -> Result<(), CacheError> {
+        let existing_block_len = match self.read_ssd_block(key)? {
+            Some(existing_block)
+                if decode_cache_block(&existing_block).ok().as_deref() == Some(value) =>
+            {
+                Some(existing_block.len() as u64)
+            }
+            Some(_) | None => None,
+        };
+        let block_len = if let Some(existing_block_len) = existing_block_len {
+            existing_block_len
+        } else {
+            let block_len = prepared_block.len() as u64;
+            self.evict_ssd_for(block_len);
+            self.write_ssd_block(key, prepared_block)?;
+            block_len
+        };
+        self.finish_bypass_ssd_write(key, value.len(), block_len, block_kind, routing_slot)
+    }
+
+    fn finish_bypass_ssd_write(
+        &mut self,
+        key: &CacheKey,
+        value_len: usize,
+        block_len: u64,
+        block_kind: CacheBlockKind,
+        routing_slot: Option<u32>,
+    ) -> Result<(), CacheError> {
         let shared = self.shared_key(key);
         if let Some(old_len) = self.disk_index.insert(Arc::clone(&shared), block_len) {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
@@ -13419,7 +13414,7 @@ impl CacheInner {
             key,
             block_kind,
             routing_slot,
-            value.len(),
+            value_len,
             0,
             CacheAdmissionReason::MemoryOnly,
         );
