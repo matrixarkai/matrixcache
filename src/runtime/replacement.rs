@@ -1701,6 +1701,10 @@ enum SlruTailAction {
 }
 
 /// Outcome of one background-maintainer step over a cold list tail.
+///
+/// The eviction payload stays inline to avoid allocating on every maintenance
+/// eviction.
+#[allow(clippy::large_enum_variant)]
 enum SlruMaintainerStep {
     /// Nothing left to do in this list.
     Stop,
