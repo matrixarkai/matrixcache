@@ -1635,6 +1635,7 @@ pub struct MultiLayerCache {
     /// reach atomics.
     read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
+    cold_tier_migration_worker: Arc<Mutex<Option<CacheColdTierMigrationWorker>>>,
     async_writeback_jobs_per_round: Arc<AtomicU64>,
     async_writeback_interval_millis: Arc<AtomicU64>,
     async_promotion_worker: Arc<Mutex<Option<CacheAsyncPromotionWorker>>>,
@@ -3025,6 +3026,7 @@ impl MultiLayerCache {
             })),
             read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
+            cold_tier_migration_worker: Arc::new(Mutex::new(None)),
             async_writeback_jobs_per_round: Arc::new(AtomicU64::new(0)),
             async_writeback_interval_millis: Arc::new(AtomicU64::new(
                 default_async_writeback_interval_millis(),
@@ -3075,6 +3077,7 @@ impl MultiLayerCache {
     }
 
     pub fn stop(&self) -> bool {
+        self.stop_cold_tier_migration_worker();
         self.stop_async_writeback_worker();
         self.stop_async_promotion_worker();
         let mut inner = self.inner.write().expect("cache lock poisoned");
