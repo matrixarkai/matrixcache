@@ -89,11 +89,7 @@ impl MultiLayerCache {
                 report.changed_before_write = report.changed_before_write.saturating_add(1);
                 continue;
             }
-            inner.put_bypass_storage_for_tier(
-                CacheTier::Ssd,
-                key,
-                selected_value.as_ref().to_vec(),
-            )?;
+            inner.put_bypass_storage_for_tier_shared(CacheTier::Ssd, key, selected_value)?;
             report.migrated = report.migrated.saturating_add(1);
         }
         Ok(report)
@@ -257,6 +253,29 @@ mod cold_tier_migration_tests {
         cache.invalidate_memory_only(&key);
         assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
         assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn exact_tier_shared_write_keeps_the_resident_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_ssd(dir.path());
+        let key = CacheKey::string(2, "shared-resident");
+        let value: Arc<[u8]> = Arc::from(vec![7u8; 4096]);
+
+        {
+            let mut inner = cache.inner.write().unwrap();
+            inner
+                .put_bypass_storage_for_tier_shared(
+                    CacheTier::Memory,
+                    key.clone(),
+                    Arc::clone(&value),
+                )
+                .unwrap();
+        }
+
+        let inner = cache.inner.read().unwrap();
+        let resident = inner.resident_value(&key).unwrap();
+        assert!(Arc::ptr_eq(&value, resident));
     }
 
     #[test]
