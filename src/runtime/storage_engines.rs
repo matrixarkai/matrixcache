@@ -25,6 +25,10 @@ fn default_async_promotion_interval_millis() -> u64 {
     1
 }
 
+fn default_ssd_recovery_batch_size() -> usize {
+    256
+}
+
 /// Everything a cache can be configured with.
 ///
 /// Tier capacities and paths are typed; the policy and engine choices are
@@ -120,6 +124,13 @@ pub struct CacheOptions {
     pub blockcache_clear_ssd_folder: bool,
     #[serde(default)]
     pub auto_recover_on_start: bool,
+    /// Recover the SSD index on a lifecycle-managed worker when automatic
+    /// startup recovery is enabled. PMEM recovery remains synchronous.
+    #[serde(default)]
+    pub ssd_recover_in_background: bool,
+    /// Maximum SSD index records installed under one cache write lock.
+    #[serde(default = "default_ssd_recovery_batch_size")]
+    pub ssd_recovery_batch_size: usize,
     /// Whether an SSD block write also survives the machine losing power.
     ///
     /// True by default, which is what it has always done: the block is
@@ -183,6 +194,8 @@ impl Default for CacheOptions {
             cache_ssd_instance_only: false,
             blockcache_clear_ssd_folder: false,
             auto_recover_on_start: false,
+            ssd_recover_in_background: false,
+            ssd_recovery_batch_size: default_ssd_recovery_batch_size(),
             ssd_block_durability: true,
             pmem_block_durability: false,
             block_options: CacheBlockOptions::default(),
@@ -353,6 +366,16 @@ impl CacheOptions {
 
     pub fn with_auto_recover_on_start(mut self, enabled: bool) -> Self {
         self.auto_recover_on_start = enabled;
+        self
+    }
+
+    pub fn with_ssd_recovery_in_background(mut self, enabled: bool) -> Self {
+        self.ssd_recover_in_background = enabled;
+        self
+    }
+
+    pub fn with_ssd_recovery_batch_size(mut self, batch_size: usize) -> Self {
+        self.ssd_recovery_batch_size = batch_size.max(1);
         self
     }
 
@@ -2973,6 +2996,42 @@ impl StorageEngineRocksDb {
         Ok(())
     }
 
+    fn visit_recovery_view_data<C>(&self, callback: &mut C) -> Result<(), CacheError>
+    where
+        C: FnMut(&str, StringViewBuffer) -> bool,
+    {
+        if !self.initialized {
+            return Err(CacheError::Stopped);
+        }
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            for item in self.rocksdb()?.iterator(rocksdb::IteratorMode::Start) {
+                let (key, value) = item.map_err(|err| CacheError::RocksDb(err.to_string()))?;
+                let key = str::from_utf8(&key)
+                    .map_err(|_| CacheError::CorruptBlock("rocksdb key is not utf8".into()))?;
+                let mut view = StringViewBuffer::new(value.len());
+                view.SetKey(key);
+                if !callback(key, view) {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        {
+            let mut keys = self.records.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                let size = self.records.get(&key).map_or(0, Vec::len);
+                let mut view = StringViewBuffer::new(size);
+                view.SetKey(key.as_ref());
+                if !callback(&key, view) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_data_recovered(&self) -> bool {
         self.recover_finished
     }
@@ -3591,7 +3650,6 @@ impl StorageEngineMultiSsd {
         Ok(deleted)
     }
 
-    #[cfg(feature = "rocksdb-ssd")]
     pub fn recover_view_data<C>(&mut self, callback: &mut C) -> Result<(), CacheError>
     where
         C: FnMut(&str, StringViewBuffer),
@@ -3601,6 +3659,26 @@ impl StorageEngineMultiSsd {
         }
         for storage in &mut self.storages {
             storage.recover_view_data(callback)?;
+        }
+        Ok(())
+    }
+
+    fn visit_recovery_view_data<C>(&self, callback: &mut C) -> Result<(), CacheError>
+    where
+        C: FnMut(&str, StringViewBuffer) -> bool,
+    {
+        if !self.initialized || self.storages.is_empty() {
+            return Err(CacheError::Stopped);
+        }
+        for storage in &self.storages {
+            let mut keep_scanning = true;
+            storage.visit_recovery_view_data(&mut |key, view| {
+                keep_scanning = callback(key, view);
+                keep_scanning
+            })?;
+            if !keep_scanning {
+                break;
+            }
         }
         Ok(())
     }
