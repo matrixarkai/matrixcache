@@ -3522,9 +3522,7 @@ impl CacheInner {
     /// A key is always in the same stripe, so a count and the sizes beside it
     /// are never split across two locks.
     fn pin_stripe_index(&self, key: &CacheKey) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.pin_registry.stripes.len()
+        self.pin_registry.stripe_index(key)
     }
 
     fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
