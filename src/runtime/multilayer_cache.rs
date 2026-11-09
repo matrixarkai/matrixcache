@@ -2224,10 +2224,41 @@ struct CachePinState {
     zero_copy_handle_hits: u64,
 }
 
+/// One pin-accounting shard, isolated from the cache lines updated by its
+/// neighbours. Acquiring unrelated keys should not turn a global counter into
+/// a coherence point shared by every reader.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct CachePinStripe {
+    state: Mutex<CachePinState>,
+    handle_count: AtomicU64,
+}
+
+impl CachePinStripe {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CachePinState> {
+        self.state.lock().expect("pin lock poisoned")
+    }
+
+    fn add_handles(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.handle_count.fetch_add(count, Ordering::Release);
+        debug_assert!(previous <= u64::MAX - count, "pin handle count overflow");
+    }
+
+    fn remove_handles(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.handle_count.fetch_sub(count, Ordering::Release);
+        debug_assert!(previous >= count, "pin handle count underflow");
+    }
+}
+
 #[derive(Debug)]
 struct CachePinRegistry {
-    stripes: Vec<Mutex<CachePinState>>,
-    handle_count: AtomicU64,
+    stripes: Vec<CachePinStripe>,
     removed_seen: AtomicBool,
     /// Set only when pinned entries keep a tier above a reduced capacity.
     /// The normal release path is one atomic load and never opens `inner`.
@@ -2238,9 +2269,8 @@ impl CachePinRegistry {
     fn new() -> Self {
         Self {
             stripes: (0..PIN_STRIPES)
-                .map(|_| Mutex::new(CachePinState::default()))
+                .map(|_| CachePinStripe::default())
                 .collect(),
-            handle_count: AtomicU64::new(0),
             removed_seen: AtomicBool::new(false),
             reclaim_needed: AtomicBool::new(false),
         }
@@ -2253,17 +2283,27 @@ impl CachePinRegistry {
     }
 
     fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
-        self.stripes[self.stripe_index(key)]
-            .lock()
-            .expect("pin lock poisoned")
+        self.stripes[self.stripe_index(key)].lock()
     }
 
-    fn remove_handles(&self, count: u64) {
-        if count == 0 {
-            return;
+    #[cfg(test)]
+    fn handle_count(&self) -> u64 {
+        self.stripes
+            .iter()
+            .map(|stripe| stripe.handle_count.load(Ordering::Acquire))
+            .fold(0, u64::saturating_add)
+    }
+
+    fn has_handles(&self) -> bool {
+        self.stripes
+            .iter()
+            .any(|stripe| stripe.handle_count.load(Ordering::Acquire) != 0)
+    }
+
+    fn reset_handle_counts(&self) {
+        for stripe in &self.stripes {
+            stripe.handle_count.store(0, Ordering::Release);
         }
-        let previous = self.handle_count.fetch_sub(count, Ordering::Release);
-        debug_assert!(previous >= count, "pin handle count underflow");
     }
 
     fn mark_removed_seen(&self) {
@@ -2294,7 +2334,8 @@ impl CachePinRegistry {
         if count == 0 {
             return;
         }
-        let mut pins = self.pins_for(key);
+        let stripe = self.stripe_index(key);
+        let mut pins = self.stripes[stripe].lock();
         let Some(entry) = pins.entries.get_mut(key) else {
             return;
         };
@@ -2308,14 +2349,13 @@ impl CachePinRegistry {
         }
         pins.unpin_operations = pins.unpin_operations.saturating_add(count);
         drop(pins);
-        self.remove_handles(removed);
+        self.stripes[stripe].remove_handles(removed);
     }
 
     fn decrement_many(&self, counts: &[(CacheKey, usize)]) {
         if counts.is_empty() {
             return;
         }
-        let mut removed_handles = 0u64;
         with_sorted_pin_updates(
             counts.len(),
             counts
@@ -2327,7 +2367,8 @@ impl CachePinRegistry {
                 let mut cursor = 0;
                 while cursor < updates.len() {
                     let stripe = updates[cursor].0;
-                    let mut pins = self.stripes[stripe].lock().expect("pin lock poisoned");
+                    let mut removed_handles = 0u64;
+                    let mut pins = self.stripes[stripe].lock();
                     while cursor < updates.len() && updates[cursor].0 == stripe {
                         let index = updates[cursor].1;
                         let (key, count) = &counts[index];
@@ -2346,10 +2387,11 @@ impl CachePinRegistry {
                         pins.unpin_operations = pins.unpin_operations.saturating_add(count);
                         cursor += 1;
                     }
+                    drop(pins);
+                    self.stripes[stripe].remove_handles(removed_handles);
                 }
             },
         );
-        self.remove_handles(removed_handles);
     }
 }
 
@@ -12726,7 +12768,7 @@ impl CacheInner {
             })
             .sum::<usize>()
             + self.pin_registry.stripes.capacity()
-                * std::mem::size_of::<Mutex<CachePinState>>();
+                * std::mem::size_of::<CachePinStripe>();
 
         // `async_writeback_queue` and `async_writeback_positions`: the values
         // waiting to be written, their keys, and the index that finds them.
@@ -13798,18 +13840,22 @@ impl MultiLayerCache {
         let _ = inner.delete_ssd_blocks(&disk_keys);
         inner.disk_order.retain(|key| key.shard_id != shard_id);
         inner.metadata.retain(|key, _| key.shard_id != shard_id);
-        let mut removed_pin_handles = 0u64;
-        for mut pins in inner.all_pins() {
-            pins.entries.retain(|key, entry| {
-                if key.shard_id == shard_id {
-                    removed_pin_handles = removed_pin_handles.saturating_add(entry.handles);
-                    false
-                } else {
-                    true
-                }
-            });
+        for stripe in 0..inner.pin_registry.stripes.len() {
+            let removed_pin_handles = {
+                let mut removed = 0u64;
+                let mut pins = inner.pin_registry.stripes[stripe].lock();
+                pins.entries.retain(|key, entry| {
+                    if key.shard_id == shard_id {
+                        removed = removed.saturating_add(entry.handles);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                removed
+            };
+            inner.remove_pin_handles(stripe, removed_pin_handles);
         }
-        inner.remove_pin_handles(removed_pin_handles);
         inner.stats.invalidations = inner
             .stats
             .invalidations

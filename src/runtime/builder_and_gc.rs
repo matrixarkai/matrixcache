@@ -3480,7 +3480,7 @@ impl CacheInner {
                 pins.zero_copy_handle_hits = 0;
             }
         }
-        self.pin_registry.handle_count.store(0, Ordering::Release);
+        self.pin_registry.reset_handle_counts();
         self.pin_registry
             .reclaim_needed
             .store(false, Ordering::Release);
@@ -3528,9 +3528,7 @@ impl CacheInner {
     }
 
     fn pins_for(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CachePinState> {
-        self.pin_registry.stripes[self.pin_stripe_index(key)]
-            .lock()
-            .expect("pin lock poisoned")
+        self.pin_registry.stripes[self.pin_stripe_index(key)].lock()
     }
 
     /// Every stripe, in a fixed order.
@@ -3542,42 +3540,29 @@ impl CacheInner {
         self.pin_registry
             .stripes
             .iter()
-            .map(|stripe| stripe.lock().expect("pin lock poisoned"))
+            .map(CachePinStripe::lock)
             .collect()
     }
 
     fn is_pinned(&self, key: &CacheKey) -> bool {
-        if self.pin_registry.handle_count.load(Ordering::Acquire) == 0 {
+        if !self.pin_registry.has_handles() {
             return false;
         }
         self.pins_for(key).entries.contains_key(key)
     }
 
-    fn add_pin_handles(&self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        let previous = self
-            .pin_registry
-            .handle_count
-            .fetch_add(count, Ordering::Release);
-        debug_assert!(previous <= u64::MAX - count, "pin handle count overflow");
+    fn add_pin_handles(&self, stripe: usize, count: u64) {
+        self.pin_registry.stripes[stripe].add_handles(count);
     }
 
-    fn remove_pin_handles(&self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        let previous = self
-            .pin_registry
-            .handle_count
-            .fetch_sub(count, Ordering::Release);
-        debug_assert!(previous >= count, "pin handle count underflow");
+    fn remove_pin_handles(&self, stripe: usize, count: u64) {
+        self.pin_registry.stripes[stripe].remove_handles(count);
     }
 
     fn remove_pin_entry(&self, key: &CacheKey) {
+        let stripe = self.pin_stripe_index(key);
         let removed_handles = {
-            let mut pins = self.pins_for(key);
+            let mut pins = self.pin_registry.stripes[stripe].lock();
             let removed = pins
                 .entries
                 .remove(key)
@@ -3585,7 +3570,7 @@ impl CacheInner {
             Self::shrink_pin_stripe_if_sparse(&mut pins);
             removed
         };
-        self.remove_pin_handles(removed_handles);
+        self.remove_pin_handles(stripe, removed_handles);
     }
 
     fn increment_pin(&self, key: &CacheKey) {
@@ -3618,19 +3603,20 @@ impl CacheInner {
                 .filter(|(_, (_, _, count))| *count != 0)
                 .map(|(index, (key, _, _))| (self.pin_stripe_index(key), index)),
             |updates| {
-                self.add_pin_handles(
-                    updates
-                        .iter()
-                        .map(|(_, index)| counts[*index].2 as u64)
-                        .fold(0, u64::saturating_add),
-                );
                 let mut cursor = 0;
                 while cursor < updates.len() {
                     let stripe = updates[cursor].0;
-                    let mut pins = self.pin_registry.stripes[stripe]
-                        .lock()
-                        .expect("pin lock poisoned");
-                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                    let end = updates[cursor..]
+                        .iter()
+                        .position(|(candidate, _)| *candidate != stripe)
+                        .map_or(updates.len(), |offset| cursor + offset);
+                    let added_handles = updates[cursor..end]
+                        .iter()
+                        .map(|(_, index)| counts[*index].2 as u64)
+                        .fold(0, u64::saturating_add);
+                    self.add_pin_handles(stripe, added_handles);
+                    let mut pins = self.pin_registry.stripes[stripe].lock();
+                    while cursor < end {
                         let index = updates[cursor].1;
                         let (key, bytes, count) = &counts[index];
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
@@ -3656,19 +3642,20 @@ impl CacheInner {
                 .filter(|(_, (_, _, handles, _))| *handles != 0)
                 .map(|(index, (key, _, _, _))| (self.pin_stripe_index(key), index)),
             |updates| {
-                self.add_pin_handles(
-                    updates
-                        .iter()
-                        .map(|(_, index)| counts[*index].2 as u64)
-                        .fold(0, u64::saturating_add),
-                );
                 let mut cursor = 0;
                 while cursor < updates.len() {
                     let stripe = updates[cursor].0;
-                    let mut pins = self.pin_registry.stripes[stripe]
-                        .lock()
-                        .expect("pin lock poisoned");
-                    while cursor < updates.len() && updates[cursor].0 == stripe {
+                    let end = updates[cursor..]
+                        .iter()
+                        .position(|(candidate, _)| *candidate != stripe)
+                        .map_or(updates.len(), |offset| cursor + offset);
+                    let added_handles = updates[cursor..end]
+                        .iter()
+                        .map(|(_, index)| counts[*index].2 as u64)
+                        .fold(0, u64::saturating_add);
+                    self.add_pin_handles(stripe, added_handles);
+                    let mut pins = self.pin_registry.stripes[stripe].lock();
+                    while cursor < end {
                         let index = updates[cursor].1;
                         let (key, bytes, handles, handle_hits) = &counts[index];
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
@@ -3690,8 +3677,9 @@ impl CacheInner {
     /// describe the same event, so there is no reason to take the lock twice
     /// for it.
     fn increment_pin_for_handle(&self, key: &CacheKey, bytes: usize) {
-        self.add_pin_handles(1);
-        let mut pins = self.pins_for(key);
+        let stripe = self.pin_stripe_index(key);
+        self.add_pin_handles(stripe, 1);
+        let mut pins = self.pin_registry.stripes[stripe].lock();
         // One lookup for the whole handle: the count and its size are the same
         // entry, so they cannot be found separately or updated apart.
         let entry = pins.entries.entry(self.shared_key(key)).or_default();
@@ -3705,10 +3693,11 @@ impl CacheInner {
     /// point: a reader taking a handle no longer serialises against every
     /// other reader.
     fn increment_pin_with_optional_size(&self, key: &CacheKey, bytes: Option<usize>) {
-        self.add_pin_handles(1);
+        let stripe = self.pin_stripe_index(key);
+        self.add_pin_handles(stripe, 1);
         // One guard for the count and the size together: they describe the
         // same handle and must not be seen apart.
-        let mut pins = self.pins_for(key);
+        let mut pins = self.pin_registry.stripes[stripe].lock();
         let entry = pins.entries.entry(self.shared_key(key)).or_default();
         entry.handles = entry.handles.saturating_add(1);
         if let Some(bytes) = bytes {
