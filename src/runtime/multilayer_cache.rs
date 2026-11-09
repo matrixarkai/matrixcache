@@ -1626,6 +1626,8 @@ pub struct MultiLayerCache {
     /// reach atomics.
     read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
+    async_writeback_jobs_per_round: Arc<AtomicU64>,
+    async_writeback_interval_millis: Arc<AtomicU64>,
     /// Whether an access-record callback is registered.
     ///
     /// Duplicated out of `CacheInner` so the check that begins every get, put
@@ -2868,6 +2870,10 @@ impl MultiLayerCache {
             .write()
             .expect("cache lock poisoned")
             .pmem_block_durability = options.pmem_block_durability;
+        cache.configure_async_writeback_worker(
+            options.async_writeback_jobs_per_round,
+            Duration::from_millis(options.async_writeback_interval_millis.max(1)),
+        );
         cache
     }
 
@@ -2971,6 +2977,10 @@ impl MultiLayerCache {
             })),
             read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
+            async_writeback_jobs_per_round: Arc::new(AtomicU64::new(0)),
+            async_writeback_interval_millis: Arc::new(AtomicU64::new(
+                default_async_writeback_interval_millis(),
+            )),
             access_record_registered: Arc::new(AtomicBool::new(false)),
             eviction_callbacks_registered: Arc::new(AtomicBool::new(false)),
             pin_registry,
@@ -2991,6 +3001,8 @@ impl MultiLayerCache {
         if inner.auto_recover_on_start {
             inner.recover_persistent_tiers_locked()?;
         }
+        drop(inner);
+        self.start_configured_async_writeback_worker();
         Ok(())
     }
 
@@ -7479,6 +7491,74 @@ impl MultiLayerCache {
         true
     }
 
+    /// Configure the worker managed by the cache lifecycle.
+    ///
+    /// A zero job count disables automatic draining. Reconfiguration replaces
+    /// a running managed worker so the new batch and interval take effect
+    /// immediately.
+    pub fn configure_async_writeback_worker(
+        &self,
+        max_jobs_per_round: usize,
+        interval: Duration,
+    ) -> bool {
+        self.async_writeback_jobs_per_round
+            .store(max_jobs_per_round as u64, Ordering::Release);
+        self.async_writeback_interval_millis.store(
+            interval.as_millis().max(1).min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+        self.stop_async_writeback_worker();
+        self.start_configured_async_writeback_worker()
+    }
+
+    fn start_configured_async_writeback_worker(&self) -> bool {
+        let max_jobs_per_round = self
+            .async_writeback_jobs_per_round
+            .load(Ordering::Acquire) as usize;
+        if max_jobs_per_round == 0 || !self.is_started() {
+            return false;
+        }
+        let interval = Duration::from_millis(
+            self.async_writeback_interval_millis
+                .load(Ordering::Acquire)
+                .max(1),
+        );
+        self.start_async_writeback_worker(max_jobs_per_round, interval)
+    }
+
+    pub fn async_writeback_worker_configuration(&self) -> Option<(usize, Duration)> {
+        let max_jobs_per_round = self
+            .async_writeback_jobs_per_round
+            .load(Ordering::Acquire) as usize;
+        (max_jobs_per_round > 0).then(|| {
+            (
+                max_jobs_per_round,
+                Duration::from_millis(
+                    self.async_writeback_interval_millis
+                        .load(Ordering::Acquire)
+                        .max(1),
+                ),
+            )
+        })
+    }
+
+    #[allow(non_snake_case)]
+    pub fn ConfigureAsyncWritebackWorker(
+        &self,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> bool {
+        self.configure_async_writeback_worker(
+            max_jobs_per_round,
+            Duration::from_millis(interval_millis.max(1)),
+        )
+    }
+
+    #[allow(non_snake_case)]
+    pub fn AsyncWritebackWorkerConfiguration(&self) -> Option<(usize, Duration)> {
+        self.async_writeback_worker_configuration()
+    }
+
     pub fn stop_async_writeback_worker(&self) -> bool {
         let worker = self
             .async_writeback_worker
@@ -9057,6 +9137,42 @@ impl ShardedMultiLayerCache {
             .iter()
             .filter(|shard| shard.start_async_writeback_worker(max_jobs_per_round, interval))
             .count()
+    }
+
+    pub fn configure_async_writeback_workers(
+        &self,
+        max_jobs_per_round: usize,
+        interval: Duration,
+    ) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| {
+                shard.configure_async_writeback_worker(max_jobs_per_round, interval)
+            })
+            .count()
+    }
+
+    pub fn async_writeback_worker_configuration(&self) -> Option<(usize, Duration)> {
+        self.shards
+            .first()
+            .and_then(MultiLayerCache::async_writeback_worker_configuration)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn ConfigureAsyncWritebackWorkers(
+        &self,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> usize {
+        self.configure_async_writeback_workers(
+            max_jobs_per_round,
+            Duration::from_millis(interval_millis.max(1)),
+        )
+    }
+
+    #[allow(non_snake_case)]
+    pub fn AsyncWritebackWorkerConfiguration(&self) -> Option<(usize, Duration)> {
+        self.async_writeback_worker_configuration()
     }
 
     pub fn stop_async_writeback_workers(&self) -> usize {
