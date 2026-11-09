@@ -2177,7 +2177,7 @@ impl StripedReadLatencyHistogram {
 #[derive(Debug, Default)]
 struct ReadPathCounters {
     memory_hits: StripedReadCounter,
-    pmem_hits: AtomicU64,
+    pmem_hits: StripedReadCounter,
     disk_hits: AtomicU64,
     misses: AtomicU64,
     zero_copy_handle_misses: AtomicU64,
@@ -2223,9 +2223,41 @@ impl ReadPathCounters {
         });
     }
 
+    fn record_shared_pmem_hit_latencies(&self, micros: u64, samples: usize) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            let stripe = *stripe;
+            let sample_count = samples as u64;
+            self.pmem_hits.add_at(stripe, sample_count);
+            self.shared_buffer_hits.add_at(stripe, sample_count);
+            self.get_latency
+                .observe_many_at(stripe, micros, samples);
+            self.read_through_latency
+                .observe_many_at(stripe, micros, samples);
+        });
+    }
+
+    fn record_resident_shared_hit_latencies(
+        &self,
+        memory_hits: u64,
+        pmem_hits: u64,
+        micros: u64,
+        samples: usize,
+    ) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            let stripe = *stripe;
+            self.memory_hits.add_at(stripe, memory_hits);
+            self.pmem_hits.add_at(stripe, pmem_hits);
+            self.shared_buffer_hits.add_at(stripe, samples as u64);
+            self.get_latency
+                .observe_many_at(stripe, micros, samples);
+            self.read_through_latency
+                .observe_many_at(stripe, micros, samples);
+        });
+    }
+
     fn reset(&self) {
         self.memory_hits.reset();
-        self.pmem_hits.store(0, Ordering::Relaxed);
+        self.pmem_hits.reset();
         self.disk_hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.zero_copy_handle_misses.store(0, Ordering::Relaxed);
@@ -4394,8 +4426,6 @@ impl MultiLayerCache {
                     if inner.pmem_should_refill_memory(value.len()) {
                         Some((value, CacheReadTier::Pmem, None))
                     } else {
-                        inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                        inner.read_counters.shared_buffer_hits.add(1);
                         inner.reconfigure_refresh_window(now_millis);
                         let outcome = inner.record_known_hit_shared_occurrences_at(
                             key,
@@ -4439,10 +4469,8 @@ impl MultiLayerCache {
                     self.read_counters
                         .record_shared_memory_hit_latencies(micros, 1);
                 } else {
-                    self.read_counters.get_latency.observe_with_total(micros);
                     self.read_counters
-                        .read_through_latency
-                        .observe_with_total(micros);
+                        .record_shared_pmem_hit_latencies(micros, 1);
                 }
             }
             let length = value.len();
@@ -4485,7 +4513,7 @@ impl MultiLayerCache {
                         return Ok(Some(value));
                     }
                     let mut inner = self.inner.write().expect("cache lock poisoned");
-                    inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                    inner.read_counters.pmem_hits.add(1);
                     inner.read_counters.shared_buffer_hits.add(1);
                     self.promote_pmem_probe_or_defer(&mut inner, key, &value, None);
                     inner.record_get_latency(started);
@@ -4915,10 +4943,7 @@ impl MultiLayerCache {
                         if inner.pmem_should_refill_memory(value.len()) {
                             pmem_refills.push((unique_position, value, outcome, started));
                         } else {
-                            inner
-                                .read_counters
-                                .pmem_hits
-                                .fetch_add(1, Ordering::Relaxed);
+                            inner.read_counters.pmem_hits.add(1);
                             if !matches!(outcome, HitOutcome::Accounted) {
                                 needs_exclusive.push((
                                     unique_position,
@@ -4978,7 +5003,7 @@ impl MultiLayerCache {
             }
             for (unique_position, value, outcome, started) in pmem_refills {
                 let key = unique_keys[unique_position];
-                inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                inner.read_counters.pmem_hits.add(1);
                 self.promote_pmem_probe_or_defer(
                     &mut inner,
                     key,
@@ -5518,9 +5543,7 @@ impl MultiLayerCache {
 
         self.read_counters
             .record_memory_and_shared_hits(memory_hits, keys.len() as u64);
-        self.read_counters
-            .pmem_hits
-            .fetch_add(pmem_hits, Ordering::Relaxed);
+        self.read_counters.pmem_hits.add(pmem_hits);
         let micros = elapsed_micros(started);
         self.read_counters
             .get_latency
@@ -5609,20 +5632,9 @@ impl MultiLayerCache {
             }
         }
 
-        self.read_counters
-            .record_memory_and_shared_hits(memory_hits, keys.len() as u64);
-        if pmem_hits != 0 {
-            self.read_counters
-                .pmem_hits
-                .fetch_add(pmem_hits, Ordering::Relaxed);
-        }
         let micros = elapsed_micros(started);
         self.read_counters
-            .get_latency
-            .observe_many_with_total(micros, keys.len());
-        self.read_counters
-            .read_through_latency
-            .observe_many_with_total(micros, keys.len());
+            .record_resident_shared_hit_latencies(memory_hits, pmem_hits, micros, keys.len());
 
         if !needs_exclusive.is_empty() {
             let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -5755,7 +5767,7 @@ impl MultiLayerCache {
             }
 
             let mut inner = self.inner.write().expect("cache lock poisoned");
-            inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+            inner.read_counters.pmem_hits.add(1);
             self.promote_pmem_probe_or_defer(&mut inner, key, &value, None);
             inner.record_get_latency(started);
             inner.record_read_through_latency(started);
@@ -6189,10 +6201,7 @@ impl MultiLayerCache {
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
                         let occurrences = positions.len();
-                        inner
-                            .read_counters
-                            .pmem_hits
-                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        inner.read_counters.pmem_hits.add(occurrences as u64);
                         inner.record_hit_metadata(key, value.len());
                         if !inner.put_memory_shared(key, Arc::clone(&value)) {
                             inner.stats.refill_failures =
@@ -6676,7 +6685,7 @@ impl MultiLayerCache {
                 if !inner.put_memory_shared(key, Arc::clone(&value)) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
-                inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
+                inner.read_counters.pmem_hits.add(1);
                 inner.record_hit(key, value.len());
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
@@ -7289,10 +7298,7 @@ impl MultiLayerCache {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
-                        inner
-                            .read_counters
-                            .pmem_hits
-                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                        inner.read_counters.pmem_hits.add(occurrences as u64);
                         inner.record_hit(key, value.len());
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
@@ -14392,7 +14398,7 @@ impl MultiLayerCache {
             async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
             async_writeback_queue_bytes: inner.async_writeback_queue_bytes,
             memory_hits: inner.read_counters.memory_hits.sum(),
-            pmem_hits: inner.read_counters.pmem_hits.load(Ordering::Relaxed),
+            pmem_hits: inner.read_counters.pmem_hits.sum(),
             disk_hits: inner.read_counters.disk_hits.load(Ordering::Relaxed),
             misses: inner.read_counters.misses.load(Ordering::Relaxed),
             hotness_promotions: inner
