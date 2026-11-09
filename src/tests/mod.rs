@@ -12243,8 +12243,15 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    for _ in 0..READS_PER_THREAD {
-                        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(&b"value"[..]));
+                    for read in 0..READS_PER_THREAD {
+                        if read % 2 == 0 {
+                            assert_eq!(cache.get(&key).unwrap().as_deref(), Some(&b"value"[..]));
+                        } else {
+                            assert_eq!(
+                                cache.get_shared(&key).unwrap().as_deref(),
+                                Some(&b"value"[..])
+                            );
+                        }
                     }
                 })
             })
@@ -12264,6 +12271,10 @@ mod tests {
             expected
         );
         assert_eq!(after.memory_hits - before.memory_hits, expected);
+        assert_eq!(
+            after.shared_buffer_hits - before.shared_buffer_hits,
+            expected / 2
+        );
         assert_eq!(
             after.get_latency_le_10us
                 + after.get_latency_le_100us
@@ -12290,6 +12301,14 @@ mod tests {
             .filter(|stripe| stripe.value.load(Ordering::Relaxed) != 0)
             .count();
         assert!(active_memory_hit_stripes > 1);
+        let active_shared_hit_stripes = inner
+            .read_counters
+            .shared_buffer_hits
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.value.load(Ordering::Relaxed) != 0)
+            .count();
+        assert!(active_shared_hit_stripes > 1);
     }
 
     #[test]

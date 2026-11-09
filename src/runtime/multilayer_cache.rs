@@ -2181,7 +2181,7 @@ struct ReadPathCounters {
     disk_hits: AtomicU64,
     misses: AtomicU64,
     zero_copy_handle_misses: AtomicU64,
-    shared_buffer_hits: AtomicU64,
+    shared_buffer_hits: StripedReadCounter,
     shared_buffer_misses: AtomicU64,
     hotness_promotions: AtomicU64,
     access_order_refreshes: AtomicU64,
@@ -2192,11 +2192,32 @@ struct ReadPathCounters {
 }
 
 impl ReadPathCounters {
+    fn record_memory_and_shared_hits(&self, memory_hits: u64, shared_hits: u64) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            let stripe = *stripe;
+            self.memory_hits.add_at(stripe, memory_hits);
+            self.shared_buffer_hits.add_at(stripe, shared_hits);
+        });
+    }
+
     fn record_memory_hit_latencies(&self, micros: u64, samples: usize) {
         READ_LATENCY_STRIPE.with(|stripe| {
             let stripe = *stripe;
             self.memory_hits.add_at(stripe, samples as u64);
             self.get_latency.observe_many_at(stripe, micros, samples);
+            self.read_through_latency
+                .observe_many_at(stripe, micros, samples);
+        });
+    }
+
+    fn record_shared_memory_hit_latencies(&self, micros: u64, samples: usize) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            let stripe = *stripe;
+            let sample_count = samples as u64;
+            self.memory_hits.add_at(stripe, sample_count);
+            self.shared_buffer_hits.add_at(stripe, sample_count);
+            self.get_latency
+                .observe_many_at(stripe, micros, samples);
             self.read_through_latency
                 .observe_many_at(stripe, micros, samples);
         });
@@ -2208,7 +2229,7 @@ impl ReadPathCounters {
         self.disk_hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.zero_copy_handle_misses.store(0, Ordering::Relaxed);
-        self.shared_buffer_hits.store(0, Ordering::Relaxed);
+        self.shared_buffer_hits.reset();
         self.shared_buffer_misses.store(0, Ordering::Relaxed);
         self.hotness_promotions.store(0, Ordering::Relaxed);
         self.access_order_refreshes.store(0, Ordering::Relaxed);
@@ -4360,10 +4381,6 @@ impl MultiLayerCache {
             } else {
                 if let Some(resident) = inner.memory.get(key) {
                     let value = Arc::clone(&resident.value);
-                    inner
-                        .read_counters
-                        .shared_buffer_hits
-                        .fetch_add(1, Ordering::Relaxed);
                     inner.reconfigure_refresh_window(now_millis);
                     let outcome = inner.record_known_hit_shared_occurrences_at(
                         key,
@@ -4378,10 +4395,7 @@ impl MultiLayerCache {
                         Some((value, CacheReadTier::Pmem, None))
                     } else {
                         inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                        inner
-                            .read_counters
-                            .shared_buffer_hits
-                            .fetch_add(1, Ordering::Relaxed);
+                        inner.read_counters.shared_buffer_hits.add(1);
                         inner.reconfigure_refresh_window(now_millis);
                         let outcome = inner.record_known_hit_shared_occurrences_at(
                             key,
@@ -4422,7 +4436,8 @@ impl MultiLayerCache {
             if hit_outcome.is_some() {
                 let micros = elapsed_micros(started);
                 if matches!(tier, CacheReadTier::Memory) {
-                    self.read_counters.record_memory_hit_latencies(micros, 1);
+                    self.read_counters
+                        .record_shared_memory_hit_latencies(micros, 1);
                 } else {
                     self.read_counters.get_latency.observe_with_total(micros);
                     self.read_counters
@@ -4471,10 +4486,7 @@ impl MultiLayerCache {
                     }
                     let mut inner = self.inner.write().expect("cache lock poisoned");
                     inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                    inner
-                        .read_counters
-                        .shared_buffer_hits
-                        .fetch_add(1, Ordering::Relaxed);
+                    inner.read_counters.shared_buffer_hits.add(1);
                     self.promote_pmem_probe_or_defer(&mut inner, key, &value, None);
                     inner.record_get_latency(started);
                     inner.record_read_through_latency(started);
@@ -4509,10 +4521,7 @@ impl MultiLayerCache {
                             return Err(CacheError::Stopped);
                         }
                         inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
-                        inner
-                            .read_counters
-                            .shared_buffer_hits
-                            .fetch_add(1, Ordering::Relaxed);
+                        inner.read_counters.shared_buffer_hits.add(1);
                         let hit_epoch = CoarseClock::now_millis();
                         inner.reconfigure_refresh_window(hit_epoch);
                         let outcome = inner.record_hit_shared_at(key, hit_epoch);
@@ -4545,10 +4554,7 @@ impl MultiLayerCache {
                 }
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
-                inner
-                    .read_counters
-                    .shared_buffer_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                inner.read_counters.shared_buffer_hits.add(1);
                 if compressed {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
@@ -4666,9 +4672,7 @@ impl MultiLayerCache {
         self.read_counters
             .misses
             .fetch_add(misses, Ordering::Relaxed);
-        self.read_counters
-            .shared_buffer_hits
-            .fetch_add(disk_hits, Ordering::Relaxed);
+        self.read_counters.shared_buffer_hits.add(disk_hits);
         self.read_counters
             .shared_buffer_misses
             .fetch_add(misses, Ordering::Relaxed);
@@ -4784,9 +4788,7 @@ impl MultiLayerCache {
         self.read_counters
             .misses
             .fetch_add(misses, Ordering::Relaxed);
-        self.read_counters
-            .shared_buffer_hits
-            .fetch_add(disk_hits, Ordering::Relaxed);
+        self.read_counters.shared_buffer_hits.add(disk_hits);
         self.read_counters
             .shared_buffer_misses
             .fetch_add(misses, Ordering::Relaxed);
@@ -5168,9 +5170,7 @@ impl MultiLayerCache {
             results[position] = value;
         }
         if shared_hits != 0 || shared_misses != 0 {
-            self.read_counters
-                .shared_buffer_hits
-                .fetch_add(shared_hits, Ordering::Relaxed);
+            self.read_counters.shared_buffer_hits.add(shared_hits);
             self.read_counters
                 .shared_buffer_misses
                 .fetch_add(shared_misses, Ordering::Relaxed);
@@ -5385,11 +5385,7 @@ impl MultiLayerCache {
         }
 
         self.read_counters
-            .memory_hits
-            .add(keys.len() as u64);
-        self.read_counters
-            .shared_buffer_hits
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            .record_memory_and_shared_hits(keys.len() as u64, keys.len() as u64);
         let micros = elapsed_micros(started);
         self.read_counters
             .get_latency
@@ -5521,14 +5517,10 @@ impl MultiLayerCache {
         }
 
         self.read_counters
-            .memory_hits
-            .add(memory_hits);
+            .record_memory_and_shared_hits(memory_hits, keys.len() as u64);
         self.read_counters
             .pmem_hits
             .fetch_add(pmem_hits, Ordering::Relaxed);
-        self.read_counters
-            .shared_buffer_hits
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
         let micros = elapsed_micros(started);
         self.read_counters
             .get_latency
@@ -5617,19 +5609,13 @@ impl MultiLayerCache {
             }
         }
 
-        if memory_hits != 0 {
-            self.read_counters
-                .memory_hits
-                .add(memory_hits);
-        }
+        self.read_counters
+            .record_memory_and_shared_hits(memory_hits, keys.len() as u64);
         if pmem_hits != 0 {
             self.read_counters
                 .pmem_hits
                 .fetch_add(pmem_hits, Ordering::Relaxed);
         }
-        self.read_counters
-            .shared_buffer_hits
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
         let micros = elapsed_micros(started);
         self.read_counters
             .get_latency
@@ -14397,10 +14383,7 @@ impl MultiLayerCache {
                         .zero_copy_handle_misses
                         .load(Ordering::Relaxed),
                 ),
-            shared_buffer_hits: inner
-                .read_counters
-                .shared_buffer_hits
-                .load(Ordering::Relaxed),
+            shared_buffer_hits: inner.read_counters.shared_buffer_hits.sum(),
             shared_buffer_misses: inner
                 .read_counters
                 .shared_buffer_misses

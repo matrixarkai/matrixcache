@@ -23,6 +23,8 @@ PUBLIC_ROW_FIELDS = [
     "threads",
     "get_refresh_distance_zero_mops_per_s",
     "get_no_move_mops_per_s",
+    "memory_shared_mops_per_s",
+    "tier_shared_mops_per_s",
     "acquire_mops_per_s",
 ]
 
