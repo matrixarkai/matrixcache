@@ -16560,39 +16560,96 @@ mod tests {
         let key = CacheKey::string(0, "pin-count");
         cache.put(key.clone(), b"value".to_vec()).unwrap();
 
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
         let first = cache.acquire(&key).unwrap().unwrap();
         let second = cache.clone_handle(&first);
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 2);
+        assert_eq!(cache.pin_registry.handle_count(), 2);
 
         cache.invalidate_memory_only(&key);
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 2);
+        assert_eq!(cache.pin_registry.handle_count(), 2);
         assert_eq!(cache.release_batch(vec![second]), 1);
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 1);
+        assert_eq!(cache.pin_registry.handle_count(), 1);
         cache.release(first);
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
 
         cache.put(key.clone(), b"value".to_vec()).unwrap();
         let held_during_clear = cache.acquire(&key).unwrap().unwrap();
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 1);
+        assert_eq!(cache.pin_registry.handle_count(), 1);
         cache.reset().unwrap();
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
         cache.release(held_during_clear);
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
 
         let bucket_key = CacheKey::page_with_slot(7, 1, 0, 5, Some(11));
         cache.put(bucket_key.clone(), b"block".to_vec()).unwrap();
         let held_during_bucket_invalidation = cache.acquire(&bucket_key).unwrap().unwrap();
         cache.invalidate_slot(7, 11).unwrap();
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
         cache.release(held_during_bucket_invalidation);
 
         let shard_key = CacheKey::string(9, "shard-pin-count");
         cache.put(shard_key.clone(), b"value".to_vec()).unwrap();
         let held_during_shard_invalidation = cache.acquire(&shard_key).unwrap().unwrap();
         cache.invalidate_shard(9).unwrap();
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
         cache.release(held_during_shard_invalidation);
+    }
+
+    // rust-internal: independent pin shards must not share one hot counter.
+    #[test]
+    fn independent_pin_stripes_keep_independent_handle_counts() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let first = CacheKey::string(0, "pin-stripe-first");
+        let first_stripe = {
+            let inner = cache.inner.read().unwrap();
+            inner.pin_stripe_index(&first)
+        };
+        let second = (0..1_000)
+            .map(|index| CacheKey::string(0, &format!("pin-stripe-{index}")))
+            .find(|key| {
+                let inner = cache.inner.read().unwrap();
+                inner.pin_stripe_index(key) != first_stripe
+            })
+            .expect("at least two pin stripes");
+        let second_stripe = {
+            let inner = cache.inner.read().unwrap();
+            inner.pin_stripe_index(&second)
+        };
+
+        cache.put(first.clone(), b"first".to_vec()).unwrap();
+        cache.put(second.clone(), b"second".to_vec()).unwrap();
+        let first_handle = cache.acquire(&first).unwrap().unwrap();
+        let second_handle = cache.acquire(&second).unwrap().unwrap();
+
+        assert_eq!(
+            cache.pin_registry.stripes[first_stripe]
+                .handle_count
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            cache.pin_registry.stripes[second_stripe]
+                .handle_count
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(cache.pin_registry.handle_count(), 2);
+
+        cache.release(first_handle);
+        assert_eq!(
+            cache.pin_registry.stripes[first_stripe]
+                .handle_count
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            cache.pin_registry.stripes[second_stripe]
+                .handle_count
+                .load(Ordering::Acquire),
+            1
+        );
+        cache.release(second_handle);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
     }
 
     // rust-internal: returning an ordinary pinned handle must not wait for the cache-wide lock.
@@ -16617,7 +16674,7 @@ mod tests {
             .expect("release waited for the cache-wide lock");
         drop(held_cache_lock);
         worker.join().unwrap();
-        assert_eq!(cache.pin_registry.handle_count.load(Ordering::Acquire), 0);
+        assert_eq!(cache.pin_registry.handle_count(), 0);
     }
 
     #[test]
