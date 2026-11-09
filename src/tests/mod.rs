@@ -22686,6 +22686,192 @@ mod tests {
         );
     }
 
+    // rust-internal: validates deferred PMEM warming without delaying the read.
+    #[test]
+    fn async_promotion_warms_memory_from_pmem() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 64, 0)
+                .with_pmem_paths([unique_temp_path("async-promotion-pmem")])
+                .with_async_promotion(8, 4096, 4, 60_000),
+        );
+        assert!(cache.stop_async_promotion_worker());
+        let key = CacheKey::string(9, "async-promotion-pmem-key");
+        cache
+            .test_insert(
+                CacheInstanceKind::Pmem,
+                key.clone(),
+                b"pmem-value".to_vec(),
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"pmem-value".to_vec()));
+        assert!(cache
+            .test_acquire(CacheInstanceKind::Dram, &key)
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.async_promotion_queue_depth(), 1);
+
+        let report = cache.drain_async_promotions(8).unwrap();
+        assert_eq!(report.drained, 1);
+        assert_eq!(report.promoted, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(
+            cache
+                .test_acquire(CacheInstanceKind::Dram, &key)
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"pmem-value"
+        );
+    }
+
+    // rust-internal: validates deferred SSD warming and stale-job rejection.
+    #[test]
+    fn async_promotion_rejects_stale_ssd_values() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 0, 4096)
+                .with_ssd_paths([unique_temp_path("async-promotion-ssd")])
+                .with_async_promotion(8, 4096, 4, 60_000),
+        );
+        assert!(cache.stop_async_promotion_worker());
+        let key = CacheKey::string(9, "async-promotion-ssd-key");
+        cache
+            .test_insert(
+                CacheInstanceKind::Ssd,
+                key.clone(),
+                b"old-value".to_vec(),
+                9,
+            )
+            .unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"old-value".to_vec()));
+        assert_eq!(cache.async_promotion_queue_depth(), 1);
+        cache.put(key.clone(), b"new-value".to_vec()).unwrap();
+
+        let report = cache.drain_async_promotions(8).unwrap();
+        assert_eq!(report.drained, 1);
+        assert_eq!(report.promoted, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"new-value".to_vec()));
+    }
+
+    // rust-internal: validates bounded promotion falls back to immediate warming.
+    #[test]
+    fn async_promotion_queue_pressure_preserves_warming() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 0, 4096)
+                .with_ssd_paths([unique_temp_path("async-promotion-pressure")])
+                .with_async_promotion(1, 4096, 1, 60_000),
+        );
+        assert!(cache.stop_async_promotion_worker());
+        let queued = CacheKey::string(9, "async-promotion-queued");
+        let fallback = CacheKey::string(9, "async-promotion-fallback");
+        for (key, value) in [
+            (queued.clone(), b"queued".to_vec()),
+            (fallback.clone(), b"fallback".to_vec()),
+        ] {
+            cache
+                .test_insert(CacheInstanceKind::Ssd, key, value.clone(), value.len())
+                .unwrap();
+        }
+
+        assert_eq!(cache.get(&queued).unwrap(), Some(b"queued".to_vec()));
+        assert_eq!(cache.async_promotion_queue_depth(), 1);
+        assert_eq!(cache.get(&fallback).unwrap(), Some(b"fallback".to_vec()));
+        assert_eq!(cache.async_promotion_queue_depth(), 1);
+        assert!(cache
+            .test_acquire(CacheInstanceKind::Dram, &fallback)
+            .unwrap()
+            .is_some());
+        assert!(cache
+            .test_acquire(CacheInstanceKind::Dram, &queued)
+            .unwrap()
+            .is_none());
+    }
+
+    // rust-internal: validates the configured worker drains real lower-tier reads.
+    #[test]
+    fn async_promotion_worker_drains_lower_tier_reads() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 0, 4096)
+                .with_ssd_paths([unique_temp_path("async-promotion-worker")])
+                .with_async_promotion(8, 4096, 4, 1),
+        );
+        let key = CacheKey::string(9, "async-promotion-worker-key");
+        cache
+            .test_insert(
+                CacheInstanceKind::Ssd,
+                key.clone(),
+                b"worker-value".to_vec(),
+                12,
+            )
+            .unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"worker-value".to_vec()));
+        for _ in 0..200 {
+            if cache
+                .test_acquire(CacheInstanceKind::Dram, &key)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cache
+            .test_acquire(CacheInstanceKind::Dram, &key)
+            .unwrap()
+            .is_some());
+        assert_eq!(cache.async_promotion_queue_depth(), 0);
+        assert!(cache.stop());
+    }
+
+    // rust-internal: validates configured promotion workers follow cache lifecycle.
+    #[test]
+    fn configured_async_promotion_workers_restart_and_fan_out() {
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 4096)
+                .with_ssd_paths([unique_temp_path("async-promotion-sharded")])
+                .with_async_promotion(32, 1 << 20, 4, 1),
+            4,
+        );
+        assert_eq!(cache.async_promotion_workers_running(), 4);
+        assert_eq!(cache.stop_async_promotion_workers(), 4);
+        assert_eq!(cache.async_promotion_workers_running(), 0);
+        assert_eq!(
+            cache.configure_async_promotion_workers(
+                32,
+                1 << 20,
+                2,
+                Duration::from_millis(2),
+            ),
+            4
+        );
+        assert_eq!(cache.async_promotion_workers_running(), 4);
+        assert!(cache.stop());
+        assert_eq!(cache.async_promotion_workers_running(), 0);
+        cache.start().unwrap();
+        assert_eq!(cache.async_promotion_workers_running(), 4);
+        assert!(cache.stop());
+    }
+
+    // rust-internal: validates shutdown interrupts a long idle polling interval.
+    #[test]
+    fn async_promotion_worker_stops_without_waiting_for_poll_interval() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 4096)
+                .with_ssd_paths([unique_temp_path("async-promotion-prompt-stop")])
+                .with_async_promotion(8, 4096, 4, 60_000),
+        );
+        assert!(cache.async_promotion_worker_running());
+        std::thread::sleep(Duration::from_millis(10));
+        let started = Instant::now();
+        assert!(cache.stop_async_promotion_worker());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn async_writeback_worker_drains_enqueued_jobs() {
         let cache = MultiLayerCache::new(64, unique_temp_path("async-writeback-worker"));

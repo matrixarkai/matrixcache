@@ -1454,6 +1454,15 @@ pub struct CacheWritebackDrainReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CachePromotionDrainReport {
+    pub requested: usize,
+    pub drained: usize,
+    pub promoted: usize,
+    pub skipped: usize,
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheWritebackSubmitReport {
     pub queued: usize,
     pub write_through: usize,
@@ -1628,6 +1637,10 @@ pub struct MultiLayerCache {
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
     async_writeback_jobs_per_round: Arc<AtomicU64>,
     async_writeback_interval_millis: Arc<AtomicU64>,
+    async_promotion_worker: Arc<Mutex<Option<CacheAsyncPromotionWorker>>>,
+    async_promotion_queue: Arc<Mutex<CachePromotionQueue>>,
+    async_promotion_jobs_per_round: Arc<AtomicU64>,
+    async_promotion_interval_millis: Arc<AtomicU64>,
     /// Whether an access-record callback is registered.
     ///
     /// Duplicated out of `CacheInner` so the check that begins every get, put
@@ -1648,6 +1661,35 @@ pub struct MultiLayerCache {
 struct CacheAsyncWritebackWorker {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct CacheAsyncPromotionWorker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CachePromotionSource {
+    Pmem,
+    Ssd { probe_epoch: u64 },
+}
+
+#[derive(Debug)]
+struct CachePromotionJob {
+    key: Arc<CacheKey>,
+    value: Arc<[u8]>,
+    source: CachePromotionSource,
+}
+
+#[derive(Debug)]
+struct CachePromotionQueue {
+    jobs: VecDeque<CachePromotionJob>,
+    positions: AHashMap<Arc<CacheKey>, u64>,
+    head: u64,
+    bytes: u64,
+    max_entries: usize,
+    max_bytes: Option<u64>,
 }
 
 /// What the memory tier holds for one entry: the bytes, and the entry own
@@ -2874,6 +2916,12 @@ impl MultiLayerCache {
             options.async_writeback_jobs_per_round,
             Duration::from_millis(options.async_writeback_interval_millis.max(1)),
         );
+        cache.configure_async_promotion(
+            options.async_promotion_queue_capacity,
+            options.async_promotion_queue_bytes,
+            options.async_promotion_jobs_per_round,
+            Duration::from_millis(options.async_promotion_interval_millis.max(1)),
+        );
         cache
     }
 
@@ -2981,6 +3029,21 @@ impl MultiLayerCache {
             async_writeback_interval_millis: Arc::new(AtomicU64::new(
                 default_async_writeback_interval_millis(),
             )),
+            async_promotion_worker: Arc::new(Mutex::new(None)),
+            async_promotion_queue: Arc::new(Mutex::new(CachePromotionQueue {
+                jobs: VecDeque::new(),
+                positions: AHashMap::new(),
+                head: 0,
+                bytes: 0,
+                max_entries: 0,
+                max_bytes: Some(default_async_promotion_queue_bytes()),
+            })),
+            async_promotion_jobs_per_round: Arc::new(AtomicU64::new(
+                default_async_promotion_jobs_per_round() as u64,
+            )),
+            async_promotion_interval_millis: Arc::new(AtomicU64::new(
+                default_async_promotion_interval_millis(),
+            )),
             access_record_registered: Arc::new(AtomicBool::new(false)),
             eviction_callbacks_registered: Arc::new(AtomicBool::new(false)),
             pin_registry,
@@ -3003,6 +3066,7 @@ impl MultiLayerCache {
         }
         drop(inner);
         self.start_configured_async_writeback_worker();
+        self.start_configured_async_promotion_worker();
         Ok(())
     }
 
@@ -3012,6 +3076,7 @@ impl MultiLayerCache {
 
     pub fn stop(&self) -> bool {
         self.stop_async_writeback_worker();
+        self.stop_async_promotion_worker();
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.started = false;
         inner.reset_pmem_manifest_writer();
@@ -4137,7 +4202,7 @@ impl MultiLayerCache {
                         .read_counters
                         .shared_buffer_hits
                         .fetch_add(1, Ordering::Relaxed);
-                    inner.promote_pmem_probe_if_current(key, &value);
+                    self.promote_pmem_probe_or_defer(&mut inner, key, &value, None);
                     inner.record_get_latency(started);
                     inner.record_read_through_latency(started);
                     inner.record_refill_latency(started);
@@ -4206,7 +4271,6 @@ impl MultiLayerCache {
                     }
                 }
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 inner
                     .read_counters
@@ -4217,7 +4281,12 @@ impl MultiLayerCache {
                 }
                 inner.record_hit(key, value.len());
                 if !inner.ssd_instance_only
-                    && !inner.refill_ssd_probe(key, Arc::clone(&value), current)
+                    && !self.refill_ssd_probe_or_defer(
+                        &mut inner,
+                        key,
+                        Arc::clone(&value),
+                        probe_epoch,
+                    )
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
@@ -4424,9 +4493,13 @@ impl MultiLayerCache {
                 let Some(value) = results[position].as_ref() else {
                     continue;
                 };
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.record_hit(key, value.len());
-                if !inner.refill_ssd_probe(key, Arc::clone(value), current) {
+                if !self.refill_ssd_probe_or_defer(
+                    &mut inner,
+                    key,
+                    Arc::clone(value),
+                    probe_epoch,
+                ) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -4631,7 +4704,12 @@ impl MultiLayerCache {
             for (unique_position, value, outcome, started) in pmem_refills {
                 let key = unique_keys[unique_position];
                 inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-                inner.promote_accounted_pmem_probe_if_current(key, &value, outcome);
+                self.promote_pmem_probe_or_defer(
+                    &mut inner,
+                    key,
+                    &value,
+                    Some(outcome),
+                );
                 inner.record_get_latency(started);
                 inner.record_read_through_latency(started);
                 inner.record_refill_latency(started);
@@ -4761,7 +4839,6 @@ impl MultiLayerCache {
                 }
                 for (unique_position, started, decoded_block) in decoded {
                     let key = unique_keys[unique_position];
-                    let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                     match decoded_block {
                         Some((value, compressed)) => {
                             inner
@@ -4776,7 +4853,12 @@ impl MultiLayerCache {
                             // `value` is already the `Arc<[u8]>` this batch
                             // returns, so the tier takes a handle to it.
                             if !inner.ssd_instance_only
-                                && !inner.refill_ssd_probe(key, Arc::clone(&value), current)
+                                && !self.refill_ssd_probe_or_defer(
+                                    &mut inner,
+                                    key,
+                                    Arc::clone(&value),
+                                    probe_epoch,
+                                )
                             {
                                 inner.stats.refill_failures =
                                     inner.stats.refill_failures.saturating_add(1);
@@ -5153,7 +5235,12 @@ impl MultiLayerCache {
                         }
                     }
                     CacheReadTier::Pmem => {
-                        inner.promote_accounted_pmem_probe_if_current(key, value, *outcome)
+                        self.promote_pmem_probe_or_defer(
+                            &mut inner,
+                            key,
+                            value,
+                            Some(*outcome),
+                        )
                     }
                     CacheReadTier::Ssd => unreachable!("resident batch never captures SSD"),
                 }
@@ -5419,7 +5506,7 @@ impl MultiLayerCache {
 
             let mut inner = self.inner.write().expect("cache lock poisoned");
             inner.read_counters.pmem_hits.fetch_add(1, Ordering::Relaxed);
-            inner.promote_pmem_probe_if_current(key, &value);
+            self.promote_pmem_probe_or_defer(&mut inner, key, &value, None);
             inner.record_get_latency(started);
             inner.record_read_through_latency(started);
             inner.record_refill_latency(started);
@@ -5493,14 +5580,18 @@ impl MultiLayerCache {
                     }
                 }
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.read_counters.disk_hits.fetch_add(1, Ordering::Relaxed);
                 if compressed {
                     inner.stats.compressed_hits += 1;
                 }
                 inner.record_hit(key, decoded.len());
                 if let Some(refill) = decoded.to_refill() {
-                    if !inner.refill_ssd_probe(key, refill, current) {
+                    if !self.refill_ssd_probe_or_defer(
+                        &mut inner,
+                        key,
+                        refill,
+                        probe_epoch,
+                    ) {
                         inner.stats.refill_failures += 1;
                     }
                 }
@@ -5610,9 +5701,13 @@ impl MultiLayerCache {
                     continue;
                 };
                 let key = &keys[position];
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 let refill_len = refill.len();
-                if !inner.refill_ssd_probe(key, refill, current) {
+                if !self.refill_ssd_probe_or_defer(
+                    &mut inner,
+                    key,
+                    refill,
+                    probe_epoch,
+                ) {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.record_hit_metadata(key, refill_len);
@@ -6020,11 +6115,15 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             for (key, positions, started, refill_started, decoded) in ssd_reads {
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match decoded {
                     Some((value, compressed)) => {
                         if let Some(refill) = value.to_refill() {
-                            if !inner.refill_ssd_probe(key, refill, current) {
+                            if !self.refill_ssd_probe_or_defer(
+                                &mut inner,
+                                key,
+                                refill,
+                                probe_epoch,
+                            ) {
                                 inner.stats.refill_failures =
                                     inner.stats.refill_failures.saturating_add(1);
                             }
@@ -6325,10 +6424,14 @@ impl MultiLayerCache {
             Some(block) => {
                 let decoded = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 inner.increment_pin_for_handle(key, decoded.len());
                 if !inner.ssd_instance_only
-                    && !inner.refill_ssd_probe(key, Arc::clone(&decoded), current)
+                    && !self.refill_ssd_probe_or_defer(
+                        &mut inner,
+                        key,
+                        Arc::clone(&decoded),
+                        probe_epoch,
+                    )
                 {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
@@ -6988,12 +7091,16 @@ impl MultiLayerCache {
             let mut pin_counts =
                 SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions, started, value) in decoded {
-                let current = inner.ssd_probe_is_current_for(key, probe_epoch);
                 match value {
                     Some((value, compressed)) => {
                         let occurrences = positions.len();
                         if !inner.ssd_instance_only
-                            && !inner.refill_ssd_probe(key, Arc::clone(&value), current)
+                            && !self.refill_ssd_probe_or_defer(
+                                &mut inner,
+                                key,
+                                Arc::clone(&value),
+                                probe_epoch,
+                            )
                         {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
@@ -7557,6 +7664,397 @@ impl MultiLayerCache {
     #[allow(non_snake_case)]
     pub fn AsyncWritebackWorkerConfiguration(&self) -> Option<(usize, Duration)> {
         self.async_writeback_worker_configuration()
+    }
+
+    /// Configure bounded lower-tier promotion outside the caller's read path.
+    ///
+    /// A zero entry limit disables the worker and keeps promotion synchronous.
+    /// When the queue cannot accept a job, the read falls back to synchronous
+    /// promotion so cache warming remains reliable under pressure.
+    pub fn configure_async_promotion(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval: Duration,
+    ) -> bool {
+        self.stop_async_promotion_worker();
+        {
+            let mut queue = self
+                .async_promotion_queue
+                .lock()
+                .expect("async promotion queue lock poisoned");
+            queue.max_entries = max_entries;
+            queue.max_bytes = (max_bytes != 0).then_some(max_bytes);
+        }
+        self.async_promotion_jobs_per_round
+            .store(max_jobs_per_round.max(1) as u64, Ordering::Release);
+        self.async_promotion_interval_millis.store(
+            interval.as_millis().max(1).min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+        self.start_configured_async_promotion_worker()
+    }
+
+    fn start_configured_async_promotion_worker(&self) -> bool {
+        let enabled = self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned")
+            .max_entries
+            > 0;
+        if !enabled || !self.is_started() {
+            return false;
+        }
+        let max_jobs_per_round = self
+            .async_promotion_jobs_per_round
+            .load(Ordering::Acquire)
+            .max(1) as usize;
+        let interval = Duration::from_millis(
+            self.async_promotion_interval_millis
+                .load(Ordering::Acquire)
+                .max(1),
+        );
+        self.start_async_promotion_worker(max_jobs_per_round, interval)
+    }
+
+    pub fn start_async_promotion_worker(
+        &self,
+        max_jobs_per_round: usize,
+        interval: Duration,
+    ) -> bool {
+        if self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned")
+            .max_entries
+            == 0
+        {
+            return false;
+        }
+        let mut worker = self
+            .async_promotion_worker
+            .lock()
+            .expect("async promotion worker lock poisoned");
+        if worker.is_some() {
+            return false;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let cache = self.clone();
+        let max_jobs_per_round = max_jobs_per_round.max(1);
+        let interval = interval.max(Duration::from_millis(1));
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match cache.drain_async_promotions(max_jobs_per_round) {
+                    Ok(report) if report.drained > 0 => std::thread::yield_now(),
+                    Ok(_) | Err(CacheError::Stopped) => std::thread::park_timeout(interval),
+                    Err(_) => std::thread::park_timeout(interval),
+                }
+            }
+        });
+        *worker = Some(CacheAsyncPromotionWorker {
+            stop,
+            handle: Some(handle),
+        });
+        true
+    }
+
+    pub fn stop_async_promotion_worker(&self) -> bool {
+        let worker = self
+            .async_promotion_worker
+            .lock()
+            .expect("async promotion worker lock poisoned")
+            .take();
+        let stopped = if let Some(mut worker) = worker {
+            worker.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = worker.handle.take() {
+                handle.thread().unpark();
+                let _ = handle.join();
+            }
+            true
+        } else {
+            false
+        };
+        let mut queue = self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned");
+        queue.jobs.clear();
+        queue.positions.clear();
+        queue.head = 0;
+        queue.bytes = 0;
+        stopped
+    }
+
+    pub fn async_promotion_worker_running(&self) -> bool {
+        self.async_promotion_worker
+            .lock()
+            .expect("async promotion worker lock poisoned")
+            .is_some()
+    }
+
+    pub fn async_promotion_queue_depth(&self) -> usize {
+        self.async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned")
+            .jobs
+            .len()
+    }
+
+    pub fn async_promotion_queue_bytes(&self) -> u64 {
+        self.async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned")
+            .bytes
+    }
+
+    pub fn async_promotion_configuration(
+        &self,
+    ) -> Option<(usize, u64, usize, Duration)> {
+        let queue = self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned");
+        (queue.max_entries > 0).then(|| {
+            (
+                queue.max_entries,
+                queue.max_bytes.unwrap_or(0),
+                self.async_promotion_jobs_per_round
+                    .load(Ordering::Acquire)
+                    .max(1) as usize,
+                Duration::from_millis(
+                    self.async_promotion_interval_millis
+                        .load(Ordering::Acquire)
+                        .max(1),
+                ),
+            )
+        })
+    }
+
+    fn enqueue_async_promotion(
+        &self,
+        key: &CacheKey,
+        value: Arc<[u8]>,
+        source: CachePromotionSource,
+    ) -> bool {
+        let value_len = value.len() as u64;
+        let mut queue = self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned");
+        if queue.max_entries == 0 {
+            return false;
+        }
+        if let Some(sequence) = queue.positions.get(key).copied() {
+            let index = sequence.saturating_sub(queue.head) as usize;
+            if let Some(old_len) = queue.jobs.get(index).map(|job| job.value.len() as u64) {
+                let next_bytes = queue.bytes.saturating_sub(old_len).saturating_add(value_len);
+                if queue.max_bytes.is_some_and(|limit| next_bytes > limit)
+                    && value_len > old_len
+                {
+                    return false;
+                }
+                queue.jobs[index].value = value;
+                queue.jobs[index].source = source;
+                queue.bytes = next_bytes;
+                return true;
+            }
+            queue.positions.remove(key);
+        }
+        if queue.jobs.len() >= queue.max_entries
+            || queue
+                .max_bytes
+                .is_some_and(|limit| queue.bytes.saturating_add(value_len) > limit)
+        {
+            return false;
+        }
+        let key = Arc::new(key.clone());
+        let sequence = queue.head.saturating_add(queue.jobs.len() as u64);
+        queue.positions.insert(Arc::clone(&key), sequence);
+        queue.jobs.push_back(CachePromotionJob { key, value, source });
+        queue.bytes = queue.bytes.saturating_add(value_len);
+        true
+    }
+
+    pub fn drain_async_promotions(
+        &self,
+        max_jobs: usize,
+    ) -> Result<CachePromotionDrainReport, CacheError> {
+        if !self.is_started() {
+            return Err(CacheError::Stopped);
+        }
+        let requested = max_jobs.max(1);
+        let (jobs, remaining) = {
+            let mut queue = self
+                .async_promotion_queue
+                .lock()
+                .expect("async promotion queue lock poisoned");
+            let count = requested.min(queue.jobs.len());
+            let mut jobs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let Some(job) = queue.jobs.pop_front() else {
+                    break;
+                };
+                queue.positions.remove(job.key.as_ref());
+                queue.head = queue.head.saturating_add(1);
+                queue.bytes = queue.bytes.saturating_sub(job.value.len() as u64);
+                jobs.push(job);
+            }
+            (jobs, queue.jobs.len())
+        };
+
+        let mut promoted = 0usize;
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        if !inner.started {
+            return Err(CacheError::Stopped);
+        }
+        for job in &jobs {
+            let before = match job.source {
+                CachePromotionSource::Pmem => inner.memory.contains_key(job.key.as_ref()),
+                CachePromotionSource::Ssd { .. } => {
+                    inner.memory.contains_key(job.key.as_ref())
+                        || inner.pmem.contains_key(job.key.as_ref())
+                }
+            };
+            let accepted = match job.source {
+                CachePromotionSource::Pmem => {
+                    if !inner.memory.contains_key(job.key.as_ref())
+                        && !inner.entry_expired(job.key.as_ref(), CoarseClock::now_millis())
+                        && inner
+                            .pmem_value(job.key.as_ref())
+                            .is_some_and(|current| Arc::ptr_eq(current, &job.value))
+                        && inner.pmem_should_refill_memory(job.value.len())
+                    {
+                        inner.put_memory_shared(job.key.as_ref(), Arc::clone(&job.value))
+                    } else {
+                        true
+                    }
+                }
+                CachePromotionSource::Ssd { probe_epoch } => {
+                    let current = inner.ssd_probe_is_current_for(job.key.as_ref(), probe_epoch);
+                    inner.refill_ssd_probe(
+                        job.key.as_ref(),
+                        Arc::clone(&job.value),
+                        current,
+                    )
+                }
+            };
+            if !accepted {
+                inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
+            }
+            let after = match job.source {
+                CachePromotionSource::Pmem => inner.memory.contains_key(job.key.as_ref()),
+                CachePromotionSource::Ssd { .. } => {
+                    inner.memory.contains_key(job.key.as_ref())
+                        || inner.pmem.contains_key(job.key.as_ref())
+                }
+            };
+            promoted += usize::from(!before && after);
+        }
+        drop(inner);
+        if promoted != 0 {
+            self.drain_eviction_records();
+        }
+        Ok(CachePromotionDrainReport {
+            requested,
+            drained: jobs.len(),
+            promoted,
+            skipped: jobs.len().saturating_sub(promoted),
+            remaining,
+        })
+    }
+
+    fn promote_pmem_probe_or_defer(
+        &self,
+        inner: &mut CacheInner,
+        key: &CacheKey,
+        value: &Arc<[u8]>,
+        accounted: Option<HitOutcome>,
+    ) {
+        let async_enabled = self
+            .async_promotion_queue
+            .lock()
+            .expect("async promotion queue lock poisoned")
+            .max_entries
+            > 0;
+        if !async_enabled {
+            match accounted {
+                Some(outcome) => {
+                    inner.promote_accounted_pmem_probe_if_current(key, value, outcome)
+                }
+                None => inner.promote_pmem_probe_if_current(key, value),
+            }
+            return;
+        }
+        if !inner.started
+            || inner.ssd_instance_only
+            || inner.memory.contains_key(key)
+            || inner.entry_expired(key, CoarseClock::now_millis())
+            || !inner
+                .pmem_value(key)
+                .is_some_and(|current| Arc::ptr_eq(current, value))
+        {
+            return;
+        }
+        match accounted {
+            Some(HitOutcome::Accounted) => {}
+            Some(HitOutcome::NeedsAccessOrderRefresh) => inner.refresh_access_order(key),
+            Some(HitOutcome::NeedsMetadata) | None => inner.record_hit(key, value.len()),
+        }
+        if !inner.pmem_should_refill_memory(value.len()) {
+            return;
+        }
+        if !self.enqueue_async_promotion(key, Arc::clone(value), CachePromotionSource::Pmem)
+            && !inner.put_memory_shared(key, Arc::clone(value))
+        {
+            inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
+        }
+    }
+
+    fn refill_ssd_probe_or_defer(
+        &self,
+        inner: &mut CacheInner,
+        key: &CacheKey,
+        value: Arc<[u8]>,
+        probe_epoch: u64,
+    ) -> bool {
+        let current = inner.ssd_probe_is_current_for(key, probe_epoch);
+        if current
+            && self.enqueue_async_promotion(
+                key,
+                Arc::clone(&value),
+                CachePromotionSource::Ssd { probe_epoch },
+            )
+        {
+            true
+        } else {
+            inner.refill_ssd_probe(key, value, current)
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn ConfigureAsyncPromotion(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> bool {
+        self.configure_async_promotion(
+            max_entries,
+            max_bytes,
+            max_jobs_per_round,
+            Duration::from_millis(interval_millis.max(1)),
+        )
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DrainAsyncPromotions(
+        &self,
+        max_jobs: usize,
+    ) -> Result<CachePromotionDrainReport, CacheError> {
+        self.drain_async_promotions(max_jobs)
     }
 
     pub fn stop_async_writeback_worker(&self) -> bool {
@@ -8997,6 +9495,20 @@ impl ShardedMultiLayerCache {
         shard_options.pmem_capacity =
             Self::split_capacity(options.pmem_capacity, shard_count, index);
         shard_options.ssd_capacity = Self::split_capacity(options.ssd_capacity, shard_count, index);
+        shard_options.async_promotion_queue_capacity = Self::split_capacity(
+            options.async_promotion_queue_capacity,
+            shard_count,
+            index,
+        );
+        shard_options.async_promotion_queue_bytes = if options.async_promotion_queue_bytes == 0 {
+            0
+        } else {
+            Self::split_capacity_u64(
+                options.async_promotion_queue_bytes,
+                shard_count,
+                index,
+            )
+        };
         shard_options.ssd_paths = if options.ssd_paths.is_empty() {
             vec![options.disk_dir().join(format!("shard-{index}"))]
         } else {
@@ -9187,6 +9699,102 @@ impl ShardedMultiLayerCache {
             .iter()
             .filter(|shard| shard.async_writeback_worker_running())
             .count()
+    }
+
+    pub fn configure_async_promotion_workers(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval: Duration,
+    ) -> usize {
+        let shard_count = self.shard_count();
+        self.shards
+            .iter()
+            .enumerate()
+            .filter(|(index, shard)| {
+                let shard_entries = Self::split_capacity(max_entries, shard_count, *index);
+                let shard_bytes = if max_bytes == 0 {
+                    0
+                } else {
+                    Self::split_capacity_u64(max_bytes, shard_count, *index)
+                };
+                shard.configure_async_promotion(
+                    shard_entries,
+                    shard_bytes,
+                    max_jobs_per_round,
+                    interval,
+                )
+            })
+            .count()
+    }
+
+    pub fn stop_async_promotion_workers(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.stop_async_promotion_worker())
+            .count()
+    }
+
+    pub fn async_promotion_workers_running(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.async_promotion_worker_running())
+            .count()
+    }
+
+    pub fn async_promotion_queue_depth(&self) -> usize {
+        self.shards
+            .iter()
+            .map(MultiLayerCache::async_promotion_queue_depth)
+            .sum()
+    }
+
+    pub fn async_promotion_queue_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(MultiLayerCache::async_promotion_queue_bytes)
+            .sum()
+    }
+
+    pub fn drain_async_promotions(
+        &self,
+        max_jobs_per_shard: usize,
+    ) -> Result<CachePromotionDrainReport, CacheError> {
+        let mut report = CachePromotionDrainReport::default();
+        for shard in self.shards.iter() {
+            let shard_report = shard.drain_async_promotions(max_jobs_per_shard)?;
+            report.requested = report.requested.saturating_add(shard_report.requested);
+            report.drained = report.drained.saturating_add(shard_report.drained);
+            report.promoted = report.promoted.saturating_add(shard_report.promoted);
+            report.skipped = report.skipped.saturating_add(shard_report.skipped);
+            report.remaining = report.remaining.saturating_add(shard_report.remaining);
+        }
+        Ok(report)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn ConfigureAsyncPromotionWorkers(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> usize {
+        self.configure_async_promotion_workers(
+            max_entries,
+            max_bytes,
+            max_jobs_per_round,
+            Duration::from_millis(interval_millis.max(1)),
+        )
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DrainAsyncPromotions(
+        &self,
+        max_jobs_per_shard: usize,
+    ) -> Result<CachePromotionDrainReport, CacheError> {
+        self.drain_async_promotions(max_jobs_per_shard)
     }
 
     pub fn set_async_writeback_queue_limit_for_test(&self, limit: usize) {

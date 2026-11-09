@@ -13,6 +13,18 @@ fn default_async_writeback_interval_millis() -> u64 {
     10
 }
 
+fn default_async_promotion_queue_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_async_promotion_jobs_per_round() -> usize {
+    64
+}
+
+fn default_async_promotion_interval_millis() -> u64 {
+    1
+}
+
 /// Everything a cache can be configured with.
 ///
 /// Tier capacities and paths are typed; the policy and engine choices are
@@ -87,6 +99,21 @@ pub struct CacheOptions {
     /// after a failed drain.
     #[serde(default = "default_async_writeback_interval_millis")]
     pub async_writeback_interval_millis: u64,
+    /// Maximum lower-tier reads waiting to refill an upper tier.
+    ///
+    /// Zero, the default, keeps promotion synchronous.
+    #[serde(default)]
+    pub async_promotion_queue_capacity: usize,
+    /// Maximum payload bytes retained by the asynchronous promotion queue.
+    /// Zero means unlimited bytes; the entry limit still applies.
+    #[serde(default = "default_async_promotion_queue_bytes")]
+    pub async_promotion_queue_bytes: u64,
+    /// Maximum promotion jobs applied in one worker round.
+    #[serde(default = "default_async_promotion_jobs_per_round")]
+    pub async_promotion_jobs_per_round: usize,
+    /// Worker sleep interval when no promotion work is available.
+    #[serde(default = "default_async_promotion_interval_millis")]
+    pub async_promotion_interval_millis: u64,
     #[serde(default)]
     pub cache_ssd_instance_only: bool,
     #[serde(default)]
@@ -142,6 +169,10 @@ impl Default for CacheOptions {
             async_writeback_queue_bytes: default_async_writeback_queue_bytes(),
             async_writeback_jobs_per_round: 0,
             async_writeback_interval_millis: default_async_writeback_interval_millis(),
+            async_promotion_queue_capacity: 0,
+            async_promotion_queue_bytes: default_async_promotion_queue_bytes(),
+            async_promotion_jobs_per_round: default_async_promotion_jobs_per_round(),
+            async_promotion_interval_millis: default_async_promotion_interval_millis(),
             cache_dram_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_pmem_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_ssd_replacement_policy: "WeightedHotnessLru".to_string(),
@@ -215,6 +246,41 @@ impl CacheOptions {
         interval_millis: u64,
     ) -> Self {
         self.with_async_writeback_worker(max_jobs_per_round, interval_millis)
+    }
+
+    /// Move lower-tier refills off the caller's read path.
+    ///
+    /// A zero queue capacity disables asynchronous promotion. Queue saturation
+    /// falls back to the synchronous path so a hot read still warms its target
+    /// tier.
+    pub fn with_async_promotion(
+        mut self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> Self {
+        self.async_promotion_queue_capacity = max_entries;
+        self.async_promotion_queue_bytes = max_bytes;
+        self.async_promotion_jobs_per_round = max_jobs_per_round.max(1);
+        self.async_promotion_interval_millis = interval_millis.max(1);
+        self
+    }
+
+    #[allow(non_snake_case)]
+    pub fn WithAsyncPromotion(
+        self,
+        max_entries: usize,
+        max_bytes: u64,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> Self {
+        self.with_async_promotion(
+            max_entries,
+            max_bytes,
+            max_jobs_per_round,
+            interval_millis,
+        )
     }
 
     pub fn with_replacement_policy(mut self, policy: CacheReplacementPolicy) -> Self {

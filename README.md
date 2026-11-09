@@ -15,7 +15,9 @@ invalidation, and asynchronous writeback with backpressure accounting.
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
-- Admission policy, cross-tier eviction, and read-through refill.
+- Admission policy, cross-tier eviction, and read-through refill, with optional
+  bounded background promotion for PMEM and SSD hits. Queue pressure falls back
+  to immediate promotion so warming remains reliable.
 - Pinned (no-promotion) handles and pinned-acquire APIs.
 - Shared-buffer reads for retrieval and scan paths that can consume cached
   bytes without copying them.
