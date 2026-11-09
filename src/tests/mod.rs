@@ -12263,6 +12263,7 @@ mod tests {
             after.read_through_latency_samples - before.read_through_latency_samples,
             expected
         );
+        assert_eq!(after.memory_hits - before.memory_hits, expected);
         assert_eq!(
             after.get_latency_le_10us
                 + after.get_latency_le_100us
@@ -12281,6 +12282,14 @@ mod tests {
             .filter(|stripe| stripe.histogram.samples() != 0)
             .count();
         assert!(active_stripes > 1);
+        let active_memory_hit_stripes = inner
+            .read_counters
+            .memory_hits
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.value.load(Ordering::Relaxed) != 0)
+            .count();
+        assert!(active_memory_hit_stripes > 1);
     }
 
     #[test]
