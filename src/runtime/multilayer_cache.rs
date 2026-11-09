@@ -2008,6 +2008,114 @@ impl AtomicLatencyHistogram {
     }
 }
 
+const READ_LATENCY_STRIPES: usize = 16;
+const _: () = assert!(READ_LATENCY_STRIPES.is_power_of_two());
+static NEXT_READ_LATENCY_STRIPE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static READ_LATENCY_STRIPE: usize =
+        NEXT_READ_LATENCY_STRIPE.fetch_add(1, Ordering::Relaxed) as usize
+            & (READ_LATENCY_STRIPES - 1);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LatencyHistogramSnapshot {
+    total_micros: u64,
+    max_micros: u64,
+    le_10us: u64,
+    le_100us: u64,
+    le_1ms: u64,
+    le_10ms: u64,
+    gt_10ms: u64,
+}
+
+impl LatencyHistogramSnapshot {
+    fn samples(self) -> u64 {
+        self.le_10us
+            .saturating_add(self.le_100us)
+            .saturating_add(self.le_1ms)
+            .saturating_add(self.le_10ms)
+            .saturating_add(self.gt_10ms)
+    }
+}
+
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct ReadLatencyStripe {
+    histogram: AtomicLatencyHistogram,
+}
+
+/// Read latency accounting distributed across cache lines.
+///
+/// A memory hit updates both the request and read-through histograms. Keeping
+/// either family on one set of atomics makes every reader contend on the same
+/// cache lines even though the metrics are only consumed by the cold snapshot
+/// path. Each thread chooses one stripe once; snapshots fold the stripes back
+/// into the existing public counters.
+#[derive(Debug)]
+struct StripedReadLatencyHistogram {
+    stripes: [ReadLatencyStripe; READ_LATENCY_STRIPES],
+}
+
+impl Default for StripedReadLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| ReadLatencyStripe::default()),
+        }
+    }
+}
+
+impl StripedReadLatencyHistogram {
+    fn active(&self) -> &AtomicLatencyHistogram {
+        READ_LATENCY_STRIPE.with(|stripe| &self.stripes[*stripe].histogram)
+    }
+
+    fn observe_with_total(&self, micros: u64) {
+        self.active().observe_with_total(micros);
+    }
+
+    fn observe_many_with_total(&self, micros: u64, samples: usize) {
+        self.active().observe_many_with_total(micros, samples);
+    }
+
+    fn snapshot(&self) -> LatencyHistogramSnapshot {
+        self.stripes.iter().fold(
+            LatencyHistogramSnapshot::default(),
+            |mut total, stripe| {
+                let histogram = &stripe.histogram;
+                total.total_micros = total
+                    .total_micros
+                    .saturating_add(histogram.total_micros.load(Ordering::Relaxed));
+                total.max_micros = total
+                    .max_micros
+                    .max(histogram.max_micros.load(Ordering::Relaxed));
+                total.le_10us = total
+                    .le_10us
+                    .saturating_add(histogram.le_10us.load(Ordering::Relaxed));
+                total.le_100us = total
+                    .le_100us
+                    .saturating_add(histogram.le_100us.load(Ordering::Relaxed));
+                total.le_1ms = total
+                    .le_1ms
+                    .saturating_add(histogram.le_1ms.load(Ordering::Relaxed));
+                total.le_10ms = total
+                    .le_10ms
+                    .saturating_add(histogram.le_10ms.load(Ordering::Relaxed));
+                total.gt_10ms = total
+                    .gt_10ms
+                    .saturating_add(histogram.gt_10ms.load(Ordering::Relaxed));
+                total
+            },
+        )
+    }
+
+    fn reset(&self) {
+        for stripe in &self.stripes {
+            stripe.histogram.reset();
+        }
+    }
+}
+
 /// The statistics a read updates, held so that a read does not need the cache
 /// exclusively in order to account for itself.
 ///
@@ -2027,8 +2135,8 @@ struct ReadPathCounters {
     hotness_promotions: AtomicU64,
     access_order_refreshes: AtomicU64,
     compressed_hits: AtomicU64,
-    get_latency: AtomicLatencyHistogram,
-    read_through_latency: AtomicLatencyHistogram,
+    get_latency: StripedReadLatencyHistogram,
+    read_through_latency: StripedReadLatencyHistogram,
     refill_latency: AtomicLatencyHistogram,
 }
 
@@ -12830,7 +12938,7 @@ impl CacheInner {
         //   `sketch_sized_from_what_is_resident`,
         //   `memory_replacement_policy`,
         //   `pmem_replacement_policy`, `ssd_replacement_policy`,
-        //   `block_options`, `tiering_policy`, `read_counters`, `stats`.
+        //   `block_options`, `tiering_policy`, `stats`.
         #[cfg(unix)]
         let manifest_writer_bytes = self
             .pmem_manifest_writer
@@ -12840,7 +12948,13 @@ impl CacheInner {
             .map_or(0, |writer| writer.path.capacity() + writer.last_record.capacity());
         #[cfg(not(unix))]
         let manifest_writer_bytes = 0;
-        let fixed_bytes = manifest_writer_bytes + self.disk_dir.capacity()
+        // `read_counters` is shared with read handles and therefore lives in
+        // one allocation behind its `Arc`. In particular, the striped read
+        // histograms are fixed per-cache bookkeeping rather than per-entry
+        // state, so account for the allocation here.
+        let fixed_bytes = manifest_writer_bytes
+            + std::mem::size_of::<ReadPathCounters>()
+            + self.disk_dir.capacity()
             + self
                 .pmem_paths
                 .iter()
@@ -14219,6 +14333,8 @@ impl MultiLayerCache {
                 )
             })
         };
+        let get_latency = inner.read_counters.get_latency.snapshot();
+        let read_through_latency = inner.read_counters.read_through_latency.snapshot();
         CacheStats {
             memory_bytes: inner.memory_bytes as u64,
             pmem_bytes: inner.pmem_bytes as u64,
@@ -14265,78 +14381,22 @@ impl MultiLayerCache {
                     .compressed_hits
                     .load(Ordering::Relaxed),
             ),
-            get_latency_samples: inner.read_counters.get_latency.samples(),
-            get_latency_total_micros: inner
-                .read_counters
-                .get_latency
-                .total_micros
-                .load(Ordering::Relaxed),
-            get_latency_max_micros: inner
-                .read_counters
-                .get_latency
-                .max_micros
-                .load(Ordering::Relaxed),
-            get_latency_le_10us: inner
-                .read_counters
-                .get_latency
-                .le_10us
-                .load(Ordering::Relaxed),
-            get_latency_le_100us: inner
-                .read_counters
-                .get_latency
-                .le_100us
-                .load(Ordering::Relaxed),
-            get_latency_le_1ms: inner
-                .read_counters
-                .get_latency
-                .le_1ms
-                .load(Ordering::Relaxed),
-            get_latency_le_10ms: inner
-                .read_counters
-                .get_latency
-                .le_10ms
-                .load(Ordering::Relaxed),
-            get_latency_gt_10ms: inner
-                .read_counters
-                .get_latency
-                .gt_10ms
-                .load(Ordering::Relaxed),
-            read_through_latency_samples: inner.read_counters.read_through_latency.samples(),
-            read_through_latency_total_micros: inner
-                .read_counters
-                .read_through_latency
-                .total_micros
-                .load(Ordering::Relaxed),
-            read_through_latency_max_micros: inner
-                .read_counters
-                .read_through_latency
-                .max_micros
-                .load(Ordering::Relaxed),
-            read_through_latency_le_10us: inner
-                .read_counters
-                .read_through_latency
-                .le_10us
-                .load(Ordering::Relaxed),
-            read_through_latency_le_100us: inner
-                .read_counters
-                .read_through_latency
-                .le_100us
-                .load(Ordering::Relaxed),
-            read_through_latency_le_1ms: inner
-                .read_counters
-                .read_through_latency
-                .le_1ms
-                .load(Ordering::Relaxed),
-            read_through_latency_le_10ms: inner
-                .read_counters
-                .read_through_latency
-                .le_10ms
-                .load(Ordering::Relaxed),
-            read_through_latency_gt_10ms: inner
-                .read_counters
-                .read_through_latency
-                .gt_10ms
-                .load(Ordering::Relaxed),
+            get_latency_samples: get_latency.samples(),
+            get_latency_total_micros: get_latency.total_micros,
+            get_latency_max_micros: get_latency.max_micros,
+            get_latency_le_10us: get_latency.le_10us,
+            get_latency_le_100us: get_latency.le_100us,
+            get_latency_le_1ms: get_latency.le_1ms,
+            get_latency_le_10ms: get_latency.le_10ms,
+            get_latency_gt_10ms: get_latency.gt_10ms,
+            read_through_latency_samples: read_through_latency.samples(),
+            read_through_latency_total_micros: read_through_latency.total_micros,
+            read_through_latency_max_micros: read_through_latency.max_micros,
+            read_through_latency_le_10us: read_through_latency.le_10us,
+            read_through_latency_le_100us: read_through_latency.le_100us,
+            read_through_latency_le_1ms: read_through_latency.le_1ms,
+            read_through_latency_le_10ms: read_through_latency.le_10ms,
+            read_through_latency_gt_10ms: read_through_latency.gt_10ms,
             refill_latency_samples: inner.read_counters.refill_latency.samples(),
             refill_latency_total_micros: inner
                 .read_counters

@@ -12219,6 +12219,70 @@ mod tests {
         );
     }
 
+    // rust-internal: read latency updates must spread across cache lines while
+    // the public snapshot still accounts for every operation exactly once.
+    #[test]
+    fn concurrent_read_latency_stripes_aggregate_exactly() {
+        const THREADS: usize = 8;
+        const READS_PER_THREAD: usize = 128;
+
+        let cache = Arc::new(MultiLayerCache::with_options(CacheOptions::new(
+            1 << 20,
+            0,
+            0,
+        )));
+        let key = CacheKey::string(1, "striped-read-latency");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        cache.set_lru_refresh_time(Duration::from_secs(60));
+        let before = cache.stats();
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..READS_PER_THREAD {
+                        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(&b"value"[..]));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let expected = (THREADS * READS_PER_THREAD) as u64;
+        let after = cache.stats();
+        assert_eq!(
+            after.get_latency_samples - before.get_latency_samples,
+            expected
+        );
+        assert_eq!(
+            after.read_through_latency_samples - before.read_through_latency_samples,
+            expected
+        );
+        assert_eq!(
+            after.get_latency_le_10us
+                + after.get_latency_le_100us
+                + after.get_latency_le_1ms
+                + after.get_latency_le_10ms
+                + after.get_latency_gt_10ms,
+            after.get_latency_samples
+        );
+
+        let inner = cache.inner.read().unwrap();
+        let active_stripes = inner
+            .read_counters
+            .get_latency
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.histogram.samples() != 0)
+            .count();
+        assert!(active_stripes > 1);
+    }
+
     #[test]
     fn acquire_no_promotion_pins_ssd_without_refilling_memory() {
         let cache = MultiLayerCache::with_tiering_policy(
