@@ -2045,6 +2045,51 @@ struct ReadLatencyStripe {
     histogram: AtomicLatencyHistogram,
 }
 
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct ReadCounterStripe {
+    value: AtomicU64,
+}
+
+#[derive(Debug)]
+struct StripedReadCounter {
+    stripes: [ReadCounterStripe; READ_LATENCY_STRIPES],
+}
+
+impl Default for StripedReadCounter {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| ReadCounterStripe::default()),
+        }
+    }
+}
+
+impl StripedReadCounter {
+    fn add(&self, value: u64) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            self.add_at(*stripe, value);
+        });
+    }
+
+    fn add_at(&self, stripe: usize, value: u64) {
+        self.stripes[stripe]
+            .value
+            .fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn sum(&self) -> u64 {
+        self.stripes.iter().fold(0, |total, stripe| {
+            total.saturating_add(stripe.value.load(Ordering::Relaxed))
+        })
+    }
+
+    fn reset(&self) {
+        for stripe in &self.stripes {
+            stripe.value.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Read latency accounting distributed across cache lines.
 ///
 /// A memory hit updates both the request and read-through histograms. Keeping
@@ -2068,6 +2113,12 @@ impl Default for StripedReadLatencyHistogram {
 impl StripedReadLatencyHistogram {
     fn active(&self) -> &AtomicLatencyHistogram {
         READ_LATENCY_STRIPE.with(|stripe| &self.stripes[*stripe].histogram)
+    }
+
+    fn observe_many_at(&self, stripe: usize, micros: u64, samples: usize) {
+        self.stripes[stripe]
+            .histogram
+            .observe_many_with_total(micros, samples);
     }
 
     fn observe_with_total(&self, micros: u64) {
@@ -2125,7 +2176,7 @@ impl StripedReadLatencyHistogram {
 /// decide whether some other write is visible.
 #[derive(Debug, Default)]
 struct ReadPathCounters {
-    memory_hits: AtomicU64,
+    memory_hits: StripedReadCounter,
     pmem_hits: AtomicU64,
     disk_hits: AtomicU64,
     misses: AtomicU64,
@@ -2141,8 +2192,18 @@ struct ReadPathCounters {
 }
 
 impl ReadPathCounters {
+    fn record_memory_hit_latencies(&self, micros: u64, samples: usize) {
+        READ_LATENCY_STRIPE.with(|stripe| {
+            let stripe = *stripe;
+            self.memory_hits.add_at(stripe, samples as u64);
+            self.get_latency.observe_many_at(stripe, micros, samples);
+            self.read_through_latency
+                .observe_many_at(stripe, micros, samples);
+        });
+    }
+
     fn reset(&self) {
-        self.memory_hits.store(0, Ordering::Relaxed);
+        self.memory_hits.reset();
         self.pmem_hits.store(0, Ordering::Relaxed);
         self.disk_hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
@@ -4301,10 +4362,6 @@ impl MultiLayerCache {
                     let value = Arc::clone(&resident.value);
                     inner
                         .read_counters
-                        .memory_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    inner
-                        .read_counters
                         .shared_buffer_hits
                         .fetch_add(1, Ordering::Relaxed);
                     inner.reconfigure_refresh_window(now_millis);
@@ -4364,12 +4421,14 @@ impl MultiLayerCache {
             // not delayed by histogram updates.
             if hit_outcome.is_some() {
                 let micros = elapsed_micros(started);
-                self.read_counters
-                    .get_latency
-                    .observe_with_total(micros);
-                self.read_counters
-                    .read_through_latency
-                    .observe_with_total(micros);
+                if matches!(tier, CacheReadTier::Memory) {
+                    self.read_counters.record_memory_hit_latencies(micros, 1);
+                } else {
+                    self.read_counters.get_latency.observe_with_total(micros);
+                    self.read_counters
+                        .read_through_latency
+                        .observe_with_total(micros);
+                }
             }
             let length = value.len();
             match tier {
@@ -4822,7 +4881,7 @@ impl MultiLayerCache {
                         inner
                             .read_counters
                             .memory_hits
-                            .fetch_add(1, Ordering::Relaxed);
+                            .add(1);
                         let outcome = inner.record_known_hit_shared_occurrences_at(
                             key,
                             resident.meta.as_ref(),
@@ -5327,7 +5386,7 @@ impl MultiLayerCache {
 
         self.read_counters
             .memory_hits
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            .add(keys.len() as u64);
         self.read_counters
             .shared_buffer_hits
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
@@ -5463,7 +5522,7 @@ impl MultiLayerCache {
 
         self.read_counters
             .memory_hits
-            .fetch_add(memory_hits, Ordering::Relaxed);
+            .add(memory_hits);
         self.read_counters
             .pmem_hits
             .fetch_add(pmem_hits, Ordering::Relaxed);
@@ -5561,7 +5620,7 @@ impl MultiLayerCache {
         if memory_hits != 0 {
             self.read_counters
                 .memory_hits
-                .fetch_add(memory_hits, Ordering::Relaxed);
+                .add(memory_hits);
         }
         if pmem_hits != 0 {
             self.read_counters
@@ -5624,10 +5683,6 @@ impl MultiLayerCache {
             if inner.ssd_instance_only || expired {
                 None
             } else if let Some(resident) = inner.memory.get(key) {
-                inner
-                    .read_counters
-                    .memory_hits
-                    .fetch_add(1, Ordering::Relaxed);
                 let epoch = CoarseClock::now_millis();
                 inner.reconfigure_refresh_window(epoch);
                 let outcome = inner.record_known_hit_shared_occurrences_at(
@@ -5687,12 +5742,7 @@ impl MultiLayerCache {
                 // shared handle, so completing the latency sample does not
                 // take the cache lock a second time.
                 let micros = elapsed_micros(started);
-                self.read_counters
-                    .get_latency
-                    .observe_with_total(micros);
-                self.read_counters
-                    .read_through_latency
-                    .observe_with_total(micros);
+                self.read_counters.record_memory_hit_latencies(micros, 1);
                 // Only these two cases need the cache exclusively, and a hit
                 // on a recently-read entry is neither.
                 match outcome {
@@ -6030,10 +6080,10 @@ impl MultiLayerCache {
                 }
                 match inner.resident_value(key).cloned() {
                     Some(value) => {
-                        inner.read_counters.memory_hits.fetch_add(
-                            positions.len() as u64,
-                            Ordering::Relaxed,
-                        );
+                        inner
+                            .read_counters
+                            .memory_hits
+                            .add(positions.len() as u64);
                         let outcome =
                             inner.record_hit_shared_occurrences_at(key, positions.len(), epoch);
                         if !matches!(outcome, HitOutcome::Accounted) {
@@ -6143,7 +6193,7 @@ impl MultiLayerCache {
                         inner
                             .read_counters
                             .memory_hits
-                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                            .add(occurrences as u64);
                         inner.record_hit_metadata(key, value.len());
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
@@ -6407,7 +6457,7 @@ impl MultiLayerCache {
                 inner
                     .read_counters
                     .memory_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                    .add(1);
                 inner.reconfigure_refresh_window(now_millis);
                 let outcome = inner.record_known_hit_shared_occurrences_at(
                     key,
@@ -6494,10 +6544,6 @@ impl MultiLayerCache {
             } else if let Some(resident) = inner.memory.get(key) {
                 let value = Arc::clone(&resident.value);
                 inner.increment_pin_for_handle(key, value.len());
-                inner
-                    .read_counters
-                    .memory_hits
-                    .fetch_add(1, Ordering::Relaxed);
                 inner.reconfigure_refresh_window(now_millis);
                 let outcome = inner.record_known_hit_shared_occurrences_at(
                     key,
@@ -6506,8 +6552,7 @@ impl MultiLayerCache {
                     now_millis,
                 );
                 let micros = elapsed_micros(started);
-                inner.record_get_latency_micros(micros);
-                inner.record_read_through_latency_micros(micros);
+                inner.read_counters.record_memory_hit_latencies(micros, 1);
                 Some((value, outcome))
             } else {
                 None
@@ -7148,7 +7193,7 @@ impl MultiLayerCache {
                 inner
                     .read_counters
                     .memory_hits
-                    .fetch_add(occurrences as u64, Ordering::Relaxed);
+                    .add(occurrences as u64);
                 let epoch = CoarseClock::now_millis();
                 let outcome = if inner.memory.contains_key(key) {
                     inner.record_hit_shared_occurrences_at(key, occurrences, epoch)
@@ -7237,7 +7282,7 @@ impl MultiLayerCache {
                         inner
                             .read_counters
                             .memory_hits
-                            .fetch_add(occurrences as u64, Ordering::Relaxed);
+                            .add(occurrences as u64);
                         inner.record_hit(key, value.len());
                         let micros = elapsed_micros(started);
                         inner.record_get_latency_micros_many(micros, occurrences);
@@ -14363,7 +14408,7 @@ impl MultiLayerCache {
             pinned_bytes,
             async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
             async_writeback_queue_bytes: inner.async_writeback_queue_bytes,
-            memory_hits: inner.read_counters.memory_hits.load(Ordering::Relaxed),
+            memory_hits: inner.read_counters.memory_hits.sum(),
             pmem_hits: inner.read_counters.pmem_hits.load(Ordering::Relaxed),
             disk_hits: inner.read_counters.disk_hits.load(Ordering::Relaxed),
             misses: inner.read_counters.misses.load(Ordering::Relaxed),
