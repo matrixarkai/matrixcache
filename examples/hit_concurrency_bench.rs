@@ -55,6 +55,7 @@ struct HitConcurrencyRow {
     get_refresh_distance_zero_mops_per_s: f64,
     get_no_move_mops_per_s: f64,
     memory_shared_mops_per_s: f64,
+    tier_shared_mops_per_s: f64,
     acquire_mops_per_s: f64,
 }
 
@@ -110,6 +111,8 @@ enum ReadShape {
     Get,
     /// Reads only the memory tier and returns its shared allocation.
     MemoryShared,
+    /// Reads through all tiers and returns the shared allocation.
+    TierShared,
     /// Takes a pinned handle and gives it back, which is the zero-copy read a
     /// caller makes when it wants the bytes without the copy.
     AcquireRelease,
@@ -132,6 +135,10 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) ->
                         }
                         ReadShape::MemoryShared => {
                             let found = cache.get_memory_shared(&key);
+                            assert!(found.is_some(), "resident key missed");
+                        }
+                        ReadShape::TierShared => {
+                            let found = cache.get_shared(&key).expect("shared get");
                             assert!(found.is_some(), "resident key missed");
                         }
                         ReadShape::AcquireRelease => {
@@ -160,66 +167,59 @@ fn main() {
          {READS_PER_THREAD} hits/thread, median of {REPEATS}\n"
     );
     println!(
-        "{:<10}{:>18}{:>18}{:>18}{:>18}",
-        "threads", "distance 0 Mops/s", "no-move Mops/s", "memory-only Mops/s", "acquire Mops/s"
+        "{:<10}{:>18}{:>18}{:>18}{:>18}{:>18}",
+        "threads",
+        "distance 0 Mops/s",
+        "no-move Mops/s",
+        "memory-only Mops/s",
+        "tier-shared Mops/s",
+        "acquire Mops/s"
     );
     let always_moves = build(Duration::ZERO);
     let mostly_still = build(NEVER_MOVES);
     let mut rows = Vec::new();
     for threads in [1_usize, 2, 4, 8] {
-        // All three arms inside each repeat, rotating which goes first.
+        // All five arms inside each repeat, rotating which goes first.
         // Measuring one arm for every repeat and then the next compares
         // separate stretches of wall clock, and a threaded read benchmark is
         // the most sensitive thing here to what else the machine is doing.
         let mut zeros = Vec::with_capacity(REPEATS);
         let mut stills = Vec::with_capacity(REPEATS);
         let mut memory_shared = Vec::with_capacity(REPEATS);
+        let mut tier_shared = Vec::with_capacity(REPEATS);
         let mut acquires = Vec::with_capacity(REPEATS);
         for repeat in 0..REPEATS {
-            let (zero, still, acquire) = match repeat % 3 {
-                0 => {
-                    let zero = throughput(&always_moves, threads, ReadShape::Get);
-                    let still = throughput(&mostly_still, threads, ReadShape::Get);
-                    (
-                        zero,
-                        still,
-                        throughput(&mostly_still, threads, ReadShape::AcquireRelease),
-                    )
-                }
-                1 => {
-                    let still = throughput(&mostly_still, threads, ReadShape::Get);
-                    let acquire = throughput(&mostly_still, threads, ReadShape::AcquireRelease);
-                    (
-                        throughput(&always_moves, threads, ReadShape::Get),
-                        still,
-                        acquire,
-                    )
-                }
-                _ => {
-                    let acquire = throughput(&mostly_still, threads, ReadShape::AcquireRelease);
-                    let zero = throughput(&always_moves, threads, ReadShape::Get);
-                    (
-                        zero,
-                        throughput(&mostly_still, threads, ReadShape::Get),
-                        acquire,
-                    )
-                }
-            };
-            zeros.push(zero);
-            stills.push(still);
-            memory_shared.push(throughput(&mostly_still, threads, ReadShape::MemoryShared));
-            acquires.push(acquire);
+            let mut samples = [0.0; 5];
+            for offset in 0..5 {
+                let arm = (repeat + offset) % 5;
+                samples[arm] = match arm {
+                    0 => throughput(&always_moves, threads, ReadShape::Get),
+                    1 => throughput(&mostly_still, threads, ReadShape::Get),
+                    2 => throughput(&mostly_still, threads, ReadShape::MemoryShared),
+                    3 => throughput(&mostly_still, threads, ReadShape::TierShared),
+                    _ => throughput(&mostly_still, threads, ReadShape::AcquireRelease),
+                };
+            }
+            zeros.push(samples[0]);
+            stills.push(samples[1]);
+            memory_shared.push(samples[2]);
+            tier_shared.push(samples[3]);
+            acquires.push(samples[4]);
         }
         let zero = median(zeros) / 1e6;
         let still = median(stills) / 1e6;
         let memory_shared = median(memory_shared) / 1e6;
+        let tier_shared = median(tier_shared) / 1e6;
         let acquire = median(acquires) / 1e6;
-        println!("{threads:<10}{zero:>18.4}{still:>18.4}{memory_shared:>18.4}{acquire:>18.4}");
+        println!(
+            "{threads:<10}{zero:>18.4}{still:>18.4}{memory_shared:>18.4}{tier_shared:>18.4}{acquire:>18.4}"
+        );
         rows.push(HitConcurrencyRow {
             threads,
             get_refresh_distance_zero_mops_per_s: zero,
             get_no_move_mops_per_s: still,
             memory_shared_mops_per_s: memory_shared,
+            tier_shared_mops_per_s: tier_shared,
             acquire_mops_per_s: acquire,
         });
     }
@@ -279,6 +279,12 @@ fn render_json_report(rows: &[HitConcurrencyRow]) -> String {
             &mut report,
             "      \"memory_shared_mops_per_s\": {:.4},",
             row.memory_shared_mops_per_s
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"tier_shared_mops_per_s\": {:.4},",
+            row.tier_shared_mops_per_s
         )
         .expect("format report");
         writeln!(
