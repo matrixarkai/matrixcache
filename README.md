@@ -18,6 +18,9 @@ invalidation, and asynchronous writeback with backpressure accounting.
 - Admission policy, cross-tier eviction, and read-through refill, with optional
   bounded background promotion for PMEM and SSD hits. Queue pressure falls back
   to immediate promotion so warming remains reliable.
+- Opt-in bounded cold-tier migration prepositions least-recently-accessed DRAM
+  and PMEM values in SSD when write-through is disabled, with value
+  revalidation before each persistent write.
 - Pinned (no-promotion) handles and pinned-acquire APIs.
 - Shared-buffer reads for retrieval and scan paths that can consume cached
   bytes without copying them.

@@ -55,6 +55,7 @@ include!("core/storage_config.rs");
 include!("runtime/replacement.rs");
 include!("runtime/storage_engines.rs");
 include!("runtime/multilayer_cache.rs");
+include!("runtime/cold_tier_migration.rs");
 include!("runtime/cache_facades.rs");
 include!("runtime/builder_and_gc.rs");
 include!("runtime/manifest_writer.rs");
