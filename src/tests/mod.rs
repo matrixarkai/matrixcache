@@ -12311,6 +12311,77 @@ mod tests {
         assert!(active_shared_hit_stripes > 1);
     }
 
+    // rust-internal: PMEM hit accounting must remain exact while concurrent
+    // readers update separate cache lines.
+    #[test]
+    fn concurrent_pmem_hit_stripes_aggregate_exactly() {
+        const THREADS: usize = 8;
+        const READS_PER_THREAD: usize = 128;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(MultiLayerCache::with_options(
+            CacheOptions::new(0, 1 << 20, 0)
+                .with_pmem_paths([directory.path().join("pmem")]),
+        ));
+        cache.start().unwrap();
+        let mut policy = cache.production_tiering_policy();
+        policy.data_placement = CacheDataPlacement::SideBySide;
+        policy.data_placement_threshold_bytes = 0;
+        cache.update_production_tiering_policy(policy);
+        cache.set_lru_refresh_time(Duration::from_secs(60));
+
+        let key = CacheKey::string(1, "striped-pmem-hit");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+        let before = cache.stats();
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..READS_PER_THREAD {
+                        assert_eq!(
+                            cache.get_shared(&key).unwrap().as_deref(),
+                            Some(&b"value"[..])
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let expected = (THREADS * READS_PER_THREAD) as u64;
+        let after = cache.stats();
+        assert_eq!(after.pmem_hits - before.pmem_hits, expected);
+        assert_eq!(
+            after.shared_buffer_hits - before.shared_buffer_hits,
+            expected
+        );
+        assert_eq!(
+            after.get_latency_samples - before.get_latency_samples,
+            expected
+        );
+        assert_eq!(
+            after.read_through_latency_samples - before.read_through_latency_samples,
+            expected
+        );
+
+        let inner = cache.inner.read().unwrap();
+        let active_pmem_hit_stripes = inner
+            .read_counters
+            .pmem_hits
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.value.load(Ordering::Relaxed) != 0)
+            .count();
+        assert!(active_pmem_hit_stripes > 1);
+    }
+
     #[test]
     fn acquire_no_promotion_pins_ssd_without_refilling_memory() {
         let cache = MultiLayerCache::with_tiering_policy(
