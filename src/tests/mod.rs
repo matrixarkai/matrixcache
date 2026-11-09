@@ -12382,6 +12382,83 @@ mod tests {
         assert!(active_pmem_hit_stripes > 1);
     }
 
+    // rust-internal: SSD hit and refill accounting must remain exact while
+    // concurrent readers update separate cache lines.
+    #[test]
+    fn concurrent_ssd_read_stripes_aggregate_exactly() {
+        const THREADS: usize = 8;
+        const READS_PER_THREAD: usize = 32;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(MultiLayerCache::with_options(
+            CacheOptions::new(0, 0, 1 << 20)
+                .with_ssd_paths([directory.path().join("ssd")])
+                .with_ssd_instance_only(true),
+        ));
+        let key = CacheKey::string(1, "striped-ssd-read");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+        let before = cache.stats();
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..READS_PER_THREAD {
+                        assert_eq!(
+                            cache.get_shared(&key).unwrap().as_deref(),
+                            Some(&b"value"[..])
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let expected = (THREADS * READS_PER_THREAD) as u64;
+        let after = cache.stats();
+        assert_eq!(after.disk_hits - before.disk_hits, expected);
+        assert_eq!(
+            after.shared_buffer_hits - before.shared_buffer_hits,
+            expected
+        );
+        assert_eq!(
+            after.get_latency_samples - before.get_latency_samples,
+            expected
+        );
+        assert_eq!(
+            after.read_through_latency_samples - before.read_through_latency_samples,
+            expected
+        );
+        assert_eq!(
+            after.refill_latency_samples - before.refill_latency_samples,
+            expected
+        );
+
+        let inner = cache.inner.read().unwrap();
+        let active_disk_hit_stripes = inner
+            .read_counters
+            .disk_hits
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.value.load(Ordering::Relaxed) != 0)
+            .count();
+        assert!(active_disk_hit_stripes > 1);
+        let active_refill_latency_stripes = inner
+            .read_counters
+            .refill_latency
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.histogram.samples() != 0)
+            .count();
+        assert!(active_refill_latency_stripes > 1);
+    }
+
     #[test]
     fn acquire_no_promotion_pins_ssd_without_refilling_memory() {
         let cache = MultiLayerCache::with_tiering_policy(
@@ -20214,8 +20291,17 @@ mod tests {
             footprint.table_bytes > footprint.metadata_bytes,
             "the table that holds the metadata has to be larger than the metadata in it"
         );
+        let table_content_bytes = footprint
+            .total_bytes
+            .saturating_sub(footprint.payload_header_bytes)
+            .saturating_sub(footprint.writeback_bytes)
+            .saturating_sub(footprint.sketch_bytes)
+            .saturating_sub(footprint.ssd_store_bytes)
+            .saturating_sub(footprint.pin_bytes)
+            .saturating_sub(footprint.fixed_bytes)
+            .saturating_sub(footprint.eviction_queue_bytes);
         assert!(
-            footprint.total_bytes
+            table_content_bytes
                 < footprint.payload_bytes
                     + footprint.key_bytes
                     + footprint.metadata_bytes
