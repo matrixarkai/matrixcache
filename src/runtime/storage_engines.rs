@@ -9,6 +9,10 @@ fn default_async_writeback_queue_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+fn default_async_writeback_interval_millis() -> u64 {
+    10
+}
+
 /// Everything a cache can be configured with.
 ///
 /// Tier capacities and paths are typed; the policy and engine choices are
@@ -74,6 +78,15 @@ pub struct CacheOptions {
     /// Zero means unlimited bytes; the entry limit still applies.
     #[serde(default = "default_async_writeback_queue_bytes")]
     pub async_writeback_queue_bytes: u64,
+    /// Maximum jobs drained by each automatic write-back worker round.
+    ///
+    /// Zero, the default, leaves automatic draining disabled.
+    #[serde(default)]
+    pub async_writeback_jobs_per_round: usize,
+    /// Sleep interval used by an automatic write-back worker when idle or
+    /// after a failed drain.
+    #[serde(default = "default_async_writeback_interval_millis")]
+    pub async_writeback_interval_millis: u64,
     #[serde(default)]
     pub cache_ssd_instance_only: bool,
     #[serde(default)]
@@ -127,6 +140,8 @@ impl Default for CacheOptions {
             ssd_write_bytes_per_sec: 0,
             async_writeback_queue_capacity: default_async_writeback_queue_capacity(),
             async_writeback_queue_bytes: default_async_writeback_queue_bytes(),
+            async_writeback_jobs_per_round: 0,
+            async_writeback_interval_millis: default_async_writeback_interval_millis(),
             cache_dram_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_pmem_replacement_policy: "WeightedHotnessLru".to_string(),
             cache_ssd_replacement_policy: "WeightedHotnessLru".to_string(),
@@ -177,6 +192,29 @@ impl CacheOptions {
     #[allow(non_snake_case)]
     pub fn WithAsyncWritebackLimits(self, max_entries: usize, max_bytes: u64) -> Self {
         self.with_async_writeback_limits(max_entries, max_bytes)
+    }
+
+    /// Enable automatic asynchronous write-back draining.
+    ///
+    /// A zero job count disables the worker. The interval is clamped to one
+    /// millisecond when the worker is enabled.
+    pub fn with_async_writeback_worker(
+        mut self,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> Self {
+        self.async_writeback_jobs_per_round = max_jobs_per_round;
+        self.async_writeback_interval_millis = interval_millis.max(1);
+        self
+    }
+
+    #[allow(non_snake_case)]
+    pub fn WithAsyncWritebackWorker(
+        self,
+        max_jobs_per_round: usize,
+        interval_millis: u64,
+    ) -> Self {
+        self.with_async_writeback_worker(max_jobs_per_round, interval_millis)
     }
 
     pub fn with_replacement_policy(mut self, policy: CacheReplacementPolicy) -> Self {

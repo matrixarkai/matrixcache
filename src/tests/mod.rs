@@ -22706,6 +22706,83 @@ mod tests {
         assert!(cache.stats().async_writeback_drained >= 1);
     }
 
+    // rust-internal: validates the configured worker follows cache lifecycle.
+    #[test]
+    fn configured_async_writeback_worker_starts_drains_and_restarts() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 0)
+                .with_async_writeback_limits(32, 4096)
+                .with_async_writeback_worker(4, 1),
+        );
+        assert_eq!(
+            cache.async_writeback_worker_configuration(),
+            Some((4, Duration::from_millis(1)))
+        );
+        assert!(cache.async_writeback_worker_running());
+
+        let first = CacheKey::string(9, "configured-worker-first");
+        cache
+            .enqueue_async_writeback(first.clone(), b"first".to_vec())
+            .unwrap();
+        for _ in 0..200 {
+            if cache.async_writeback_queue_depth() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(cache.get(&first).unwrap(), Some(b"first".to_vec()));
+
+        assert!(cache.stop());
+        assert!(!cache.async_writeback_worker_running());
+        cache.start().unwrap();
+        assert!(cache.async_writeback_worker_running());
+
+        let second = CacheKey::string(9, "configured-worker-second");
+        cache
+            .enqueue_async_writeback(second.clone(), b"second".to_vec())
+            .unwrap();
+        for _ in 0..200 {
+            if cache.async_writeback_queue_depth() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(cache.get(&second).unwrap(), Some(b"second".to_vec()));
+        assert!(cache.stop());
+    }
+
+    // rust-internal: validates runtime disable and sharded worker fanout.
+    #[test]
+    fn configured_async_writeback_workers_can_be_disabled_and_reenabled() {
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 0).with_async_writeback_worker(4, 1),
+            4,
+        );
+        assert_eq!(cache.async_writeback_workers_running(), 4);
+        assert_eq!(
+            cache.async_writeback_worker_configuration(),
+            Some((4, Duration::from_millis(1)))
+        );
+
+        assert_eq!(
+            cache.configure_async_writeback_workers(0, Duration::from_millis(1)),
+            0
+        );
+        assert_eq!(cache.async_writeback_workers_running(), 0);
+        assert_eq!(cache.async_writeback_worker_configuration(), None);
+
+        assert_eq!(
+            cache.configure_async_writeback_workers(2, Duration::from_millis(2)),
+            4
+        );
+        assert_eq!(cache.async_writeback_workers_running(), 4);
+        assert_eq!(
+            cache.async_writeback_worker_configuration(),
+            Some((2, Duration::from_millis(2)))
+        );
+        assert!(cache.stop());
+    }
+
     #[test]
     fn sharded_async_writeback_batch_enqueue_routes_by_shard() {
         let cache = MatrixCacheBuilder::build_sharded_cache(
