@@ -54,6 +54,7 @@ struct HitConcurrencyRow {
     threads: usize,
     get_refresh_distance_zero_mops_per_s: f64,
     get_no_move_mops_per_s: f64,
+    memory_shared_mops_per_s: f64,
     acquire_mops_per_s: f64,
 }
 
@@ -107,6 +108,8 @@ fn build(refresh_window: Duration) -> Arc<MultiLayerCache> {
 enum ReadShape {
     /// Copies the value out.
     Get,
+    /// Reads only the memory tier and returns its shared allocation.
+    MemoryShared,
     /// Takes a pinned handle and gives it back, which is the zero-copy read a
     /// caller makes when it wants the bytes without the copy.
     AcquireRelease,
@@ -125,6 +128,10 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) ->
                     match shape {
                         ReadShape::Get => {
                             let found = cache.get(&key).expect("get");
+                            assert!(found.is_some(), "resident key missed");
+                        }
+                        ReadShape::MemoryShared => {
+                            let found = cache.get_memory_shared(&key);
                             assert!(found.is_some(), "resident key missed");
                         }
                         ReadShape::AcquireRelease => {
@@ -153,8 +160,8 @@ fn main() {
          {READS_PER_THREAD} hits/thread, median of {REPEATS}\n"
     );
     println!(
-        "{:<10}{:>18}{:>18}{:>18}",
-        "threads", "distance 0 Mops/s", "no-move Mops/s", "acquire Mops/s"
+        "{:<10}{:>18}{:>18}{:>18}{:>18}",
+        "threads", "distance 0 Mops/s", "no-move Mops/s", "memory-only Mops/s", "acquire Mops/s"
     );
     let always_moves = build(Duration::ZERO);
     let mostly_still = build(NEVER_MOVES);
@@ -166,6 +173,7 @@ fn main() {
         // the most sensitive thing here to what else the machine is doing.
         let mut zeros = Vec::with_capacity(REPEATS);
         let mut stills = Vec::with_capacity(REPEATS);
+        let mut memory_shared = Vec::with_capacity(REPEATS);
         let mut acquires = Vec::with_capacity(REPEATS);
         for repeat in 0..REPEATS {
             let (zero, still, acquire) = match repeat % 3 {
@@ -199,16 +207,19 @@ fn main() {
             };
             zeros.push(zero);
             stills.push(still);
+            memory_shared.push(throughput(&mostly_still, threads, ReadShape::MemoryShared));
             acquires.push(acquire);
         }
         let zero = median(zeros) / 1e6;
         let still = median(stills) / 1e6;
+        let memory_shared = median(memory_shared) / 1e6;
         let acquire = median(acquires) / 1e6;
-        println!("{threads:<10}{zero:>18.4}{still:>18.4}{acquire:>18.4}");
+        println!("{threads:<10}{zero:>18.4}{still:>18.4}{memory_shared:>18.4}{acquire:>18.4}");
         rows.push(HitConcurrencyRow {
             threads,
             get_refresh_distance_zero_mops_per_s: zero,
             get_no_move_mops_per_s: still,
+            memory_shared_mops_per_s: memory_shared,
             acquire_mops_per_s: acquire,
         });
     }
@@ -262,6 +273,12 @@ fn render_json_report(rows: &[HitConcurrencyRow]) -> String {
             &mut report,
             "      \"get_no_move_mops_per_s\": {:.4},",
             row.get_no_move_mops_per_s
+        )
+        .expect("format report");
+        writeln!(
+            &mut report,
+            "      \"memory_shared_mops_per_s\": {:.4},",
+            row.memory_shared_mops_per_s
         )
         .expect("format report");
         writeln!(

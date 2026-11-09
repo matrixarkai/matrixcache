@@ -13686,6 +13686,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_shared_memory_reads_do_not_require_exclusive_access() {
+        let cache = Arc::new(
+            MultiLayerCache::try_with_options(CacheOptions::new(1 << 20, 0, 0)).unwrap(),
+        );
+        cache.set_lru_refresh_time(Duration::from_secs(600));
+        let key = CacheKey::string(7, "shared-memory-read-locking");
+        cache.put(key.clone(), vec![8u8; 512]).unwrap();
+
+        let before = cache.stats().access_order_refreshes;
+        assert!(cache.get_memory_shared(&key).is_some());
+        let after_first = cache.stats().access_order_refreshes;
+        assert_eq!(
+            after_first - before,
+            1,
+            "the first reuse still has to refresh the access order"
+        );
+
+        let read_guard = cache.inner.read().expect("cache lock poisoned");
+        let worker_cache = Arc::clone(&cache);
+        let worker_key = key.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let value = worker_cache.get_memory_shared(&worker_key);
+            sender.send(value.as_ref().map(|bytes| bytes.len())).unwrap();
+            value
+        });
+        let completed = receiver.recv_timeout(Duration::from_secs(1));
+        drop(read_guard);
+        let value = worker.join().expect("memory reader");
+
+        assert_eq!(completed, Ok(Some(512)), "the read waited for write access");
+        assert_eq!(value.as_deref(), Some(&vec![8u8; 512][..]));
+        assert_eq!(
+            cache.stats().access_order_refreshes,
+            after_first,
+            "reads inside the refresh window must not move the entry"
+        );
+    }
+
+    #[test]
     fn a_sharded_shared_memory_read_reaches_the_right_shard() {
         // Forwarded, because a method on the single-shard type is unreachable
         // on the type most likely to be holding a large cache otherwise.
