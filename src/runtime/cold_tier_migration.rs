@@ -15,6 +15,7 @@ pub struct CacheColdTierMigrationReport {
 #[derive(Debug)]
 struct CacheColdTierMigrationWorker {
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     thread: std::thread::Thread,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -113,20 +114,63 @@ impl MultiLayerCache {
 
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let paused = Arc::new(AtomicBool::new(false));
+        let worker_paused = Arc::clone(&paused);
         let cache = self.clone();
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
-                let _ = cache.migrate_cold_entries_to_ssd(max_entries_per_round);
+                if !worker_paused.load(Ordering::Acquire) {
+                    let _ = cache.migrate_cold_entries_to_ssd(max_entries_per_round);
+                }
                 std::thread::park_timeout(interval);
             }
         });
         let thread = handle.thread().clone();
         *worker = Some(CacheColdTierMigrationWorker {
             stop,
+            paused,
             thread,
             handle: Some(handle),
         });
         true
+    }
+
+    /// Suspends migration without tearing down the worker. Returns `false`
+    /// when no worker is running or it was already paused.
+    pub fn pause_cold_tier_migration_worker(&self) -> bool {
+        let worker = self
+            .cold_tier_migration_worker
+            .lock()
+            .expect("cold-tier migration worker lock poisoned");
+        let Some(worker) = worker.as_ref() else {
+            return false;
+        };
+        !worker.paused.swap(true, Ordering::AcqRel)
+    }
+
+    /// Resumes a paused worker and wakes it for an immediate bounded pass.
+    /// Returns `false` when no worker is running or it was already active.
+    pub fn resume_cold_tier_migration_worker(&self) -> bool {
+        let worker = self
+            .cold_tier_migration_worker
+            .lock()
+            .expect("cold-tier migration worker lock poisoned");
+        let Some(worker) = worker.as_ref() else {
+            return false;
+        };
+        if !worker.paused.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        worker.thread.unpark();
+        true
+    }
+
+    pub fn cold_tier_migration_worker_paused(&self) -> bool {
+        self.cold_tier_migration_worker
+            .lock()
+            .expect("cold-tier migration worker lock poisoned")
+            .as_ref()
+            .is_some_and(|worker| worker.paused.load(Ordering::Acquire))
     }
 
     /// Stops the cold-tier worker and waits for it to exit.
@@ -194,6 +238,27 @@ impl ShardedMultiLayerCache {
         self.shards
             .iter()
             .filter(|shard| shard.stop_cold_tier_migration_worker())
+            .count()
+    }
+
+    pub fn pause_cold_tier_migration_workers(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.pause_cold_tier_migration_worker())
+            .count()
+    }
+
+    pub fn resume_cold_tier_migration_workers(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.resume_cold_tier_migration_worker())
+            .count()
+    }
+
+    pub fn cold_tier_migration_workers_paused(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.cold_tier_migration_worker_paused())
             .count()
     }
 
@@ -299,6 +364,33 @@ mod cold_tier_migration_tests {
     }
 
     #[test]
+    fn paused_worker_keeps_state_and_resume_runs_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_ssd(dir.path());
+        assert!(cache.start_cold_tier_migration_worker(8, Duration::from_secs(30)));
+        assert!(cache.pause_cold_tier_migration_worker());
+        assert!(!cache.pause_cold_tier_migration_worker());
+        assert!(cache.cold_tier_migration_worker_paused());
+
+        let key = CacheKey::string(4, "paused-worker");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), b"value".to_vec())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!cache.inner.read().unwrap().disk_index.contains_key(&key));
+
+        assert!(cache.resume_cold_tier_migration_worker());
+        assert!(!cache.resume_cold_tier_migration_worker());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cache.inner.read().unwrap().disk_index.contains_key(&key) {
+            assert!(Instant::now() < deadline, "resumed worker did not run");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!cache.cold_tier_migration_worker_paused());
+        assert!(cache.stop_cold_tier_migration_worker());
+    }
+
+    #[test]
     fn sharded_worker_lifecycle_reaches_every_shard() {
         let dir = tempfile::tempdir().unwrap();
         let options = CacheOptions::new(4096, 4096, 1 << 20)
@@ -309,6 +401,10 @@ mod cold_tier_migration_tests {
             4
         );
         assert_eq!(cache.cold_tier_migration_workers_running(), 4);
+        assert_eq!(cache.pause_cold_tier_migration_workers(), 4);
+        assert_eq!(cache.cold_tier_migration_workers_paused(), 4);
+        assert_eq!(cache.resume_cold_tier_migration_workers(), 4);
+        assert_eq!(cache.cold_tier_migration_workers_paused(), 0);
         assert_eq!(cache.stop_cold_tier_migration_workers(), 4);
         assert_eq!(cache.cold_tier_migration_workers_running(), 0);
     }
