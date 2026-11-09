@@ -6242,36 +6242,64 @@ impl MultiLayerCache {
     /// reclaimed on the way, which is the same opportunity `get_memory` takes.
     pub fn get_memory_shared(&self, key: &CacheKey) -> Option<Arc<[u8]>> {
         self.emit_access_record(CacheAccessRecordKind::Get, key);
-        let mut inner = self.inner.write().expect("cache lock poisoned");
-        if !inner.started {
-            return None;
-        }
-        // Holding the cache exclusively already, so an expired entry is
-        // dropped here rather than left for something else to find, which is
-        // what `get` does with the same opportunity.
-        if inner.entry_expired(key, CoarseClock::now_millis()) {
-            inner.remove_expired_entry(key);
-            inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
-            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
-            drop(inner);
-            // Reclaiming on a read queues a record for a registered handler,
-            // and the four copying reads hand it over before returning. The
-            // pinning reads did not, so whether the handler heard about an
-            // expiry -- and when -- came down to which read noticed it.
+        let now_millis = CoarseClock::now_millis();
+        let expired;
+        let probe = {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started {
+                return None;
+            }
+            expired = inner.entry_expired(key, now_millis);
+            if expired {
+                None
+            } else if let Some(resident) = inner.memory.get(key) {
+                let value = Arc::clone(&resident.value);
+                inner
+                    .read_counters
+                    .memory_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                inner.reconfigure_refresh_window(now_millis);
+                let outcome = inner.record_known_hit_shared_occurrences_at(
+                    key,
+                    resident.meta.as_ref(),
+                    1,
+                    now_millis,
+                );
+                Some((value, outcome))
+            } else {
+                inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        };
+
+        if expired {
+            {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if inner.entry_expired(key, now_millis) {
+                    inner.remove_expired_entry(key);
+                    inner.stats.expired_reads = inner.stats.expired_reads.saturating_add(1);
+                    inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.drain_eviction_records();
             return None;
         }
-        let value = inner.resident_value(key).cloned();
-        if value.is_some() {
-            inner.read_counters.memory_hits.fetch_add(1, Ordering::Relaxed);
-            inner.record_hit(
-                key,
-                value.as_ref().map(|bytes| bytes.len()).unwrap_or_default(),
-            );
-        } else {
-            inner.read_counters.misses.fetch_add(1, Ordering::Relaxed);
+
+        let (value, outcome) = probe?;
+        match outcome {
+            HitOutcome::Accounted => {}
+            HitOutcome::NeedsAccessOrderRefresh => {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                inner.refresh_access_order(key);
+            }
+            HitOutcome::NeedsMetadata => {
+                let mut inner = self.inner.write().expect("cache lock poisoned");
+                if inner.memory.contains_key(key) {
+                    inner.record_hit(key, value.len());
+                }
+            }
         }
-        value
+        Some(value)
     }
 
     /// The memory tier's bytes, copied.
