@@ -23,6 +23,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 fn throughput(cache: &Arc<MultiLayerCache>, keys: &Arc<Vec<CacheKey>>, threads: usize) -> f64 {
+    let pinned = std::env::var_os("MATRIXCACHE_BENCH_PINNED").is_some();
     let start = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
@@ -34,11 +35,21 @@ fn throughput(cache: &Arc<MultiLayerCache>, keys: &Arc<Vec<CacheKey>>, threads: 
                 let mut bytes = 0_usize;
                 for read in 0..READS_PER_THREAD {
                     let slot = (read.wrapping_mul(7_919) + worker.wrapping_mul(1_009)) % keys.len();
-                    bytes += cache
-                        .get_shared(&keys[slot])
-                        .expect("PMEM read")
-                        .expect("resident value")
-                        .len();
+                    if pinned {
+                        let handle = cache
+                            .acquire(&keys[slot])
+                            .expect("PMEM acquire")
+                            .expect("resident value");
+                        assert_eq!(handle.tier(), CacheReadTier::Pmem);
+                        bytes += handle.as_slice().len();
+                        cache.release(handle);
+                    } else {
+                        bytes += cache
+                            .get_shared(&keys[slot])
+                            .expect("PMEM read")
+                            .expect("resident value")
+                            .len();
+                    }
                 }
                 assert_eq!(bytes, READS_PER_THREAD * VALUE_BYTES);
             })
@@ -124,7 +135,13 @@ fn main() {
     );
     println!(
         "{:<10}{:>18}{:>18}",
-        "threads", "single Mops/s", "batch Mops/s"
+        "threads",
+        if std::env::var_os("MATRIXCACHE_BENCH_PINNED").is_some() {
+            "pinned Mops/s"
+        } else {
+            "single Mops/s"
+        },
+        "batch Mops/s"
     );
     for threads in [1_usize, 2, 4, 8] {
         let reads = median(
