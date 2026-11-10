@@ -2622,7 +2622,10 @@ impl CacheInner {
 
     /// Whether a value served from PMEM belongs in the memory tier too.
     fn pmem_should_refill_memory(&self, value_len: usize) -> bool {
-        if self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes {
+        if !self.pmem_promotion_enabled
+            || self.memory_capacity_bytes == 0
+            || value_len > self.memory_capacity_bytes
+        {
             return false;
         }
         !matches!(
@@ -2691,7 +2694,8 @@ impl CacheInner {
     // Skipping a raced promotion is not a refill failure. The caller may still
     // return the value observed by its read, but must not install it again.
     fn refill_ssd_probe(&mut self, key: &CacheKey, value: Arc<[u8]>, current: bool) -> bool {
-        if !current
+        if !self.ssd_promotion_enabled
+            || !current
             || !self.started
             || self.ssd_instance_only
             || self.memory.contains_key(key)

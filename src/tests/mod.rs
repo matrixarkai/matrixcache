@@ -771,6 +771,72 @@ mod tests {
 
     use super::*;
 
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn pmem_reads_respect_disabled_promotion_across_read_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(4096, 4096, 0)
+            .with_pmem_paths([dir.path().join("pmem")])
+            .with_read_promotion(false, true);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        let key = CacheKey::string(4, "pmem-scan");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Pmem, key.clone(), b"value".to_vec())
+            .unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(cache.get_shared(&key).unwrap().as_deref(), Some(b"value".as_slice()));
+        assert_eq!(cache.get_batch(std::slice::from_ref(&key)).unwrap(), vec![Some(b"value".to_vec())]);
+        let handle = cache.acquire(&key).unwrap().unwrap();
+        cache.release(handle);
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Pmem), 1);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn ssd_reads_respect_disabled_promotion_across_read_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(4096, 0, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_read_promotion(true, false);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        let key = CacheKey::string(4, "ssd-scan");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Ssd, key.clone(), b"value".to_vec())
+            .unwrap();
+
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(cache.get_shared(&key).unwrap().as_deref(), Some(b"value".as_slice()));
+        assert_eq!(cache.get_batch(std::slice::from_ref(&key)).unwrap(), vec![Some(b"value".to_vec())]);
+        let handle = cache.acquire(&key).unwrap().unwrap();
+        cache.release(handle);
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 1);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn sharded_read_promotion_policy_reaches_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(8192, 8192, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_pmem_paths([dir.path().join("pmem")])
+            .with_read_promotion(false, false);
+        let cache = ShardedMultiLayerCache::new(options, 4);
+        assert!(cache.shards.iter().all(|shard| {
+            let inner = shard.inner.read().unwrap();
+            !inner.pmem_promotion_enabled && !inner.ssd_promotion_enabled
+        }));
+        cache.set_read_promotion_enabled(true, true);
+        assert!(cache.shards.iter().all(|shard| {
+            let inner = shard.inner.read().unwrap();
+            inner.pmem_promotion_enabled && inner.ssd_promotion_enabled
+        }));
+        assert!(CacheOptions::default().pmem_promotion_enabled);
+        assert!(CacheOptions::default().ssd_promotion_enabled);
+    }
+
     /// A sharded cache has to report what its shards recorded.
     ///
     /// The aggregation is a hand-maintained list of field names, and eight had

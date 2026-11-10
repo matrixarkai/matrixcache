@@ -71,6 +71,12 @@ pub struct CacheOptions {
     /// cold-tier migration instead; SSD is still populated on upper-tier eviction.
     #[serde(default = "default_ssd_write_through")]
     pub ssd_write_through: bool,
+    /// Refill DRAM after a PMEM hit. Disable for scan-heavy workloads.
+    #[serde(default = "default_cache_promotion_enabled")]
+    pub pmem_promotion_enabled: bool,
+    /// Refill an upper tier after an SSD hit.
+    #[serde(default = "default_cache_promotion_enabled")]
+    pub ssd_promotion_enabled: bool,
     #[serde(default)]
     pub pmem_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -184,6 +190,10 @@ pub struct CacheOptions {
     pub block_options: CacheBlockOptions,
 }
 
+fn default_cache_promotion_enabled() -> bool {
+    true
+}
+
 fn default_eviction_handler_enabled() -> bool {
     true
 }
@@ -196,6 +206,8 @@ impl Default for CacheOptions {
             pmem_capacity: policy.pmem_capacity_bytes,
             ssd_capacity: policy.ssd_capacity_bytes,
             ssd_write_through: policy.ssd_write_through,
+            pmem_promotion_enabled: true,
+            ssd_promotion_enabled: true,
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
             ssd_write_bytes_per_sec: 0,
@@ -252,6 +264,13 @@ impl CacheOptions {
     /// Choose immediate SSD writes or bounded cold-tier migration.
     pub fn with_ssd_write_through(mut self, enabled: bool) -> Self {
         self.ssd_write_through = enabled;
+        self
+    }
+
+    /// Choose whether PMEM and SSD reads warm upper tiers.
+    pub fn with_read_promotion(mut self, pmem: bool, ssd: bool) -> Self {
+        self.pmem_promotion_enabled = pmem;
+        self.ssd_promotion_enabled = ssd;
         self
     }
 
