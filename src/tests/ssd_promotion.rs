@@ -3,6 +3,30 @@
 
 use super::*;
 
+#[test]
+fn corrupt_ssd_batch_releases_resident_and_duplicate_pins() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let resident = CacheKey::string(0, "resident-before-error");
+    let broken = CacheKey::string(0, "broken-ssd");
+    cache.put(resident.clone(), b"retained".to_vec()).unwrap();
+    cache
+        .inner
+        .write()
+        .unwrap()
+        .write_ssd_block(&broken, CACHE_BLOCK_MAGIC.to_vec())
+        .unwrap();
+    let existing = cache.acquire(&resident).unwrap().unwrap();
+    let before = cache.stats().pinned_entries;
+    assert!(cache
+        .acquire_batch(&[resident.clone(), broken, resident.clone()])
+        .is_err());
+    assert_eq!(cache.stats().pinned_entries, before);
+    cache.release(existing);
+    assert_eq!(cache.stats().pinned_entries, 0);
+    assert_eq!(cache.get(&resident).unwrap().unwrap(), b"retained");
+}
+
 fn cache() -> (tempfile::TempDir, MultiLayerCache) {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(
