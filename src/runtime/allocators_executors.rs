@@ -819,6 +819,33 @@ impl SimpleLogBasedMemoryAllocator {
             .and_then(|region| region.crc32)
     }
 
+    /// Move one live region after its owner accepts the new address.
+    /// A rejected replacement leaves the original allocation untouched.
+    pub fn relocate<L: LogBasedAllocatorGcEventListener>(
+        &mut self,
+        old_ptr: AllocatorAddress,
+        listener: &mut L,
+    ) -> Result<AllocatorAddress, CacheError> {
+        let len = self.read(old_ptr)?.len();
+        let new_ptr = self.allocate(len)?;
+        {
+            let [old, new] = self.regions.get_disjoint_mut([&old_ptr, &new_ptr]);
+            let old = old.and_then(Option::as_mut).expect("live relocation source");
+            let new = new.and_then(Option::as_mut).expect("allocated relocation target");
+            new.data.copy_from_slice(&old.data);
+            new.sealed = old.sealed;
+            new.crc32 = old.crc32;
+            new.len_for_crc = old.len_for_crc;
+        }
+        if let Err(error) = listener.on_gc_copy(old_ptr, new_ptr) {
+            self.free(new_ptr, len)?;
+            self.gc(&[new_ptr as ChunkId])?;
+            return Err(error);
+        }
+        self.free(old_ptr, len)?;
+        Ok(new_ptr)
+    }
+
     pub fn gc_runs(&self) -> u64 {
         self.gc_runs
     }
@@ -927,7 +954,7 @@ impl CacheAllocatorApi for SimpleLogBasedMemoryAllocator {
             return Err(CacheError::CapacityExceeded);
         }
         let ptr = self.next_ptr;
-        self.next_ptr = self.next_ptr.saturating_add(1).max(1);
+        self.next_ptr = self.next_ptr.checked_add(1).ok_or(CacheError::CapacityExceeded)?;
         self.regions.insert(
             ptr,
             Some(SimpleAllocationRegion {
@@ -2874,6 +2901,25 @@ impl StorageGcController {
         }
         self.fly_gc_chunks = self.fly_gc_chunks.saturating_sub(chunk_count as i64);
         gc_result.map(|_| chunk_count)
+    }
+
+    /// Relocate one live region with owner approval while collection is enabled.
+    pub fn relocate_live_region<L: LogBasedAllocatorGcEventListener>(
+        &mut self,
+        address: AllocatorAddress,
+        listener: &mut L,
+    ) -> Result<Option<AllocatorAddress>, CacheError> {
+        if !self.enable_gc || self.pause_gc {
+            return Ok(None);
+        }
+        self.fly_gc_chunks = self.fly_gc_chunks.saturating_add(1);
+        let result = self.allocator.relocate(address, listener);
+        self.fly_gc_chunks = self.fly_gc_chunks.saturating_sub(1);
+        if result.is_ok() {
+            self.complete_gc_chunks = self.complete_gc_chunks.saturating_add(1);
+            self.complete_gc_tasks = self.complete_gc_tasks.saturating_add(1);
+        }
+        result.map(Some)
     }
 
     pub fn allocator(&self) -> &SimpleLogBasedMemoryAllocator {

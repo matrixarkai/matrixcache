@@ -1400,12 +1400,10 @@ pub trait RecoverDataCallback {
 /// `update` is handed the record's new location so an index pointing at the old
 /// one can be corrected.
 ///
-/// **Nothing in this crate calls it.** Collection here sweeps freed slots rather
-/// than relocating live ones, so no record ever changes address and the callback
-/// has no occasion to fire. It is implemented — [`CacheInstance`] provides it —
-/// for callers driving collection themselves, and to keep the surface the
-/// reference defines, where collection does compact and an implementor that
-/// ignored this would be left with dangling entries.
+/// [`MemStorage::relocate_record`] invokes this callback with the caller's
+/// pinned buffer as the old identity token. Rejection preserves the original
+/// allocator record. Ordinary background collection still sweeps tombstones;
+/// callers must explicitly select live records for relocation.
 pub trait GcCopyCallback {
     fn update(
         &mut self,
@@ -1755,6 +1753,31 @@ impl MemStorage {
         let mut raw = RawBuffer::with_storage_engine(value, storage_engine, async_delete);
         raw.set_key(key);
         Ok(raw.into_cache_buffer())
+    }
+
+    /// Relocate an allocator record while its owner validates a pinned buffer.
+    /// The expected buffer supplies the original allocation identity to the callback.
+    pub fn relocate_record<C: GcCopyCallback>(
+        allocator: &mut SimpleLogBasedMemoryAllocator,
+        address: AllocatorAddress,
+        expected: &CacheBuffer,
+        callback: &mut C,
+    ) -> Result<AllocatorAddress, CacheError> {
+        let record = allocator.read(address)?;
+        if Self::get_key_from_data(record)? != expected.key()
+            || Self::get_value_from_data(record)? != expected.data()
+        {
+            return Err(CacheError::ReplaceMismatch);
+        }
+        struct Owner<'a, C> { expected: &'a CacheBuffer, callback: &'a mut C }
+        impl<C: GcCopyCallback> LogBasedAllocatorGcEventListener for Owner<'_, C> {
+            fn on_gc_copy(&mut self, _: AllocatorAddress, _: AllocatorAddress) -> Result<(), CacheError> {
+                let mut replacement = CacheBuffer::new(self.expected.to_vec());
+                replacement.set_key(self.expected.key());
+                self.callback.update(self.expected.key(), self.expected.data(), replacement)
+            }
+        }
+        allocator.relocate(address, &mut Owner { expected, callback })
     }
 
     pub fn create_cache_buffer_from_allocator_data<A>(
