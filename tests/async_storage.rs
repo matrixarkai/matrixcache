@@ -8,6 +8,40 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn queued_delete_follows_write_and_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("delete-order")
+        .to_string_lossy()
+        .into_owned();
+    let mut runtime =
+        AsyncStorageRuntime::start(matrixcache::StorageEngineRocksDb::new(path.clone()), 4)
+            .unwrap();
+    let put = runtime
+        .try_put(buffer("record", b"old-payload"), |_| {})
+        .unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let delete = runtime
+        .try_delete("record", move |result| {
+            sender.send(result.is_ok()).unwrap();
+        })
+        .unwrap();
+    assert_eq!(put.wait().unwrap().value(), b"old-payload");
+    delete.wait().unwrap();
+    assert!(receiver.recv().unwrap());
+    assert!(runtime.shutdown().unwrap());
+    let mut reopened = matrixcache::StorageEngineRocksDb::new(path);
+    assert!(reopened.start());
+    assert!(matches!(reopened.get("record"), Err(CacheError::NotFound)));
+    assert!(reopened.stop());
+    assert!(matches!(
+        runtime.try_delete("record", |_| {}),
+        Err(CacheError::Stopped)
+    ));
+}
+
+#[test]
 fn queued_disk_write_survives_engine_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory
