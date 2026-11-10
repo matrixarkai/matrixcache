@@ -2005,6 +2005,7 @@ impl PmemAllocatorRecoverListenerImpl {
 pub struct StorageEngineSimple {
     initialized: bool,
     capacity: u64,
+    used_bytes: u64,
     records: HashMap<String, Vec<u8>>,
     delete_completed_count: u32,
 }
@@ -2014,6 +2015,7 @@ impl StorageEngineSimple {
         Self {
             initialized: false,
             capacity: u64::MAX,
+            used_bytes: 0,
             records: HashMap::new(),
             delete_completed_count: 0,
         }
@@ -2027,10 +2029,7 @@ impl StorageEngineSimple {
     }
 
     fn used_bytes(&self) -> u64 {
-        self.records
-            .values()
-            .map(|record| record.len() as u64)
-            .sum()
+        self.used_bytes
     }
 
     fn buffer_from_record(&self, record: &[u8]) -> Result<CacheBuffer, CacheError> {
@@ -2110,6 +2109,7 @@ impl StorageEngineApi for StorageEngineSimple {
             return Err(CacheError::CapacityExceeded);
         }
         self.records.insert(key.to_string(), record);
+        self.used_bytes = next_used;
         let mut buffer = CacheBuffer::new(value);
         buffer.set_key(key);
         Ok(buffer)
@@ -2171,13 +2171,15 @@ impl StorageEngineApi for StorageEngineSimple {
         if !self.initialized {
             return Err(CacheError::Stopped);
         }
-        self.records.remove(key).ok_or(CacheError::NotFound)?;
+        let removed = self.records.remove(key).ok_or(CacheError::NotFound)?;
+        self.used_bytes = self.used_bytes.saturating_sub(removed.len() as u64);
         self.delete_completed_count = self.delete_completed_count.saturating_add(1);
         Ok(())
     }
 
     fn reset(&mut self) -> Result<(), CacheError> {
         self.records.clear();
+        self.used_bytes = 0;
         self.delete_completed_count = 0;
         Ok(())
     }
