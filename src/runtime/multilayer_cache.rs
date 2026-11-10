@@ -7607,8 +7607,8 @@ impl MultiLayerCache {
 
         // The counter and the write under one lock. Bumping the counter used
         // to take the lock, release it, and let `put_sized` take it again.
+        let mut inner = self.inner.write().expect("cache lock poisoned");
         let write_result = {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
@@ -7620,19 +7620,9 @@ impl MultiLayerCache {
             inner.record_put_latency(started);
             result
         };
-        // Recorded exactly as `put_sized` records them, outside the lock.
-        if write_result.is_ok() {
-            self.drain_eviction_records();
-            self.emit_access_record(CacheAccessRecordKind::Put, &key);
-        }
         write_result?;
-
-        // The write happened above; what is left is a lookup and a pin, and
-        // neither needs the cache exclusively any more.
-        let inner = self.inner.read().expect("cache lock poisoned");
-        if !inner.started {
-            return Err(CacheError::Stopped);
-        }
+        // Select and pin before releasing the write lock: another writer or
+        // a reentrant callback must not replace the value returned here.
         let handle_value = if !inner.ssd_instance_only {
             if let Some(memory_value) = inner.resident_value(&key).cloned() {
                 Some((memory_value, CacheReadTier::Memory))
@@ -7648,12 +7638,16 @@ impl MultiLayerCache {
         } else {
             None
         };
-        if let Some((value, tier)) = handle_value {
+        let handle = if let Some((value, tier)) = handle_value {
             inner.increment_pin_with_size(&key, value.len());
-            Ok(Some(CachePinnedHandle { key, value, tier }))
+            Some(CachePinnedHandle { key: key.clone(), value, tier })
         } else {
-            Ok(None)
-        }
+            None
+        };
+        drop(inner);
+        self.drain_eviction_records();
+        self.emit_access_record(CacheAccessRecordKind::Put, &key);
+        Ok(handle)
     }
 
     pub fn put(&self, key: CacheKey, value: Vec<u8>) -> Result<(), CacheError> {
