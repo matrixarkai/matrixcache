@@ -7730,6 +7730,10 @@ impl MultiLayerCache {
             .iter()
             .map(|(key, _, _)| key.clone())
             .collect::<Vec<_>>();
+        let entries = entries
+            .into_iter()
+            .map(|(key, value, logical_size)| (key, Arc::<[u8]>::from(value), logical_size))
+            .collect();
         let inserted = {
             let mut inner = self.inner.write().expect("cache lock poisoned");
             if !inner.started {
@@ -8660,59 +8664,90 @@ impl MultiLayerCache {
         max_jobs: usize,
     ) -> Result<CacheWritebackDrainReport, CacheError> {
         let started = Instant::now();
-        let jobs = {
-            let mut inner = self.inner.write().expect("cache lock poisoned");
-            if !inner.started {
-                return Err(CacheError::Stopped);
-            }
-            let mut jobs = Vec::new();
-            for _ in 0..max_jobs {
-                let Some(job) = inner.async_writeback_queue.pop_front() else {
-                    break;
-                };
-                inner.async_writeback_queue_bytes = inner
-                    .async_writeback_queue_bytes
-                    .saturating_sub(job.value.len() as u64);
-                inner.async_writeback_positions.remove(&job.key);
-                inner.async_writeback_head += 1;
-                jobs.push(job);
-            }
-            inner.refresh_async_writeback_pressure_stats();
-            jobs
-        };
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        if !inner.started {
+            return Err(CacheError::Stopped);
+        }
+        let old_head = inner.async_writeback_head;
+        let mut jobs = Vec::with_capacity(max_jobs.min(inner.async_writeback_queue.len()));
+        for _ in 0..max_jobs {
+            let Some(job) = inner.async_writeback_queue.pop_front() else {
+                break;
+            };
+            inner.async_writeback_queue_bytes = inner
+                .async_writeback_queue_bytes
+                .saturating_sub(job.value.len() as u64);
+            inner.async_writeback_positions.remove(&job.key);
+            inner.async_writeback_head += 1;
+            jobs.push(job);
+        }
         let drained = jobs.len();
-        let mut coalesced = Vec::<(CacheKey, Vec<u8>)>::new();
-        let mut coalesced_positions = AHashMap::<CacheKey, usize>::with_capacity(jobs.len());
-        for job in jobs {
-            if let Some(index) = coalesced_positions.get(&job.key).copied() {
-                coalesced[index].1 = job.value;
+        if drained == 0 {
+            inner.refresh_async_writeback_pressure_stats();
+            inner.record_writeback_latency(started);
+            return Ok(CacheWritebackDrainReport {
+                requested: max_jobs,
+                drained: 0,
+                remaining: inner.async_writeback_queue.len(),
+            });
+        }
+        let originals = jobs
+            .into_iter()
+            .map(|job| (job.key, Arc::<[u8]>::from(job.value)))
+            .collect::<Vec<_>>();
+        let keys = originals.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let mut coalesced = Vec::<(CacheKey, Arc<[u8]>, usize)>::new();
+        let mut positions = AHashMap::<CacheKey, usize>::with_capacity(drained);
+        for (key, value) in &originals {
+            let entry = (key.clone(), Arc::clone(value), value.len());
+            if let Some(index) = positions.get(key).copied() {
+                coalesced[index] = entry;
             } else {
-                let index = coalesced.len();
-                coalesced_positions.insert(job.key.clone(), index);
-                coalesced.push((job.key, job.value));
+                positions.insert(key.clone(), coalesced.len());
+                coalesced.push(entry);
             }
         }
-        self.put_batch_sized(
-            coalesced
-                .into_iter()
-                .map(|(key, value)| {
-                    let logical_size = value.len();
-                    (key, value, logical_size)
-                })
-                .collect(),
-        )?;
-        let mut inner = self.inner.write().expect("cache lock poisoned");
+        let inserted = match inner.put_batch_with_requests(coalesced) {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                inner.async_writeback_head = old_head;
+                for (key, value) in originals.into_iter().rev() {
+                    inner.async_writeback_queue_bytes = inner
+                        .async_writeback_queue_bytes
+                        .saturating_add(value.len() as u64);
+                    inner.async_writeback_queue.push_front(CacheWritebackJob {
+                        key,
+                        value: value.as_ref().to_vec(),
+                    });
+                }
+                for (offset, key) in keys.into_iter().enumerate() {
+                    let shared = inner.shared_key(&key);
+                    inner.async_writeback_positions.insert(shared, old_head + offset as u64);
+                }
+                inner.refresh_async_writeback_pressure_stats();
+                drop(inner);
+                self.drain_eviction_records();
+                return Err(error);
+            }
+        };
+        for _ in 0..inserted {
+            inner.record_put_latency(started);
+        }
         inner.stats.async_writeback_drained = inner
             .stats
             .async_writeback_drained
             .saturating_add(drained as u64);
         inner.refresh_async_writeback_pressure_stats();
         inner.record_writeback_latency(started);
-        Ok(CacheWritebackDrainReport {
+        let report = CacheWritebackDrainReport {
             requested: max_jobs,
             drained,
             remaining: inner.async_writeback_queue.len(),
-        })
+        };
+        drop(inner);
+        self.drain_eviction_records();
+        self.emit_access_records(CacheAccessRecordKind::Put, keys.iter());
+        Ok(report)
     }
 
     pub fn flush_async_writeback(&self) -> Result<CacheWritebackDrainReport, CacheError> {
@@ -13432,7 +13467,7 @@ impl CacheInner {
 
     fn put_batch_with_requests(
         &mut self,
-        entries: Vec<(CacheKey, Vec<u8>, usize)>,
+        entries: Vec<(CacheKey, Arc<[u8]>, usize)>,
     ) -> Result<usize, CacheError> {
         // Once for the batch, not once per entry: the sweep is bounded, and
         // running it per entry would turn it into a scan on a large batch.
@@ -13460,7 +13495,6 @@ impl CacheInner {
                 }
             }
             // Shared across the tiers, exactly as the single-entry path above.
-            let value = Arc::<[u8]>::from(value);
             if self.disk_index.contains_key(&key) || ssd_rewrites.contains_key(&key) {
                 ssd_rewrites.insert(key.clone(), Arc::clone(&value));
             }

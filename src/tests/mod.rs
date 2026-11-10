@@ -23508,6 +23508,56 @@ mod tests {
         assert!(cache.stop());
     }
 
+    // shared-corpus: storage_cache_eviction
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    #[test]
+    fn failed_writeback_drain_keeps_jobs_and_newer_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 0, 4096).with_ssd_paths([dir.path().join("ssd")]),
+        );
+        let first = CacheKey::string(9, "retry-first");
+        let second = CacheKey::string(9, "retry-second");
+        cache.enqueue_async_writeback(first.clone(), b"old".to_vec()).unwrap();
+        cache.enqueue_async_writeback(second.clone(), b"other".to_vec()).unwrap();
+        let manifest = cache.inner.read().unwrap().manifest_path();
+        fs::create_dir_all(&manifest).unwrap();
+
+        assert!(cache.drain_async_writeback(2).is_err());
+        assert_eq!(cache.async_writeback_queue_depth(), 2);
+        fs::remove_dir_all(&manifest).unwrap();
+        cache.enqueue_async_writeback(first.clone(), b"new".to_vec()).unwrap();
+        assert_eq!(cache.async_writeback_queue_depth(), 2);
+        assert_eq!(cache.drain_async_writeback(2).unwrap().drained, 2);
+        assert_eq!(cache.get(&first).unwrap(), Some(b"new".to_vec()));
+        assert_eq!(cache.get(&second).unwrap(), Some(b"other".to_vec()));
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn stopped_ssd_backend_keeps_writeback_job_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(64, 0, 4096).with_ssd_paths([dir.path().join("ssd")]),
+        );
+        let key = CacheKey::string(9, "backend-retry");
+        cache.enqueue_async_writeback(key.clone(), b"value".to_vec()).unwrap();
+        {
+            let mut inner = cache.inner.write().unwrap();
+            inner.ssd_store.stop();
+        }
+        assert!(cache.drain_async_writeback(1).is_err());
+        assert_eq!(cache.async_writeback_queue_depth(), 1);
+        {
+            let mut inner = cache.inner.write().unwrap();
+            assert!(inner.ssd_store.start());
+        }
+        assert_eq!(cache.drain_async_writeback(1).unwrap().drained, 1);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert!(cache.stop());
+    }
+
     // rust-internal: validates the configured worker follows cache lifecycle.
     #[test]
     fn configured_async_writeback_worker_starts_drains_and_restarts() {
