@@ -298,7 +298,12 @@ fn main() {
     }
     let cold_timing = summarize(cold_get_samples, cold_total_started.elapsed());
     let soak_dir = dir.join("replacement-soak");
-    let soak_cache = MultiLayerCache::new(48, &soak_dir);
+    let soak_cache = MultiLayerCache::with_options(
+        CacheOptions::new(48, 32, 4096)
+            .with_ssd_paths([soak_dir.join("ssd")])
+            .with_pmem_paths([soak_dir.join("pmem")])
+            .with_dram_pmem_data_placement(CacheDataPlacement::Tiered, 1024 * 1024),
+    );
     let soak_iterations = config.replacement_soak_iterations;
     let soak = soak_cache.replacement_policy_soak(soak_iterations);
     let stats = cache.stats();
@@ -306,8 +311,8 @@ fn main() {
     let pmem_to_ssd_eviction = stats.pmem_evictions > 0 && stats.disk_fills > 0;
     let ssd_read_through_refill = cold_ssd_refills > 0 && stats.refill_failures == 0;
     let replacement_soak_ready = soak.passed;
-    let pmem_soak_ready = !soak.pmem_tier_configured
-        || (soak.observed_pmem_hits > 0
+    let pmem_soak_ready = soak.pmem_tier_configured
+        && (soak.observed_pmem_hits > 0
             && soak.observed_pmem_fills > 0
             && soak.observed_pmem_evictions > 0
             && soak.observed_pmem_admissions > 0);
