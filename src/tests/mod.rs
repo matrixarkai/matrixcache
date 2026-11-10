@@ -773,6 +773,50 @@ mod tests {
 
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn options_enable_frequency_admission_before_first_write() {
+        for enabled in [false, true] {
+            let options = CacheOptions::new(8, 0, 0).with_admission_filters(enabled, false);
+            let cache = MultiLayerCache::try_with_options(options).unwrap();
+            assert_eq!(cache.admission_filter_enabled(), enabled);
+            let hot = CacheKey::string(3, "hot");
+            cache.put(hot.clone(), b"12345678".to_vec()).unwrap();
+            for _ in 0..80 {
+                assert_eq!(cache.get(&hot).unwrap(), Some(b"12345678".to_vec()));
+            }
+            let before = cache.stats();
+            cache
+                .put(CacheKey::string(3, "cold"), b"abcdefgh".to_vec())
+                .unwrap();
+            let after = cache.stats();
+            assert_eq!(
+                after.memory_admission_rejected - before.memory_admission_rejected,
+                u64::from(enabled)
+            );
+            assert_eq!(
+                after.memory_fills - before.memory_fills,
+                u64::from(!enabled)
+            );
+            assert_eq!(cache.get(&hot).unwrap(), Some(b"12345678".to_vec()));
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn sharded_options_enable_admission_filters_per_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(256, 0, 1 << 20)
+            .with_ssd_paths([dir.path().join("ssd")])
+            .with_admission_filters(true, true);
+        let cache = ShardedMultiLayerCache::new(options, 4);
+        assert!(cache.shards.iter().all(|shard| {
+            shard.admission_filter_enabled() && shard.ssd_admission_filter_enabled()
+        }));
+        assert!(!CacheOptions::default().memory_admission_filter_enabled);
+        assert!(!CacheOptions::default().ssd_admission_filter_enabled);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn pmem_reads_respect_disabled_promotion_across_read_apis() {
         let dir = tempfile::tempdir().unwrap();
         let options = CacheOptions::new(4096, 4096, 0)

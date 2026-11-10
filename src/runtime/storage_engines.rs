@@ -77,6 +77,12 @@ pub struct CacheOptions {
     /// Refill an upper tier after an SSD hit.
     #[serde(default = "default_cache_promotion_enabled")]
     pub ssd_promotion_enabled: bool,
+    /// Compare memory admissions against recent request frequency.
+    #[serde(default)]
+    pub memory_admission_filter_enabled: bool,
+    /// Use recent request frequency for SSD admission and eviction.
+    #[serde(default)]
+    pub ssd_admission_filter_enabled: bool,
     #[serde(default)]
     pub pmem_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -208,6 +214,8 @@ impl Default for CacheOptions {
             ssd_write_through: policy.ssd_write_through,
             pmem_promotion_enabled: true,
             ssd_promotion_enabled: true,
+            memory_admission_filter_enabled: false,
+            ssd_admission_filter_enabled: false,
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
             ssd_write_bytes_per_sec: 0,
@@ -271,6 +279,13 @@ impl CacheOptions {
     pub fn with_read_promotion(mut self, pmem: bool, ssd: bool) -> Self {
         self.pmem_promotion_enabled = pmem;
         self.ssd_promotion_enabled = ssd;
+        self
+    }
+
+    /// Apply frequency-based admission before the first write.
+    pub fn with_admission_filters(mut self, memory: bool, ssd: bool) -> Self {
+        self.memory_admission_filter_enabled = memory;
+        self.ssd_admission_filter_enabled = ssd;
         self
     }
 
