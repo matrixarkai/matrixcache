@@ -20,6 +20,13 @@ struct CacheColdTierMigrationWorker {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Debug, Default)]
+struct CacheColdTierScanCursor {
+    memory_last_key: Option<CacheKey>,
+    pmem_last_key: Option<CacheKey>,
+    pmem_first: bool,
+}
+
 impl MultiLayerCache {
     /// Configure bounded automatic migration for this cache and future starts.
     /// Zero entries disables it. Reconfiguration replaces the running worker.
@@ -109,22 +116,40 @@ impl MultiLayerCache {
 
             let mut selected = Vec::with_capacity(max_entries);
             let mut seen = AHashSet::with_capacity(max_entries);
-            for key in inner
-                .memory_order
-                .iter_access()
-                .chain(inner.pmem_order.iter_access())
-            {
-                if selected.len() >= max_entries {
-                    break;
-                }
-                if inner.disk_index.contains_key(key) || !seen.insert(key.clone()) {
-                    continue;
-                }
-                let value = inner
-                    .resident_value(key)
-                    .or_else(|| inner.pmem_value(key));
-                if let Some(value) = value {
-                    selected.push((key.clone(), Arc::clone(value)));
+            let mut cursor = self
+                .cold_tier_scan_cursor
+                .lock()
+                .expect("cold-tier scan cursor lock poisoned");
+            let scan_limit = max_entries.saturating_mul(8).clamp(64, 4096);
+            let first_pmem = cursor.pmem_first;
+            cursor.pmem_first = !first_pmem;
+            for pmem in [first_pmem, !first_pmem] {
+                let order = if pmem {
+                    &inner.pmem_order
+                } else {
+                    &inner.memory_order
+                };
+                let last_key = if pmem {
+                    &mut cursor.pmem_last_key
+                } else {
+                    &mut cursor.memory_last_key
+                };
+                for _ in 0..scan_limit / 2 {
+                    if selected.len() >= max_entries {
+                        break;
+                    }
+                    let Some(key) = order.iter_access_after(last_key.as_ref()).next() else {
+                        *last_key = None;
+                        break;
+                    };
+                    *last_key = Some(key.clone());
+                    if inner.disk_index.contains_key(key) || !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    let value = inner.resident_value(key).or_else(|| inner.pmem_value(key));
+                    if let Some(value) = value {
+                        selected.push((key.clone(), Arc::clone(value)));
+                    }
                 }
             }
             (selected, inner.block_options)
@@ -375,6 +400,82 @@ mod cold_tier_migration_tests {
         let inner = cache.inner.read().unwrap();
         assert!(inner.disk_index.contains_key(&oldest));
         assert!(!inner.disk_index.contains_key(&newest));
+    }
+
+    #[test]
+    fn migration_scans_a_bounded_prefix_and_resumes_at_the_next_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 1 << 20,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 1 << 20,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions::default(),
+        );
+        let keys = (0..200)
+            .map(|index| CacheKey::string(7, &format!("scan-{index}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache
+                .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), vec![7; 16])
+                .unwrap();
+        }
+        let (expected_first, final_key) = {
+            let mut inner = cache.inner.write().unwrap();
+            let expected = inner.memory_order.iter_access().nth(31).unwrap().clone();
+            let final_key = inner.memory_order.iter_access().last().unwrap().clone();
+            for key in &keys {
+                if key != &final_key {
+                    inner.disk_index.insert(Arc::new(key.clone()), 1);
+                }
+            }
+            (expected, final_key)
+        };
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().selected, 0);
+        assert_eq!(
+            cache.cold_tier_scan_cursor.lock().unwrap().memory_last_key,
+            Some(expected_first)
+        );
+        for _ in 0..5 {
+            assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().selected, 0);
+        }
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 1);
+        assert!(cache.inner.read().unwrap().disk_index.contains_key(&final_key));
+    }
+
+    #[test]
+    fn migration_does_not_starve_pmem_behind_a_large_memory_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 1 << 20,
+            pmem_capacity_bytes: 4096,
+            ssd_capacity_bytes: 1 << 20,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions::default(),
+        );
+        for index in 0..200 {
+            let key = CacheKey::string(7, &format!("resident-{index}"));
+            cache
+                .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), vec![7; 16])
+                .unwrap();
+            cache.inner.write().unwrap().disk_index.insert(Arc::new(key), 1);
+        }
+        let pmem_key = CacheKey::string(7, "pmem-candidate");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Pmem, pmem_key.clone(), b"cold".to_vec())
+            .unwrap();
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 1);
+        assert!(cache.inner.read().unwrap().disk_index.contains_key(&pmem_key));
     }
 
     #[test]

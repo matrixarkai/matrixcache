@@ -3716,6 +3716,21 @@ impl CacheKeyOrder {
         }
     }
 
+    /// Resume an access-order scan after a key without walking the prefix.
+    /// A removed key restarts at the head so concurrent eviction cannot strand
+    /// a background scanner.
+    pub(crate) fn iter_access_after(&self, key: Option<&CacheKey>) -> CacheKeyOrderAccessIter<'_> {
+        let cursor = key
+            .and_then(|key| self.index.get(key))
+            .map_or(self.access_head, |node| {
+                self.nodes[*node as usize].access_next
+            });
+        CacheKeyOrderAccessIter {
+            order: self,
+            cursor,
+        }
+    }
+
     /// Whether `node` sits strictly between the eviction end and the insertion
     /// point.
     fn node_is_cold(&self, node: u32) -> bool {
