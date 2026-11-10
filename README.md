@@ -441,7 +441,9 @@ and says what the number means:
   `tools/validate_batch_concurrency_report.py`.
 - `hit_concurrency_bench` -- concurrent memory-hit throughput benchmark. Add
   `--json-output <path>` to archive scale evidence and validate it with
-  `tools/validate_hit_concurrency_report.py`.
+  `tools/validate_hit_concurrency_report.py`. Version 2 synchronizes worker
+  starts and divides all completed reads by the elapsed wall time; older
+  per-worker summed rates are not comparable to this report.
 - `tools/run_scale_reports.py` -- runs the read/retrieval scale benchmarks
   above, validates each JSON report, and writes a manifest that points to the
   archived reports. Add `--markdown-output <path>` when the same run should

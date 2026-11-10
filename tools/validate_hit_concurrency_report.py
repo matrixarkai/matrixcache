@@ -50,7 +50,7 @@ def main() -> None:
     except json.JSONDecodeError as error:
         fail(f"invalid JSON: {error}")
 
-    if report.get("report_version") != "matrixcache_hit_concurrency_v1":
+    if report.get("report_version") != "matrixcache_hit_concurrency_v2":
         fail("unexpected report_version")
     for field in ["resident_values", "value_bytes", "reads_per_thread", "passes"]:
         value = report.get(field)
