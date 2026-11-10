@@ -1091,7 +1091,46 @@ impl LogBasedMemoryAllocatorApi for SimpleLogBasedMemoryAllocator {
                 self.freed_lens.remove(&ptr);
             }
         }
+        // Release burst-sized metadata only after substantial reclamation.
+        if self.regions.capacity() > 64
+            && self.regions.len() <= self.regions.capacity() / 4
+        {
+            self.regions.shrink_to(self.regions.len().saturating_mul(2).max(32));
+        }
+        if self.freed_lens.capacity() > 64
+            && self.freed_lens.len() <= self.freed_lens.capacity() / 4
+        {
+            self.freed_lens
+                .shrink_to(self.freed_lens.len().saturating_mul(2).max(32));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod log_allocator_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn reclamation_releases_burst_metadata_without_removing_live_regions() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::new();
+        let live = allocator.allocate(8).unwrap();
+        allocator.write(live, b"retained").unwrap();
+        let mut retired = Vec::new();
+        for _ in 0..4096 {
+            let address = allocator.allocate(8).unwrap();
+            allocator.free(address, 8).unwrap();
+            retired.push(address as ChunkId);
+        }
+        let region_capacity = allocator.regions.capacity();
+        let freed_capacity = allocator.freed_lens.capacity();
+        allocator.gc(&retired).unwrap();
+        assert!(allocator.regions.capacity() < region_capacity / 2);
+        assert!(allocator.freed_lens.capacity() < freed_capacity / 2);
+        assert_eq!(allocator.read(live).unwrap(), b"retained");
+        assert_eq!(allocator.stats().unwrap().num_occupied_bytes, 8);
+        assert_eq!(allocator.test_global_free_list_size(), 0);
+        assert!(matches!(allocator.read(retired[0] as AllocatorAddress), Err(CacheError::NotFound)));
     }
 }
 
