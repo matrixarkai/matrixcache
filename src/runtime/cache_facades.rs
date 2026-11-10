@@ -344,14 +344,14 @@ impl CacheInstance {
         self.put_owned_buffer(key, value)
     }
 
-    fn put_owned_buffer(&self, key: &str, value: Vec<u8>) -> Result<CacheBuffer, CacheError> {
+    fn put_owned_buffer<V: AsRef<[u8]> + Into<Arc<[u8]>>>(&self, key: &str, value: V) -> Result<CacheBuffer, CacheError> {
         let started = Instant::now();
         let tier = self.instance_type.as_tier().ok_or(CacheError::UnsupportedInstance(self.instance_type))?;
         let key = Self::key(key);
         let mut inner = self.cache.inner.write().expect("cache lock poisoned");
         let result = (|| {
             if !inner.started { return Err(CacheError::Stopped); }
-            let size = value.len();
+            let size = value.as_ref().len();
             if !inner.test_insert_for_tier(tier, key.clone(), value, size)? {
                 return Err(CacheError::CapacityExceeded);
             }
@@ -379,9 +379,7 @@ impl CacheInstance {
         if buffer.key().is_empty() {
             return Err(CacheError::NotFound);
         }
-        let key = buffer.key().to_string();
-        let value = buffer.to_vec();
-        self.put_owned_buffer(&key, value)
+        self.put_owned_buffer(buffer.key(), Arc::clone(&buffer.value))
     }
 
     pub fn async_put(&self, key: &str, value: Vec<u8>, _src: &str) -> Result<(), CacheError> {
