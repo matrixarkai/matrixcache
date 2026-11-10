@@ -7410,18 +7410,23 @@ impl MultiLayerCache {
                     remaining.push((key, positions));
                     continue;
                 }
-                let Some(value) = inner.resident_value(key).cloned() else {
+                let resident = inner.resident_value(key).map(|value| (value, CacheReadTier::Memory))
+                    .or_else(|| inner.pmem_value(key)
+                        .filter(|value| !inner.pmem_should_refill_memory(value.len()))
+                        .map(|value| (value, CacheReadTier::Pmem)));
+                let Some((value, tier)) = resident.map(|(value, tier)| (Arc::clone(value), tier)) else {
                     remaining.push((key, positions));
                     continue;
                 };
 
                 let occurrences = positions.len();
-                inner
-                    .read_counters
-                    .memory_hits
-                    .add(occurrences as u64);
+                match tier {
+                    CacheReadTier::Memory => inner.read_counters.memory_hits.add(occurrences as u64),
+                    CacheReadTier::Pmem => inner.read_counters.pmem_hits.add(occurrences as u64),
+                    CacheReadTier::Ssd => unreachable!("resident tiers only"),
+                }
                 let epoch = CoarseClock::now_millis();
-                let outcome = if inner.memory.contains_key(key) {
+                let outcome = if inner.memory.contains_key(key) || inner.pmem.contains_key(key) {
                     inner.record_hit_shared_occurrences_at(key, occurrences, epoch)
                 } else {
                     HitOutcome::Accounted
@@ -7437,7 +7442,7 @@ impl MultiLayerCache {
                     results[position] = Some(CachePinnedHandle {
                         key: key.clone(),
                         value: value.clone(),
-                        tier: CacheReadTier::Memory,
+                        tier,
                     });
                 }
                 pin_counts.push((key, value, pinned_occurrences, 1));
@@ -7453,7 +7458,7 @@ impl MultiLayerCache {
                     HitOutcome::Accounted => {}
                     HitOutcome::NeedsAccessOrderRefresh => inner.refresh_access_order(key),
                     HitOutcome::NeedsMetadata => {
-                        if inner.memory.contains_key(key) {
+                        if inner.memory.contains_key(key) || inner.pmem.contains_key(key) {
                             inner.record_hit(key, len);
                         }
                     }

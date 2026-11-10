@@ -844,6 +844,47 @@ fn warmed_pmem_pin_completes_while_another_reader_holds_cache_lock() {
 
 // rust-internal: PMEM-only shared reads stay lock-light and do not report false refill failures.
 #[test]
+fn warmed_pmem_batch_pins_share_lock_and_preserve_duplicate_positions() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let mut policy = cache.production_tiering_policy();
+    policy.data_placement = CacheDataPlacement::SideBySide;
+    policy.data_placement_threshold_bytes = 0;
+    cache.update_production_tiering_policy(policy);
+    cache.set_lru_refresh_time(Duration::from_secs(3600));
+    let first = CacheKey::string(0, "pmem-batch-first");
+    let second = CacheKey::string(0, "pmem-batch-second");
+    cache.put(first.clone(), b"first".to_vec()).unwrap();
+    cache.put(second.clone(), b"second".to_vec()).unwrap();
+    for key in [&first, &second] {
+        cache.release(cache.acquire(key).unwrap().unwrap());
+    }
+    let keys = vec![first.clone(), second, first];
+    let reader_cache = cache.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let guard = cache.inner.read().unwrap();
+    let worker = std::thread::spawn(move || {
+        sender.send(reader_cache.acquire_batch(&keys)).unwrap();
+    });
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    drop(guard);
+    worker.join().unwrap();
+    let handles = result
+        .expect("resident batch must not require exclusive access")
+        .unwrap();
+    for (handle, expected) in handles
+        .iter()
+        .zip([b"first".as_slice(), b"second", b"first"])
+    {
+        let handle = handle.as_ref().unwrap();
+        assert_eq!(handle.tier(), CacheReadTier::Pmem);
+        assert_eq!(handle.as_slice(), expected);
+    }
+    cache.release_batch(handles.into_iter().flatten().collect());
+    assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+}
+
+#[test]
 fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(

@@ -69,6 +69,7 @@ fn batch_throughput(
     threads: usize,
 ) -> f64 {
     let batches_per_thread = READS_PER_THREAD / BATCH;
+    let pinned = std::env::var_os("MATRIXCACHE_BENCH_PINNED").is_some();
     let start = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
@@ -88,11 +89,24 @@ fn batch_throughput(
                             % keys.len();
                         batch.push(keys[slot].clone());
                     }
-                    let values = cache.get_shared_batch(&batch).expect("PMEM batch read");
-                    bytes += values
-                        .iter()
-                        .map(|value| value.as_ref().expect("resident value").len())
-                        .sum::<usize>();
+                    if pinned {
+                        let handles = cache.acquire_batch(&batch).expect("PMEM batch acquire");
+                        bytes += handles
+                            .iter()
+                            .map(|handle| {
+                                let handle = handle.as_ref().expect("resident value");
+                                assert_eq!(handle.tier(), CacheReadTier::Pmem);
+                                handle.as_slice().len()
+                            })
+                            .sum::<usize>();
+                        cache.release_batch(handles.into_iter().flatten().collect());
+                    } else {
+                        let values = cache.get_shared_batch(&batch).expect("PMEM batch read");
+                        bytes += values
+                            .iter()
+                            .map(|value| value.as_ref().expect("resident value").len())
+                            .sum::<usize>();
+                    }
                 }
                 assert_eq!(bytes, batches_per_thread * BATCH * VALUE_BYTES);
             })
