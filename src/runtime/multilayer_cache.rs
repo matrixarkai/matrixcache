@@ -6513,9 +6513,9 @@ impl MultiLayerCache {
             expired = inner.entry_expired(key, now_millis);
             if expired {
                 None
-            } else if let Some(resident) = inner.memory.get(key) {
+            } else if let Some((held_key, resident)) = inner.memory.get_key_value(key) {
                 let value = Arc::clone(&resident.value);
-                inner.increment_pin_for_handle(key, value.len());
+                inner.increment_pin_for_handle_shared(Arc::clone(held_key), value.len());
                 inner.reconfigure_refresh_window(now_millis);
                 let outcome = inner.record_known_hit_shared_occurrences_at(
                     key,
