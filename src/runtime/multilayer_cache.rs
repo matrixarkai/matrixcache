@@ -1636,6 +1636,8 @@ pub struct MultiLayerCache {
     read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
     cold_tier_migration_worker: Arc<Mutex<Option<CacheColdTierMigrationWorker>>>,
+    cold_tier_migration_entries_per_round: Arc<AtomicU64>,
+    cold_tier_migration_interval_millis: Arc<AtomicU64>,
     ssd_recovery_worker: Arc<Mutex<Option<CacheSsdRecoveryWorker>>>,
     async_writeback_jobs_per_round: Arc<AtomicU64>,
     async_writeback_interval_millis: Arc<AtomicU64>,
@@ -3142,7 +3144,16 @@ impl MultiLayerCache {
             Err(_) => {
                 let mut fallback = options;
                 fallback.auto_recover_on_start = false;
-                Self::build_with_options(fallback)
+                let migration = (
+                    fallback.cold_tier_migration_entries_per_round,
+                    fallback.cold_tier_migration_interval_millis,
+                );
+                let cache = Self::build_with_options(fallback);
+                cache.configure_cold_tier_migration_worker(
+                    migration.0,
+                    Duration::from_millis(migration.1.max(1)),
+                );
+                cache
             }
         }
     }
@@ -3169,6 +3180,10 @@ impl MultiLayerCache {
         }
         let auto_recover_on_start = options.auto_recover_on_start;
         let ssd_recover_in_background = options.ssd_recover_in_background;
+        let migration = (
+            options.cold_tier_migration_entries_per_round,
+            options.cold_tier_migration_interval_millis,
+        );
         let cache = Self::build_with_options(options);
         if auto_recover_on_start {
             if ssd_recover_in_background {
@@ -3178,6 +3193,10 @@ impl MultiLayerCache {
                 cache.recover_persistent_tiers()?;
             }
         }
+        cache.configure_cold_tier_migration_worker(
+            migration.0,
+            Duration::from_millis(migration.1.max(1)),
+        );
         Ok(cache)
     }
 
@@ -3336,6 +3355,10 @@ impl MultiLayerCache {
             read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
             cold_tier_migration_worker: Arc::new(Mutex::new(None)),
+            cold_tier_migration_entries_per_round: Arc::new(AtomicU64::new(0)),
+            cold_tier_migration_interval_millis: Arc::new(AtomicU64::new(
+                default_cold_tier_migration_interval_millis(),
+            )),
             ssd_recovery_worker: Arc::new(Mutex::new(None)),
             async_writeback_jobs_per_round: Arc::new(AtomicU64::new(0)),
             async_writeback_interval_millis: Arc::new(AtomicU64::new(
@@ -3385,6 +3408,7 @@ impl MultiLayerCache {
             }
         }
         self.start_configured_async_writeback_worker();
+        self.start_configured_cold_tier_migration_worker();
         self.start_configured_async_promotion_worker();
         Ok(())
     }
