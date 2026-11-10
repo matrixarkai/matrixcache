@@ -34,7 +34,7 @@ use matrixcache::{CacheKey, CacheOptions, MultiLayerCache};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 const VALUE_BYTES: usize = 64;
@@ -120,11 +120,13 @@ enum ReadShape {
 
 /// Aggregate hits per second across `threads` readers.
 fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) -> f64 {
+    let start = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
-                let started = Instant::now();
+                start.wait();
                 for round in 0..READS_PER_THREAD {
                     let index = (worker * 31 + round * 7) % RESIDENT;
                     let key = CacheKey::string(0, &format!("hit-{index:05}"));
@@ -148,16 +150,15 @@ fn throughput(cache: &Arc<MultiLayerCache>, threads: usize, shape: ReadShape) ->
                         }
                     }
                 }
-                started.elapsed().as_secs_f64()
             })
         })
         .collect::<Vec<_>>();
-    // Each worker times its own run, so a thread descheduled by other load
-    // inflates its own elapsed time rather than everyone's.
-    workers
-        .into_iter()
-        .map(|worker| READS_PER_THREAD as f64 / worker.join().expect("worker"))
-        .sum()
+    start.wait();
+    let started = Instant::now();
+    for worker in workers {
+        worker.join().expect("worker");
+    }
+    (threads * READS_PER_THREAD) as f64 / started.elapsed().as_secs_f64()
 }
 
 fn main() {
@@ -252,7 +253,7 @@ fn render_json_report(rows: &[HitConcurrencyRow]) -> String {
     writeln!(&mut report, "{{").expect("format report");
     writeln!(
         &mut report,
-        "  \"report_version\": \"matrixcache_hit_concurrency_v1\","
+        "  \"report_version\": \"matrixcache_hit_concurrency_v2\","
     )
     .expect("format report");
     writeln!(&mut report, "  \"resident_values\": {RESIDENT},").expect("format report");
