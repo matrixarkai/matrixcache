@@ -3258,9 +3258,29 @@ impl StorageEngineApi for StorageEngineRocksDb {
     where
         F: FnOnce(Result<CacheBuffer, CacheError>),
     {
+        #[cfg(feature = "rocksdb-ssd")]
+        let result = (|| {
+            if !self.initialized {
+                return Err(CacheError::Stopped);
+            }
+            self.rocksdb()?
+                .put_opt(buffer.key().as_bytes(), buffer.value(), &Self::rocksdb_write_options())
+                .map_err(|error| CacheError::RocksDb(error.to_string()))?;
+            Ok(CacheBuffer {
+                key: Arc::clone(&buffer.key),
+                value: Arc::clone(&buffer.value),
+                logical_size: None,
+                tier: None,
+                cache: None,
+                handle: None,
+            })
+        })();
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        let result = {
         let key = buffer.Key().to_string();
         let value = buffer.to_vec();
-        let result = self.put(&key, value);
+        self.put(&key, value)
+        };
         match result {
             Ok(buf) => {
                 cb(Ok(buf.clone_detached()));
