@@ -520,6 +520,15 @@ impl KeyArena {
             .expect("linked key-list node has a key")
     }
 
+    fn shared_key(&self, node: u32) -> Arc<str> {
+        Arc::clone(
+            self.nodes[node as usize]
+                .key
+                .as_ref()
+                .expect("linked key-list node has a key"),
+        )
+    }
+
     fn clear(&mut self) {
         self.nodes.clear();
         self.free.clear();
@@ -2088,8 +2097,8 @@ impl ReplacementSlru {
         }
     }
 
-    fn node_key(&self, node: u32) -> String {
-        self.arena.key(node).to_string()
+    fn node_key(&self, node: u32) -> Arc<str> {
+        self.arena.shared_key(node)
     }
 
     fn segment_len(&self, segment: u32) -> usize {
@@ -2139,7 +2148,7 @@ impl ReplacementSlru {
     fn try_evict_or_shuffle_cold(&mut self, segment: u32) -> Option<CacheBuffer> {
         let node = self.list_tail(segment, COLD_LRU)?;
         let key = self.node_key(node);
-        let action = match self.index.get_mut(key.as_str()) {
+        let action = match self.index.get_mut(key.as_ref()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 if entry.flag >= BUFFER_FETCHED {
@@ -2169,7 +2178,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(key.as_str()) {
+        let action = match self.index.get_mut(key.as_ref()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2195,7 +2204,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(key.as_str()) {
+        let action = match self.index.get_mut(key.as_ref()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2301,7 +2310,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(key.as_str()) {
+        let action = match self.index.get_mut(key.as_ref()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2327,7 +2336,7 @@ impl ReplacementSlru {
             return SlruMaintainerStep::Stop;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(key.as_str()) {
+        let action = match self.index.get_mut(key.as_ref()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 if entry.flag == BUFFER_ACTIVE {
