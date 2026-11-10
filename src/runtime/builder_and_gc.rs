@@ -3675,12 +3675,16 @@ impl CacheInner {
     /// describe the same event, so there is no reason to take the lock twice
     /// for it.
     fn increment_pin_for_handle(&self, key: &CacheKey, bytes: usize) {
-        let stripe = self.pin_stripe_index(key);
+        self.increment_pin_for_handle_shared(self.shared_key(key), bytes);
+    }
+
+    fn increment_pin_for_handle_shared(&self, key: Arc<CacheKey>, bytes: usize) {
+        let stripe = self.pin_stripe_index(&key);
         self.add_pin_handles(stripe, 1);
         let mut pins = self.pin_registry.stripes[stripe].lock();
         // One lookup for the whole handle: the count and its size are the same
         // entry, so they cannot be found separately or updated apart.
-        let entry = pins.entries.entry(self.shared_key(key)).or_default();
+        let entry = pins.entries.entry(key).or_default();
         entry.handles = entry.handles.saturating_add(1);
         entry.handle_bytes = entry.handle_bytes.max(bytes);
         pins.pin_operations = pins.pin_operations.saturating_add(1);
