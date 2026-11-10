@@ -27,7 +27,7 @@ struct StorageWrite {
     buffer: CacheBuffer,
     callback: WriteCallback,
     completed: mpsc::Sender<WriteResult>,
-    reservation: WriteReservation,
+    reservation: Option<WriteReservation>,
 }
 
 struct WriteReservation {
@@ -158,17 +158,21 @@ impl AsyncStorageRuntime {
         F: FnOnce(WriteResult) + Send + 'static,
     {
         let sender = self.sender.as_ref().ok_or(CacheError::Stopped)?;
-        let bytes = buffer.value().len();
-        self.pending_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
-                pending
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.max_pending_bytes)
+        let reservation = if self.max_pending_bytes == usize::MAX || buffer.value().is_empty() {
+            None
+        } else {
+            let bytes = buffer.value().len();
+            self.pending_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
+                    pending
+                        .checked_add(bytes)
+                        .filter(|next| *next <= self.max_pending_bytes)
+                })
+                .map_err(|_| CacheError::CapacityExceeded)?;
+            Some(WriteReservation {
+                pending: Arc::clone(&self.pending_bytes),
+                bytes,
             })
-            .map_err(|_| CacheError::CapacityExceeded)?;
-        let reservation = WriteReservation {
-            pending: Arc::clone(&self.pending_bytes),
-            bytes,
         };
         let (completed, receiver) = mpsc::channel();
         let write = StorageWrite {
