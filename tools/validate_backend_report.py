@@ -61,6 +61,7 @@ REQUIRED_CONTRACT = {
     "pmem_to_ssd_eviction",
     "ssd_read_through_refill",
     "replacement_soak",
+    "pmem_soak_activity",
     "async_writeback_backpressure",
     "restart_disk_refill",
     "passed",
@@ -219,7 +220,9 @@ def validate_timing(data: dict[str, Any], field: str, expected_count: int) -> No
     expected_qps = count / (total_us / 1_000_000.0)
     reported_qps = require_numeric_field(timing, "qps")
     qps_delta = abs(reported_qps - expected_qps)
-    if qps_delta > max(0.01, expected_qps * QPS_RELATIVE_TOLERANCE):
+    # total_us is truncated to whole microseconds in the report.
+    qps_tolerance = QPS_RELATIVE_TOLERANCE + 1.0 / total_us
+    if qps_delta > max(0.01, expected_qps * qps_tolerance):
         fail(
             f"{field!r}.qps={reported_qps:.2f} disagrees with "
             f"count/total_us={expected_qps:.2f}"
@@ -333,6 +336,13 @@ def validate_contract(data: dict[str, Any], allow_failed: bool) -> None:
                     f"{item.get('iterations')!r} does not match "
                     f"replacement_soak_iterations={data['replacement_soak_iterations']}"
                 )
+        elif name == "pmem_soak_activity":
+            if item.get("pmem_tier_configured") is not True:
+                fail("replacement soak must configure PMEM")
+            for field in ("pmem_hits", "pmem_fills", "pmem_evictions", "pmem_admissions"):
+                value = require_int_field(item, field)
+                if value <= 0:
+                    fail(f"pmem_soak_activity.{field} must be positive")
         elif name == "dram_to_pmem_eviction":
             require_evidence_counter(item, "memory_evictions", data["memory_evictions"])
             require_evidence_counter(item, "pmem_fills", data["pmem_fills"])
