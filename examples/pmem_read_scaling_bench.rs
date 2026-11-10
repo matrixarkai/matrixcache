@@ -8,7 +8,7 @@
 //! lookup and synchronization costs.
 
 use matrixcache::{CacheDataPlacement, CacheKey, CacheOptions, CacheReadTier, MultiLayerCache};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 const ENTRIES: usize = 4_096;
@@ -23,12 +23,14 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 fn throughput(cache: &Arc<MultiLayerCache>, keys: &Arc<Vec<CacheKey>>, threads: usize) -> f64 {
+    let start = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
             let keys = Arc::clone(keys);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
-                let started = Instant::now();
+                start.wait();
                 let mut bytes = 0_usize;
                 for read in 0..READS_PER_THREAD {
                     let slot = (read.wrapping_mul(7_919) + worker.wrapping_mul(1_009)) % keys.len();
@@ -39,14 +41,15 @@ fn throughput(cache: &Arc<MultiLayerCache>, keys: &Arc<Vec<CacheKey>>, threads: 
                         .len();
                 }
                 assert_eq!(bytes, READS_PER_THREAD * VALUE_BYTES);
-                READS_PER_THREAD as f64 / started.elapsed().as_secs_f64()
             })
         })
         .collect::<Vec<_>>();
-    workers
-        .into_iter()
-        .map(|worker| worker.join().expect("reader"))
-        .sum()
+    start.wait();
+    let started = Instant::now();
+    for worker in workers {
+        worker.join().expect("reader");
+    }
+    (threads * READS_PER_THREAD) as f64 / started.elapsed().as_secs_f64()
 }
 
 fn batch_throughput(
@@ -55,12 +58,14 @@ fn batch_throughput(
     threads: usize,
 ) -> f64 {
     let batches_per_thread = READS_PER_THREAD / BATCH;
+    let start = Arc::new(Barrier::new(threads + 1));
     let workers = (0..threads)
         .map(|worker| {
             let cache = Arc::clone(cache);
             let keys = Arc::clone(keys);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
-                let started = Instant::now();
+                start.wait();
                 let mut bytes = 0_usize;
                 let mut batch = Vec::with_capacity(BATCH);
                 for read in 0..batches_per_thread {
@@ -79,14 +84,15 @@ fn batch_throughput(
                         .sum::<usize>();
                 }
                 assert_eq!(bytes, batches_per_thread * BATCH * VALUE_BYTES);
-                (batches_per_thread * BATCH) as f64 / started.elapsed().as_secs_f64()
             })
         })
         .collect::<Vec<_>>();
-    workers
-        .into_iter()
-        .map(|worker| worker.join().expect("batch reader"))
-        .sum()
+    start.wait();
+    let started = Instant::now();
+    for worker in workers {
+        worker.join().expect("batch reader");
+    }
+    (threads * batches_per_thread * BATCH) as f64 / started.elapsed().as_secs_f64()
 }
 
 fn main() {
