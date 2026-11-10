@@ -12,6 +12,31 @@ it, ship it, and send the changes back if you want to. It manages a hot in-memor
 admission control, cross-tier eviction, read-through refill, pinned handles,
 invalidation, and asynchronous writeback with backpressure accounting.
 
+## Related Projects
+
+[TemporalStore](https://github.com/matrixarkai/TemporalStore) serves temporal features and context;
+[MatrixObject](https://github.com/matrixarkai/MatrixObject) provides distributed object storage;
+[MatrixRaft](https://github.com/matrixarkai/matrixraft) provides consensus;
+[MatrixArk](https://github.com/matrixarkai/matrixark) provides the Python context runtime; and
+[MatrixAdsDemo](https://github.com/matrixarkai/MatrixAdsDemo) demonstrates ads serving.
+Each project is independently usable and Apache-2.0 licensed.
+
+## Start Here
+
+| Task | Read |
+|---|---|
+| Build the default RocksDB-backed cache | [SSD backend](#ssd-backend) and [usage](#usage) |
+| Choose persistence guarantees | [Durability](#durability) |
+| Validate options before opening tiers | [Checking a configuration](#checking-a-configuration) |
+| Size local sharding and distributed routing | [Choosing a shard count](#choosing-a-shard-count) and [placing keys](#placing-keys-on-a-cluster) |
+| Measure reads, writes, and storage overhead | [Measuring](#measuring) |
+
+MatrixCache is an embedded library, not a network cache server. Applications own request
+routing and authoritative data durability. Shared-buffer and pinned reads can retain old
+value allocations after replacement; release handles promptly and size memory for the
+active workload, not only the current key count. Cache-tier durability settings do not
+replace the application's commit protocol.
+
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
