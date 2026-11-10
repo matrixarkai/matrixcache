@@ -74,7 +74,11 @@ impl L2CachePolicyRuntime {
                         policy.on_evict(buffer);
                     }
                     if worker_stop.load(Ordering::Acquire) {
-                        if more {
+                        let pending = {
+                            let inbox = worker_inbox.lock().expect("L2 inbox lock poisoned");
+                            !inbox.access.is_empty() || !inbox.evictions.is_empty()
+                        };
+                        if pending {
                             continue;
                         }
                         policy.resume();
@@ -111,10 +115,10 @@ impl L2CachePolicyRuntime {
 
     /// Returns false if stopped or the bounded access inbox is full.
     pub fn on_access(&self, kind: AccessRecordKind, key: &str) -> bool {
+        let mut inbox = self.inbox.lock().expect("L2 inbox lock poisoned");
         if self.stop.load(Ordering::Acquire) {
             return false;
         }
-        let mut inbox = self.inbox.lock().expect("L2 inbox lock poisoned");
         if inbox.access_capacity != 0 && inbox.access.len() >= inbox.access_capacity {
             return false;
         }
@@ -128,10 +132,13 @@ impl L2CachePolicyRuntime {
 
     /// Returns the buffer to the caller if migration cannot accept it.
     pub fn on_evict(&self, buffer: CacheBuffer) -> Result<(), Box<CacheBuffer>> {
-        if self.stop.load(Ordering::Acquire) || !self.eviction_enabled {
+        if !self.eviction_enabled {
             return Err(Box::new(buffer));
         }
         let mut inbox = self.inbox.lock().expect("L2 inbox lock poisoned");
+        if self.stop.load(Ordering::Acquire) {
+            return Err(Box::new(buffer));
+        }
         if inbox.eviction_capacity != 0 && inbox.evictions.len() >= inbox.eviction_capacity {
             return Err(Box::new(buffer));
         }
@@ -162,7 +169,10 @@ impl L2CachePolicyRuntime {
 
     /// Joins the worker and drains accepted migration events before returning.
     pub fn stop(&mut self) -> Result<(), CacheError> {
-        self.stop.store(true, Ordering::Release);
+        {
+            let _inbox = self.inbox.lock().expect("L2 inbox lock poisoned");
+            self.stop.store(true, Ordering::Release);
+        }
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
