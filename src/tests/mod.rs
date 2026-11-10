@@ -6784,6 +6784,64 @@ mod tests {
         assert!(recovered.Stop());
     }
 
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn multi_ssd_batches_preserve_order_across_inline_and_spilled_routes() {
+        for device_count in [2, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = (0..device_count)
+                .map(|index| dir.path().join(format!("engine-{index}")))
+                .collect::<Vec<_>>();
+            let mut engine = StorageEngineMultiSsd::with_paths(paths, 1 << 20);
+            assert!(engine.start());
+            let entries = (0..128)
+                .map(|index| (format!("key-{index}"), vec![index as u8; 64]))
+                .collect::<Vec<_>>();
+            engine.put_batch(entries.clone()).unwrap();
+
+            let cache_paths = (0..device_count)
+                .map(|index| dir.path().join(format!("cache-{index}")))
+                .collect::<Vec<_>>();
+            let cache = MultiLayerCache::with_options(
+                CacheOptions::new(0, 0, 1 << 20)
+                    .with_ssd_paths(cache_paths)
+                    .with_ssd_instance_only(true),
+            );
+            for (key, value) in &entries {
+                cache.put(CacheKey::string(0, key), value.clone()).unwrap();
+            }
+            for count in [8, 128] {
+                let mut keys = entries[..count]
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.push("missing".to_string());
+                keys.push(keys[0].clone());
+                let expected = entries[..count]
+                    .iter()
+                    .map(|(_, value)| Some(value.clone()))
+                    .chain([None, Some(entries[0].1.clone())])
+                    .collect::<Vec<_>>();
+                assert_eq!(engine.get_batch(&keys).unwrap(), expected);
+
+                let cache_keys = keys
+                    .iter()
+                    .map(|key| CacheKey::string(0, key))
+                    .collect::<Vec<_>>();
+                let unique = cache.get_shared_batch(&cache_keys[..count]).unwrap();
+                for (actual, expected) in unique.iter().zip(expected[..count].iter()) {
+                    assert_eq!(actual.as_deref(), expected.as_deref());
+                }
+                let actual = cache.get_shared_batch(&cache_keys).unwrap();
+                for (actual, expected) in actual.iter().zip(expected.iter()) {
+                    assert_eq!(actual.as_deref(), expected.as_deref());
+                }
+            }
+            assert!(cache.stop());
+            assert!(engine.stop());
+        }
+    }
+
     #[test]
     fn multilayer_cache_uses_all_configured_ssd_paths_and_recovers() {
         let paths = vec![

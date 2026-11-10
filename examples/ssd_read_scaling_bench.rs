@@ -15,9 +15,17 @@ const BATCH: usize = 16;
 
 fn cache() -> (tempfile::TempDir, MultiLayerCache, Vec<CacheKey>) {
     let directory = tempfile::tempdir().unwrap();
+    let paths = if std::env::args().any(|arg| arg == "--multi-ssd") {
+        vec![
+            directory.path().join("ssd-a"),
+            directory.path().join("ssd-b"),
+        ]
+    } else {
+        vec![directory.path().join("ssd")]
+    };
     let cache = MultiLayerCache::with_options(
         CacheOptions::new(0, 0, 64 << 20)
-            .with_ssd_paths([directory.path().join("ssd")])
+            .with_ssd_paths(paths)
             .with_ssd_instance_only(true),
     );
     let keys = (0..KEYS)
