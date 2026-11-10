@@ -154,14 +154,15 @@ impl MultiLayerCache {
             }
             let block_kind = infer_block_kind(&key);
             let routing_slot = extract_routing_slot(&key);
-            inner.put_bypass_ssd_preencoded(
+            if inner.put_bypass_ssd_preencoded(
                 &key,
                 selected_value.as_ref(),
                 prepared_block,
                 block_kind,
                 routing_slot,
-            )?;
-            report.migrated = report.migrated.saturating_add(1);
+            )? {
+                report.migrated = report.migrated.saturating_add(1);
+            }
         }
         Ok(report)
     }
@@ -388,6 +389,123 @@ mod cold_tier_migration_tests {
         cache.invalidate_memory_only(&key);
         assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
         assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn migration_respects_ssd_write_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_ssd(dir.path());
+        let key = CacheKey::string(2, "budgeted");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), b"value".to_vec())
+            .unwrap();
+        cache.inner.write().unwrap().ssd_write_budget.disable_admission();
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 0);
+        assert!(!cache.inner.read().unwrap().disk_index.contains_key(&key));
+    }
+
+    #[test]
+    fn migration_rejects_oversized_values_without_evicting_ssd() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 4096,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 1 << 20,
+            max_ssd_block_bytes: 16,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions::default(),
+        );
+        let key = CacheKey::string(2, "oversized");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, key.clone(), vec![7; 32])
+            .unwrap();
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 0);
+        assert!(!cache.inner.read().unwrap().disk_index.contains_key(&key));
+    }
+
+    #[test]
+    fn cold_migration_does_not_displace_a_hot_ssd_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 4096,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 100,
+            max_ssd_block_bytes: 100,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions::default(),
+        );
+        let hot = CacheKey::string(2, "hot");
+        let cold = CacheKey::string(2, "cold");
+        let hot_value = (0..48).collect::<Vec<u8>>();
+        let cold_value = (48..96).collect::<Vec<u8>>();
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, hot.clone(), hot_value.clone())
+            .unwrap();
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 1);
+        assert_eq!(cache.get(&hot).unwrap(), Some(hot_value));
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, cold.clone(), cold_value)
+            .unwrap();
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 0);
+        let inner = cache.inner.read().unwrap();
+        assert!(inner.disk_index.contains_key(&hot));
+        assert!(!inner.disk_index.contains_key(&cold));
+        assert_eq!(inner.stats.ssd_evictions, 0);
+    }
+
+    #[test]
+    fn background_retries_do_not_inflate_ssd_admission_frequency() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 4096,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 100,
+            max_ssd_block_bytes: 100,
+            ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(
+            dir.path(),
+            policy,
+            CacheBlockOptions::default(),
+        );
+        cache.set_ssd_admission_filter_enabled(true);
+        let hot = CacheKey::string(2, "hot-frequency");
+        let cold = CacheKey::string(2, "cold-frequency");
+        let hot_value = (0..48).collect::<Vec<u8>>();
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, hot.clone(), hot_value.clone())
+            .unwrap();
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 1);
+        cache.invalidate_memory_only(&hot);
+        for _ in 0..128 {
+            assert_eq!(cache.get(&hot).unwrap(), Some(hot_value.clone()));
+        }
+        assert!(cache.inner.read().unwrap().ssd_access_frequency
+            .as_ref().unwrap().estimate(&hot) > 0);
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, cold.clone(), (48..96).collect())
+            .unwrap();
+
+        let before = cache.inner.read().unwrap().ssd_access_frequency
+            .as_ref().unwrap().estimate(&cold);
+        for _ in 0..8 {
+            assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 0);
+        }
+        let inner = cache.inner.read().unwrap();
+        assert_eq!(inner.ssd_access_frequency.as_ref().unwrap().estimate(&cold), before);
+        assert!(inner.disk_index.contains_key(&hot));
+        assert!(!inner.disk_index.contains_key(&cold));
     }
 
     #[test]

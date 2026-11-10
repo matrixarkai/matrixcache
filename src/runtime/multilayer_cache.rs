@@ -13256,7 +13256,7 @@ impl CacheInner {
             return Ok(false);
         }
         if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64, &mut None) > self.ssd_capacity_bytes as u64
-            && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len())
+            && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), true)
         {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
             self.stats.writeback_backpressure_events =
@@ -13451,6 +13451,7 @@ impl CacheInner {
                     &key,
                     &request,
                     value.len(),
+                    true,
                 )
             {
                 self.stats.ssd_admission_rejected =
@@ -13651,24 +13652,54 @@ impl CacheInner {
         prepared_block: Vec<u8>,
         block_kind: CacheBlockKind,
         routing_slot: Option<u32>,
-    ) -> Result<(), CacheError> {
-        let existing_block_len = match self.read_ssd_block(key)? {
-            Some(existing_block)
-                if decode_cache_block(&existing_block).ok().as_deref() == Some(value) =>
-            {
-                Some(existing_block.len() as u64)
-            }
-            Some(_) | None => None,
+    ) -> Result<bool, CacheError> {
+        if self.disk_index.contains_key(key) {
+            return Ok(false);
+        }
+        let block_len = prepared_block.len();
+        if value.len() > self.tiering_policy.max_ssd_block_bytes
+            || block_len > self.tiering_policy.max_ssd_block_bytes
+            || block_len > self.ssd_capacity_bytes
+        {
+            self.stats.ssd_oversize_rejections =
+                self.stats.ssd_oversize_rejections.saturating_add(1);
+            self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+            return Ok(false);
+        }
+        let request = CacheAdmissionRequest {
+            block_kind,
+            shard_id: key.shard_id,
+            routing_slot,
+            block_bytes: value.len(),
+            hotness: 0,
+            pinned: false,
         };
-        let block_len = if let Some(existing_block_len) = existing_block_len {
-            existing_block_len
-        } else {
-            let block_len = prepared_block.len() as u64;
-            self.evict_ssd_for(block_len);
-            self.write_ssd_block(key, prepared_block)?;
-            block_len
-        };
-        self.finish_bypass_ssd_write(key, value.len(), block_len, block_kind, routing_slot)
+        if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64, &mut None)
+            > self.ssd_capacity_bytes as u64
+            && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), false)
+        {
+            self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+            return Ok(false);
+        }
+        if !self.ssd_write_budget_admits(key) {
+            return Ok(false);
+        }
+        if !self.make_room_for_ssd_install(&[], 0, key, block_len as u64, &mut None) {
+            self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+            return Ok(false);
+        }
+        self.write_ssd_block(key, prepared_block)?;
+        if let Err(error) = self.append_disk_manifest_put(key, block_len as u64) {
+            let _ = self.delete_ssd_blocks(std::slice::from_ref(&key));
+            return Err(error);
+        }
+        let shared = self.shared_key(key);
+        self.disk_index.insert(Arc::clone(&shared), block_len as u64);
+        self.disk_order.push_back_if_absent_shared(shared);
+        self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
+        self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
+        self.stats.ssd_admission_accepted = self.stats.ssd_admission_accepted.saturating_add(1);
+        Ok(true)
     }
 
     fn finish_bypass_ssd_write(
