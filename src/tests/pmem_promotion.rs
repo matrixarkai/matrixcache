@@ -3,6 +3,20 @@
 
 use super::*;
 
+// rust-internal: durable directory flush failures must reach the persistence caller.
+#[cfg(unix)]
+#[test]
+fn parent_directory_sync_reports_open_errors_and_accepts_relative_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing").join("block.bin");
+    assert_eq!(
+        sync_parent_dir(&missing).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    sync_parent_dir(&directory.path().join("block.bin")).unwrap();
+    sync_parent_dir(Path::new("relative-block.bin")).unwrap();
+}
+
 // rust-internal: release coalescing retains one allocation handle per consecutive run.
 #[test]
 fn duplicate_release_coalescing_compacts_all_size_paths() {
