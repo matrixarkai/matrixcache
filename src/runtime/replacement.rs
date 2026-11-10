@@ -1487,6 +1487,9 @@ impl ReplacementFifo {
         old_data: &[u8],
         buffer: CacheBuffer,
     ) -> Result<(), CacheError> {
+        if buffer.key() != key {
+            return Err(CacheError::ReplaceMismatch);
+        }
         let entry = self.index.get_mut(key).ok_or(CacheError::NotFound)?;
         if entry.buffer.data() != old_data {
             return Err(CacheError::ReplaceMismatch);
@@ -1852,6 +1855,9 @@ impl ReplacementSlru {
         old_data: &[u8],
         buffer: CacheBuffer,
     ) -> Result<(), CacheError> {
+        if buffer.key() != key {
+            return Err(CacheError::ReplaceMismatch);
+        }
         let entry = self.index.get_mut(key).ok_or(CacheError::NotFound)?;
         if entry.buffer.data() != old_data {
             return Err(CacheError::ReplaceMismatch);

@@ -18438,6 +18438,12 @@ mod tests {
         fifo.Put(test_buffer("guarded", b"old"));
 
         assert!(matches!(
+            fifo.UpdateCacheBuffer("guarded", b"old", test_buffer("other", b"bad")),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        assert_eq!(fifo.Get("guarded").unwrap().Data(), b"old");
+
+        assert!(matches!(
             fifo.UpdateCacheBuffer("guarded", b"stale", test_buffer("guarded", b"bad")),
             Err(CacheError::ReplaceMismatch)
         ));
@@ -18599,6 +18605,12 @@ mod tests {
         slru.Init().unwrap();
         slru.Put(test_buffer("x", b"old"));
         slru.Put(test_buffer("y", b"yy"));
+
+        assert!(matches!(
+            slru.UpdateCacheBuffer("x", b"old", test_buffer("other", b"bad")),
+            Err(CacheError::ReplaceMismatch)
+        ));
+        assert_eq!(slru.Peek("x").unwrap().Data(), b"old");
 
         assert!(matches!(
             slru.UpdateCacheBuffer("x", b"stale", test_buffer("x", b"bad")),
