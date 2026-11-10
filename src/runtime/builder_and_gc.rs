@@ -3710,7 +3710,7 @@ impl CacheInner {
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*count as u64);
                         entry.handle_bytes = entry.handle_bytes.max(value.len());
-                        for _ in 0..*count { self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value(value)); }
+                        self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value_count(value, *count as u64));
                         if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
                         cursor += 1;
@@ -3751,7 +3751,7 @@ impl CacheInner {
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*handles as u64);
                         entry.handle_bytes = entry.handle_bytes.max(value.len());
-                        for _ in 0..*handles { self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value(value)); }
+                        self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value_count(value, *handles as u64));
                         if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
                         pins.zero_copy_handle_hits =
