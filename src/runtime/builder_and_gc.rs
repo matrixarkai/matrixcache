@@ -3275,6 +3275,7 @@ impl CacheInner {
         key: &CacheKey,
         request: &CacheAdmissionRequest,
         block_bytes: usize,
+        record_demand: bool,
     ) -> bool {
         // FIFO replaces by insertion order, not popularity. The capacity
         // executor still checks pins and refuses an entry when none can leave.
@@ -3282,7 +3283,9 @@ impl CacheInner {
             return false;
         }
         let frequency = self.ssd_access_frequency.as_ref().map(|sketch| {
-            sketch.record(key);
+            if record_demand {
+                sketch.record(key);
+            }
             sketch.estimate(key)
         });
         let incoming_score = EvictionScore {
