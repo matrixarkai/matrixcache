@@ -4,6 +4,185 @@
 use super::*;
 
 #[test]
+fn record_relocation_updates_cache_owner_with_original_identity() {
+    let mut owner = CacheInstance::new(
+        1024,
+        ReplacementPolicyKind::Fifo,
+        StorageEngineKind::Dram,
+        Vec::new(),
+    );
+    owner.start().unwrap();
+    owner.put("record", b"payload".to_vec()).unwrap();
+    let expected = owner.get_cache_buffer("record").unwrap().unwrap();
+    let record = MemStorage::do_put("record", b"payload");
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(1024);
+    let old = allocator.allocate(record.len()).unwrap();
+    allocator.write(old, &record).unwrap();
+    let new = MemStorage::relocate_record(&mut allocator, old, &expected, &mut owner).unwrap();
+    assert_eq!(owner.get("record").unwrap().unwrap(), b"payload");
+    assert_eq!(expected.data(), b"payload");
+    assert!(matches!(allocator.read(old), Err(CacheError::NotFound)));
+    assert!(allocator.read(new).is_ok());
+    assert!(matches!(
+        MemStorage::relocate_record(&mut allocator, new, &expected, &mut owner),
+        Err(CacheError::ReplaceMismatch)
+    ));
+    assert!(allocator.read(new).is_ok());
+}
+
+#[test]
+fn controller_live_relocation_obeys_start_pause_and_stop() {
+    struct Owner(AllocatorAddress);
+    impl LogBasedAllocatorGcEventListener for Owner {
+        fn on_gc_copy(
+            &mut self,
+            old: AllocatorAddress,
+            new: AllocatorAddress,
+        ) -> Result<(), CacheError> {
+            if self.0 != old {
+                return Err(CacheError::ReplaceMismatch);
+            }
+            self.0 = new;
+            Ok(())
+        }
+    }
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+    let old = allocator.allocate(8).unwrap();
+    allocator.write(old, b"gc-owner").unwrap();
+    let mut owner = Owner(old);
+    let mut controller = StorageGcController::new(allocator, false);
+    assert_eq!(
+        controller.relocate_live_region(old, &mut owner).unwrap(),
+        None
+    );
+    controller.start();
+    controller.set_pause_gc(true);
+    assert_eq!(
+        controller.relocate_live_region(old, &mut owner).unwrap(),
+        None
+    );
+    controller.set_pause_gc(false);
+    let new = controller
+        .relocate_live_region(old, &mut owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.0, new);
+    assert_eq!(controller.allocator().read(new).unwrap(), b"gc-owner");
+    controller.stop();
+    assert_eq!(
+        controller.relocate_live_region(new, &mut owner).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn allocator_relocation_capacity_failure_leaves_source_and_owner_untouched() {
+    struct MustNotCall;
+    impl LogBasedAllocatorGcEventListener for MustNotCall {
+        fn on_gc_copy(
+            &mut self,
+            _: AllocatorAddress,
+            _: AllocatorAddress,
+        ) -> Result<(), CacheError> {
+            panic!("owner called before a relocation target was allocated");
+        }
+    }
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(8);
+    let old = allocator.allocate(8).unwrap();
+    allocator.write(old, b"original").unwrap();
+    assert!(matches!(
+        allocator.relocate(old, &mut MustNotCall),
+        Err(CacheError::CapacityExceeded)
+    ));
+    assert_eq!(allocator.read(old).unwrap(), b"original");
+    assert_eq!(allocator.live_region_count(), 1);
+    assert!(matches!(
+        allocator.relocate(old + 100, &mut MustNotCall),
+        Err(CacheError::NotFound)
+    ));
+}
+
+#[test]
+fn allocator_relocation_preserves_checksum_metadata() {
+    struct Accept;
+    impl LogBasedAllocatorGcEventListener for Accept {
+        fn on_gc_copy(
+            &mut self,
+            _: AllocatorAddress,
+            _: AllocatorAddress,
+        ) -> Result<(), CacheError> {
+            Ok(())
+        }
+    }
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+    let old = allocator.allocate(8).unwrap();
+    allocator.write(old, b"verified").unwrap();
+    let checksum = crc32c(b"verified");
+    allocator.seal_with_crc(old, 8, checksum).unwrap();
+    let new = allocator.relocate(old, &mut Accept).unwrap();
+    assert!(allocator.sealed(new));
+    assert_eq!(allocator.crc32(new), Some(checksum));
+    assert_eq!(allocator.read(new).unwrap(), b"verified");
+}
+
+#[test]
+fn log_allocator_address_exhaustion_preserves_live_region() {
+    let mut allocator =
+        SimpleLogBasedMemoryAllocator::with_capacity_and_base(64, AllocatorAddress::MAX - 1);
+    let address = allocator.allocate(8).unwrap();
+    allocator.write(address, b"original").unwrap();
+    assert!(matches!(
+        allocator.allocate(8),
+        Err(CacheError::CapacityExceeded)
+    ));
+    assert_eq!(allocator.read(address).unwrap(), b"original");
+    assert_eq!(allocator.live_region_count(), 1);
+}
+
+#[test]
+fn allocator_relocation_preserves_data_and_rolls_back_rejection() {
+    struct Listener {
+        reject: bool,
+        moved: Option<(AllocatorAddress, AllocatorAddress)>,
+    }
+    impl LogBasedAllocatorGcEventListener for Listener {
+        fn on_gc_copy(
+            &mut self,
+            old: AllocatorAddress,
+            new: AllocatorAddress,
+        ) -> Result<(), CacheError> {
+            if self.reject {
+                return Err(CacheError::ReplaceMismatch);
+            }
+            self.moved = Some((old, new));
+            Ok(())
+        }
+    }
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(1024);
+    let old = allocator.allocate(8).unwrap();
+    allocator.write(old, b"payload!").unwrap();
+    allocator.seal(old).unwrap();
+    let mut listener = Listener {
+        reject: true,
+        moved: None,
+    };
+    assert!(matches!(
+        allocator.relocate(old, &mut listener),
+        Err(CacheError::ReplaceMismatch)
+    ));
+    assert_eq!(allocator.read(old).unwrap(), b"payload!");
+    assert_eq!(allocator.live_region_count(), 1);
+    listener.reject = false;
+    let new = allocator.relocate(old, &mut listener).unwrap();
+    assert_ne!(old, new);
+    assert_eq!(listener.moved, Some((old, new)));
+    assert_eq!(allocator.read(new).unwrap(), b"payload!");
+    assert!(allocator.sealed(new));
+    assert!(matches!(allocator.read(old), Err(CacheError::NotFound)));
+    assert_eq!(allocator.live_region_count(), 1);
+}
+
+#[test]
 fn stale_handle_release_after_reset_preserves_new_generation() {
     for batch in [false, true] {
         let (_dir, cache) = cache();
