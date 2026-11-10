@@ -8,6 +8,71 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn rejected_submissions_return_original_payload_and_release_reservations() {
+    for byte_rejection in [false, true] {
+        let limit = if byte_rejection { 8 } else { 32 };
+        let mut runtime =
+            AsyncStorageRuntime::start_with_byte_limit(StorageEngineSimple::new(), 1, limit)
+                .unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let first = runtime
+            .try_put(buffer("active", b"12345678"), move |_| {
+                entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued = if byte_rejection {
+            None
+        } else {
+            Some(
+                runtime
+                    .try_put(buffer("queued", b"12345678"), |_| {})
+                    .unwrap(),
+            )
+        };
+        let input = buffer("retry", b"original");
+        let address = input.data_ptr() as usize;
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_called = Arc::clone(&called);
+        let rejected = match runtime.try_put_recoverable(input, move |_| {
+            callback_called.store(true, std::sync::atomic::Ordering::SeqCst);
+        }) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("submission should be rejected"),
+        };
+        assert!(matches!(rejected.error, CacheError::CapacityExceeded));
+        assert_eq!(rejected.buffer.key(), "retry");
+        assert_eq!(rejected.buffer.data_ptr() as usize, address);
+        release.send(()).unwrap();
+        first.wait().unwrap();
+        if let Some(queued) = queued {
+            queued.wait().unwrap();
+        }
+        let result = runtime
+            .try_put_recoverable(rejected.buffer, |_| {})
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(result.data_ptr() as usize, address);
+        runtime
+            .try_put(buffer("full-budget", &vec![0; limit]), |_| {})
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(runtime.shutdown().unwrap());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        let stopped = match runtime.try_put_recoverable(result, |_| {}) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("stopped submission accepted"),
+        };
+        assert!(matches!(stopped.error, CacheError::Stopped));
+        assert_eq!(stopped.buffer.data_ptr() as usize, address);
+    }
+}
+
+#[test]
 fn queued_cache_instances_preserve_callback_pins_and_delete_order() {
     use matrixcache::{CacheInstance, ReplacementPolicyKind, StorageEngineKind};
     for kind in [

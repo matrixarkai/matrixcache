@@ -18,6 +18,26 @@ use std::thread::{self, JoinHandle};
 type WriteResult = Result<CacheBuffer, CacheError>;
 type WriteCallback = Box<dyn FnOnce(WriteResult) + Send>;
 
+/// A write that was not admitted. No write or callback ran; the original
+/// buffer is returned so the caller can retry without copying its payload.
+#[derive(Debug)]
+pub struct StorageWriteRejected {
+    pub error: CacheError,
+    pub buffer: CacheBuffer,
+}
+
+impl std::fmt::Display for StorageWriteRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for StorageWriteRejected {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 trait StorageWorkerBackend: Send + 'static {
     fn start(&mut self) -> Result<(), CacheError>;
     fn put(&mut self, buffer: CacheBuffer) -> WriteResult;
@@ -237,18 +257,45 @@ impl AsyncStorageRuntime {
     where
         F: FnOnce(WriteResult) + Send + 'static,
     {
-        let sender = self.sender.as_ref().ok_or(CacheError::Stopped)?;
+        self.try_put_recoverable(buffer, callback)
+            .map_err(|rejected| rejected.error)
+    }
+
+    /// Submit with ownership recovery on queue, byte-budget or stopped rejection.
+    /// The callback is discarded without invocation when submission fails.
+    #[allow(clippy::result_large_err)] // Preserve ownership inline without a rejection-path allocation.
+    pub fn try_put_recoverable<F>(
+        &self,
+        buffer: CacheBuffer,
+        callback: F,
+    ) -> Result<StorageWriteCompletion, StorageWriteRejected>
+    where
+        F: FnOnce(WriteResult) + Send + 'static,
+    {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(StorageWriteRejected {
+                error: CacheError::Stopped,
+                buffer,
+            });
+        };
         let reservation = if self.max_pending_bytes == usize::MAX || buffer.value().is_empty() {
             None
         } else {
             let bytes = buffer.value().len();
-            self.pending_bytes
+            if self
+                .pending_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
                     pending
                         .checked_add(bytes)
                         .filter(|next| *next <= self.max_pending_bytes)
                 })
-                .map_err(|_| CacheError::CapacityExceeded)?;
+                .is_err()
+            {
+                return Err(StorageWriteRejected {
+                    error: CacheError::CapacityExceeded,
+                    buffer,
+                });
+            }
             Some(WriteReservation {
                 pending: Arc::clone(&self.pending_bytes),
                 bytes,
@@ -263,8 +310,19 @@ impl AsyncStorageRuntime {
         };
         match sender.try_send(StorageCommand::Put(write)) {
             Ok(()) => Ok(StorageWriteCompletion(receiver)),
-            Err(TrySendError::Full(_)) => Err(CacheError::CapacityExceeded),
-            Err(TrySendError::Disconnected(_)) => Err(CacheError::Stopped),
+            Err(rejected) => {
+                let (error, command) = match rejected {
+                    TrySendError::Full(command) => (CacheError::CapacityExceeded, command),
+                    TrySendError::Disconnected(command) => (CacheError::Stopped, command),
+                };
+                let StorageCommand::Put(write) = command else {
+                    unreachable!("only write submitted");
+                };
+                Err(StorageWriteRejected {
+                    error,
+                    buffer: write.buffer,
+                })
+            }
         }
     }
 
