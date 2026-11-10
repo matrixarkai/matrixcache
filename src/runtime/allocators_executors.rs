@@ -853,10 +853,7 @@ impl SimpleLogBasedMemoryAllocator {
     }
 
     pub fn live_region_count(&self) -> usize {
-        self.regions
-            .values()
-            .filter(|region| region.is_some())
-            .count()
+        self.regions.len() - self.freed_lens.len()
     }
 
     #[allow(non_snake_case)]
@@ -905,10 +902,7 @@ impl SimpleLogBasedMemoryAllocator {
     }
 
     pub fn test_global_free_list_size(&self) -> usize {
-        self.regions
-            .values()
-            .filter(|region| region.is_none())
-            .count()
+        self.freed_lens.len()
     }
 
     #[allow(non_snake_case)]
@@ -1032,20 +1026,15 @@ impl LogBasedMemoryAllocatorApi for SimpleLogBasedMemoryAllocator {
     where
         F: FnMut(&ChunkMeta) -> bool,
     {
-        for (ptr, region) in &self.regions {
-            if region.is_none() {
-                // A freed region is wholly reclaimable: it was allocated at this
-                // size, all of it is now free, and nothing references it.
-                let len = self.freed_lens.get(ptr).copied().unwrap_or(0);
-                let meta = ChunkMeta {
-                    id: *ptr as ChunkId,
-                    num_allocated_bytes: len,
-                    num_freed_bytes: len,
-                    ref_count: 0,
-                };
-                if !func(&meta) {
-                    break;
-                }
+        for (&ptr, &len) in &self.freed_lens {
+            let meta = ChunkMeta {
+                id: ptr as ChunkId,
+                num_allocated_bytes: len,
+                num_freed_bytes: len,
+                ref_count: 0,
+            };
+            if !func(&meta) {
+                break;
             }
         }
         Ok(())
@@ -1110,6 +1099,36 @@ impl LogBasedMemoryAllocatorApi for SimpleLogBasedMemoryAllocator {
 #[cfg(test)]
 mod log_allocator_metadata_tests {
     use super::*;
+
+    #[test]
+    fn retired_enumeration_preserves_lengths_stop_and_gc_visibility() {
+        let mut allocator = SimpleLogBasedMemoryAllocator::new();
+        for _ in 0..4096 {
+            allocator.allocate(1).unwrap();
+        }
+        let first = allocator.allocate(17).unwrap();
+        let second = allocator.allocate(29).unwrap();
+        allocator.free(first, 0).unwrap();
+        allocator.free(second, 1).unwrap();
+        assert_eq!(allocator.live_region_count(), 4096);
+        assert_eq!(allocator.test_global_free_list_size(), 2);
+        let mut calls = 0;
+        allocator.iterate_recyclable_chunk_meta(|_| { calls += 1; false }).unwrap();
+        assert_eq!(calls, 1);
+        let mut chunks = Vec::new();
+        allocator.iterate_recyclable_chunk_meta(|meta| {
+            chunks.push((meta.id, meta.num_allocated_bytes, meta.num_freed_bytes, meta.ref_count));
+            true
+        }).unwrap();
+        chunks.sort_unstable();
+        assert_eq!(chunks, vec![(first as ChunkId, 17, 17, 0), (second as ChunkId, 29, 29, 0)]);
+        allocator.gc(&[first as ChunkId]).unwrap();
+        assert_eq!(allocator.live_region_count(), 4096);
+        assert_eq!(allocator.test_global_free_list_size(), 1);
+        let mut remaining = Vec::new();
+        allocator.iterate_recyclable_chunk_meta(|meta| { remaining.push(meta.id); true }).unwrap();
+        assert_eq!(remaining, vec![second as ChunkId]);
+    }
 
     #[test]
     fn reclamation_releases_burst_metadata_without_removing_live_regions() {
