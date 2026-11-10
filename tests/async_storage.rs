@@ -50,7 +50,6 @@ fn rocksdb_worker_callback_and_completion_share_input_payload() {
     assert_worker_shares_payload(engine);
 }
 
-#[cfg(feature = "rocksdb-ssd")]
 fn assert_worker_shares_payload<E: StorageEngineApi + Send + 'static>(engine: E) {
     let mut runtime = AsyncStorageRuntime::start_with_byte_limit(engine, 2, 1024 * 1024).unwrap();
     let input = buffer("shared", &vec![7; 1024 * 1024]);
@@ -67,6 +66,11 @@ fn assert_worker_shares_payload<E: StorageEngineApi + Send + 'static>(engine: E)
     assert_eq!(receiver.recv().unwrap(), input_address);
     assert_eq!(result.value(), &vec![7; 1024 * 1024]);
     assert!(runtime.shutdown().unwrap());
+}
+
+#[test]
+fn memory_worker_callback_and_completion_share_input_payload() {
+    assert_worker_shares_payload(StorageEngineSimple::new());
 }
 
 fn buffer(key: &str, value: &[u8]) -> CacheBuffer {

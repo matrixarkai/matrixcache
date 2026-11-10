@@ -2055,6 +2055,21 @@ impl StorageEngineSimple {
         self.used_bytes
     }
 
+    fn install_record(&mut self, key: &str, value: &[u8]) -> Result<(), CacheError> {
+        if !self.initialized {
+            return Err(CacheError::Stopped);
+        }
+        let record = MemStorage::do_put(key, value);
+        let old_len = self.records.get(key).map_or(0u64, |old| old.len() as u64);
+        let next_used = self.used_bytes().saturating_sub(old_len).saturating_add(record.len() as u64);
+        if next_used > self.capacity {
+            return Err(CacheError::CapacityExceeded);
+        }
+        self.records.insert(key.to_string(), record);
+        self.used_bytes = next_used;
+        Ok(())
+    }
+
     fn buffer_from_record(&self, record: &[u8]) -> Result<CacheBuffer, CacheError> {
         MemStorage::create_cache_buffer_from_data(record, StorageEngineKind::Simple, false)
     }
@@ -2119,20 +2134,7 @@ impl StorageEngineApi for StorageEngineSimple {
     }
 
     fn put(&mut self, key: &str, value: Vec<u8>) -> Result<CacheBuffer, CacheError> {
-        if !self.initialized {
-            return Err(CacheError::Stopped);
-        }
-        let record = MemStorage::do_put(key, &value);
-        let old_len = self.records.get(key).map_or(0u64, |old| old.len() as u64);
-        let next_used = self
-            .used_bytes()
-            .saturating_sub(old_len)
-            .saturating_add(record.len() as u64);
-        if next_used > self.capacity {
-            return Err(CacheError::CapacityExceeded);
-        }
-        self.records.insert(key.to_string(), record);
-        self.used_bytes = next_used;
+        self.install_record(key, &value)?;
         let mut buffer = CacheBuffer::new(value);
         buffer.set_key(key);
         Ok(buffer)
@@ -2142,9 +2144,14 @@ impl StorageEngineApi for StorageEngineSimple {
     where
         F: FnOnce(Result<CacheBuffer, CacheError>),
     {
-        let key = buffer.key().to_string();
-        let value = buffer.to_vec();
-        let result = self.put(&key, value);
+        let result = self.install_record(buffer.key(), buffer.value()).map(|()| CacheBuffer {
+            key: Arc::clone(&buffer.key),
+            value: Arc::clone(&buffer.value),
+            logical_size: None,
+            tier: None,
+            cache: None,
+            handle: None,
+        });
         match result {
             Ok(buf) => {
                 cb(Ok(buf.clone_detached()));
