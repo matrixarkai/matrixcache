@@ -3229,6 +3229,22 @@ impl CacheInner {
             return PickedEvictionVictim { victim, groups_weighed, promote: Vec::new() };
         }
         let groups = &mut bounded_groups[..bounded_group_count];
+        // Object keys occur once in the tier order, so without slot groups
+        // there is nothing to fold. Avoid sorting keys on every eviction.
+        if groups.iter().all(|candidate| {
+            matches!(candidate, Some((EvictionGroupKey::Object(_), _, _)))
+        }) {
+            let victim = groups.iter().filter_map(Option::as_ref).min_by(|left, right| {
+                left.2.cmp(&right.2).then_with(|| left.1.cmp(right.1))
+            }).map(|(_, key, score)| {
+                ((*key).clone(), eviction_reason_for(*score), pinned_skips)
+            });
+            return PickedEvictionVictim {
+                victim,
+                groups_weighed: bounded_group_count,
+                promote: Vec::new(),
+            };
+        }
         groups.sort_unstable_by(|left, right| {
             left.as_ref()
                 .expect("bounded candidate present")
