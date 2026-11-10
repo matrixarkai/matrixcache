@@ -58,6 +58,7 @@ include!("runtime/multilayer_cache.rs");
 include!("runtime/background_recovery.rs");
 include!("runtime/cold_tier_migration.rs");
 include!("runtime/cache_facades.rs");
+include!("runtime/l2_worker.rs");
 include!("runtime/builder_and_gc.rs");
 include!("runtime/manifest_writer.rs");
 include!("runtime/zoned_store.rs");
@@ -70,6 +71,9 @@ include!("core/config_check.rs");
 include!("core/cluster.rs");
 include!("core/legacy_names.rs");
 include!("tests/mod.rs");
+#[cfg(test)]
+#[path = "tests/l2_worker.rs"]
+mod l2_worker_tests;
 #[cfg(test)]
 #[path = "tests/pmem_promotion.rs"]
 mod pmem_promotion_tests;
