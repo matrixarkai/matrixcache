@@ -2628,11 +2628,10 @@ impl CacheInner {
         {
             return false;
         }
-        !matches!(
+        matches!(
             self.tiering_policy.data_placement,
-            CacheDataPlacement::SideBySide
-        ) || self.pmem_capacity_bytes == 0
-            || value_len <= self.tiering_policy.data_placement_threshold_bytes
+            CacheDataPlacement::Tiered
+        )
     }
 
     fn bump_ssd_probe_epoch(&mut self) {
