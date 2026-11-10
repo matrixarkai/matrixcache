@@ -56,7 +56,9 @@ include!("runtime/replacement.rs");
 include!("runtime/storage_engines.rs");
 #[path = "runtime/async_storage.rs"]
 mod async_storage;
-pub use async_storage::{AsyncStorageRuntime, StorageDeleteCompletion, StorageWriteCompletion};
+pub use async_storage::{
+    AsyncStorageRuntime, StorageDeleteCompletion, StorageWriteCompletion, StorageWriteRejected,
+};
 include!("runtime/multilayer_cache.rs");
 include!("runtime/background_recovery.rs");
 include!("runtime/cold_tier_migration.rs");
