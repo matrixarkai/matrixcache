@@ -587,8 +587,19 @@ fn coalesce_batch_positions_borrowed<'a>(
     positions_by_key
 }
 
-type ReleasedPinCount = (CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>);
+type ReleasedAllocationRuns = SmallVec<[(Arc<[u8]>, u64); 1]>;
+type ReleasedPinCount = (CacheKey, usize, ReleasedAllocationRuns);
 type ReleasedPinCounts = SmallVec<[ReleasedPinCount; SMALL_BATCH_DEDUP_LIMIT]>;
+
+fn push_released_allocation(values: &mut ReleasedAllocationRuns, value: Arc<[u8]>) {
+    if let Some((previous, count)) = values.last_mut() {
+        if Arc::ptr_eq(previous, &value) {
+            *count = count.saturating_add(1);
+            return;
+        }
+    }
+    values.push((value, 1));
+}
 
 fn coalesce_release_counts<I>(
     handles: I,
@@ -607,7 +618,7 @@ where
     let mut released = 0usize;
     if upper_bound.unwrap_or(usize::MAX) <= INLINE_BATCH_KEYS {
         let mut counts =
-            SmallVec::<[(CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>); SMALL_BATCH_DEDUP_LIMIT]>::new();
+            ReleasedPinCounts::new();
         for handle in handles {
             released = released.saturating_add(1);
             if let Some((_, count, values)) = counts
@@ -615,9 +626,9 @@ where
                 .find(|(existing, _, _)| existing == &handle.key)
             {
                 *count = count.saturating_add(1);
-                values.push(handle.value);
+                push_released_allocation(values, handle.value);
             } else {
-                counts.push((handle.key, 1, smallvec::smallvec![handle.value]));
+                counts.push((handle.key, 1, smallvec::smallvec![(handle.value, 1)]));
             }
         }
         return (released, counts);
@@ -625,7 +636,7 @@ where
 
     if upper_bound.unwrap_or(usize::MAX) <= SMALL_BATCH_DEDUP_LIMIT {
         let mut counts =
-            SmallVec::<[(CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>); SMALL_BATCH_DEDUP_LIMIT]>::new();
+            ReleasedPinCounts::new();
         let mut unique_positions = [u8::MAX; SMALL_BATCH_DEDUP_SLOTS];
         let slot_mask = unique_positions.len() - 1;
         for handle in handles {
@@ -637,13 +648,13 @@ where
                 let unique_position = unique_positions[slot];
                 if unique_position == u8::MAX {
                     unique_positions[slot] = counts.len() as u8;
-                    counts.push((handle.key, 1, smallvec::smallvec![handle.value]));
+                    counts.push((handle.key, 1, smallvec::smallvec![(handle.value, 1)]));
                     break;
                 }
                 let unique_position = unique_position as usize;
                 if counts[unique_position].0 == handle.key {
                     counts[unique_position].1 = counts[unique_position].1.saturating_add(1);
-                    counts[unique_position].2.push(handle.value);
+                    push_released_allocation(&mut counts[unique_position].2, handle.value);
                     break;
                 }
                 slot = (slot + 1) & slot_mask;
@@ -652,12 +663,12 @@ where
         return (released, counts);
     }
 
-    let mut counts_by_key = AHashMap::<CacheKey, (usize, SmallVec<[Arc<[u8]>; 1]>)>::with_capacity(lower_bound);
+    let mut counts_by_key = AHashMap::<CacheKey, (usize, ReleasedAllocationRuns)>::with_capacity(lower_bound);
     for handle in handles {
         released = released.saturating_add(1);
         let entry = counts_by_key.entry(handle.key).or_default();
         entry.0 += 1;
-        entry.1.push(handle.value);
+        push_released_allocation(&mut entry.1, handle.value);
     }
     (released, counts_by_key.into_iter().map(|(key, (count, values))| (key, count, values)).collect())
 }
@@ -2811,17 +2822,10 @@ impl CachePinRegistry {
                             continue;
                         };
                         let mut valid_count = 0u64;
-                        let mut position = 0;
-                        while position < values.len() {
-                            let value = &values[position];
-                            let mut end = position + 1;
-                            while end < values.len() && Arc::ptr_eq(value, &values[end]) {
-                                end += 1;
-                            }
-                            let (released, bytes) = entry.release_value_count(value, (end - position) as u64);
+                        for (value, requested) in values {
+                            let (released, bytes) = entry.release_value_count(value, *requested);
                             valid_count = valid_count.saturating_add(released);
                             self.remove_payload_bytes_at(stripe, bytes);
-                            position = end;
                         }
                         let count = if entry.values.is_empty() { *count as u64 } else { valid_count };
                         removed_handles = removed_handles.saturating_add(entry.handles.min(count));

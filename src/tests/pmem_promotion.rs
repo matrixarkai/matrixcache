@@ -3,6 +3,32 @@
 
 use super::*;
 
+// rust-internal: release coalescing retains one allocation handle per consecutive run.
+#[test]
+fn duplicate_release_coalescing_compacts_all_size_paths() {
+    let key = CacheKey::string(0, "release-runs");
+    let value: Arc<[u8]> = Arc::from(b"payload".as_slice());
+    for size in [4, 32, 4096] {
+        let handles = (0..size)
+            .map(|_| CachePinnedHandle {
+                key: key.clone(),
+                value: Arc::clone(&value),
+                tier: CacheReadTier::Memory,
+            })
+            .collect::<Vec<_>>();
+        let (released, counts) = coalesce_release_counts(handles);
+        assert_eq!(released, size);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].1, size);
+        assert_eq!(counts[0].2.len(), 1);
+        assert_eq!(counts[0].2[0].1, size as u64);
+        assert!(!counts[0].2.spilled());
+        assert_eq!(Arc::strong_count(&value), 2);
+        drop(counts);
+        assert_eq!(Arc::strong_count(&value), 1);
+    }
+}
+
 // rust-internal: counted pin registration preserves allocation ownership and admission bounds.
 #[test]
 fn counted_pin_registration_clamps_and_charges_each_allocation_once() {
