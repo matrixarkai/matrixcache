@@ -802,6 +802,20 @@ mod tests {
 
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn options_size_admission_history_for_expected_block_size() {
+        let capacity = 64 * 1024 * 1024;
+        let options = CacheOptions::new(capacity, 0, 0)
+            .with_expected_entry_bytes(4096)
+            .with_admission_filters(true, false);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        let sketch_bytes = cache.inner.read().unwrap().access_frequency.footprint_bytes();
+        assert_eq!(sketch_bytes, FrequencySketch::bytes_for(capacity / 4096));
+        assert!(sketch_bytes < FrequencySketch::bytes_for(capacity / 64));
+        assert_eq!(cache.expected_entry_bytes(), 4096);
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn sharded_options_enable_admission_filters_per_shard() {
         let dir = tempfile::tempdir().unwrap();
         let options = CacheOptions::new(256, 0, 1 << 20)
