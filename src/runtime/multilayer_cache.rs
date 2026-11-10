@@ -1636,6 +1636,7 @@ pub struct MultiLayerCache {
     read_counters: Arc<ReadPathCounters>,
     async_writeback_worker: Arc<Mutex<Option<CacheAsyncWritebackWorker>>>,
     cold_tier_migration_worker: Arc<Mutex<Option<CacheColdTierMigrationWorker>>>,
+    cold_tier_scan_cursor: Arc<Mutex<CacheColdTierScanCursor>>,
     cold_tier_migration_entries_per_round: Arc<AtomicU64>,
     cold_tier_migration_interval_millis: Arc<AtomicU64>,
     ssd_recovery_worker: Arc<Mutex<Option<CacheSsdRecoveryWorker>>>,
@@ -3355,6 +3356,7 @@ impl MultiLayerCache {
             read_counters,
             async_writeback_worker: Arc::new(Mutex::new(None)),
             cold_tier_migration_worker: Arc::new(Mutex::new(None)),
+            cold_tier_scan_cursor: Arc::new(Mutex::new(CacheColdTierScanCursor::default())),
             cold_tier_migration_entries_per_round: Arc::new(AtomicU64::new(0)),
             cold_tier_migration_interval_millis: Arc::new(AtomicU64::new(
                 default_cold_tier_migration_interval_millis(),
