@@ -761,6 +761,7 @@ pub struct SimpleLogBasedMemoryAllocator {
     num_allocated_bytes: usize,
     num_freed_bytes: usize,
     gc_runs: u64,
+    live_bytes: usize,
 }
 
 impl SimpleLogBasedMemoryAllocator {
@@ -781,6 +782,7 @@ impl SimpleLogBasedMemoryAllocator {
             num_allocated_bytes: 0,
             num_freed_bytes: 0,
             gc_runs: 0,
+            live_bytes: 0,
         }
     }
 
@@ -944,13 +946,7 @@ impl Default for SimpleLogBasedMemoryAllocator {
 
 impl CacheAllocatorApi for SimpleLogBasedMemoryAllocator {
     fn allocate(&mut self, len: usize) -> Result<AllocatorAddress, CacheError> {
-        let live_bytes = self
-            .regions
-            .values()
-            .filter_map(Option::as_ref)
-            .map(|region| region.data.len())
-            .sum::<usize>();
-        if self.capacity != 0 && live_bytes.saturating_add(len) > self.capacity {
+        if self.capacity != 0 && self.live_bytes.saturating_add(len) > self.capacity {
             return Err(CacheError::CapacityExceeded);
         }
         let ptr = self.next_ptr;
@@ -965,6 +961,7 @@ impl CacheAllocatorApi for SimpleLogBasedMemoryAllocator {
             }),
         );
         self.num_allocated_bytes = self.num_allocated_bytes.saturating_add(len);
+        self.live_bytes = self.live_bytes.saturating_add(len);
         Ok(ptr)
     }
 
@@ -983,6 +980,7 @@ impl CacheAllocatorApi for SimpleLogBasedMemoryAllocator {
             .num_freed_bytes
             .saturating_add(len.min(region.data.len()));
         self.freed_lens.insert(ptr, region.data.len());
+        self.live_bytes = self.live_bytes.saturating_sub(region.data.len());
         Ok(())
     }
 
@@ -1017,16 +1015,10 @@ impl CacheAllocatorApi for SimpleLogBasedMemoryAllocator {
     }
 
     fn stats(&self) -> Result<AllocatorStats, CacheError> {
-        let live_bytes = self
-            .regions
-            .values()
-            .filter_map(Option::as_ref)
-            .map(|region| region.data.len())
-            .sum::<usize>();
         Ok(AllocatorStats {
             num_allocated_bytes: self.num_allocated_bytes,
             num_freed_bytes: self.num_freed_bytes,
-            num_occupied_bytes: live_bytes,
+            num_occupied_bytes: self.live_bytes,
         })
     }
 
