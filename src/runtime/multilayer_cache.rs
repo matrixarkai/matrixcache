@@ -14140,11 +14140,11 @@ impl CacheInner {
         Ok(())
     }
 
-    fn test_insert_for_tier(
+    fn test_insert_for_tier<V: AsRef<[u8]> + Into<Arc<[u8]>>>(
         &mut self,
         tier: CacheTier,
         key: CacheKey,
-        value: Vec<u8>,
+        value: V,
         size: usize,
     ) -> Result<bool, CacheError> {
         let mut admitted = true;
@@ -14160,7 +14160,7 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_memory(&key, value) {
+                if !self.put_memory_shared(&key, value.into()) {
                     admitted = false;
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
@@ -14174,13 +14174,13 @@ impl CacheInner {
                     0,
                     CacheAdmissionReason::MemoryOnly,
                 );
-                if !self.put_pmem(&key, value) {
+                if !self.put_pmem_shared(&key, value.into()) {
                     admitted = false;
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
             CacheTier::Ssd => {
-                let block = encode_cache_block(&value, self.block_options)?;
+                let block = encode_cache_block(value.as_ref(), self.block_options)?;
                 let block_len = block.len();
                 self.evict_ssd_for(block_len as u64);
                 self.write_ssd_block(&key, block)?;

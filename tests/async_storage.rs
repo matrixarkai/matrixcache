@@ -25,14 +25,20 @@ fn queued_cache_instances_preserve_callback_pins_and_delete_order() {
         let observer = instance.clone();
         let mut runtime = AsyncStorageRuntime::start_cache_instance(instance, 4, 4096).unwrap();
         let (sender, receiver) = mpsc::channel();
+        let input = buffer("record", b"original");
+        let input_address = input.data_ptr() as usize;
         let completion = runtime
-            .try_put(buffer("record", b"original"), move |result| {
+            .try_put(input, move |result| {
                 sender.send(result.unwrap()).unwrap();
             })
             .unwrap();
         let result = completion.wait().unwrap();
         let callback_buffer = receiver.recv().unwrap();
         assert_eq!(result.value(), b"original");
+        if kind != StorageEngineKind::Ssd {
+            assert_eq!(result.data_ptr() as usize, input_address);
+            assert_eq!(callback_buffer.data_ptr() as usize, input_address);
+        }
         drop(result);
         observer
             .update("record", &callback_buffer, buffer("record", b"updated"))
