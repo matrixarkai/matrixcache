@@ -3481,13 +3481,20 @@ impl MultiLayerCache {
         let auto_recover_on_start = inner.auto_recover_on_start;
         let ssd_recover_in_background = inner.ssd_recover_in_background;
         drop(inner);
-        if auto_recover_on_start {
-            if ssd_recover_in_background {
-                self.recover_pmem_index()?;
-                self.start_configured_ssd_recovery_worker()?;
-            } else {
-                self.recover_persistent_tiers()?;
+        let recovery = (|| -> Result<(), CacheError> {
+            if auto_recover_on_start {
+                if ssd_recover_in_background {
+                    self.recover_pmem_index()?;
+                    self.start_configured_ssd_recovery_worker()?;
+                } else {
+                    self.recover_persistent_tiers()?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = recovery {
+            self.stop();
+            return Err(error);
         }
         self.start_configured_async_writeback_worker();
         self.start_configured_cold_tier_migration_worker();

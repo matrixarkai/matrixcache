@@ -773,6 +773,35 @@ mod tests {
 
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn failed_pmem_recovery_leaves_cache_stopped_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(0, 1024, 0)
+                .with_pmem_paths([dir.path().join("pmem")])
+                .with_auto_recover_on_start(false),
+        );
+        let key = CacheKey::string(0, "recover-after-failure");
+        cache.put(key.clone(), vec![7; 64]).unwrap();
+        let manifest = cache.inner.read().unwrap().pmem_manifest_path().unwrap();
+        assert!(cache.stop());
+
+        let saved = dir.path().join("saved-manifest");
+        std::fs::rename(&manifest, &saved).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        cache.set_auto_recover_on_start(true);
+        assert!(cache.start().is_err());
+        assert!(!cache.is_started());
+        assert!(matches!(cache.get(&key), Err(CacheError::Stopped)));
+
+        std::fs::remove_dir(&manifest).unwrap();
+        std::fs::rename(saved, manifest).unwrap();
+        cache.start().unwrap();
+        assert_eq!(cache.get(&key).unwrap(), Some(vec![7; 64]));
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn sharded_start_rolls_back_when_later_shard_cannot_open() {
         let dir = tempfile::tempdir().unwrap();
         let ssd = dir.path().join("ssd");
