@@ -3320,9 +3320,13 @@ impl CacheInner {
         block_bytes: usize,
         record_demand: bool,
     ) -> bool {
-        // FIFO replaces by insertion order, not popularity. The capacity
-        // executor still checks pins and refuses an entry when none can leave.
-        if self.ssd_replacement_policy == CacheReplacementPolicy::Fifo {
+        // Recency-only admission must not inherit weighted popularity. An
+        // explicitly enabled frequency filter still governs LRU admission.
+        // Capacity enforcement independently protects pinned entries.
+        if self.ssd_replacement_policy == CacheReplacementPolicy::Fifo
+            || (self.ssd_replacement_policy == CacheReplacementPolicy::Lru
+                && self.ssd_access_frequency.is_none())
+        {
             return false;
         }
         let frequency = self.ssd_access_frequency.as_ref().map(|sketch| {
