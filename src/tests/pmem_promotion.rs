@@ -3,6 +3,30 @@
 
 use super::*;
 
+// rust-internal: reentrant callbacks must not change the inserted handle's bytes.
+#[test]
+fn pinned_insert_returns_its_value_before_reentrant_overwrite() {
+    let (_dir, cache) = cache();
+    let cache = Arc::new(cache);
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "pinned-callback");
+    let weak = Arc::downgrade(&cache);
+    let callback_key = key.clone();
+    cache.register_access_record_callback(move |_| {
+        let cache = weak.upgrade().unwrap();
+        cache.clear_access_record_callback();
+        cache.put(callback_key.clone(), b"new".to_vec()).unwrap();
+    });
+    let handle = cache
+        .insert_pinned(key.clone(), b"old".to_vec())
+        .unwrap()
+        .unwrap();
+    assert_eq!(handle.as_slice(), b"old");
+    assert_eq!(cache.get(&key).unwrap().unwrap(), b"new");
+    cache.release(handle);
+    assert_eq!(cache.stats().pinned_entries, 0);
+}
+
 fn cache() -> (tempfile::TempDir, MultiLayerCache) {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(
