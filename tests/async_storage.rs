@@ -28,6 +28,34 @@ fn queued_disk_write_survives_engine_reopen() {
     assert!(reopened.stop());
 }
 
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
+fn rocksdb_worker_callback_and_completion_share_input_payload() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = matrixcache::StorageEngineRocksDb::new(
+        directory
+            .path()
+            .join("shared")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let mut runtime = AsyncStorageRuntime::start_with_byte_limit(engine, 2, 1024 * 1024).unwrap();
+    let input = buffer("shared", &vec![7; 1024 * 1024]);
+    let input_address = input.data_ptr() as usize;
+    let (sender, receiver) = mpsc::channel();
+    let completion = runtime
+        .try_put(input, move |result| {
+            let result = result.unwrap();
+            sender.send(result.data_ptr() as usize).unwrap();
+        })
+        .unwrap();
+    let result = completion.wait().unwrap();
+    assert_eq!(result.data_ptr() as usize, input_address);
+    assert_eq!(receiver.recv().unwrap(), input_address);
+    assert_eq!(result.value(), &vec![7; 1024 * 1024]);
+    assert!(runtime.shutdown().unwrap());
+}
+
 fn buffer(key: &str, value: &[u8]) -> CacheBuffer {
     let mut buffer = CacheBuffer::new(value.to_vec());
     buffer.set_key(key);
