@@ -2591,13 +2591,18 @@ impl PinnedEntry {
     }
 
     fn release_value(&mut self, value: &Arc<[u8]>) -> usize {
+        self.release_value_count(value, 1).1
+    }
+
+    fn release_value_count(&mut self, value: &Arc<[u8]>, requested: u64) -> (u64, usize) {
         let weak = Arc::downgrade(value);
         if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
-            let released_bytes = if *count == 1 { value.len() } else { 0 };
-            *count = count.saturating_sub(1);
-            return released_bytes;
+            let released = requested.min(*count);
+            *count -= released;
+            let released_bytes = if released != 0 && *count == 0 { value.len() } else { 0 };
+            return (released, released_bytes);
         }
-        0
+        (0, 0)
     }
 
     fn has_value_pin(&self, value: &Arc<[u8]>) -> bool {
@@ -2806,11 +2811,17 @@ impl CachePinRegistry {
                             continue;
                         };
                         let mut valid_count = 0u64;
-                        for value in values {
-                            if entry.has_value_pin(value) {
-                                valid_count += 1;
-                                self.remove_payload_bytes_at(stripe, entry.release_value(value));
+                        let mut position = 0;
+                        while position < values.len() {
+                            let value = &values[position];
+                            let mut end = position + 1;
+                            while end < values.len() && Arc::ptr_eq(value, &values[end]) {
+                                end += 1;
                             }
+                            let (released, bytes) = entry.release_value_count(value, (end - position) as u64);
+                            valid_count = valid_count.saturating_add(released);
+                            self.remove_payload_bytes_at(stripe, bytes);
+                            position = end;
                         }
                         let count = if entry.values.is_empty() { *count as u64 } else { valid_count };
                         removed_handles = removed_handles.saturating_add(entry.handles.min(count));
