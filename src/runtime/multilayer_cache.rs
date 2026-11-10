@@ -8464,7 +8464,7 @@ impl MultiLayerCache {
             handle.thread().unpark();
             let _ = handle.join();
         }
-        true
+        self.async_writeback_queue_depth() == 0 || self.flush_async_writeback().is_ok()
     }
 
     /// How many write-backs are queued.
