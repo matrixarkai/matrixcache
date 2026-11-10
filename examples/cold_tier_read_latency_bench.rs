@@ -6,6 +6,8 @@
 //! Run both backend configurations on an otherwise idle host:
 //! `cargo run --release --example cold_tier_read_latency_bench`
 //! `cargo run --release --no-default-features --example cold_tier_read_latency_bench`
+//! Set `MATRIXCACHE_MIGRATION_BATCH` and `MATRIXCACHE_MIGRATION_INTERVAL_MS`
+//! to compare migration fill rate against hot-read latency. Defaults: 4 and 1.
 
 use matrixcache::{CacheBlockOptions, CacheKey, CacheTier, CacheTieringPolicy, MultiLayerCache};
 use std::hint::black_box;
@@ -90,6 +92,16 @@ fn report(name: &str, mut sample: ReadSample) {
 }
 
 fn main() {
+    let batch = std::env::var("MATRIXCACHE_MIGRATION_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    let interval_ms = std::env::var("MATRIXCACHE_MIGRATION_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
     let dir = tempfile::tempdir().expect("cache directory");
     let policy = CacheTieringPolicy {
         memory_capacity_bytes: ENTRY_COUNT * VALUE_BYTES * 2,
@@ -116,7 +128,7 @@ fn main() {
     }
     let hot_keys = Arc::new(hot_keys);
     println!(
-        "backend={} entries={ENTRY_COUNT} value_bytes={VALUE_BYTES} readers={READERS}",
+        "backend={} entries={ENTRY_COUNT} value_bytes={VALUE_BYTES} readers={READERS} batch={batch} interval_ms={interval_ms}",
         if cfg!(feature = "rocksdb-ssd") {
             "rocksdb"
         } else {
@@ -127,7 +139,7 @@ fn main() {
         "baseline",
         run_reads(&cache, &hot_keys, Duration::from_secs(2)),
     );
-    assert!(cache.start_cold_tier_migration_worker(4, Duration::from_millis(1)));
+    assert!(cache.start_cold_tier_migration_worker(batch, Duration::from_millis(interval_ms)));
     report(
         "migrating",
         run_reads(&cache, &hot_keys, Duration::from_secs(2)),
