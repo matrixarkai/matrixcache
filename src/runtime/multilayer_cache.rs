@@ -2570,17 +2570,22 @@ struct PinnedEntry {
 
 impl PinnedEntry {
     fn remember_value(&mut self, value: &Arc<[u8]>) -> usize {
+        self.remember_value_count(value, 1)
+    }
+
+    fn remember_value_count(&mut self, value: &Arc<[u8]>, requested: u64) -> usize {
         self.values.retain(|(held, count)| *count != 0 && held.strong_count() != 0);
         let registered = self.values.iter().fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
-        if registered >= self.handles {
+        let additional = requested.min(self.handles.saturating_sub(registered));
+        if additional == 0 {
             return 0;
         }
         let weak = Arc::downgrade(value);
         if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
-            *count = count.saturating_add(1);
+            *count = count.saturating_add(additional);
             0
         } else {
-            self.values.push((weak, 1));
+            self.values.push((weak, additional));
             value.len()
         }
     }

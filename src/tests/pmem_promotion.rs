@@ -3,6 +3,29 @@
 
 use super::*;
 
+// rust-internal: counted pin registration preserves allocation ownership and admission bounds.
+#[test]
+fn counted_pin_registration_clamps_and_charges_each_allocation_once() {
+    let old: Arc<[u8]> = Arc::from(b"old".as_slice());
+    let new: Arc<[u8]> = Arc::from(b"new-value".as_slice());
+    let mut entry = PinnedEntry {
+        handles: 4096,
+        ..Default::default()
+    };
+    assert_eq!(entry.remember_value_count(&old, 2048), old.len());
+    assert_eq!(entry.remember_value_count(&old, 1024), 0);
+    assert_eq!(entry.remember_value_count(&new, u64::MAX), new.len());
+    assert_eq!(entry.values[0].1, 3072);
+    assert_eq!(entry.values[1].1, 1024);
+    assert_eq!(entry.remember_value(&new), 0);
+    assert_eq!(entry.registered_value_bytes(), old.len() + new.len());
+    for _ in 0..3071 {
+        assert_eq!(entry.release_value(&old), 0);
+    }
+    assert_eq!(entry.release_value(&old), old.len());
+    assert!(entry.has_value_pin(&new));
+}
+
 #[test]
 fn heap_allocator_capacity_tracks_full_regions_across_partial_frees_and_clones() {
     let mut allocator = JeAllocator::new(32);
