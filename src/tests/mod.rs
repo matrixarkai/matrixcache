@@ -14028,10 +14028,14 @@ mod tests {
             writes == 1,
             "removed bytes must have one authority, found {writes} write sites"
         );
+        let generation_notifications: usize = RUNTIME.iter()
+            .map(|source| source.matches("if entry.values.len() > 1 {").count()).sum();
         assert_eq!(
-            raises, writes,
+            raises, writes + generation_notifications,
             "the removed-byte authority must raise the flag `size()` trusts"
         );
+        assert!(RUNTIME.iter().any(|source| source.contains("entry.values.len() > 1")),
+            "multiple retained allocations must also notify size accounting");
         assert!(
             helper_uses >= 5,
             "only {helper_uses} helper definition/call sites found; a removal path may bypass              the atomic pin check"

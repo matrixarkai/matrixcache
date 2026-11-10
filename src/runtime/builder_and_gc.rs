@@ -3640,7 +3640,16 @@ impl CacheInner {
         self.increment_pin_with_optional_size(key, Some(bytes));
     }
 
-    fn increment_pin_with_size_counts(&self, counts: &[(&CacheKey, usize, usize)]) {
+    fn remember_pin_value(&self, key: &CacheKey, value: &Arc<[u8]>) {
+        if let Some(entry) = self.pins_for(key).entries.get_mut(key) {
+            entry.remember_value(value);
+            if entry.values.len() > 1 {
+                self.pin_registry.mark_removed_seen();
+            }
+        }
+    }
+
+    fn increment_pin_with_size_counts(&self, counts: &[(&CacheKey, Arc<[u8]>, usize)]) {
         if counts.is_empty() {
             return;
         }
@@ -3667,10 +3676,12 @@ impl CacheInner {
                     let mut pins = self.pin_registry.stripes[stripe].lock();
                     while cursor < end {
                         let index = updates[cursor].1;
-                        let (key, bytes, count) = &counts[index];
+                        let (key, value, count) = &counts[index];
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*count as u64);
-                        entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                        entry.handle_bytes = entry.handle_bytes.max(value.len());
+                        for _ in 0..*count { entry.remember_value(value); }
+                        if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
                         cursor += 1;
                     }
@@ -3679,7 +3690,7 @@ impl CacheInner {
         );
     }
 
-    fn increment_pin_handle_counts(&self, counts: &[(&CacheKey, usize, usize, usize)]) {
+    fn increment_pin_handle_counts(&self, counts: &[(&CacheKey, Arc<[u8]>, usize, usize)]) {
         if counts.is_empty() {
             return;
         }
@@ -3706,10 +3717,12 @@ impl CacheInner {
                     let mut pins = self.pin_registry.stripes[stripe].lock();
                     while cursor < end {
                         let index = updates[cursor].1;
-                        let (key, bytes, handles, handle_hits) = &counts[index];
+                        let (key, value, handles, handle_hits) = &counts[index];
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*handles as u64);
-                        entry.handle_bytes = entry.handle_bytes.max(*bytes);
+                        entry.handle_bytes = entry.handle_bytes.max(value.len());
+                        for _ in 0..*handles { entry.remember_value(value); }
+                        if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
                         pins.zero_copy_handle_hits =
                             pins.zero_copy_handle_hits.saturating_add(*handle_hits as u64);
@@ -3786,7 +3799,18 @@ impl CacheInner {
         }
         self.all_pins()
             .iter()
-            .flat_map(|pins| pins.entries.values().filter_map(|entry| entry.removed_bytes))
+            .flat_map(|pins| pins.entries.iter().map(|(key, entry)| {
+                if entry.values.is_empty() {
+                    return entry.removed_bytes.unwrap_or(0);
+                }
+                entry.values.iter().filter(|(_, count)| *count != 0)
+                    .filter_map(|(value, _)| value.upgrade())
+                    .filter(|value| {
+                        !self.resident_value(key).is_some_and(|resident| Arc::ptr_eq(resident, value))
+                            && !self.pmem_value(key).is_some_and(|resident| Arc::ptr_eq(resident, value))
+                    })
+                    .fold(0usize, |bytes, value| bytes.saturating_add(value.len()))
+            }))
             .fold(0usize, usize::saturating_add)
     }
 
