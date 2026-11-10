@@ -35,6 +35,37 @@ fn buffer(key: &str, value: &[u8]) -> CacheBuffer {
 }
 
 #[test]
+fn payload_budget_includes_active_callbacks_and_recovers_after_completion() {
+    let mut runtime =
+        AsyncStorageRuntime::start_with_byte_limit(StorageEngineSimple::new(), 8, 8).unwrap();
+    let (entered, ready) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let first = runtime
+        .try_put(buffer("first", b"12345678"), move |_| {
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        runtime.try_put(buffer("blocked", b"x"), |_| panic!("rejected callback")),
+        Err(CacheError::CapacityExceeded)
+    ));
+    release.send(()).unwrap();
+    first.wait().unwrap();
+    runtime
+        .try_put(buffer("next", b"12345678"), |_| {})
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(matches!(
+        runtime.try_put(buffer("oversized", b"123456789"), |_| {}),
+        Err(CacheError::CapacityExceeded)
+    ));
+    assert!(runtime.shutdown().unwrap());
+}
+
+#[test]
 fn worker_bounds_pending_writes_and_drains_in_order() {
     let mut runtime = AsyncStorageRuntime::start(StorageEngineSimple::new(), 1).unwrap();
     let caller = std::thread::current().id();
