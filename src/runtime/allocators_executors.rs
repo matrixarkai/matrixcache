@@ -1168,6 +1168,7 @@ pub struct JeAllocator {
     num_allocated_bytes: usize,
     num_freed_bytes: usize,
     freed_objects: usize,
+    live_bytes: usize,
 }
 
 impl JeAllocator {
@@ -1183,6 +1184,7 @@ impl JeAllocator {
             num_allocated_bytes: 0,
             num_freed_bytes: 0,
             freed_objects: 0,
+            live_bytes: 0,
         }
     }
 
@@ -1267,16 +1269,11 @@ impl JeAllocator {
 
 impl CacheAllocatorApi for JeAllocator {
     fn allocate(&mut self, len: usize) -> Result<AllocatorAddress, CacheError> {
-        let occupied = self
-            .regions
-            .values()
-            .map(|region| region.data.len())
-            .sum::<usize>();
-        if self.capacity != 0 && occupied.saturating_add(len) > self.capacity {
+        if self.capacity != 0 && self.live_bytes.saturating_add(len) > self.capacity {
             return Err(CacheError::CapacityExceeded);
         }
         let ptr = self.next_ptr;
-        self.next_ptr = self.next_ptr.saturating_add(1).max(1 << 40);
+        self.next_ptr = self.next_ptr.checked_add(1).ok_or(CacheError::CapacityExceeded)?;
         self.regions.insert(
             ptr,
             JeAllocationRegion {
@@ -1286,6 +1283,7 @@ impl CacheAllocatorApi for JeAllocator {
             },
         );
         self.num_allocated_bytes = self.num_allocated_bytes.saturating_add(len);
+        self.live_bytes = self.live_bytes.saturating_add(len);
         Ok(ptr)
     }
 
@@ -1299,6 +1297,7 @@ impl CacheAllocatorApi for JeAllocator {
             .num_freed_bytes
             .saturating_add(len.min(region.data.len()));
         self.freed_objects = self.freed_objects.saturating_add(1);
+        self.live_bytes = self.live_bytes.saturating_sub(region.data.len());
         Ok(())
     }
 
@@ -1324,15 +1323,10 @@ impl CacheAllocatorApi for JeAllocator {
     }
 
     fn stats(&self) -> Result<AllocatorStats, CacheError> {
-        let occupied = self
-            .regions
-            .values()
-            .map(|region| region.data.len())
-            .sum::<usize>();
         Ok(AllocatorStats {
             num_allocated_bytes: self.num_allocated_bytes,
             num_freed_bytes: self.num_freed_bytes,
-            num_occupied_bytes: occupied,
+            num_occupied_bytes: self.live_bytes,
         })
     }
 

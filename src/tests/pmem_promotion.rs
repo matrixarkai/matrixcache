@@ -4,6 +4,33 @@
 use super::*;
 
 #[test]
+fn heap_allocator_capacity_tracks_full_regions_across_partial_frees_and_clones() {
+    let mut allocator = JeAllocator::new(32);
+    let first = allocator.allocate(16).unwrap();
+    let second = allocator.allocate(16).unwrap();
+    assert!(matches!(
+        allocator.allocate(1),
+        Err(CacheError::CapacityExceeded)
+    ));
+    allocator.free(first, 1).unwrap();
+    assert_eq!(allocator.stats().unwrap().num_occupied_bytes, 16);
+    assert_eq!(allocator.stats().unwrap().num_freed_bytes, 1);
+    let mut cloned = allocator.clone();
+    cloned.free(second, 0).unwrap();
+    assert_eq!(cloned.stats().unwrap().num_occupied_bytes, 0);
+    assert_eq!(allocator.stats().unwrap().num_occupied_bytes, 16);
+    assert!(matches!(
+        allocator.free(first, 16),
+        Err(CacheError::NotFound)
+    ));
+    assert!(allocator.allocate(16).is_ok());
+    assert!(matches!(
+        allocator.allocate(1),
+        Err(CacheError::CapacityExceeded)
+    ));
+}
+
+#[test]
 fn log_allocator_capacity_reuses_full_region_after_partial_free_accounting() {
     let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
     let addresses = (0..4)
