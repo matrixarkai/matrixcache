@@ -8,6 +8,62 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn write_and_delete_futures_wake_without_blocking_poll() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Notify(mpsc::Sender<()>);
+    impl Wake for Notify {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+    let mut runtime = AsyncStorageRuntime::start(StorageEngineSimple::new(), 4).unwrap();
+    let (entered, ready) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let mut write = runtime
+        .try_put(buffer("awaitable", b"payload"), move |_| {
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut delete = runtime.try_delete("awaitable", |_| {}).unwrap();
+    let (notify, wakes) = mpsc::channel();
+    let waker = Waker::from(Arc::new(Notify(notify)));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(Pin::new(&mut write).poll(&mut cx), Poll::Pending));
+    assert!(matches!(Pin::new(&mut delete).poll(&mut cx), Poll::Pending));
+    release.send(()).unwrap();
+    for _ in 0..2 {
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    assert!(
+        matches!(Pin::new(&mut write).poll(&mut cx), Poll::Ready(Ok(result)) if result.value() == b"payload")
+    );
+    assert!(matches!(
+        Pin::new(&mut delete).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(runtime.shutdown().unwrap());
+}
+
+#[test]
+fn dropped_completion_does_not_cancel_accepted_write() {
+    let mut runtime = AsyncStorageRuntime::start(StorageEngineSimple::new(), 2).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    drop(
+        runtime
+            .try_put(buffer("unobserved", b"payload"), move |result| {
+                sender.send(result.unwrap().value().to_vec()).unwrap();
+            })
+            .unwrap(),
+    );
+    assert!(runtime.shutdown().unwrap());
+    assert_eq!(receiver.recv().unwrap(), b"payload");
+}
+
+#[test]
 fn queued_delete_follows_write_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory

@@ -2,7 +2,13 @@
 // Copyright 2026 MatrixArkAI
 
 use super::{cache_error_for_callback, CacheBuffer, CacheError, StorageEngineApi};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::task::{Context, Poll};
+#[path = "storage_completion.rs"]
+mod completion;
+use completion::{CompletionReceiver, CompletionSender};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -19,14 +25,14 @@ enum StorageCommand {
     Delete {
         key: String,
         callback: Box<dyn FnOnce(Result<(), CacheError>) + Send>,
-        completed: mpsc::Sender<Result<(), CacheError>>,
+        completed: CompletionSender<()>,
     },
 }
 
 struct StorageWrite {
     buffer: CacheBuffer,
     callback: WriteCallback,
-    completed: mpsc::Sender<WriteResult>,
+    completed: CompletionSender<CacheBuffer>,
     reservation: Option<WriteReservation>,
 }
 
@@ -42,20 +48,34 @@ impl Drop for WriteReservation {
 }
 
 /// Completion of an accepted write. Dropping it does not cancel the write.
-pub struct StorageWriteCompletion(Receiver<WriteResult>);
+pub struct StorageWriteCompletion(CompletionReceiver<CacheBuffer>);
 
 impl StorageWriteCompletion {
     pub fn wait(self) -> WriteResult {
-        self.0.recv().map_err(|_| CacheError::Stopped)?
+        self.0.wait()
+    }
+}
+
+impl Future for StorageWriteCompletion {
+    type Output = WriteResult;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
     }
 }
 
 /// Completion of an accepted delete. Dropping it does not cancel deletion.
-pub struct StorageDeleteCompletion(Receiver<Result<(), CacheError>>);
+pub struct StorageDeleteCompletion(CompletionReceiver<()>);
 
 impl StorageDeleteCompletion {
     pub fn wait(self) -> Result<(), CacheError> {
-        self.0.recv().map_err(|_| CacheError::Stopped)?
+        self.0.wait()
+    }
+}
+
+impl Future for StorageDeleteCompletion {
+    type Output = Result<(), CacheError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
     }
 }
 
@@ -120,7 +140,7 @@ impl AsyncStorageRuntime {
                                 (write.callback)(callback_result);
                             }));
                             drop(write.reservation);
-                            let _ = write.completed.send(result);
+                            write.completed.send(result);
                         }
                         StorageCommand::Delete {
                             key,
@@ -135,7 +155,7 @@ impl AsyncStorageRuntime {
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 callback(callback_result)
                             }));
-                            let _ = completed.send(result);
+                            completed.send(result);
                         }
                     }
                 }
@@ -174,7 +194,7 @@ impl AsyncStorageRuntime {
                 bytes,
             })
         };
-        let (completed, receiver) = mpsc::channel();
+        let (completed, receiver) = completion::channel();
         let write = StorageWrite {
             buffer,
             callback: Box::new(callback),
@@ -199,7 +219,7 @@ impl AsyncStorageRuntime {
         F: FnOnce(Result<(), CacheError>) + Send + 'static,
     {
         let sender = self.sender.as_ref().ok_or(CacheError::Stopped)?;
-        let (completed, receiver) = mpsc::channel();
+        let (completed, receiver) = completion::channel();
         let command = StorageCommand::Delete {
             key: key.into(),
             callback: Box::new(callback),
