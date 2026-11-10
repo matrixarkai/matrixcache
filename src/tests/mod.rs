@@ -16365,6 +16365,30 @@ mod tests {
         assert!(matches!(engine.Get("async-key"), Err(CacheError::Stopped)));
     }
 
+    // rust-internal: the simple store's cached byte total must follow mutations.
+    #[test]
+    fn simple_storage_engine_capacity_tracks_overwrite_delete_and_reset() {
+        let small = MemStorage::do_put("a", b"1").len() as u64;
+        let large = MemStorage::do_put("a", b"1234").len() as u64;
+        let mut engine = StorageEngineSimple::with_capacity(small + large);
+        assert!(engine.start());
+        engine.put("a", b"1".to_vec()).unwrap();
+        engine.put("b", b"1234".to_vec()).unwrap();
+        assert!(matches!(
+            engine.put("a", b"1234".to_vec()),
+            Err(CacheError::CapacityExceeded)
+        ));
+        assert_eq!(engine.get("a").unwrap().data(), b"1");
+
+        engine.put("b", b"1".to_vec()).unwrap();
+        engine.put("a", b"1234".to_vec()).unwrap();
+        engine.delete("b").unwrap();
+        engine.put("b", b"1".to_vec()).unwrap();
+        engine.reset().unwrap();
+        engine.put("a", b"1234".to_vec()).unwrap();
+        engine.put("b", b"1".to_vec()).unwrap();
+    }
+
     #[test]
     fn rocksdb_storage_engine_persists_path_and_ssd_view_semantics() {
         let dir = tempfile::tempdir().unwrap();
