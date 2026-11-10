@@ -773,6 +773,37 @@ mod tests {
 
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn sharded_start_rolls_back_when_later_shard_cannot_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssd = dir.path().join("ssd");
+        let cache = ShardedMultiLayerCache::with_options(
+            CacheOptions::new(1024, 0, 0)
+                .with_ssd_paths([ssd.clone()])
+                .with_auto_recover_on_start(false),
+            2,
+        );
+        assert!(cache.stop());
+
+        let blocked = ssd.join("shard-1");
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(cache.start().is_err());
+
+        let key = (0..100)
+            .map(|index| CacheKey::string(0, &format!("shard-zero-{index}")))
+            .find(|key| cache.shard_index_for_key(key) == 0)
+            .unwrap();
+        assert!(matches!(cache.put(key.clone(), vec![1]), Err(CacheError::Stopped)));
+
+        std::fs::remove_file(blocked).unwrap();
+        cache.start().unwrap();
+        cache.put(key.clone(), vec![1]).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), Some(vec![1]));
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn options_enable_frequency_admission_before_first_write() {
         for enabled in [false, true] {
             let options = CacheOptions::new(8, 0, 0).with_admission_filters(enabled, false);

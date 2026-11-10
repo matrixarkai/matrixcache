@@ -10060,8 +10060,14 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn start(&self) -> Result<(), CacheError> {
-        for shard in self.shards.iter() {
-            shard.start()?;
+        for (index, shard) in self.shards.iter().enumerate() {
+            if let Err(error) = shard.start() {
+                shard.stop();
+                for started in &self.shards[..index] {
+                    started.stop();
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -10072,7 +10078,11 @@ impl ShardedMultiLayerCache {
 
     pub fn stop(&self) -> bool {
         self.stop_async_writeback_workers();
-        self.shards.iter().all(MultiLayerCache::stop)
+        let mut stopped = true;
+        for shard in self.shards.iter() {
+            stopped = shard.stop() && stopped;
+        }
+        stopped
     }
 
     pub fn start_async_writeback_workers(
