@@ -19,11 +19,11 @@ fn counted_pin_registration_clamps_and_charges_each_allocation_once() {
     assert_eq!(entry.values[1].1, 1024);
     assert_eq!(entry.remember_value(&new), 0);
     assert_eq!(entry.registered_value_bytes(), old.len() + new.len());
-    for _ in 0..3071 {
-        assert_eq!(entry.release_value(&old), 0);
-    }
-    assert_eq!(entry.release_value(&old), old.len());
+    assert_eq!(entry.release_value_count(&old, 3071), (3071, 0));
+    assert_eq!(entry.release_value_count(&old, u64::MAX), (1, old.len()));
+    assert_eq!(entry.release_value_count(&old, 1), (0, 0));
     assert!(entry.has_value_pin(&new));
+    assert_eq!(entry.values[1].1, 1024);
 }
 
 #[test]
