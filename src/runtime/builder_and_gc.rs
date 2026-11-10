@@ -1805,7 +1805,7 @@ impl CacheInner {
     /// Same threshold as the tier maps, and against the bucket count for the
     /// same reason -- see `estimated_buckets`.
     fn shrink_pin_stripe_if_sparse(pins: &mut CachePinState) {
-        const SHRINK_FLOOR: usize = 64;
+        const SHRINK_FLOOR: usize = 32;
         let buckets = estimated_buckets(pins.entries.capacity());
         if buckets > SHRINK_FLOOR && pins.entries.len().saturating_mul(4) <= buckets {
             pins.entries.shrink_to_fit();
@@ -2349,7 +2349,27 @@ impl CacheInner {
         self.put_memory_shared(key, Arc::<[u8]>::from(value))
     }
 
+    fn retained_payload_admissible(&self, key: &CacheKey, value: &Arc<[u8]>) -> bool {
+        if !self.pin_registry.removed_seen.load(Ordering::Relaxed) || !self.pin_registry.has_handles() {
+            return true;
+        }
+        let held = self.resident_value(key).is_some_and(|current| Arc::ptr_eq(current, value))
+            || self.pmem_value(key).is_some_and(|current| Arc::ptr_eq(current, value))
+            || self.pins_for(key).entries.get(key).is_some_and(|entry| {
+                entry.values.iter().any(|(current, count)| *count != 0
+                    && std::ptr::eq(current.as_ptr(), Arc::as_ptr(value)))
+            });
+        let capacity = self.memory_capacity_bytes.saturating_add(self.pmem_capacity_bytes);
+        let limit = capacity.saturating_add(capacity.saturating_mul(3) / 10);
+        self.pin_registry.payload_bytes()
+            .saturating_add(if held { 0 } else { value.len() as u64 }) <= limit as u64
+    }
+
     fn put_memory_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
+        if !self.retained_payload_admissible(key, &value) {
+            self.stats.memory_admission_rejected = self.stats.memory_admission_rejected.saturating_add(1);
+            return false;
+        }
         let eviction_started = Instant::now();
         let value_len = value.len();
         if self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes {
@@ -2425,6 +2445,10 @@ impl CacheInner {
         value: Arc<[u8]>,
         persist: bool,
     ) -> bool {
+        if !self.retained_payload_admissible(key, &value) {
+            self.stats.pmem_admission_rejected = self.stats.pmem_admission_rejected.saturating_add(1);
+            return false;
+        }
         self.note_ssd_probe_mutation(key);
         let eviction_started = Instant::now();
         if self.pmem_capacity_bytes == 0 || value.len() > self.pmem_capacity_bytes {
@@ -3521,6 +3545,9 @@ impl CacheInner {
         self.memory_order.clear();
         self.pmem_order.clear();
         for mut pins in self.all_pins() {
+            for (key, entry) in &pins.entries {
+                self.pin_registry.remove_payload_bytes(key, entry.registered_value_bytes());
+            }
             pins.entries.clear();
             if reset_stats {
                 // The pin counters live here now. Resetting the statistics has
@@ -3615,7 +3642,10 @@ impl CacheInner {
             let removed = pins
                 .entries
                 .remove(key)
-                .map_or(0, |entry| entry.handles);
+                .map_or(0, |entry| {
+                    self.pin_registry.remove_payload_bytes(key, entry.registered_value_bytes());
+                    entry.handles
+                });
             Self::shrink_pin_stripe_if_sparse(&mut pins);
             removed
         };
@@ -3642,7 +3672,7 @@ impl CacheInner {
 
     fn remember_pin_value(&self, key: &CacheKey, value: &Arc<[u8]>) {
         if let Some(entry) = self.pins_for(key).entries.get_mut(key) {
-            entry.remember_value(value);
+            self.pin_registry.add_payload_bytes(key, entry.remember_value(value));
             if entry.values.len() > 1 {
                 self.pin_registry.mark_removed_seen();
             }
@@ -3680,7 +3710,7 @@ impl CacheInner {
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*count as u64);
                         entry.handle_bytes = entry.handle_bytes.max(value.len());
-                        for _ in 0..*count { entry.remember_value(value); }
+                        for _ in 0..*count { self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value(value)); }
                         if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*count as u64);
                         cursor += 1;
@@ -3721,7 +3751,7 @@ impl CacheInner {
                         let entry = pins.entries.entry(self.shared_key(key)).or_default();
                         entry.handles = entry.handles.saturating_add(*handles as u64);
                         entry.handle_bytes = entry.handle_bytes.max(value.len());
-                        for _ in 0..*handles { entry.remember_value(value); }
+                        for _ in 0..*handles { self.pin_registry.add_payload_bytes_at(stripe, entry.remember_value(value)); }
                         if entry.values.len() > 1 { self.pin_registry.mark_removed_seen(); }
                         pins.pin_operations = pins.pin_operations.saturating_add(*handles as u64);
                         pins.zero_copy_handle_hits =
@@ -3794,7 +3824,9 @@ impl CacheInner {
         // entry's `removed_bytes` is `None` and the sum is zero. Answered
         // without locking a single stripe, which is what `size()` was doing
         // on every call -- and on a sharded cache, once per shard.
-        if !self.pin_registry.removed_seen.load(Ordering::Relaxed) {
+        if !self.pin_registry.removed_seen.load(Ordering::Relaxed)
+            || !self.pin_registry.has_handles()
+        {
             return 0;
         }
         self.all_pins()

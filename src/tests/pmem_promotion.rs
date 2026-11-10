@@ -4,6 +4,200 @@
 use super::*;
 
 #[test]
+fn stale_handle_release_after_reset_preserves_new_generation() {
+    for batch in [false, true] {
+        let (_dir, cache) = cache();
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "reset-generation");
+        let old = cache
+            .insert_pinned(key.clone(), vec![1; 8])
+            .unwrap()
+            .unwrap();
+        cache.reset().unwrap();
+        let new = cache
+            .insert_pinned(key.clone(), vec![2; 16])
+            .unwrap()
+            .unwrap();
+        if batch {
+            cache.release_batch(vec![old]);
+        } else {
+            cache.release(old);
+        }
+        assert_eq!(cache.stats().pinned_entries, 1);
+        assert_eq!(cache.pin_registry.payload_bytes(), 16);
+        cache.release(new);
+        assert_eq!(cache.stats().pinned_entries, 0);
+        assert_eq!(cache.pin_registry.payload_bytes(), 0);
+    }
+}
+
+#[test]
+fn atomic_payload_counter_cleans_up_explicit_unpin_and_reset() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "counter-cleanup");
+    let first = cache
+        .insert_pinned(key.clone(), vec![1; 8])
+        .unwrap()
+        .unwrap();
+    cache.unpin(&key);
+    assert_eq!(cache.pin_registry.payload_bytes(), 0);
+    cache.release(first);
+    let second = cache.insert_pinned(key, vec![2; 16]).unwrap().unwrap();
+    assert_eq!(cache.pin_registry.payload_bytes(), 16);
+    cache.reset().unwrap();
+    assert_eq!(cache.pin_registry.payload_bytes(), 0);
+    cache.release(second);
+    assert_eq!(cache.pin_registry.payload_bytes(), 0);
+}
+
+#[test]
+fn atomic_pin_payload_counter_tracks_versions_and_clones() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "atomic-payload");
+    let first = cache
+        .insert_pinned(key.clone(), vec![1; 8])
+        .unwrap()
+        .unwrap();
+    let cloned = first.clone_with_cache(&cache);
+    cache.invalidate(&key).unwrap();
+    let second = cache
+        .insert_pinned(key.clone(), vec![2; 16])
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.pin_registry.payload_bytes(), 24);
+    cache.release(second);
+    assert_eq!(cache.pin_registry.payload_bytes(), 8);
+    cache.release_batch(vec![first, cloned]);
+    assert_eq!(cache.pin_registry.payload_bytes(), 0);
+}
+
+#[test]
+fn allocation_byte_deltas_count_first_pin_and_last_release_only() {
+    let value: Arc<[u8]> = Arc::from(vec![1; 16]);
+    let mut entry = PinnedEntry {
+        handles: 2,
+        ..PinnedEntry::default()
+    };
+    assert_eq!(entry.remember_value(&value), 16);
+    assert_eq!(entry.remember_value(&value), 0);
+    assert_eq!(entry.release_value(&value), 0);
+    assert_eq!(entry.release_value(&value), 16);
+    assert_eq!(entry.release_value(&value), 0);
+}
+
+#[test]
+fn upper_tier_bypass_admission_respects_retained_pressure() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let old_key = CacheKey::string(0, "held-pressure");
+    let incoming = CacheKey::string(0, "bypass-pressure");
+    let mut handles = Vec::new();
+    for index in 0..20 {
+        handles.push(
+            cache
+                .insert_pinned(old_key.clone(), vec![index; 8])
+                .unwrap()
+                .unwrap(),
+        );
+        cache.invalidate(&old_key).unwrap();
+    }
+    cache.put_memory_only(incoming.clone(), vec![9; 8]);
+    assert_eq!(cache.peek_tier(&incoming), None);
+    for tier in [CacheTier::Memory, CacheTier::Pmem] {
+        cache
+            .put_bypass_storage_for_tier(tier, incoming.clone(), vec![9; 8])
+            .unwrap();
+        assert_eq!(cache.peek_tier(&incoming), None);
+    }
+    assert_eq!(handles[0].as_slice(), &[0; 8]);
+    cache.release_batch(handles);
+    cache.put_memory_only(incoming.clone(), vec![9; 8]);
+    assert_eq!(cache.peek_tier(&incoming), Some(CacheReadTier::Memory));
+}
+
+#[test]
+fn retained_pressure_allows_reusing_existing_shared_payload() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    cache.set_capacity_for_tier(CacheTier::Pmem, 0);
+    let key = CacheKey::string(0, "shared-budget");
+    let mut handles = Vec::new();
+    for index in 0..10 {
+        handles.push(
+            cache
+                .insert_pinned(key.clone(), vec![index; 8])
+                .unwrap()
+                .unwrap(),
+        );
+        cache.invalidate(&key).unwrap();
+    }
+    let value = Arc::clone(&handles[0].value);
+    cache.put_shared(key.clone(), Arc::clone(&value)).unwrap();
+    assert!(Arc::ptr_eq(
+        &cache.get_shared(&key).unwrap().unwrap(),
+        &value
+    ));
+    cache.release_batch(handles);
+}
+
+#[test]
+fn ssd_fallback_does_not_bypass_pinned_retention_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(64, 0, 4096).with_ssd_paths([dir.path().join("ssd")]),
+    );
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "ssd-pin-budget");
+    let mut handles = Vec::new();
+    for index in 0..10 {
+        handles.push(
+            cache
+                .insert_pinned(key.clone(), vec![index; 8])
+                .unwrap()
+                .unwrap(),
+        );
+        cache.invalidate(&key).unwrap();
+    }
+    assert!(matches!(
+        cache.insert_pinned(key.clone(), vec![9; 8]),
+        Err(CacheError::CapacityExceeded)
+    ));
+    cache.put(key.clone(), vec![7; 8]).unwrap();
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+    cache.release_batch(handles);
+    assert!(cache.insert_pinned(key, vec![8; 8]).unwrap().is_some());
+}
+
+#[test]
+fn retained_payload_pressure_rejects_then_recovers_after_release() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    cache.set_capacity_for_tier(CacheTier::Pmem, 0);
+    let key = CacheKey::string(0, "bounded-retention");
+    let mut handles = Vec::new();
+    let mut rejected = false;
+    for index in 0..32 {
+        match cache.insert_pinned(key.clone(), vec![index; 8]) {
+            Ok(Some(handle)) => {
+                handles.push(handle);
+                cache.invalidate(&key).unwrap();
+            }
+            Err(CacheError::CapacityExceeded) => {
+                rejected = true;
+                break;
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    assert!(rejected);
+    assert!(cache.stats().pinned_bytes <= 83);
+    cache.release_batch(handles);
+    assert!(cache.insert_pinned(key, vec![9; 8]).unwrap().is_some());
+}
+
+#[test]
 fn concurrent_pinned_versions_account_until_batch_release() {
     let (_dir, cache) = cache();
     let cache = Arc::new(cache);

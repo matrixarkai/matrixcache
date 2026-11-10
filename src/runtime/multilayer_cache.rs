@@ -2538,30 +2538,45 @@ struct PinnedEntry {
 }
 
 impl PinnedEntry {
-    fn remember_value(&mut self, value: &Arc<[u8]>) {
+    fn remember_value(&mut self, value: &Arc<[u8]>) -> usize {
         self.values.retain(|(held, count)| *count != 0 && held.strong_count() != 0);
         let registered = self.values.iter().fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
         if registered >= self.handles {
-            return;
+            return 0;
         }
         let weak = Arc::downgrade(value);
         if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
             *count = count.saturating_add(1);
+            0
         } else {
             self.values.push((weak, 1));
+            value.len()
         }
     }
 
-    fn release_value(&mut self, value: &Arc<[u8]>) {
+    fn release_value(&mut self, value: &Arc<[u8]>) -> usize {
         let weak = Arc::downgrade(value);
         if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
+            let released_bytes = if *count == 1 { value.len() } else { 0 };
             *count = count.saturating_sub(1);
+            return released_bytes;
         }
+        0
+    }
+
+    fn has_value_pin(&self, value: &Arc<[u8]>) -> bool {
+        self.values.iter().any(|(held, count)| *count != 0
+            && std::ptr::eq(held.as_ptr(), Arc::as_ptr(value)))
     }
 
     fn retained_value_bytes(&self) -> usize {
         self.values.iter()
             .filter(|(held, count)| *count != 0 && held.strong_count() != 0)
+            .fold(0usize, |bytes, (held, _)| bytes.saturating_add(held.as_ptr().len()))
+    }
+
+    fn registered_value_bytes(&self) -> usize {
+        self.values.iter().filter(|(_, count)| *count != 0)
             .fold(0usize, |bytes, (held, _)| bytes.saturating_add(held.as_ptr().len()))
     }
 }
@@ -2583,6 +2598,7 @@ struct CachePinState {
 #[repr(align(64))]
 #[derive(Debug, Default)]
 struct CachePinStripe {
+    payload_bytes: AtomicU64,
     state: Mutex<CachePinState>,
     handle_count: AtomicU64,
 }
@@ -2664,6 +2680,27 @@ impl CachePinRegistry {
         self.removed_seen.store(true, Ordering::Relaxed);
     }
 
+    fn payload_bytes(&self) -> u64 {
+        self.stripes.iter().map(|stripe| stripe.payload_bytes.load(Ordering::Acquire))
+            .fold(0, u64::saturating_add)
+    }
+
+    fn add_payload_bytes(&self, key: &CacheKey, bytes: usize) {
+        if bytes != 0 { self.add_payload_bytes_at(self.stripe_index(key), bytes); }
+    }
+
+    fn remove_payload_bytes(&self, key: &CacheKey, bytes: usize) {
+        if bytes != 0 { self.remove_payload_bytes_at(self.stripe_index(key), bytes); }
+    }
+
+    fn add_payload_bytes_at(&self, stripe: usize, bytes: usize) {
+        if bytes != 0 { self.stripes[stripe].payload_bytes.fetch_add(bytes as u64, Ordering::AcqRel); }
+    }
+
+    fn remove_payload_bytes_at(&self, stripe: usize, bytes: usize) {
+        if bytes != 0 { self.stripes[stripe].payload_bytes.fetch_sub(bytes as u64, Ordering::AcqRel); }
+    }
+
     /// Keep removed bytes attached to a handle only while that handle is
     /// still live. The check and update share one stripe lock so release
     /// cannot remove the last pin between them and leave a zero-handle entry.
@@ -2673,6 +2710,7 @@ impl CachePinRegistry {
             return false;
         };
         if entry.handles == 0 {
+            self.remove_payload_bytes(key, entry.registered_value_bytes());
             pins.entries.remove(key);
             CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
             return false;
@@ -2698,6 +2736,7 @@ impl CachePinRegistry {
         if entry.handles > count {
             entry.handles -= count;
         } else {
+            self.remove_payload_bytes(key, entry.registered_value_bytes());
             pins.entries.remove(key);
             CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
         }
@@ -2730,12 +2769,19 @@ impl CachePinRegistry {
                             cursor += 1;
                             continue;
                         };
-                        let count = *count as u64;
-                        for value in values { entry.release_value(value); }
+                        let mut valid_count = 0u64;
+                        for value in values {
+                            if entry.has_value_pin(value) {
+                                valid_count += 1;
+                                self.remove_payload_bytes_at(stripe, entry.release_value(value));
+                            }
+                        }
+                        let count = if entry.values.is_empty() { *count as u64 } else { valid_count };
                         removed_handles = removed_handles.saturating_add(entry.handles.min(count));
                         if entry.handles > count {
                             entry.handles -= count;
                         } else {
+                            self.remove_payload_bytes_at(stripe, entry.registered_value_bytes());
                             pins.entries.remove(key);
                             CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
                         }
@@ -7098,13 +7144,24 @@ impl MultiLayerCache {
     }
 
     pub fn release(&self, handle: CachePinnedHandle) {
-        {
-            let mut pins = self.pin_registry.pins_for(&handle.key);
-            if let Some(entry) = pins.entries.get_mut(&handle.key) {
-                entry.release_value(&handle.value);
-            }
+        let stripe = self.pin_registry.stripe_index(&handle.key);
+        let mut pins = self.pin_registry.stripes[stripe].lock();
+        let Some(entry) = pins.entries.get_mut(&handle.key) else { return; };
+        if !entry.values.is_empty() && !entry.has_value_pin(&handle.value) { return; }
+        self.pin_registry.remove_payload_bytes(&handle.key, entry.release_value(&handle.value));
+        if entry.handles > 1 {
+            entry.handles -= 1;
+        } else {
+            self.pin_registry.remove_payload_bytes(&handle.key, entry.registered_value_bytes());
+            pins.entries.remove(&handle.key);
+            CacheInner::shrink_pin_stripe_if_sparse(&mut pins);
         }
-        self.unpin(&handle.key);
+        pins.unpin_operations = pins.unpin_operations.saturating_add(1);
+        drop(pins);
+        self.pin_registry.stripes[stripe].remove_handles(1);
+        if self.pin_registry.reclaim_needed.load(Ordering::Acquire) {
+            self.reclaim_after_release();
+        }
     }
 
     /// Bring the tiers back under their capacities, after a release that may
@@ -7671,6 +7728,13 @@ impl MultiLayerCache {
         let write_result = {
             if !inner.started {
                 return Err(CacheError::Stopped);
+            }
+            let capacity = inner.memory_capacity_bytes.saturating_add(inner.pmem_capacity_bytes);
+            let retained_limit = capacity.saturating_add(capacity.saturating_mul(3) / 10);
+            if capacity != 0 && inner.pin_registry.removed_seen.load(Ordering::Relaxed)
+                && inner.pin_registry.payload_bytes().saturating_add(shared.len() as u64) > retained_limit as u64
+            {
+                return Err(CacheError::CapacityExceeded);
             }
             inner.stats.insert_pinned_operations =
                 inner.stats.insert_pinned_operations.saturating_add(1);
@@ -13385,8 +13449,28 @@ impl CacheInner {
             && (decision.admit_ssd
                 || self.tiering_policy.ssd_write_through
                 || self.ssd_instance_only);
-        let admit_memory = decision.admit_memory && !self.ssd_instance_only;
-        let admit_pmem = decision.admit_pmem && !self.ssd_instance_only;
+        let mut admit_memory = decision.admit_memory && !self.ssd_instance_only;
+        let mut admit_pmem = decision.admit_pmem && !self.ssd_instance_only;
+        if (admit_memory || admit_pmem)
+            && self.pin_registry.removed_seen.load(Ordering::Relaxed)
+        {
+            let capacity = self.memory_capacity_bytes.saturating_add(self.pmem_capacity_bytes);
+            let retained_limit = capacity.saturating_add(capacity.saturating_mul(3) / 10);
+            let already_held = self.resident_value(key).is_some_and(|held| Arc::ptr_eq(held, &value))
+                || self.pmem_value(key).is_some_and(|held| Arc::ptr_eq(held, &value))
+                || self.pins_for(key).entries.get(key).is_some_and(|entry| {
+                    entry.values.iter().any(|(held, count)| *count != 0
+                        && std::ptr::eq(held.as_ptr(), Arc::as_ptr(&value)))
+                });
+            let incoming = if already_held { 0 } else { value.len() };
+            if self.pin_registry.payload_bytes().saturating_add(incoming as u64) > retained_limit as u64 {
+                if !admit_ssd {
+                    return Err(CacheError::CapacityExceeded);
+                }
+                admit_memory = false;
+                admit_pmem = false;
+            }
+        }
         let mut pmem_admitted_via_memory_fallback = false;
 
         if admit_memory {
@@ -14260,6 +14344,7 @@ impl MultiLayerCache {
                 pins.entries.retain(|key, entry| {
                     if key.shard_id == shard_id {
                         removed = removed.saturating_add(entry.handles);
+                        inner.pin_registry.remove_payload_bytes(key, entry.registered_value_bytes());
                         false
                     } else {
                         true
