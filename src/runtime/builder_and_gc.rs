@@ -561,12 +561,10 @@ fn write_cache_block_atomic(path: &Path, block: &[u8], durable: bool) -> Result<
 /// Not gated to one backend: the persistent tier writes files in every build,
 /// so it needs this in every build.
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            dir.sync_all()?;
-        }
-    }
-    Ok(())
+    let parent = path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 /// Decoded block bytes, in the form the read that asked for them needs.
