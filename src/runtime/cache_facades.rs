@@ -1335,6 +1335,10 @@ impl L2CachePolicy {
     }
 
     pub fn test_continue(&mut self) {
+        self.resume();
+    }
+
+    pub fn resume(&mut self) {
         self.paused = false;
     }
 
