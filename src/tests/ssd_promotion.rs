@@ -4,6 +4,52 @@
 use super::*;
 
 #[test]
+fn ssd_lru_admits_new_entries_without_weighted_popularity_veto() {
+    for pin_oldest in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let block_bytes = encode_cache_block(&[7; 64], CacheBlockOptions::default())
+            .unwrap()
+            .len();
+        let mut options =
+            CacheOptions::new(0, 0, block_bytes * 3).with_ssd_paths([directory.path().join("ssd")]);
+        options.cache_ssd_replacement_policy = "lru".into();
+        let cache = MultiLayerCache::with_options(options);
+        cache.start().unwrap();
+        cache.set_ssd_admission_filter_enabled(false);
+        cache.set_lru_refresh_time(Duration::ZERO);
+        let keys = (0..3)
+            .map(|index| CacheKey::string(0, &format!("resident-{index}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.put(key.clone(), vec![7; 64]).unwrap();
+        }
+        for _ in 0..32 {
+            for key in &keys {
+                assert!(cache.get(key).unwrap().is_some());
+            }
+        }
+        let held = if pin_oldest {
+            Some(cache.acquire(&keys[0]).unwrap().unwrap())
+        } else {
+            None
+        };
+        let newcomer = CacheKey::string(0, "newcomer");
+        cache.put(newcomer.clone(), vec![9; 64]).unwrap();
+        assert_eq!(
+            cache.get_no_promotion(&newcomer).unwrap().unwrap().value,
+            vec![9; 64]
+        );
+        let victim = if pin_oldest { 1 } else { 0 };
+        assert!(cache.get_no_promotion(&keys[victim]).unwrap().is_none());
+        if let Some(handle) = held {
+            assert_eq!(handle.as_slice(), &[7; 64]);
+            cache.release(handle);
+        }
+        assert!(cache.stop());
+    }
+}
+
+#[test]
 fn corrupt_ssd_batch_releases_resident_and_duplicate_pins() {
     for no_promotion in [false, true] {
         let (_dir, cache) = cache();
