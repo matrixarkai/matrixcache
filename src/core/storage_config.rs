@@ -1277,7 +1277,7 @@ impl StorageEngineKind {
 /// The replacement policy named by a configuration value.
 ///
 /// Wider than [`CacheReplacementPolicy`], which is what the crate implements:
-/// `Lru` and the `MaxCode` sentinel both map onto `WeightedHotnessLru`. Accept
+/// the `MaxCode` sentinel maps onto `WeightedHotnessLru`. Accept
 /// this at a configuration boundary and convert inward; match on
 /// [`CacheReplacementPolicy`] when deciding behaviour.
 ///
@@ -1336,7 +1336,7 @@ impl ReplacementPolicyKind {
         match self {
             ReplacementPolicyKind::Fifo => CacheReplacementPolicy::Fifo,
             ReplacementPolicyKind::Slru => CacheReplacementPolicy::Slru,
-            ReplacementPolicyKind::Lru => CacheReplacementPolicy::WeightedHotnessLru,
+            ReplacementPolicyKind::Lru => CacheReplacementPolicy::Lru,
             ReplacementPolicyKind::WeightedHotnessLru => {
                 CacheReplacementPolicy::WeightedHotnessLru
             }

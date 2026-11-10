@@ -1181,9 +1181,7 @@ mod tests {
         // It must say what the cache will actually use.
         assert!(finding.message.contains("WeightedHotnessLru"), "{}", finding.message);
 
-        // Every name the cache does offer passes, including the two spellings
-        // of the default. "LRU" is one of them: plain LRU is not a separate
-        // policy here, so asking for it is asking for the weighted one.
+        // Every named policy passes validation and resolves to the runtime policy.
         for name in ["FIFO", "fifo", "SLRU", "WeightedHotnessLru", "LRU"] {
             let accepted = CacheOptions {
                 dram_capacity: 1 << 16,
@@ -1204,6 +1202,41 @@ mod tests {
                 "the check and the builder disagree about {name}"
             );
         }
+        assert_eq!(
+            CacheReplacementPolicy::from_config_name("LRU"),
+            CacheReplacementPolicy::Lru
+        );
+    }
+
+    #[test]
+    fn lru_retain_recent_hit_and_skip_pinned_victim() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions {
+            dram_capacity: 128,
+            pmem_capacity: 0,
+            ssd_capacity: 1 << 20,
+            ssd_paths: vec![dir.path().to_path_buf()],
+            ..CacheOptions::default()
+        });
+        cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Lru);
+        cache.start().unwrap();
+        let a = CacheKey::string(0, "a");
+        let b = CacheKey::string(0, "b");
+        let c = CacheKey::string(0, "c");
+        cache.put(a.clone(), vec![1; 64]).unwrap();
+        cache.put_memory_only(b.clone(), vec![2; 64]);
+        assert_eq!(cache.get(&a).unwrap(), Some(vec![1; 64]));
+        cache.put(c.clone(), vec![3; 64]).unwrap();
+        assert!(cache.get_memory(&a).is_some());
+        assert!(cache.get_memory(&b).is_none());
+        assert!(cache.get_memory(&c).is_some());
+
+        let held = cache.acquire(&a).unwrap().unwrap();
+        cache.put_memory_only(b.clone(), vec![2; 64]);
+        assert!(cache.get_memory(&a).is_some());
+        assert!(cache.get_memory(&b).is_some());
+        assert!(cache.get_memory(&c).is_none());
+        cache.release(held);
     }
 
     /// A cache with no capacity anywhere accepts writes and stores none.
