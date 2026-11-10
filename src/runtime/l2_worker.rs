@@ -127,13 +127,13 @@ impl L2CachePolicyRuntime {
     }
 
     /// Returns the buffer to the caller if migration cannot accept it.
-    pub fn on_evict(&self, buffer: CacheBuffer) -> Result<(), CacheBuffer> {
+    pub fn on_evict(&self, buffer: CacheBuffer) -> Result<(), Box<CacheBuffer>> {
         if self.stop.load(Ordering::Acquire) || !self.eviction_enabled {
-            return Err(buffer);
+            return Err(Box::new(buffer));
         }
         let mut inbox = self.inbox.lock().expect("L2 inbox lock poisoned");
         if inbox.eviction_capacity != 0 && inbox.evictions.len() >= inbox.eviction_capacity {
-            return Err(buffer);
+            return Err(Box::new(buffer));
         }
         inbox.evictions.push_back(buffer);
         drop(inbox);
