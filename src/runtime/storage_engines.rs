@@ -67,6 +67,10 @@ pub struct CacheOptions {
     pub pmem_capacity: usize,
     #[serde(default)]
     pub ssd_capacity: usize,
+    /// Persist each admitted write to SSD immediately. Disable to use bounded
+    /// cold-tier migration instead; SSD is still populated on upper-tier eviction.
+    #[serde(default = "default_ssd_write_through")]
+    pub ssd_write_through: bool,
     #[serde(default)]
     pub pmem_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -184,6 +188,7 @@ impl Default for CacheOptions {
             dram_capacity: policy.memory_capacity_bytes,
             pmem_capacity: policy.pmem_capacity_bytes,
             ssd_capacity: policy.ssd_capacity_bytes,
+            ssd_write_through: policy.ssd_write_through,
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
             ssd_write_bytes_per_sec: 0,
@@ -233,6 +238,12 @@ impl CacheOptions {
 
     pub fn with_ssd_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.ssd_paths = paths.into_iter().collect();
+        self
+    }
+
+    /// Choose immediate SSD writes or bounded cold-tier migration.
+    pub fn with_ssd_write_through(mut self, enabled: bool) -> Self {
+        self.ssd_write_through = enabled;
         self
     }
 
@@ -421,6 +432,7 @@ impl CacheOptions {
             memory_capacity_bytes: self.dram_capacity,
             pmem_capacity_bytes: self.pmem_capacity,
             ssd_capacity_bytes: self.ssd_capacity,
+            ssd_write_through: self.ssd_write_through,
             data_placement: CacheDataPlacement::from_config_name(
                 &self.cache_dram_pmem_data_placement_type,
             ),

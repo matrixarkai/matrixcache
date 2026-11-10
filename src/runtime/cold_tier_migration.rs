@@ -378,6 +378,64 @@ impl ShardedMultiLayerCache {
 mod cold_tier_migration_tests {
     use super::*;
 
+    #[test]
+    fn options_allow_memory_first_writes_and_cold_read_refill() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(4096, 0, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_ssd_write_through(false);
+        assert!(!options.tiering_policy().ssd_write_through);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        let key = CacheKey::string(8, "memory-first");
+        cache.put(key.clone(), b"value".to_vec()).unwrap();
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 1);
+        cache.invalidate_memory_only(&key);
+        assert_eq!(cache.get_memory(&key), None);
+        assert_eq!(cache.get(&key).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(cache.get_memory(&key), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn sharded_options_preserve_memory_first_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(8192, 0, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_ssd_write_through(false);
+        let cache = ShardedMultiLayerCache::new(options, 2);
+        let mut keys = Vec::new();
+        for index in 0..100 {
+            let key = CacheKey::string(9, &format!("sharded-{index}"));
+            if keys.iter().all(|old: &CacheKey| {
+                cache.shard_index_for_key(old) != cache.shard_index_for_key(&key)
+            }) {
+                keys.push(key);
+            }
+            if keys.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(keys.len(), 2);
+        for key in &keys {
+            cache.put(key.clone(), b"value".to_vec()).unwrap();
+        }
+        assert_eq!(cache.item_count_for_tier(CacheTier::Ssd), 0);
+        assert_eq!(cache.migrate_cold_entries_to_ssd(1).unwrap().migrated, 2);
+        cache.clear_memory_for_test();
+        for key in &keys {
+            assert_eq!(cache.get(key).unwrap(), Some(b"value".to_vec()));
+        }
+    }
+
+    #[test]
+    fn default_options_keep_ssd_write_through() {
+        let options = CacheOptions::default();
+        assert!(options.ssd_write_through);
+        assert!(options.tiering_policy().ssd_write_through);
+    }
+
     fn cache_with_ssd(dir: &Path) -> MultiLayerCache {
         let policy = CacheTieringPolicy {
             memory_capacity_bytes: 4096,
