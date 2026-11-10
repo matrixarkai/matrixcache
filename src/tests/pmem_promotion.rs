@@ -3,6 +3,180 @@
 
 use super::*;
 
+#[test]
+fn concurrent_pinned_versions_account_until_batch_release() {
+    let (_dir, cache) = cache();
+    let cache = Arc::new(cache);
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "concurrent-generations");
+    let workers = (0..8)
+        .map(|index| {
+            let cache = Arc::clone(&cache);
+            let key = key.clone();
+            std::thread::spawn(move || {
+                let handle = cache.insert_pinned(key, vec![index; 8]).unwrap().unwrap();
+                assert_eq!(handle.as_slice(), &[index; 8]);
+                handle
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut handles = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    cache.invalidate(&key).unwrap();
+    assert_eq!(cache.stats().pinned_bytes, 64);
+    assert_eq!(cache.size(), 64);
+    let remaining = handles.split_off(4);
+    assert_eq!(cache.release_batch(handles), 4);
+    assert_eq!(cache.stats().pinned_bytes, 32);
+    assert_eq!(cache.size(), 32);
+    assert_eq!(cache.release_batch(remaining), 4);
+    assert_eq!(cache.stats().pinned_bytes, 0);
+    assert_eq!(cache.size(), 0);
+}
+
+#[test]
+fn retained_clone_batch_release_does_not_count_unpinned_resident() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "clone-resident");
+    let first = cache
+        .insert_pinned(key.clone(), vec![1; 8])
+        .unwrap()
+        .unwrap();
+    let cloned = first.clone_with_cache(&cache);
+    cache.invalidate(&key).unwrap();
+    let second = cache
+        .insert_pinned(key.clone(), vec![2; 16])
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.stats().pinned_bytes, 24);
+    cache.release(second);
+    assert_eq!(cache.stats().pinned_bytes, 8);
+    assert_eq!(cache.size(), 24);
+    assert_eq!(cache.release_batch(vec![first, cloned]), 2);
+    assert_eq!(cache.stats().pinned_bytes, 0);
+    assert_eq!(cache.size(), 16);
+}
+
+#[test]
+fn retained_versions_release_larger_allocation_first() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "reverse-release");
+    let first = cache
+        .insert_pinned(key.clone(), vec![1; 8])
+        .unwrap()
+        .unwrap();
+    cache.invalidate(&key).unwrap();
+    let second = cache
+        .insert_pinned(key.clone(), vec![2; 16])
+        .unwrap()
+        .unwrap();
+    cache.invalidate(&key).unwrap();
+    assert_eq!(cache.stats().pinned_bytes, 24);
+    cache.release(second);
+    assert_eq!(cache.stats().pinned_bytes, 8);
+    cache.release(first);
+    assert_eq!(cache.stats().pinned_bytes, 0);
+}
+
+#[test]
+fn batch_and_no_promotion_versions_account_retained_values() {
+    for mode in 0..3 {
+        let (_dir, cache) = cache();
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "batch-retained");
+        let acquire = || match mode {
+            0 => cache.acquire_no_promotion(&key).unwrap().unwrap(),
+            1 => cache
+                .acquire_batch(std::slice::from_ref(&key))
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap(),
+            _ => cache
+                .acquire_batch_no_promotion(std::slice::from_ref(&key))
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap(),
+        };
+        cache.put(key.clone(), vec![1; 8]).unwrap();
+        let first = acquire();
+        cache.invalidate(&key).unwrap();
+        cache.put(key.clone(), vec![2; 16]).unwrap();
+        let second = acquire();
+        cache.invalidate(&key).unwrap();
+        assert_eq!(cache.stats().pinned_bytes, 24, "mode={mode}");
+        cache.release(first);
+        assert_eq!(cache.stats().pinned_bytes, 16);
+        cache.release(second);
+        assert_eq!(cache.stats().pinned_bytes, 0);
+    }
+}
+
+#[test]
+fn acquired_versions_account_distinct_retained_values() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "acquired-versions");
+    cache.put(key.clone(), vec![1; 8]).unwrap();
+    let first = cache.acquire(&key).unwrap().unwrap();
+    cache.invalidate(&key).unwrap();
+    cache.put(key.clone(), vec![2; 16]).unwrap();
+    let second = cache.acquire(&key).unwrap().unwrap();
+    cache.invalidate(&key).unwrap();
+    assert_eq!(cache.stats().pinned_bytes, 24);
+    cache.release(first);
+    assert_eq!(cache.stats().pinned_bytes, 16);
+    cache.release(second);
+    assert_eq!(cache.stats().pinned_bytes, 0);
+}
+
+#[test]
+fn generation_tracker_deduplicates_and_releases_allocations() {
+    let first: Arc<[u8]> = Arc::from(vec![1; 8]);
+    let second: Arc<[u8]> = Arc::from(vec![2; 16]);
+    let mut entry = PinnedEntry {
+        handles: 3,
+        ..PinnedEntry::default()
+    };
+    entry.remember_value(&first);
+    entry.remember_value(&first);
+    entry.remember_value(&second);
+    assert_eq!(entry.retained_value_bytes(), 24);
+    drop(first);
+    assert_eq!(entry.retained_value_bytes(), 16);
+    drop(second);
+    assert_eq!(entry.retained_value_bytes(), 0);
+}
+
+#[test]
+fn diagnostic_distinct_retained_pin_versions() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "retained-versions");
+    let first = cache
+        .insert_pinned(key.clone(), vec![1; 8])
+        .unwrap()
+        .unwrap();
+    cache.invalidate(&key).unwrap();
+    let second = cache
+        .insert_pinned(key.clone(), vec![2; 16])
+        .unwrap()
+        .unwrap();
+    cache.invalidate(&key).unwrap();
+    assert_eq!(first.as_slice(), &[1; 8]);
+    assert_eq!(second.as_slice(), &[2; 16]);
+    assert_eq!(cache.stats().pinned_bytes, 24);
+    cache.release(first);
+    assert_eq!(cache.stats().pinned_bytes, 16);
+    cache.release(second);
+    assert_eq!(cache.stats().pinned_bytes, 0);
+}
+
 // rust-internal: reentrant callbacks must not change the inserted handle's bytes.
 #[test]
 fn pinned_insert_returns_its_value_before_reentrant_overwrite() {

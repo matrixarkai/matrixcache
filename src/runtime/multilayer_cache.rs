@@ -197,7 +197,7 @@ mod batch_value_expansion_tests {
         assert_eq!(
             counts
                 .iter()
-                .find(|(key, _)| key == &duplicate)
+                .find(|(key, _, _)| key == &duplicate)
                 .expect("duplicated handle is grouped")
                 .1,
             2
@@ -587,11 +587,14 @@ fn coalesce_batch_positions_borrowed<'a>(
     positions_by_key
 }
 
+type ReleasedPinCount = (CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>);
+type ReleasedPinCounts = SmallVec<[ReleasedPinCount; SMALL_BATCH_DEDUP_LIMIT]>;
+
 fn coalesce_release_counts<I>(
     handles: I,
 ) -> (
     usize,
-    SmallVec<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>,
+    ReleasedPinCounts,
 )
 where
     I: IntoIterator<Item = CachePinnedHandle>,
@@ -604,16 +607,17 @@ where
     let mut released = 0usize;
     if upper_bound.unwrap_or(usize::MAX) <= INLINE_BATCH_KEYS {
         let mut counts =
-            SmallVec::<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+            SmallVec::<[(CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>); SMALL_BATCH_DEDUP_LIMIT]>::new();
         for handle in handles {
             released = released.saturating_add(1);
-            if let Some((_, count)) = counts
+            if let Some((_, count, values)) = counts
                 .iter_mut()
-                .find(|(existing, _)| existing == &handle.key)
+                .find(|(existing, _, _)| existing == &handle.key)
             {
                 *count = count.saturating_add(1);
+                values.push(handle.value);
             } else {
-                counts.push((handle.key, 1));
+                counts.push((handle.key, 1, smallvec::smallvec![handle.value]));
             }
         }
         return (released, counts);
@@ -621,7 +625,7 @@ where
 
     if upper_bound.unwrap_or(usize::MAX) <= SMALL_BATCH_DEDUP_LIMIT {
         let mut counts =
-            SmallVec::<[(CacheKey, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+            SmallVec::<[(CacheKey, usize, SmallVec<[Arc<[u8]>; 1]>); SMALL_BATCH_DEDUP_LIMIT]>::new();
         let mut unique_positions = [u8::MAX; SMALL_BATCH_DEDUP_SLOTS];
         let slot_mask = unique_positions.len() - 1;
         for handle in handles {
@@ -633,12 +637,13 @@ where
                 let unique_position = unique_positions[slot];
                 if unique_position == u8::MAX {
                     unique_positions[slot] = counts.len() as u8;
-                    counts.push((handle.key, 1));
+                    counts.push((handle.key, 1, smallvec::smallvec![handle.value]));
                     break;
                 }
                 let unique_position = unique_position as usize;
                 if counts[unique_position].0 == handle.key {
                     counts[unique_position].1 = counts[unique_position].1.saturating_add(1);
+                    counts[unique_position].2.push(handle.value);
                     break;
                 }
                 slot = (slot + 1) & slot_mask;
@@ -647,12 +652,14 @@ where
         return (released, counts);
     }
 
-    let mut counts_by_key = AHashMap::<CacheKey, usize>::with_capacity(lower_bound);
+    let mut counts_by_key = AHashMap::<CacheKey, (usize, SmallVec<[Arc<[u8]>; 1]>)>::with_capacity(lower_bound);
     for handle in handles {
         released = released.saturating_add(1);
-        *counts_by_key.entry(handle.key).or_default() += 1;
+        let entry = counts_by_key.entry(handle.key).or_default();
+        entry.0 += 1;
+        entry.1.push(handle.value);
     }
-    (released, counts_by_key.into_iter().collect())
+    (released, counts_by_key.into_iter().map(|(key, (count, values))| (key, count, values)).collect())
 }
 
 /// Group requested positions by the key they asked for.
@@ -2526,6 +2533,36 @@ struct PinnedEntry {
     handle_bytes: usize,
     /// Set when the key has been removed from its tier while still held.
     removed_bytes: Option<usize>,
+    /// Distinct allocations observed by value-aware handle acquisition.
+    values: SmallVec<[(std::sync::Weak<[u8]>, u64); 1]>,
+}
+
+impl PinnedEntry {
+    fn remember_value(&mut self, value: &Arc<[u8]>) {
+        self.values.retain(|(held, count)| *count != 0 && held.strong_count() != 0);
+        let registered = self.values.iter().fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
+        if registered >= self.handles {
+            return;
+        }
+        let weak = Arc::downgrade(value);
+        if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
+            *count = count.saturating_add(1);
+        } else {
+            self.values.push((weak, 1));
+        }
+    }
+
+    fn release_value(&mut self, value: &Arc<[u8]>) {
+        let weak = Arc::downgrade(value);
+        if let Some((_, count)) = self.values.iter_mut().find(|(held, _)| held.ptr_eq(&weak)) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    fn retained_value_bytes(&self) -> usize {
+        self.values.iter().filter(|(_, count)| *count != 0).filter_map(|(held, _)| held.upgrade())
+            .fold(0usize, |bytes, value| bytes.saturating_add(value.len()))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2668,7 +2705,7 @@ impl CachePinRegistry {
         self.stripes[stripe].remove_handles(removed);
     }
 
-    fn decrement_many(&self, counts: &[(CacheKey, usize)]) {
+    fn decrement_many(&self, counts: &[ReleasedPinCount]) {
         if counts.is_empty() {
             return;
         }
@@ -2677,8 +2714,8 @@ impl CachePinRegistry {
             counts
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, count))| *count != 0)
-                .map(|(index, (key, _))| (self.stripe_index(key), index)),
+                .filter(|(_, (_, count, _))| *count != 0)
+                .map(|(index, (key, _, _))| (self.stripe_index(key), index)),
             |updates| {
                 let mut cursor = 0;
                 while cursor < updates.len() {
@@ -2687,12 +2724,13 @@ impl CachePinRegistry {
                     let mut pins = self.stripes[stripe].lock();
                     while cursor < updates.len() && updates[cursor].0 == stripe {
                         let index = updates[cursor].1;
-                        let (key, count) = &counts[index];
+                        let (key, count, values) = &counts[index];
                         let Some(entry) = pins.entries.get_mut(key) else {
                             cursor += 1;
                             continue;
                         };
                         let count = *count as u64;
+                        for value in values { entry.release_value(value); }
                         removed_handles = removed_handles.saturating_add(entry.handles.min(count));
                         if entry.handles > count {
                             entry.handles -= count;
@@ -6645,6 +6683,7 @@ impl MultiLayerCache {
             } else if let Some((held_key, resident)) = inner.memory.get_key_value(key) {
                 let value = Arc::clone(&resident.value);
                 inner.increment_pin_for_handle_shared(Arc::clone(held_key), value.len());
+                inner.remember_pin_value(key, &value);
                 inner.reconfigure_refresh_window(now_millis);
                 let outcome = inner.record_known_hit_shared_occurrences_at(
                     key,
@@ -6718,6 +6757,7 @@ impl MultiLayerCache {
                     Some(block) => {
                         let decoded = decode_cache_block_shared(&block)?;
                         inner.increment_pin_for_handle(key, decoded.len());
+                        inner.remember_pin_value(key, &decoded);
                         inner.read_counters.disk_hits.add(1);
                         if is_encoded_compressed_block(&block) {
                             inner
@@ -6785,6 +6825,7 @@ impl MultiLayerCache {
             }
             if let Some(value) = inner.pmem_value(key).cloned() {
                 inner.increment_pin_for_handle(key, value.len());
+                inner.remember_pin_value(key, &value);
                 if inner.pmem_should_refill_memory(value.len())
                     && !inner.put_memory_shared(key, Arc::clone(&value))
                 {
@@ -6812,6 +6853,7 @@ impl MultiLayerCache {
                 let decoded = decode_cache_block_shared(&block)?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.increment_pin_for_handle(key, decoded.len());
+                inner.remember_pin_value(key, &decoded);
                 if !inner.ssd_instance_only
                     && !self.refill_ssd_probe_or_defer(
                         &mut inner,
@@ -6868,6 +6910,7 @@ impl MultiLayerCache {
             } else {
                 if let Some(value) = inner.resident_value(key).cloned() {
                     inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
                     return Ok(Some(CachePinnedHandle {
                         key: key.clone(),
                         value,
@@ -6876,6 +6919,7 @@ impl MultiLayerCache {
                 }
                 if let Some(value) = inner.pmem_value(key).cloned() {
                     inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
                     return Ok(Some(CachePinnedHandle {
                         key: key.clone(),
                         value,
@@ -6918,6 +6962,7 @@ impl MultiLayerCache {
             return Err(CacheError::Stopped);
         }
         inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
         Ok(Some(CachePinnedHandle {
             key: key.clone(),
             value,
@@ -6946,7 +6991,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+                SmallVec::<[(&CacheKey, Arc<[u8]>, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in positions_by_key {
                 if inner.entry_expired(key, now_millis) {
                     expired_keys.push(key);
@@ -6963,7 +7008,7 @@ impl MultiLayerCache {
                             });
                         }
                         // Takes the key by move: nothing below reads it.
-                        pin_counts.push((key, value.len(), occurrences));
+                        pin_counts.push((key, value, occurrences));
                         continue;
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
@@ -6975,13 +7020,14 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Pmem,
                             });
                         }
-                        pin_counts.push((key, value.len(), occurrences));
+                        pin_counts.push((key, value, occurrences));
                         continue;
                     }
                 }
                 ssd_candidates.push((key, positions));
             }
             inner.increment_pin_with_size_counts(&pin_counts);
+
         }
 
         if !expired_keys.is_empty() {
@@ -7033,10 +7079,12 @@ impl MultiLayerCache {
         }
         let pin_counts = decoded_hits
             .iter()
-            .map(|(key, positions, value)| (*key, value.len(), positions.len()))
-            .collect::<SmallVec<[(&CacheKey, usize, usize); INLINE_BATCH_KEYS]>>();
+            .map(|(key, positions, value)| (*key, Arc::clone(value), positions.len()))
+            .collect::<SmallVec<[(&CacheKey, Arc<[u8]>, usize); INLINE_BATCH_KEYS]>>();
         inner.increment_pin_with_size_counts(&pin_counts);
+
         for (key, positions, value) in decoded_hits {
+            inner.remember_pin_value(key, &value);
             for position in positions {
                 results[position] = Some(CachePinnedHandle {
                     key: key.clone(),
@@ -7049,6 +7097,12 @@ impl MultiLayerCache {
     }
 
     pub fn release(&self, handle: CachePinnedHandle) {
+        {
+            let mut pins = self.pin_registry.pins_for(&handle.key);
+            if let Some(entry) = pins.entries.get_mut(&handle.key) {
+                entry.release_value(&handle.value);
+            }
+        }
         self.unpin(&handle.key);
     }
 
@@ -7102,6 +7156,7 @@ impl MultiLayerCache {
     pub fn clone_handle(&self, handle: &CachePinnedHandle) -> CachePinnedHandle {
         let inner = self.inner.read().expect("cache lock poisoned");
         inner.increment_pin(&handle.key);
+        inner.remember_pin_value(&handle.key, &handle.value);
         CachePinnedHandle {
             key: handle.key.clone(),
             value: handle.value.clone(),
@@ -7147,7 +7202,7 @@ impl MultiLayerCache {
             let hit_epoch = CoarseClock::now_millis();
             inner.reconfigure_refresh_window(hit_epoch);
             let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+                SmallVec::<[(&CacheKey, Arc<[u8]>, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in positions_by_key {
                 let key = *key;
                 if inner.entry_expired(key, now_millis) {
@@ -7189,7 +7244,7 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Ssd,
                             });
                         }
-                        pin_counts.push((key, value.len(), occurrences, 1));
+                        pin_counts.push((key, value, occurrences, 1));
                     }
                     None => {
                         inner
@@ -7207,6 +7262,7 @@ impl MultiLayerCache {
                 }
             }
             inner.increment_pin_handle_counts(&pin_counts);
+
         }
 
         let needs_exclusive = !expired.is_empty() || !exclusive_work.is_empty();
@@ -7274,7 +7330,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+                SmallVec::<[(&CacheKey, Arc<[u8]>, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in positions_by_key {
                 let started = Instant::now();
                 if inner.ssd_instance_only || inner.entry_expired(key, now_millis) {
@@ -7311,9 +7367,10 @@ impl MultiLayerCache {
                         tier: CacheReadTier::Memory,
                     });
                 }
-                pin_counts.push((key, value.len(), pinned_occurrences, 1));
+                pin_counts.push((key, value, pinned_occurrences, 1));
             }
             inner.increment_pin_handle_counts(&pin_counts);
+
         }
 
         if !exclusive_work.is_empty() {
@@ -7357,7 +7414,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+                SmallVec::<[(&CacheKey, Arc<[u8]>, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions) in exclusive_remaining {
                 let started = Instant::now();
                 if inner.entry_expired(key, now_millis) {
@@ -7391,7 +7448,7 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Memory,
                             });
                         }
-                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
+                        pin_counts.push((key, value, pinned_occurrences, 1));
                         continue;
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
@@ -7416,7 +7473,7 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Pmem,
                             });
                         }
-                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
+                        pin_counts.push((key, value, pinned_occurrences, 1));
                         needs_eviction_drain = true;
                         continue;
                     }
@@ -7424,6 +7481,7 @@ impl MultiLayerCache {
                 ssd_candidates.push((key, positions, started));
             }
             inner.increment_pin_handle_counts(&pin_counts);
+
         }
 
         if !ssd_candidates.is_empty() {
@@ -7472,7 +7530,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             let mut pin_counts =
-                SmallVec::<[(&CacheKey, usize, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
+                SmallVec::<[(&CacheKey, Arc<[u8]>, usize, usize); SMALL_BATCH_DEDUP_LIMIT]>::new();
             for (key, positions, started, value) in decoded {
                 match value {
                     Some((value, compressed)) => {
@@ -7506,7 +7564,7 @@ impl MultiLayerCache {
                                 tier: CacheReadTier::Ssd,
                             });
                         }
-                        pin_counts.push((key, value.len(), pinned_occurrences, 1));
+                        pin_counts.push((key, value, pinned_occurrences, 1));
                         needs_eviction_drain = true;
                     }
                     None => {
@@ -7526,6 +7584,7 @@ impl MultiLayerCache {
                 }
             }
             inner.increment_pin_handle_counts(&pin_counts);
+
             }
         }
         if needs_eviction_drain {
@@ -7640,6 +7699,7 @@ impl MultiLayerCache {
         };
         let handle = if let Some((value, tier)) = handle_value {
             inner.increment_pin_with_size(&key, value.len());
+            inner.remember_pin_value(&key, &value);
             Some(CachePinnedHandle { key: key.clone(), value, tier })
         } else {
             None
@@ -7871,6 +7931,7 @@ impl MultiLayerCache {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
                 Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -7882,6 +7943,7 @@ impl MultiLayerCache {
                     return Ok(None);
                 };
                 inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
                 Ok(Some(CachePinnedHandle {
                     key: key.clone(),
                     value,
@@ -7892,6 +7954,7 @@ impl MultiLayerCache {
                 Some(block) => {
                     let value = decode_cache_block_shared(&block)?;
                     inner.increment_pin_with_size(key, value.len());
+                    inner.remember_pin_value(key, &value);
                     Ok(Some(CachePinnedHandle {
                         key: key.clone(),
                         value,
@@ -14549,6 +14612,9 @@ impl MultiLayerCache {
                     .entries
                     .iter()
                     .map(|(key, entry)| {
+                        if !entry.values.is_empty() {
+                            return entry.retained_value_bytes() as u64;
+                        }
                         let memory_bytes =
                             inner.resident_value(key).map(|value| value.len()).unwrap_or(0);
                         let pmem_bytes =
