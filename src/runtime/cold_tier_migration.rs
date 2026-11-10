@@ -134,15 +134,18 @@ impl MultiLayerCache {
                 } else {
                     &mut cursor.memory_last_key
                 };
+                let mut entries = order.iter_access_after(last_key.as_ref());
+                let mut last_scanned = None;
+                let mut exhausted = false;
                 for _ in 0..scan_limit / 2 {
                     if selected.len() >= max_entries {
                         break;
                     }
-                    let Some(key) = order.iter_access_after(last_key.as_ref()).next() else {
-                        *last_key = None;
+                    let Some(key) = entries.next() else {
+                        exhausted = true;
                         break;
                     };
-                    *last_key = Some(key.clone());
+                    last_scanned = Some(key);
                     if inner.disk_index.contains_key(key) || !seen.insert(key.clone()) {
                         continue;
                     }
@@ -150,6 +153,11 @@ impl MultiLayerCache {
                     if let Some(value) = value {
                         selected.push((key.clone(), Arc::clone(value)));
                     }
+                }
+                if exhausted {
+                    *last_key = None;
+                } else if let Some(key) = last_scanned {
+                    *last_key = Some(key.clone());
                 }
             }
             (selected, inner.block_options)
