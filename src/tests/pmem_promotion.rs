@@ -143,6 +143,29 @@ fn pmem_reads_skip_structurally_impossible_memory_refills() {
     }
 }
 
+// rust-internal: changing the side-by-side threshold must not turn PMEM reads
+// into memory promotions for entries placed under the previous threshold.
+#[test]
+fn side_by_side_pmem_hit_stays_in_pmem_after_threshold_change() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let key = CacheKey::string(0, "placement-change");
+    let mut policy = cache.production_tiering_policy();
+    policy.data_placement = CacheDataPlacement::SideBySide;
+    policy.data_placement_threshold_bytes = 4;
+    cache.update_production_tiering_policy(policy);
+    cache.put(key.clone(), b"12345678".to_vec()).unwrap();
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+
+    cache.set_data_placement_threshold_bytes(16);
+    assert_eq!(
+        cache.get_shared(&key).unwrap().unwrap().as_ref(),
+        b"12345678"
+    );
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+    assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+}
+
 // rust-internal: PMEM-only shared reads stay lock-light and do not report false refill failures.
 #[test]
 fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
@@ -202,9 +225,9 @@ fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Pmem)));
 }
 
-// rust-internal: distinct owned PMEM batches refill memory without changing values or counters.
+// rust-internal: switching to tiered placement refills owned PMEM batches.
 #[test]
-fn owned_pmem_batch_refills_memory_in_one_batch_path() {
+fn owned_pmem_batch_refills_memory_after_switch_to_tiered() {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(
         CacheOptions::new(8192, 8192, 0)
@@ -219,7 +242,7 @@ fn owned_pmem_batch_refills_memory_in_one_batch_path() {
         cache.put(key.clone(), vec![index as u8; 64]).unwrap();
         assert_eq!(cache.peek_tier(key), Some(CacheReadTier::Pmem));
     }
-    cache.set_data_placement_threshold_bytes(usize::MAX);
+    cache.set_data_placement(CacheDataPlacement::Tiered);
 
     let before = cache.stats();
     let values = cache.get_batch(&keys).unwrap();
@@ -248,9 +271,9 @@ fn owned_pmem_batch_refills_memory_in_one_batch_path() {
         .all(|key| cache.peek_tier(key) == Some(CacheReadTier::Memory)));
 }
 
-// rust-internal: mixed resident batches use one path while preserving tier accounting.
+// rust-internal: mixed resident batches refill after switching to tiered placement.
 #[test]
-fn owned_mixed_memory_pmem_batch_refills_and_preserves_values() {
+fn owned_mixed_memory_pmem_batch_refills_after_switch_to_tiered() {
     let dir = tempfile::tempdir().unwrap();
     let cache = MultiLayerCache::with_options(
         CacheOptions::new(8192, 8192, 0)
@@ -275,7 +298,7 @@ fn owned_mixed_memory_pmem_batch_refills_and_preserves_values() {
             })
         );
     }
-    cache.set_data_placement_threshold_bytes(usize::MAX);
+    cache.set_data_placement(CacheDataPlacement::Tiered);
 
     let before = cache.stats();
     let values = cache.get_batch(&keys).unwrap();
