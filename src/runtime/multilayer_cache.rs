@@ -1662,6 +1662,74 @@ pub struct MultiLayerCache {
     pin_registry: Arc<CachePinRegistry>,
 }
 
+struct CacheWorkerWeak {
+    inner: Weak<RwLock<CacheInner>>,
+    read_counters: Weak<ReadPathCounters>,
+    async_writeback_worker: Weak<Mutex<Option<CacheAsyncWritebackWorker>>>,
+    cold_tier_migration_worker: Weak<Mutex<Option<CacheColdTierMigrationWorker>>>,
+    cold_tier_scan_cursor: Weak<Mutex<CacheColdTierScanCursor>>,
+    cold_tier_migration_entries_per_round: Weak<AtomicU64>,
+    cold_tier_migration_interval_millis: Weak<AtomicU64>,
+    ssd_recovery_worker: Weak<Mutex<Option<CacheSsdRecoveryWorker>>>,
+    async_writeback_jobs_per_round: Weak<AtomicU64>,
+    async_writeback_interval_millis: Weak<AtomicU64>,
+    async_promotion_worker: Weak<Mutex<Option<CacheAsyncPromotionWorker>>>,
+    async_promotion_queue: Weak<Mutex<CachePromotionQueue>>,
+    async_promotion_jobs_per_round: Weak<AtomicU64>,
+    async_promotion_interval_millis: Weak<AtomicU64>,
+    access_record_registered: Weak<AtomicBool>,
+    eviction_callbacks_registered: Weak<AtomicBool>,
+    pin_registry: Weak<CachePinRegistry>,
+}
+
+impl MultiLayerCache {
+    fn worker_weak(&self) -> CacheWorkerWeak {
+        CacheWorkerWeak {
+            inner: Arc::downgrade(&self.inner),
+            read_counters: Arc::downgrade(&self.read_counters),
+            async_writeback_worker: Arc::downgrade(&self.async_writeback_worker),
+            cold_tier_migration_worker: Arc::downgrade(&self.cold_tier_migration_worker),
+            cold_tier_scan_cursor: Arc::downgrade(&self.cold_tier_scan_cursor),
+            cold_tier_migration_entries_per_round: Arc::downgrade(&self.cold_tier_migration_entries_per_round),
+            cold_tier_migration_interval_millis: Arc::downgrade(&self.cold_tier_migration_interval_millis),
+            ssd_recovery_worker: Arc::downgrade(&self.ssd_recovery_worker),
+            async_writeback_jobs_per_round: Arc::downgrade(&self.async_writeback_jobs_per_round),
+            async_writeback_interval_millis: Arc::downgrade(&self.async_writeback_interval_millis),
+            async_promotion_worker: Arc::downgrade(&self.async_promotion_worker),
+            async_promotion_queue: Arc::downgrade(&self.async_promotion_queue),
+            async_promotion_jobs_per_round: Arc::downgrade(&self.async_promotion_jobs_per_round),
+            async_promotion_interval_millis: Arc::downgrade(&self.async_promotion_interval_millis),
+            access_record_registered: Arc::downgrade(&self.access_record_registered),
+            eviction_callbacks_registered: Arc::downgrade(&self.eviction_callbacks_registered),
+            pin_registry: Arc::downgrade(&self.pin_registry),
+        }
+    }
+}
+
+impl CacheWorkerWeak {
+    fn upgrade(&self) -> Option<MultiLayerCache> {
+        Some(MultiLayerCache {
+            inner: self.inner.upgrade()?,
+            read_counters: self.read_counters.upgrade()?,
+            async_writeback_worker: self.async_writeback_worker.upgrade()?,
+            cold_tier_migration_worker: self.cold_tier_migration_worker.upgrade()?,
+            cold_tier_scan_cursor: self.cold_tier_scan_cursor.upgrade()?,
+            cold_tier_migration_entries_per_round: self.cold_tier_migration_entries_per_round.upgrade()?,
+            cold_tier_migration_interval_millis: self.cold_tier_migration_interval_millis.upgrade()?,
+            ssd_recovery_worker: self.ssd_recovery_worker.upgrade()?,
+            async_writeback_jobs_per_round: self.async_writeback_jobs_per_round.upgrade()?,
+            async_writeback_interval_millis: self.async_writeback_interval_millis.upgrade()?,
+            async_promotion_worker: self.async_promotion_worker.upgrade()?,
+            async_promotion_queue: self.async_promotion_queue.upgrade()?,
+            async_promotion_jobs_per_round: self.async_promotion_jobs_per_round.upgrade()?,
+            async_promotion_interval_millis: self.async_promotion_interval_millis.upgrade()?,
+            access_record_registered: self.access_record_registered.upgrade()?,
+            eviction_callbacks_registered: self.eviction_callbacks_registered.upgrade()?,
+            pin_registry: self.pin_registry.upgrade()?,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct CacheAsyncWritebackWorker {
     stop: Arc<AtomicBool>,
@@ -7883,16 +7951,21 @@ impl MultiLayerCache {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let cache = self.clone();
+        let cache = self.worker_weak();
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
-                match cache.drain_async_writeback(max_jobs_per_round) {
+                let Some(current) = cache.upgrade() else { break };
+                let result = current.drain_async_writeback(max_jobs_per_round);
+                drop(current);
+                match result {
                     Ok(report) if report.drained > 0 => std::thread::yield_now(),
                     Ok(_) | Err(CacheError::Stopped) => std::thread::sleep(interval),
                     Err(_) => std::thread::sleep(interval),
                 }
             }
-            let _ = cache.drain_async_writeback(max_jobs_per_round);
+            if let Some(current) = cache.upgrade() {
+                let _ = current.drain_async_writeback(max_jobs_per_round);
+            }
         });
         *worker = Some(CacheAsyncWritebackWorker {
             stop,
@@ -8044,12 +8117,15 @@ impl MultiLayerCache {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let cache = self.clone();
+        let cache = self.worker_weak();
         let max_jobs_per_round = max_jobs_per_round.max(1);
         let interval = interval.max(Duration::from_millis(1));
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
-                match cache.drain_async_promotions(max_jobs_per_round) {
+                let Some(current) = cache.upgrade() else { break };
+                let result = current.drain_async_promotions(max_jobs_per_round);
+                drop(current);
+                match result {
                     Ok(report) if report.drained > 0 => std::thread::yield_now(),
                     Ok(_) | Err(CacheError::Stopped) => std::thread::park_timeout(interval),
                     Err(_) => std::thread::park_timeout(interval),

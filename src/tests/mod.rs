@@ -23416,6 +23416,31 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    // rust-internal: worker threads must not retain the cache after callers drop it.
+    #[test]
+    fn background_workers_release_cache_after_last_caller_drops() {
+        for kind in 0..3 {
+            let cache = MultiLayerCache::with_options(
+                CacheOptions::new(64, 0, 4096)
+                    .with_ssd_paths([unique_temp_path("worker-drop")]),
+            );
+            match kind {
+                0 => assert!(cache.start_async_writeback_worker(1, Duration::from_millis(1))),
+                1 => assert!(cache.configure_async_promotion(4, 4096, 1, Duration::from_millis(1))),
+                _ => assert!(cache.start_cold_tier_migration_worker(1, Duration::from_millis(1))),
+            }
+            let inner = Arc::downgrade(&cache.inner);
+            drop(cache);
+            for _ in 0..200 {
+                if inner.upgrade().is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(inner.upgrade().is_none(), "worker {kind} retained the cache");
+        }
+    }
+
     #[test]
     fn async_writeback_worker_drains_enqueued_jobs() {
         let cache = MultiLayerCache::new(64, unique_temp_path("async-writeback-worker"));

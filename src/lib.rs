@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "rocksdb-ssd")]
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use ahash::{AHashMap, AHashSet, RandomState};

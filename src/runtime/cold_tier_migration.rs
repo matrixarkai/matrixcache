@@ -220,12 +220,14 @@ impl MultiLayerCache {
         let worker_stop = Arc::clone(&stop);
         let paused = Arc::new(AtomicBool::new(false));
         let worker_paused = Arc::clone(&paused);
-        let cache = self.clone();
+        let cache = self.worker_weak();
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
+                let Some(current) = cache.upgrade() else { break };
                 if !worker_paused.load(Ordering::Acquire) {
-                    let _ = cache.migrate_cold_entries_to_ssd(max_entries_per_round);
+                    let _ = current.migrate_cold_entries_to_ssd(max_entries_per_round);
                 }
+                drop(current);
                 std::thread::park_timeout(interval);
             }
         });
