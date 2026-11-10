@@ -331,10 +331,8 @@ pub struct CacheLatencyMetricsReport {
 
 /// The replacement policies this crate actually implements.
 ///
-/// Distinct from [`ReplacementPolicyKind`], which is the wider vocabulary a
-/// configuration file may use. Converting from that one is lossy on purpose:
-/// its `Lru` and its `MaxCode` sentinel both arrive here as
-/// `WeightedHotnessLru`, because plain LRU is not implemented separately.
+/// Distinct from [`ReplacementPolicyKind`], which also has a `MaxCode`
+/// sentinel. That sentinel resolves to the default weighted policy.
 ///
 /// Defaults to `WeightedHotnessLru`.
 /// Which entry a tier gives up when it needs room.
@@ -353,12 +351,14 @@ pub struct CacheLatencyMetricsReport {
 /// weighted one.
 ///
 /// `Fifo` gives up the oldest and reads nothing else.
+/// `Lru` gives up the least recently accessed unpinned entry.
 ///
 /// [`ReplacementSlru`] is a separate thing: a standalone segmented store with
 /// its own capacity and hot/warm/cold lists, not the policy a tier selects by.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheReplacementPolicy {
     Fifo,
+    Lru,
     Slru,
     #[default]
     WeightedHotnessLru,
@@ -374,15 +374,11 @@ impl CacheReplacementPolicy {
     pub fn try_from_config_name(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("fifo") {
             Some(Self::Fifo)
+        } else if value.eq_ignore_ascii_case("lru") {
+            Some(Self::Lru)
         } else if value.eq_ignore_ascii_case("slru") {
             Some(Self::Slru)
-        } else if value.eq_ignore_ascii_case("weightedhotnesslru")
-            // Plain LRU is not a separate policy here; the weighted one is
-            // what a configuration asking for LRU gets, and has always got.
-            // Named rather than left to the fallback, so asking for it is not
-            // reported as a name nobody recognises.
-            || value.eq_ignore_ascii_case("lru")
-        {
+        } else if value.eq_ignore_ascii_case("weightedhotnesslru") {
             Some(Self::WeightedHotnessLru)
         } else {
             None
@@ -391,7 +387,7 @@ impl CacheReplacementPolicy {
 
     /// Every name a configuration may use, for saying so in an error.
     pub fn config_names() -> Vec<&'static str> {
-        [Self::Fifo, Self::Slru, Self::WeightedHotnessLru]
+        [Self::Fifo, Self::Lru, Self::Slru, Self::WeightedHotnessLru]
             .into_iter()
             .map(Self::as_config_name)
             .collect()
@@ -409,6 +405,7 @@ impl CacheReplacementPolicy {
     pub fn as_config_name(self) -> &'static str {
         match self {
             Self::Fifo => "FIFO",
+            Self::Lru => "LRU",
             Self::Slru => "SLRU",
             Self::WeightedHotnessLru => "WeightedHotnessLru",
         }

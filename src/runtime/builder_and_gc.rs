@@ -2082,7 +2082,12 @@ impl CacheInner {
         // It is also the read most worth acting on: the first one is the
         // strongest evidence an entry is not the one-hit-wonder the insertion
         // point is there to filter out.
-        if hits_before == 0 || self.access_order_needs_refresh(Some(seen_at)) {
+        if self.memory_replacement_policy == CacheReplacementPolicy::Lru
+            || self.pmem_replacement_policy == CacheReplacementPolicy::Lru
+            || self.ssd_replacement_policy == CacheReplacementPolicy::Lru
+            || hits_before == 0
+            || self.access_order_needs_refresh(Some(seen_at))
+        {
             entry.last_access_epoch.store(epoch, Ordering::Relaxed);
             self.read_counters
                 .access_order_refreshes
@@ -2940,6 +2945,9 @@ impl CacheInner {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.memory_order)
             }
+            CacheReplacementPolicy::Lru => {
+                self.select_lru_eviction_victim(&self.memory_order)
+            }
             CacheReplacementPolicy::Slru => {
                 let candidates = self.memory_cold_candidate_count();
                 let picked =
@@ -2963,6 +2971,9 @@ impl CacheInner {
         match self.pmem_replacement_policy {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.pmem_order)
+            }
+            CacheReplacementPolicy::Lru => {
+                self.select_lru_eviction_victim(&self.pmem_order)
             }
             CacheReplacementPolicy::Slru => {
                 let picked = self.select_windowed_eviction_victim(
@@ -2991,6 +3002,9 @@ impl CacheInner {
         match self.ssd_replacement_policy {
             CacheReplacementPolicy::Fifo => {
                 self.select_fifo_eviction_victim(&self.disk_order)
+            }
+            CacheReplacementPolicy::Lru => {
+                self.select_lru_eviction_victim(&self.disk_order)
             }
             CacheReplacementPolicy::Slru => {
                 let picked = self.select_windowed_eviction_victim(
@@ -3021,6 +3035,21 @@ impl CacheInner {
     ) -> Option<(CacheKey, EvictionReason, u64)> {
         let mut pinned_skips = 0u64;
         for key in keys.iter() {
+            if self.is_pinned(key) {
+                pinned_skips = pinned_skips.saturating_add(1);
+                continue;
+            }
+            return Some((key.clone(), EvictionReason::Stale, pinned_skips));
+        }
+        None
+    }
+
+    fn select_lru_eviction_victim(
+        &self,
+        keys: &CacheKeyOrder,
+    ) -> Option<(CacheKey, EvictionReason, u64)> {
+        let mut pinned_skips = 0u64;
+        for key in keys.iter_access() {
             if self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
                 continue;
