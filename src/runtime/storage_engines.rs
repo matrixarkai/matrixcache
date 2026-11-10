@@ -3634,7 +3634,10 @@ impl StorageEngineMultiSsd {
         let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
         let (unique_keys, output_positions) = coalesce_storage_batch_key_refs(&key_refs);
 
-        let mut routed = vec![Vec::<(usize, &str)>::new(); self.storages.len()];
+        let mut routed = smallvec::SmallVec::<
+            [smallvec::SmallVec<[(usize, &str); 16]>; 4],
+        >::with_capacity(self.storages.len());
+        routed.resize_with(self.storages.len(), smallvec::SmallVec::new);
         for (unique_index, key) in unique_keys.iter().enumerate() {
             let storage_index = Self::hash(key) as usize % self.storages.len();
             routed[storage_index].push((unique_index, *key));
@@ -3666,7 +3669,10 @@ impl StorageEngineMultiSsd {
             return Ok(Vec::new());
         }
 
-        let mut routed = vec![Vec::<(usize, &str)>::new(); self.storages.len()];
+        let mut routed = smallvec::SmallVec::<
+            [smallvec::SmallVec<[(usize, &str); 16]>; 4],
+        >::with_capacity(self.storages.len());
+        routed.resize_with(self.storages.len(), smallvec::SmallVec::new);
         for (index, key) in keys.iter().copied().enumerate() {
             let storage_index = Self::hash(key) as usize % self.storages.len();
             routed[storage_index].push((index, key));
