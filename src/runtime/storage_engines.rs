@@ -83,6 +83,9 @@ pub struct CacheOptions {
     /// Use recent request frequency for SSD admission and eviction.
     #[serde(default)]
     pub ssd_admission_filter_enabled: bool,
+    /// Expected bytes per entry when sizing an empty cache's admission sketch.
+    #[serde(default = "default_expected_entry_bytes")]
+    pub expected_entry_bytes: usize,
     #[serde(default)]
     pub pmem_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -200,6 +203,10 @@ fn default_cache_promotion_enabled() -> bool {
     true
 }
 
+fn default_expected_entry_bytes() -> usize {
+    DEFAULT_EXPECTED_ENTRY_BYTES
+}
+
 fn default_eviction_handler_enabled() -> bool {
     true
 }
@@ -216,6 +223,7 @@ impl Default for CacheOptions {
             ssd_promotion_enabled: true,
             memory_admission_filter_enabled: false,
             ssd_admission_filter_enabled: false,
+            expected_entry_bytes: default_expected_entry_bytes(),
             pmem_paths: Vec::new(),
             ssd_paths: Vec::new(),
             ssd_write_bytes_per_sec: 0,
@@ -286,6 +294,12 @@ impl CacheOptions {
     pub fn with_admission_filters(mut self, memory: bool, ssd: bool) -> Self {
         self.memory_admission_filter_enabled = memory;
         self.ssd_admission_filter_enabled = ssd;
+        self
+    }
+
+    /// Size admission history for the expected block size before the first write.
+    pub fn with_expected_entry_bytes(mut self, bytes: usize) -> Self {
+        self.expected_entry_bytes = bytes.max(1);
         self
     }
 
