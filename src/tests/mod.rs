@@ -23461,6 +23461,30 @@ mod tests {
         assert!(cache.stats().async_writeback_drained >= 1);
     }
 
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn stop_flushes_all_queued_writeback_jobs() {
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(4096, 0, 0)
+                .with_async_writeback_limits(32, 4096)
+                .with_async_writeback_worker(1, 60_000),
+        );
+        let keys = (0..16)
+            .map(|index| CacheKey::string(9, &format!("pending-{index}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.enqueue_async_writeback(key.clone(), b"value".to_vec()).unwrap();
+        }
+        assert!(cache.async_writeback_queue_depth() > 1);
+        assert!(cache.stop());
+        assert_eq!(cache.async_writeback_queue_depth(), 0);
+        cache.start().unwrap();
+        for key in &keys {
+            assert_eq!(cache.get(key).unwrap(), Some(b"value".to_vec()));
+        }
+        assert!(cache.stop());
+    }
+
     // rust-internal: validates the configured worker follows cache lifecycle.
     #[test]
     fn configured_async_writeback_worker_starts_drains_and_restarts() {

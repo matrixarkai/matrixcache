@@ -3504,11 +3504,13 @@ impl MultiLayerCache {
         self.stop_cold_tier_migration_worker();
         self.stop_async_writeback_worker();
         self.stop_async_promotion_worker();
+        let flushed = self.async_writeback_queue_depth() == 0
+            || self.flush_async_writeback().is_ok();
         let mut inner = self.inner.write().expect("cache lock poisoned");
         inner.started = false;
         inner.reset_pmem_manifest_writer();
         inner.ssd_store.stop();
-        true
+        flushed
     }
 
     pub fn stop_bool(&self) -> bool {
@@ -7959,8 +7961,8 @@ impl MultiLayerCache {
                 drop(current);
                 match result {
                     Ok(report) if report.drained > 0 => std::thread::yield_now(),
-                    Ok(_) | Err(CacheError::Stopped) => std::thread::sleep(interval),
-                    Err(_) => std::thread::sleep(interval),
+                    Ok(_) | Err(CacheError::Stopped) => std::thread::park_timeout(interval),
+                    Err(_) => std::thread::park_timeout(interval),
                 }
             }
             if let Some(current) = cache.upgrade() {
@@ -8459,6 +8461,7 @@ impl MultiLayerCache {
         };
         worker.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = worker.handle.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
         true
