@@ -13636,6 +13636,23 @@ impl CacheInner {
             self.stats.ssd_write_through_admissions =
                 self.stats.ssd_write_through_admissions.saturating_add(1);
         }
+        // Raw framing has an exact size, so reject cold candidates before
+        // allocating and copying the payload into its encoded block.
+        let raw_framing = matches!(self.block_options.compression, CacheCompression::None)
+            || value.len() < self.block_options.min_compress_bytes;
+        if raw_framing {
+            let block_len = value.len().saturating_add(CACHE_HEADER_LEN);
+            if block_len <= self.tiering_policy.max_ssd_block_bytes
+                && block_len <= self.ssd_capacity_bytes
+                && self.projected_ssd_install_bytes(&[], 0, key, block_len as u64, &mut None) > self.ssd_capacity_bytes as u64
+                && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), true)
+            {
+                self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+                self.stats.writeback_backpressure_events = self.stats.writeback_backpressure_events.saturating_add(1);
+                self.stats.puts += 1;
+                return Ok(false);
+            }
+        }
         let block = encode_cache_block(&value, self.block_options)?;
         let compressed = is_encoded_compressed_block(&block);
         let block_len = block.len();
@@ -13651,6 +13668,7 @@ impl CacheInner {
             return Ok(false);
         }
         if self.projected_ssd_install_bytes(&[], 0, key, block_len as u64, &mut None) > self.ssd_capacity_bytes as u64
+            && !raw_framing
             && self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), true)
         {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
