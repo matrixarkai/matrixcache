@@ -6740,7 +6740,22 @@ impl MultiLayerCache {
                 );
                 let micros = elapsed_micros(started);
                 inner.read_counters.record_memory_hit_latencies(micros, 1);
-                Some((value, outcome))
+                Some((value, outcome, CacheReadTier::Memory))
+            } else if let Some((held_key, resident)) = inner.pmem.get_key_value(key)
+                .filter(|(_, resident)| !inner.pmem_should_refill_memory(resident.value.len()))
+            {
+                let value = Arc::clone(&resident.value);
+                inner.increment_pin_for_handle_shared(Arc::clone(held_key), value.len());
+                inner.remember_pin_value(key, &value);
+                inner.reconfigure_refresh_window(now_millis);
+                let outcome = inner.record_known_hit_shared_occurrences_at(
+                    key, resident.meta.as_ref(), 1, now_millis,
+                );
+                inner.read_counters.pmem_hits.add(1);
+                inner.record_get_latency(started);
+                inner.record_read_through_latency(started);
+                inner.record_refill_latency(started);
+                Some((value, outcome, CacheReadTier::Pmem))
             } else {
                 None
             }
@@ -6768,7 +6783,7 @@ impl MultiLayerCache {
             return Ok(None);
         }
 
-        if let Some((value, outcome)) = probe {
+        if let Some((value, outcome, tier)) = probe {
             // Only these two need the cache exclusively, and a hit on a
             // recently-read entry is neither.
             match outcome {
@@ -6779,7 +6794,7 @@ impl MultiLayerCache {
                 }
                 HitOutcome::NeedsMetadata => {
                     let mut inner = self.inner.write().expect("cache lock poisoned");
-                    if inner.memory.contains_key(key) {
+                    if inner.memory.contains_key(key) || inner.pmem.contains_key(key) {
                         inner.record_hit(key, value.len());
                     }
                 }
@@ -6787,7 +6802,7 @@ impl MultiLayerCache {
             return Ok(Some(CachePinnedHandle {
                 key: key.clone(),
                 value,
-                tier: CacheReadTier::Memory,
+                tier,
             }));
         }
 

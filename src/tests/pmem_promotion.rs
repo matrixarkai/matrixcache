@@ -792,6 +792,26 @@ fn side_by_side_pmem_hit_stays_in_pmem_after_threshold_change() {
     assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
 }
 
+#[test]
+fn pinned_pmem_reads_preserve_placement_and_release_pins() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let mut policy = cache.production_tiering_policy();
+    policy.data_placement = CacheDataPlacement::SideBySide;
+    policy.data_placement_threshold_bytes = 0;
+    cache.update_production_tiering_policy(policy);
+    let key = CacheKey::string(0, "shared-pmem-pinned");
+    cache.put(key.clone(), b"payload".to_vec()).unwrap();
+    let before = cache.stats();
+    let handle = cache.acquire(&key).unwrap().unwrap();
+    assert_eq!(handle.tier(), CacheReadTier::Pmem);
+    assert_eq!(handle.as_slice(), b"payload");
+    assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+    assert_eq!(cache.size_for_tier(CacheTier::Memory), 0);
+    assert_eq!(cache.stats().pmem_hits, before.pmem_hits + 1);
+    cache.release(handle);
+}
+
 // rust-internal: PMEM-only shared reads stay lock-light and do not report false refill failures.
 #[test]
 fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
