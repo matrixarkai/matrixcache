@@ -773,6 +773,38 @@ mod tests {
 
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn storage_put_callback_shares_returned_bytes() {
+        fn check<E: StorageEngineApi>(engine: &mut E) {
+            assert!(engine.start());
+            let mut input = CacheBuffer::new(vec![9; 64 * 1024]);
+            input.set_key("shared-callback");
+            let mut callback_ptr = None;
+            let returned = engine
+                .async_put(input, |result| {
+                    let callback = result.unwrap();
+                    assert_eq!(callback.key(), "shared-callback");
+                    assert_eq!(callback.data(), &[9; 64 * 1024]);
+                    callback_ptr = Some(callback.data_ptr());
+                })
+                .unwrap();
+            assert_eq!(callback_ptr, Some(returned.data_ptr()));
+            assert_eq!(engine.get("shared-callback").unwrap().data(), returned.data());
+            assert!(engine.stop());
+        }
+
+        check(&mut StorageEngineSimple::with_capacity(1 << 20));
+        let dir = tempfile::tempdir().unwrap();
+        check(&mut StorageEngineRocksDb::new(
+            dir.path().join("single").to_string_lossy().to_string(),
+        ));
+        check(&mut StorageEngineMultiSsd::with_paths(
+            [dir.path().join("multi-a"), dir.path().join("multi-b")],
+            1 << 20,
+        ));
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn failed_pmem_recovery_leaves_cache_stopped_and_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let cache = MultiLayerCache::with_options(
