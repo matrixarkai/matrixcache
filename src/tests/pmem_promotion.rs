@@ -4,6 +4,34 @@
 use super::*;
 
 #[test]
+fn log_allocator_capacity_reuses_full_region_after_partial_free_accounting() {
+    let mut allocator = SimpleLogBasedMemoryAllocator::with_capacity(64);
+    let addresses = (0..4)
+        .map(|_| allocator.allocate(16).unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        allocator.allocate(1),
+        Err(CacheError::CapacityExceeded)
+    ));
+    allocator.free(addresses[0], 0).unwrap();
+    let replacement = allocator.allocate(16).unwrap();
+    assert!(matches!(
+        allocator.allocate(1),
+        Err(CacheError::CapacityExceeded)
+    ));
+    assert!(matches!(
+        allocator.free(addresses[0], 16),
+        Err(CacheError::NotFound)
+    ));
+    allocator.free(replacement, 1).unwrap();
+    assert!(allocator.allocate(16).is_ok());
+    assert!(matches!(
+        allocator.allocate(1),
+        Err(CacheError::CapacityExceeded)
+    ));
+}
+
+#[test]
 fn record_relocation_updates_cache_owner_with_original_identity() {
     let mut owner = CacheInstance::new(
         1024,
