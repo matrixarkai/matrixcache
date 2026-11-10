@@ -2560,8 +2560,9 @@ impl PinnedEntry {
     }
 
     fn retained_value_bytes(&self) -> usize {
-        self.values.iter().filter(|(_, count)| *count != 0).filter_map(|(held, _)| held.upgrade())
-            .fold(0usize, |bytes, value| bytes.saturating_add(value.len()))
+        self.values.iter()
+            .filter(|(held, count)| *count != 0 && held.strong_count() != 0)
+            .fold(0usize, |bytes, (held, _)| bytes.saturating_add(held.as_ptr().len()))
     }
 }
 
