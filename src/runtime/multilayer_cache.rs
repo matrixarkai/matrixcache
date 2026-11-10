@@ -14146,7 +14146,8 @@ impl CacheInner {
         key: CacheKey,
         value: Vec<u8>,
         size: usize,
-    ) -> Result<(), CacheError> {
+    ) -> Result<bool, CacheError> {
+        let mut admitted = true;
         let block_kind = infer_block_kind(&key);
         let routing_slot = extract_routing_slot(&key);
         match tier {
@@ -14160,6 +14161,7 @@ impl CacheInner {
                     CacheAdmissionReason::MemoryOnly,
                 );
                 if !self.put_memory(&key, value) {
+                    admitted = false;
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -14173,6 +14175,7 @@ impl CacheInner {
                     CacheAdmissionReason::MemoryOnly,
                 );
                 if !self.put_pmem(&key, value) {
+                    admitted = false;
                     self.stats.refill_failures = self.stats.refill_failures.saturating_add(1);
                 }
             }
@@ -14203,7 +14206,7 @@ impl CacheInner {
             CacheTier::Reject => return Err(CacheError::UnsupportedTier(tier)),
         }
         self.stats.puts = self.stats.puts.saturating_add(1);
-        Ok(())
+        Ok(admitted)
     }
 
     fn test_remove_for_tier(&mut self, tier: CacheTier, key: &CacheKey) -> Result<(), CacheError> {

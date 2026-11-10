@@ -341,8 +341,38 @@ impl CacheInstance {
         key: &str,
         value: Vec<u8>,
     ) -> Result<CacheBuffer, CacheError> {
-        self.put(key, value)?;
-        self.get_cache_buffer(key)?.ok_or(CacheError::NotFound)
+        self.put_owned_buffer(key, value)
+    }
+
+    fn put_owned_buffer(&self, key: &str, value: Vec<u8>) -> Result<CacheBuffer, CacheError> {
+        let started = Instant::now();
+        let tier = self.instance_type.as_tier().ok_or(CacheError::UnsupportedInstance(self.instance_type))?;
+        let key = Self::key(key);
+        let mut inner = self.cache.inner.write().expect("cache lock poisoned");
+        let result = (|| {
+            if !inner.started { return Err(CacheError::Stopped); }
+            let size = value.len();
+            if !inner.test_insert_for_tier(tier, key.clone(), value, size)? {
+                return Err(CacheError::CapacityExceeded);
+            }
+            let (value, read_tier) = match tier {
+                CacheTier::Memory => (inner.resident_value(&key).cloned().ok_or(CacheError::NotFound)?, CacheReadTier::Memory),
+                CacheTier::Pmem => (inner.pmem_value(&key).cloned().ok_or(CacheError::NotFound)?, CacheReadTier::Pmem),
+                CacheTier::Ssd => {
+                    let block = inner.read_ssd_block(&key)?.ok_or(CacheError::NotFound)?;
+                    (decode_cache_block_shared(&block)?, CacheReadTier::Ssd)
+                }
+                CacheTier::Reject => return Err(CacheError::UnsupportedTier(tier)),
+            };
+            inner.increment_pin_with_size(&key, value.len());
+            inner.remember_pin_value(&key, &value);
+            let handle = CachePinnedHandle { key: key.clone(), value, tier: read_tier };
+            Ok(CacheBuffer::from_handle(Arc::clone(&key.record_key), self.cache.clone(), handle))
+        })();
+        inner.record_put_latency(started);
+        drop(inner);
+        self.cache.drain_eviction_records();
+        result
     }
 
     pub fn put_cache_buffer(&self, buffer: CacheBuffer) -> Result<CacheBuffer, CacheError> {
@@ -351,8 +381,7 @@ impl CacheInstance {
         }
         let key = buffer.key().to_string();
         let value = buffer.to_vec();
-        self.put(&key, value)?;
-        self.get_cache_buffer(&key)?.ok_or(CacheError::NotFound)
+        self.put_owned_buffer(&key, value)
     }
 
     pub fn async_put(&self, key: &str, value: Vec<u8>, _src: &str) -> Result<(), CacheError> {
@@ -371,10 +400,8 @@ impl CacheInstance {
         let result = self.put_cache_buffer(buffer);
         match result {
             Ok(inserted) => {
-                let callback_result = self
-                    .get_cache_buffer(inserted.key())
-                    .and_then(|buffer| buffer.ok_or(CacheError::NotFound));
-                cb(callback_result);
+                let handle = self.cache.clone_handle(inserted.handle.as_ref().expect("write result owns a pin"));
+                cb(Ok(CacheBuffer::from_handle(Arc::clone(&inserted.key), self.cache.clone(), handle)));
                 Ok(inserted)
             }
             Err(err) => {
