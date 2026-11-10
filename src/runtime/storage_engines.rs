@@ -13,6 +13,10 @@ fn default_async_writeback_interval_millis() -> u64 {
     10
 }
 
+fn default_cold_tier_migration_interval_millis() -> u64 {
+    100
+}
+
 fn default_async_promotion_queue_bytes() -> u64 {
     64 * 1024 * 1024
 }
@@ -103,6 +107,13 @@ pub struct CacheOptions {
     /// after a failed drain.
     #[serde(default = "default_async_writeback_interval_millis")]
     pub async_writeback_interval_millis: u64,
+    /// Cold upper-tier entries copied to SSD per background round.
+    /// Zero disables automatic migration.
+    #[serde(default)]
+    pub cold_tier_migration_entries_per_round: usize,
+    /// Delay between bounded cold-tier migration rounds.
+    #[serde(default = "default_cold_tier_migration_interval_millis")]
+    pub cold_tier_migration_interval_millis: u64,
     /// Maximum lower-tier reads waiting to refill an upper tier.
     ///
     /// Zero, the default, keeps promotion synchronous.
@@ -180,6 +191,8 @@ impl Default for CacheOptions {
             async_writeback_queue_bytes: default_async_writeback_queue_bytes(),
             async_writeback_jobs_per_round: 0,
             async_writeback_interval_millis: default_async_writeback_interval_millis(),
+            cold_tier_migration_entries_per_round: 0,
+            cold_tier_migration_interval_millis: default_cold_tier_migration_interval_millis(),
             async_promotion_queue_capacity: 0,
             async_promotion_queue_bytes: default_async_promotion_queue_bytes(),
             async_promotion_jobs_per_round: default_async_promotion_jobs_per_round(),
@@ -249,6 +262,17 @@ impl CacheOptions {
     ) -> Self {
         self.async_writeback_jobs_per_round = max_jobs_per_round;
         self.async_writeback_interval_millis = interval_millis.max(1);
+        self
+    }
+
+    /// Enable bounded automatic migration from DRAM/PMEM into SSD.
+    pub fn with_cold_tier_migration_worker(
+        mut self,
+        max_entries_per_round: usize,
+        interval_millis: u64,
+    ) -> Self {
+        self.cold_tier_migration_entries_per_round = max_entries_per_round;
+        self.cold_tier_migration_interval_millis = interval_millis.max(1);
         self
     }
 

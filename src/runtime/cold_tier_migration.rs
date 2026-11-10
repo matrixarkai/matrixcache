@@ -21,6 +21,63 @@ struct CacheColdTierMigrationWorker {
 }
 
 impl MultiLayerCache {
+    /// Configure bounded automatic migration for this cache and future starts.
+    /// Zero entries disables it. Reconfiguration replaces the running worker.
+    pub fn configure_cold_tier_migration_worker(
+        &self,
+        max_entries_per_round: usize,
+        interval: Duration,
+    ) {
+        self.stop_cold_tier_migration_worker();
+        self.cold_tier_migration_entries_per_round
+            .store(max_entries_per_round as u64, Ordering::Release);
+        self.cold_tier_migration_interval_millis.store(
+            interval.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+        self.start_configured_cold_tier_migration_worker();
+    }
+
+    fn start_configured_cold_tier_migration_worker(&self) -> bool {
+        let max_entries = self
+            .cold_tier_migration_entries_per_round
+            .load(Ordering::Acquire);
+        if max_entries == 0 {
+            return false;
+        }
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started || inner.ssd_capacity_bytes == 0 {
+                return false;
+            }
+        }
+        let interval = Duration::from_millis(
+            self.cold_tier_migration_interval_millis
+                .load(Ordering::Acquire)
+                .max(1),
+        );
+        self.start_cold_tier_migration_worker(
+            usize::try_from(max_entries).unwrap_or(usize::MAX),
+            interval,
+        )
+    }
+
+    pub fn cold_tier_migration_worker_configuration(&self) -> Option<(usize, Duration)> {
+        let max_entries = self
+            .cold_tier_migration_entries_per_round
+            .load(Ordering::Acquire);
+        (max_entries > 0).then(|| {
+            (
+                usize::try_from(max_entries).unwrap_or(usize::MAX),
+                Duration::from_millis(
+                    self.cold_tier_migration_interval_millis
+                        .load(Ordering::Acquire)
+                        .max(1),
+                ),
+            )
+        })
+    }
+
     /// Copies the coldest resident entries into the SSD tier without removing
     /// their upper-tier copies.
     ///
@@ -368,6 +425,63 @@ mod cold_tier_migration_tests {
         assert!(cache.stop_cold_tier_migration_worker());
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(!cache.cold_tier_migration_worker_running());
+    }
+
+    #[test]
+    fn configured_worker_migrates_after_start_and_restarts_with_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(4096, 0, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_cold_tier_migration_worker(1, 10);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        assert!(cache.cold_tier_migration_worker_running());
+        assert_eq!(
+            cache.cold_tier_migration_worker_configuration(),
+            Some((1, Duration::from_millis(10)))
+        );
+
+        let first = CacheKey::string(3, "first");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, first.clone(), b"one".to_vec())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cache.inner.read().unwrap().disk_index.contains_key(&first) {
+            assert!(Instant::now() < deadline, "configured worker did not migrate");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cache.invalidate_memory_only(&first);
+        assert_eq!(cache.get(&first).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(cache.get_memory(&first), Some(b"one".to_vec()));
+
+        cache.stop();
+        assert!(!cache.cold_tier_migration_worker_running());
+        cache.start().unwrap();
+        assert!(cache.cold_tier_migration_worker_running());
+        let second = CacheKey::string(3, "second");
+        cache
+            .put_bypass_storage_for_tier(CacheTier::Memory, second.clone(), b"two".to_vec())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cache.inner.read().unwrap().disk_index.contains_key(&second) {
+            assert!(Instant::now() < deadline, "restarted worker did not migrate");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cache.configure_cold_tier_migration_worker(0, Duration::from_millis(10));
+        assert!(!cache.cold_tier_migration_worker_running());
+        cache.stop();
+    }
+
+    #[test]
+    fn configured_worker_respects_disabled_ssd_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(4096, 0, 0)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_cold_tier_migration_worker(1, 10);
+        let cache = MultiLayerCache::try_with_options(options).unwrap();
+        assert!(!cache.cold_tier_migration_worker_running());
+        cache.configure_cold_tier_migration_worker(0, Duration::from_millis(10));
+        assert_eq!(cache.cold_tier_migration_worker_configuration(), None);
+        cache.stop();
     }
 
     #[test]
