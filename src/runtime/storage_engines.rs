@@ -987,6 +987,17 @@ impl CacheBuffer {
         }
     }
 
+    fn clone_detached(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            value: Arc::clone(&self.value),
+            logical_size: self.logical_size,
+            tier: self.tier,
+            cache: None,
+            handle: None,
+        }
+    }
+
     pub fn view(key: impl Into<String>, logical_size: usize) -> Self {
         Self {
             key: Arc::from(key.into()),
@@ -2113,9 +2124,7 @@ impl StorageEngineApi for StorageEngineSimple {
         let result = self.put(&key, value);
         match result {
             Ok(buf) => {
-                let mut cloned = CacheBuffer::new(buf.to_vec());
-                cloned.set_key(buf.key());
-                cb(Ok(cloned));
+                cb(Ok(buf.clone_detached()));
                 Ok(buf)
             }
             Err(err) => {
@@ -3229,9 +3238,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
         let result = self.put(&key, value);
         match result {
             Ok(buf) => {
-                let mut cloned = CacheBuffer::new(buf.to_vec());
-                cloned.SetKey(buf.Key());
-                cb(Ok(cloned));
+                cb(Ok(buf.clone_detached()));
                 Ok(buf)
             }
             Err(err) => {
@@ -3851,9 +3858,7 @@ impl StorageEngineApi for StorageEngineMultiSsd {
         let result = self.put(&key, value);
         match result {
             Ok(buf) => {
-                let mut cloned = CacheBuffer::new(buf.to_vec());
-                cloned.set_key(buf.key());
-                cb(Ok(cloned));
+                cb(Ok(buf.clone_detached()));
                 Ok(buf)
             }
             Err(err) => {
