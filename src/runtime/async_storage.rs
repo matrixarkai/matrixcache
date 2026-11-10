@@ -12,6 +12,17 @@ use std::thread::{self, JoinHandle};
 type WriteResult = Result<CacheBuffer, CacheError>;
 type WriteCallback = Box<dyn FnOnce(WriteResult) + Send>;
 
+// Writes remain inline to avoid a separate heap allocation for every submission.
+#[allow(clippy::large_enum_variant)]
+enum StorageCommand {
+    Put(StorageWrite),
+    Delete {
+        key: String,
+        callback: Box<dyn FnOnce(Result<(), CacheError>) + Send>,
+        completed: mpsc::Sender<Result<(), CacheError>>,
+    },
+}
+
 struct StorageWrite {
     buffer: CacheBuffer,
     callback: WriteCallback,
@@ -39,6 +50,15 @@ impl StorageWriteCompletion {
     }
 }
 
+/// Completion of an accepted delete. Dropping it does not cancel deletion.
+pub struct StorageDeleteCompletion(Receiver<Result<(), CacheError>>);
+
+impl StorageDeleteCompletion {
+    pub fn wait(self) -> Result<(), CacheError> {
+        self.0.recv().map_err(|_| CacheError::Stopped)?
+    }
+}
+
 /// Bounded, ordered storage writes on a dedicated worker thread.
 ///
 /// Rejected submissions are not written and do not invoke the callback.
@@ -57,7 +77,7 @@ impl StorageWriteCompletion {
 /// # Ok::<(), matrixcache::CacheError>(())
 /// ```
 pub struct AsyncStorageRuntime {
-    sender: Option<SyncSender<StorageWrite>>,
+    sender: Option<SyncSender<StorageCommand>>,
     worker: Option<JoinHandle<bool>>,
     pending_bytes: Arc<AtomicUsize>,
     max_pending_bytes: usize,
@@ -82,23 +102,42 @@ impl AsyncStorageRuntime {
         if !engine.start() {
             return Err(CacheError::Stopped);
         }
-        let (sender, receiver) = mpsc::sync_channel::<StorageWrite>(queue_capacity);
+        let (sender, receiver) = mpsc::sync_channel::<StorageCommand>(queue_capacity);
         let pending_bytes = Arc::new(AtomicUsize::new(0));
         let worker = thread::Builder::new()
             .name("matrixcache-storage".into())
             .spawn(move || {
-                while let Ok(write) = receiver.recv() {
-                    let result = engine.async_put(write.buffer, |_| {});
-                    let callback_result = match &result {
-                        Ok(buffer) => Ok(buffer.clone_detached()),
-                        Err(error) => Err(cache_error_for_callback(error)),
-                    };
-                    // A caller callback must not strand the rest of the queue.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (write.callback)(callback_result);
-                    }));
-                    drop(write.reservation);
-                    let _ = write.completed.send(result);
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        StorageCommand::Put(write) => {
+                            let result = engine.async_put(write.buffer, |_| {});
+                            let callback_result = match &result {
+                                Ok(buffer) => Ok(buffer.clone_detached()),
+                                Err(error) => Err(cache_error_for_callback(error)),
+                            };
+                            // A caller callback must not strand the rest of the queue.
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                (write.callback)(callback_result);
+                            }));
+                            drop(write.reservation);
+                            let _ = write.completed.send(result);
+                        }
+                        StorageCommand::Delete {
+                            key,
+                            callback,
+                            completed,
+                        } => {
+                            let result = engine.delete(&key);
+                            let callback_result = match &result {
+                                Ok(()) => Ok(()),
+                                Err(error) => Err(cache_error_for_callback(error)),
+                            };
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                callback(callback_result)
+                            }));
+                            let _ = completed.send(result);
+                        }
+                    }
                 }
                 engine.stop()
             })?;
@@ -138,8 +177,32 @@ impl AsyncStorageRuntime {
             completed,
             reservation,
         };
-        match sender.try_send(write) {
+        match sender.try_send(StorageCommand::Put(write)) {
             Ok(()) => Ok(StorageWriteCompletion(receiver)),
+            Err(TrySendError::Full(_)) => Err(CacheError::CapacityExceeded),
+            Err(TrySendError::Disconnected(_)) => Err(CacheError::Stopped),
+        }
+    }
+
+    /// Queue a delete after earlier accepted writes/deletes. Queue admission is
+    /// bounded by job count; deletes do not reserve payload bytes.
+    pub fn try_delete<F>(
+        &self,
+        key: impl Into<String>,
+        callback: F,
+    ) -> Result<StorageDeleteCompletion, CacheError>
+    where
+        F: FnOnce(Result<(), CacheError>) + Send + 'static,
+    {
+        let sender = self.sender.as_ref().ok_or(CacheError::Stopped)?;
+        let (completed, receiver) = mpsc::channel();
+        let command = StorageCommand::Delete {
+            key: key.into(),
+            callback: Box::new(callback),
+            completed,
+        };
+        match sender.try_send(command) {
+            Ok(()) => Ok(StorageDeleteCompletion(receiver)),
             Err(TrySendError::Full(_)) => Err(CacheError::CapacityExceeded),
             Err(TrySendError::Disconnected(_)) => Err(CacheError::Stopped),
         }
