@@ -998,6 +998,15 @@ impl CacheBuffer {
         }
     }
 
+    fn clone_for_callback(&self) -> Self {
+        match (&self.cache, &self.handle) {
+            (Some(cache), Some(handle)) => Self::from_handle(
+                Arc::clone(&self.key), cache.clone(), cache.clone_handle(handle),
+            ),
+            _ => self.clone_detached(),
+        }
+    }
+
     pub fn view(key: impl Into<String>, logical_size: usize) -> Self {
         Self {
             key: Arc::from(key.into()),

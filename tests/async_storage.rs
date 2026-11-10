@@ -8,6 +8,50 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn queued_cache_instances_preserve_callback_pins_and_delete_order() {
+    use matrixcache::{CacheInstance, ReplacementPolicyKind, StorageEngineKind};
+    for kind in [
+        StorageEngineKind::Dram,
+        StorageEngineKind::Pmem,
+        StorageEngineKind::Ssd,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let instance = CacheInstance::new(
+            4096,
+            ReplacementPolicyKind::Fifo,
+            kind,
+            vec![directory.path().join("tier")],
+        );
+        let observer = instance.clone();
+        let mut runtime = AsyncStorageRuntime::start_cache_instance(instance, 4, 4096).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let completion = runtime
+            .try_put(buffer("record", b"original"), move |result| {
+                sender.send(result.unwrap()).unwrap();
+            })
+            .unwrap();
+        let result = completion.wait().unwrap();
+        let callback_buffer = receiver.recv().unwrap();
+        assert_eq!(result.value(), b"original");
+        drop(result);
+        observer
+            .update("record", &callback_buffer, buffer("record", b"updated"))
+            .unwrap();
+        assert_eq!(observer.get("record").unwrap().unwrap(), b"updated");
+        assert_eq!(callback_buffer.value(), b"original");
+        drop(callback_buffer);
+        runtime
+            .try_delete("record", |_| {})
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(observer.get("record").unwrap().is_none());
+        assert!(runtime.shutdown().unwrap());
+        assert!(matches!(observer.get("record"), Err(CacheError::Stopped)));
+    }
+}
+
+#[test]
 fn write_and_delete_futures_wake_without_blocking_poll() {
     use std::future::Future;
     use std::pin::Pin;

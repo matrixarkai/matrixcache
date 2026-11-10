@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
-use super::{cache_error_for_callback, CacheBuffer, CacheError, StorageEngineApi};
+use super::{cache_error_for_callback, CacheBuffer, CacheError, CacheInstance, StorageEngineApi};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -17,6 +17,49 @@ use std::thread::{self, JoinHandle};
 
 type WriteResult = Result<CacheBuffer, CacheError>;
 type WriteCallback = Box<dyn FnOnce(WriteResult) + Send>;
+
+trait StorageWorkerBackend: Send + 'static {
+    fn start(&mut self) -> Result<(), CacheError>;
+    fn put(&mut self, buffer: CacheBuffer) -> WriteResult;
+    fn delete(&mut self, key: &str) -> Result<(), CacheError>;
+    fn stop(&mut self) -> bool;
+}
+
+struct EngineBackend<E>(E);
+impl<E: StorageEngineApi + Send + 'static> StorageWorkerBackend for EngineBackend<E> {
+    fn start(&mut self) -> Result<(), CacheError> {
+        if self.0.start() {
+            Ok(())
+        } else {
+            Err(CacheError::Stopped)
+        }
+    }
+    fn put(&mut self, buffer: CacheBuffer) -> WriteResult {
+        self.0.async_put(buffer, |_| {})
+    }
+    fn delete(&mut self, key: &str) -> Result<(), CacheError> {
+        self.0.delete(key)
+    }
+    fn stop(&mut self) -> bool {
+        self.0.stop()
+    }
+}
+
+struct InstanceBackend(CacheInstance);
+impl StorageWorkerBackend for InstanceBackend {
+    fn start(&mut self) -> Result<(), CacheError> {
+        self.0.start()
+    }
+    fn put(&mut self, buffer: CacheBuffer) -> WriteResult {
+        self.0.put_cache_buffer(buffer)
+    }
+    fn delete(&mut self, key: &str) -> Result<(), CacheError> {
+        self.0.delete(key)
+    }
+    fn stop(&mut self) -> bool {
+        self.0.stop().is_ok()
+    }
+}
 
 // Writes remain inline to avoid a separate heap allocation for every submission.
 #[allow(clippy::large_enum_variant)]
@@ -115,13 +158,30 @@ impl AsyncStorageRuntime {
     /// its callback. Completed buffers held by callers and engine-resident data
     /// are not part of this budget. A zero limit accepts only empty payloads.
     pub fn start_with_byte_limit<E: StorageEngineApi + Send + 'static>(
-        mut engine: E,
+        engine: E,
         queue_capacity: usize,
         max_pending_bytes: usize,
     ) -> Result<Self, CacheError> {
-        if !engine.start() {
-            return Err(CacheError::Stopped);
-        }
+        Self::start_backend(EngineBackend(engine), queue_capacity, max_pending_bytes)
+    }
+
+    /// Run cache-instance writes and deletes on the bounded worker. This runtime
+    /// owns start/stop for the instance, including its shared clones. Other
+    /// owners must not stop the instance while the runtime is active.
+    pub fn start_cache_instance(
+        instance: CacheInstance,
+        queue_capacity: usize,
+        max_pending_bytes: usize,
+    ) -> Result<Self, CacheError> {
+        Self::start_backend(InstanceBackend(instance), queue_capacity, max_pending_bytes)
+    }
+
+    fn start_backend<B: StorageWorkerBackend>(
+        mut engine: B,
+        queue_capacity: usize,
+        max_pending_bytes: usize,
+    ) -> Result<Self, CacheError> {
+        engine.start()?;
         let (sender, receiver) = mpsc::sync_channel::<StorageCommand>(queue_capacity);
         let pending_bytes = Arc::new(AtomicUsize::new(0));
         let worker = thread::Builder::new()
@@ -130,9 +190,9 @@ impl AsyncStorageRuntime {
                 while let Ok(command) = receiver.recv() {
                     match command {
                         StorageCommand::Put(write) => {
-                            let result = engine.async_put(write.buffer, |_| {});
+                            let result = engine.put(write.buffer);
                             let callback_result = match &result {
-                                Ok(buffer) => Ok(buffer.clone_detached()),
+                                Ok(buffer) => Ok(buffer.clone_for_callback()),
                                 Err(error) => Err(cache_error_for_callback(error)),
                             };
                             // A caller callback must not strand the rest of the queue.
