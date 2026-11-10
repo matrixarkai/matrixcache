@@ -7067,9 +7067,9 @@ impl MultiLayerCache {
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Option<CachePinnedHandle>>, CacheError> {
-        let mut results = empty_batch_results(keys.len());
+        let mut results = PinnedBatchCleanup { cache: self, handles: empty_batch_results(keys.len()) };
         if keys.is_empty() {
-            return Ok(results);
+            return Ok(results.finish());
         }
 
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
@@ -7143,7 +7143,7 @@ impl MultiLayerCache {
         }
 
         if ssd_candidates.is_empty() {
-            return Ok(results);
+            return Ok(results.finish());
         }
 
         let candidate_keys = ssd_candidates
@@ -7163,7 +7163,7 @@ impl MultiLayerCache {
             decoded_hits.push((key, positions, decode_cache_block_shared(&block)?));
         }
         if decoded_hits.is_empty() {
-            return Ok(results);
+            return Ok(results.finish());
         }
 
         let inner = self.inner.read().expect("cache lock poisoned");
@@ -7186,7 +7186,7 @@ impl MultiLayerCache {
                 });
             }
         }
-        Ok(results)
+        Ok(results.finish())
     }
 
     pub fn release(&self, handle: CachePinnedHandle) {
