@@ -3228,6 +3228,8 @@ impl MultiLayerCache {
             options.pmem_promotion_enabled,
             options.ssd_promotion_enabled,
         );
+        cache.set_admission_filter_enabled(options.memory_admission_filter_enabled);
+        cache.set_ssd_admission_filter_enabled(options.ssd_admission_filter_enabled);
         cache.set_eviction_handler_enabled(options.eviction_handler_enabled);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
