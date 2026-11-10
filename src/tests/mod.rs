@@ -17019,6 +17019,35 @@ mod tests {
     }
 
     #[test]
+    fn replacement_indexes_and_lists_share_the_buffers_key_allocation() {
+        let mut fifo = ReplacementFifo::new(1 << 20);
+        fifo.init().unwrap();
+        let mut fifo_buffer = CacheBuffer::new(b"fifo".to_vec());
+        fifo_buffer.set_key("one-policy-key-allocation-fifo");
+        assert!(fifo.put(fifo_buffer).is_empty());
+        let (fifo_key, fifo_entry) = fifo.index.iter().next().expect("FIFO entry");
+        assert_eq!(fifo_key.as_ptr(), fifo_entry.buffer.key().as_ptr());
+        assert_eq!(
+            fifo_key.as_ptr(),
+            fifo.arena.key(fifo_entry.node).as_ptr(),
+            "the FIFO list copied the key held by its index"
+        );
+
+        let mut slru = ReplacementSlru::new(1 << 20);
+        slru.init().unwrap();
+        let mut slru_buffer = CacheBuffer::new(b"slru".to_vec());
+        slru_buffer.set_key("one-policy-key-allocation-slru");
+        assert!(slru.put(slru_buffer).is_empty());
+        let (slru_key, slru_entry) = slru.index.iter().next().expect("SLRU entry");
+        assert_eq!(slru_key.as_ptr(), slru_entry.buffer.key().as_ptr());
+        assert_eq!(
+            slru_key.as_ptr(),
+            slru.arena.key(slru_entry.node).as_ptr(),
+            "the SLRU list copied the key held by its index"
+        );
+    }
+
+    #[test]
     fn storage_config_index_updater_ops() {
         let index = Arc::new(SsdIndex::new());
         index.Put("a", SsdIndexValue::SsdColoredPtr(1));

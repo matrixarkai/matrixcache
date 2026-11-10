@@ -904,6 +904,11 @@ impl CacheBuffer {
         &self.key
     }
 
+    /// Share the immutable key with internal indexes without copying it.
+    fn shared_key(&self) -> Arc<str> {
+        Arc::clone(&self.key)
+    }
+
     pub fn set_key(&mut self, key: impl Into<String>) {
         self.key = Arc::from(key.into());
     }

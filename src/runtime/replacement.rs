@@ -425,7 +425,7 @@ const KEY_LIST_NIL: u32 = u32::MAX;
 /// the owning index.
 #[derive(Debug, Clone)]
 struct KeyListNode {
-    key: PolicyKey,
+    key: Option<Arc<str>>,
     prev: u32,
     next: u32,
 }
@@ -489,17 +489,16 @@ impl KeyArena {
         Self::default()
     }
 
-    fn alloc(&mut self, key: &str) -> u32 {
+    fn alloc(&mut self, key: Arc<str>) -> u32 {
         if let Some(index) = self.free.pop() {
             let node = &mut self.nodes[index as usize];
-            node.key.clear();
-            node.key.push_str(key);
+            node.key = Some(key);
             node.prev = KEY_LIST_NIL;
             node.next = KEY_LIST_NIL;
             return index;
         }
         self.nodes.push(KeyListNode {
-            key: key.to_string(),
+            key: Some(key),
             prev: KEY_LIST_NIL,
             next: KEY_LIST_NIL,
         });
@@ -508,14 +507,17 @@ impl KeyArena {
 
     fn release(&mut self, node: u32) {
         let slot = &mut self.nodes[node as usize];
-        slot.key.clear();
+        slot.key = None;
         slot.prev = KEY_LIST_NIL;
         slot.next = KEY_LIST_NIL;
         self.free.push(node);
     }
 
     fn key(&self, node: u32) -> &str {
-        &self.nodes[node as usize].key
+        self.nodes[node as usize]
+            .key
+            .as_deref()
+            .expect("linked key-list node has a key")
     }
 
     fn clear(&mut self) {
@@ -572,7 +574,13 @@ impl KeyArena {
         let mut collected = Vec::new();
         let mut cursor = list.tail;
         while cursor != KEY_LIST_NIL && collected.len() < size {
-            collected.push(self.nodes[cursor as usize].key.clone());
+            collected.push(
+                self.nodes[cursor as usize]
+                    .key
+                    .as_deref()
+                    .expect("linked key-list node has a key")
+                    .to_string(),
+            );
             cursor = self.nodes[cursor as usize].prev;
         }
         collected
@@ -584,7 +592,7 @@ pub struct BaseLruList {
     capacity: usize,
     arena: KeyArena,
     list: KeyList,
-    index: HashMap<PolicyKey, u32>,
+    index: HashMap<Arc<str>, u32>,
 }
 
 impl BaseLruList {
@@ -610,12 +618,13 @@ impl BaseLruList {
     }
 
     pub fn put(&mut self, key: PolicyKey) {
-        if let Some(&node) = self.index.get(&key) {
+        if let Some(&node) = self.index.get(key.as_str()) {
             self.arena.unlink(&mut self.list, node);
             self.arena.link_front(&mut self.list, node);
             return;
         }
-        let node = self.arena.alloc(&key);
+        let key: Arc<str> = Arc::from(key);
+        let node = self.arena.alloc(Arc::clone(&key));
         self.arena.link_front(&mut self.list, node);
         self.index.insert(key, node);
     }
@@ -661,7 +670,7 @@ impl BaseLruList {
         let key = self.arena.key(node).to_string();
         self.arena.unlink(&mut self.list, node);
         self.arena.release(node);
-        self.index.remove(&key);
+        self.index.remove(key.as_str());
         vec![key]
     }
 
@@ -1398,7 +1407,7 @@ struct FifoEntry {
 
 pub struct ReplacementFifo {
     base: ReplacementPolicyBase,
-    index: HashMap<String, FifoEntry>,
+    index: HashMap<Arc<str>, FifoEntry>,
     arena: KeyArena,
     queue: KeyList,
     mem_eviction_func: Option<MemEvictionHandler>,
@@ -1450,12 +1459,12 @@ impl ReplacementFifo {
         if !self.base.initialized {
             return Vec::new();
         }
-        let key = buffer.key().to_string();
+        let key = buffer.shared_key();
         if key.is_empty() {
             return Vec::new();
         }
         let space = cache_buffer_space(&buffer);
-        if let Some(entry) = self.index.get_mut(&key) {
+        if let Some(entry) = self.index.get_mut(key.as_ref()) {
             let old_space = cache_buffer_space(&entry.buffer);
             entry.buffer = buffer;
             self.base.used = self
@@ -1464,7 +1473,7 @@ impl ReplacementFifo {
                 .saturating_sub(old_space)
                 .saturating_add(space);
         } else {
-            let node = self.arena.alloc(&key);
+            let node = self.arena.alloc(Arc::clone(&key));
             self.arena.link_back(&mut self.queue, node);
             self.base.used = self.base.used.saturating_add(space);
             self.index.insert(key, FifoEntry { buffer, node });
@@ -1560,7 +1569,7 @@ impl ReplacementFifo {
             let key = self.arena.key(node).to_string();
             self.arena.unlink(&mut self.queue, node);
             self.arena.release(node);
-            let Some(entry) = self.index.remove(&key) else {
+            let Some(entry) = self.index.remove(key.as_str()) else {
                 continue;
             };
             self.base.used = self
@@ -1733,7 +1742,7 @@ enum SlruMaintainerStep {
 /// disabled by [`ReplacementSlru::test_config_lru_maintainer`].
 pub struct ReplacementSlru {
     base: ReplacementPolicyBase,
-    index: HashMap<String, SlruEntry>,
+    index: HashMap<Arc<str>, SlruEntry>,
     segments: Vec<SlruSegment>,
     arena: KeyArena,
     num_segments: usize,
@@ -1805,18 +1814,18 @@ impl ReplacementSlru {
         if !self.base.initialized {
             return Vec::new();
         }
-        let key = buffer.key().to_string();
+        let key = buffer.shared_key();
         if key.is_empty() {
             return Vec::new();
         }
-        let segment = self.pick_segment(&key);
-        if let Some(old) = self.index.remove(&key) {
+        let segment = self.pick_segment(key.as_ref());
+        if let Some(old) = self.index.remove(key.as_ref()) {
             let space = cache_buffer_space(&old.buffer);
             self.detach(old.segment, old.lru, old.node, space);
             self.release_node(old.node);
         }
         let space = cache_buffer_space(&buffer);
-        let node = self.alloc_node(&key);
+        let node = self.alloc_node(Arc::clone(&key));
         self.attach_front(segment, HOT_LRU, node, space);
         self.index.insert(
             key,
@@ -2030,7 +2039,7 @@ impl ReplacementSlru {
         self.bytes_each_segment = self.base.capacity() / self.num_segments;
     }
 
-    fn alloc_node(&mut self, key: &str) -> u32 {
+    fn alloc_node(&mut self, key: Arc<str>) -> u32 {
         self.arena.alloc(key)
     }
 
@@ -2124,7 +2133,7 @@ impl ReplacementSlru {
     fn try_evict_or_shuffle_cold(&mut self, segment: u32) -> Option<CacheBuffer> {
         let node = self.list_tail(segment, COLD_LRU)?;
         let key = self.node_key(node);
-        let action = match self.index.get_mut(&key) {
+        let action = match self.index.get_mut(key.as_str()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 if entry.flag >= BUFFER_FETCHED {
@@ -2154,7 +2163,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(&key) {
+        let action = match self.index.get_mut(key.as_str()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2180,7 +2189,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(&key) {
+        let action = match self.index.get_mut(key.as_str()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2286,7 +2295,7 @@ impl ReplacementSlru {
             return false;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(&key) {
+        let action = match self.index.get_mut(key.as_str()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 let space = cache_buffer_space(&entry.buffer);
@@ -2312,7 +2321,7 @@ impl ReplacementSlru {
             return SlruMaintainerStep::Stop;
         };
         let key = self.node_key(node);
-        let action = match self.index.get_mut(&key) {
+        let action = match self.index.get_mut(key.as_str()) {
             None => SlruTailAction::Orphan,
             Some(entry) => {
                 if entry.flag == BUFFER_ACTIVE {
