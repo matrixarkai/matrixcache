@@ -812,6 +812,36 @@ fn pinned_pmem_reads_preserve_placement_and_release_pins() {
     cache.release(handle);
 }
 
+#[test]
+fn warmed_pmem_pin_completes_while_another_reader_holds_cache_lock() {
+    let (_dir, cache) = cache();
+    cache.start().unwrap();
+    let mut policy = cache.production_tiering_policy();
+    policy.data_placement = CacheDataPlacement::SideBySide;
+    policy.data_placement_threshold_bytes = 0;
+    cache.update_production_tiering_policy(policy);
+    let key = CacheKey::string(0, "concurrent-pmem-pin");
+    cache.set_lru_refresh_time(Duration::from_secs(3600));
+    cache.put(key.clone(), b"payload".to_vec()).unwrap();
+    cache.release(cache.acquire(&key).unwrap().unwrap());
+    let reader_cache = cache.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let guard = cache.inner.read().unwrap();
+    let worker = std::thread::spawn(move || {
+        let result = reader_cache.acquire(&key);
+        sender.send(result).unwrap();
+    });
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    drop(guard);
+    worker.join().unwrap();
+    let handle = result
+        .expect("PMEM acquire must not require exclusive cache access")
+        .unwrap()
+        .unwrap();
+    assert_eq!(handle.tier(), CacheReadTier::Pmem);
+    cache.release(handle);
+}
+
 // rust-internal: PMEM-only shared reads stay lock-light and do not report false refill failures.
 #[test]
 fn pmem_only_public_reads_stay_in_pmem_without_refill_failures() {
