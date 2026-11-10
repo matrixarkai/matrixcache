@@ -3222,6 +3222,7 @@ impl MultiLayerCache {
             CacheReplacementPolicy::from_config_name(&options.cache_ssd_replacement_policy),
         );
         cache.set_ssd_instance_only(options.cache_ssd_instance_only);
+        cache.set_eviction_handler_enabled(options.eviction_handler_enabled);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
         cache.set_ssd_recovery_in_background(options.ssd_recover_in_background);

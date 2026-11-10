@@ -379,6 +379,46 @@ mod cold_tier_migration_tests {
     use super::*;
 
     #[test]
+    fn options_control_eviction_demotion_from_start() {
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = CacheOptions::new(8, 0, 1 << 20)
+                .with_ssd_paths([dir.path().to_path_buf()])
+                .with_ssd_write_through(false)
+                .with_eviction_handler_enabled(enabled);
+            let cache = MultiLayerCache::try_with_options(options).unwrap();
+            let first = CacheKey::string(10, "first");
+            let second = CacheKey::string(10, "second");
+            let evictions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&evictions);
+            cache.register_eviction_callback(move |record| {
+                captured.lock().unwrap().push(record);
+            });
+            assert_eq!(cache.eviction_handler_enabled(), enabled);
+            cache.put(first.clone(), b"12345678".to_vec()).unwrap();
+            cache.put(second, b"abcdefgh".to_vec()).unwrap();
+            assert_eq!(cache.item_count_for_tier(CacheTier::Ssd) > 0, enabled);
+            assert_eq!(!evictions.lock().unwrap().is_empty(), enabled);
+            if enabled {
+                assert_eq!(cache.get(&first).unwrap(), Some(b"12345678".to_vec()));
+            } else {
+                assert_eq!(cache.get(&first).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_options_apply_eviction_setting_to_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CacheOptions::new(128, 0, 1 << 20)
+            .with_ssd_paths([dir.path().to_path_buf()])
+            .with_eviction_handler_enabled(false);
+        let cache = ShardedMultiLayerCache::new(options, 4);
+        assert!(cache.shards.iter().all(|shard| !shard.eviction_handler_enabled()));
+        assert!(CacheOptions::default().eviction_handler_enabled);
+    }
+
+    #[test]
     fn options_allow_memory_first_writes_and_cold_read_refill() {
         let dir = tempfile::tempdir().unwrap();
         let options = CacheOptions::new(4096, 0, 1 << 20)

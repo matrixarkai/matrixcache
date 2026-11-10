@@ -135,6 +135,9 @@ pub struct CacheOptions {
     pub async_promotion_interval_millis: u64,
     #[serde(default)]
     pub cache_ssd_instance_only: bool,
+    /// Demote evicted values into the next tier and deliver eviction callbacks.
+    #[serde(default = "default_eviction_handler_enabled")]
+    pub eviction_handler_enabled: bool,
     #[serde(default)]
     pub blockcache_clear_ssd_folder: bool,
     #[serde(default)]
@@ -181,6 +184,10 @@ pub struct CacheOptions {
     pub block_options: CacheBlockOptions,
 }
 
+fn default_eviction_handler_enabled() -> bool {
+    true
+}
+
 impl Default for CacheOptions {
     fn default() -> Self {
         let policy = CacheTieringPolicy::default();
@@ -210,6 +217,7 @@ impl Default for CacheOptions {
             metric_id_prefix: String::new(),
             metric_registry_tags: HashMap::new(),
             cache_ssd_instance_only: false,
+            eviction_handler_enabled: true,
             blockcache_clear_ssd_folder: false,
             auto_recover_on_start: false,
             ssd_recover_in_background: false,
@@ -244,6 +252,12 @@ impl CacheOptions {
     /// Choose immediate SSD writes or bounded cold-tier migration.
     pub fn with_ssd_write_through(mut self, enabled: bool) -> Self {
         self.ssd_write_through = enabled;
+        self
+    }
+
+    /// Configure lower-tier demotion and eviction callbacks before startup.
+    pub fn with_eviction_handler_enabled(mut self, enabled: bool) -> Self {
+        self.eviction_handler_enabled = enabled;
         self
     }
 
