@@ -39,6 +39,19 @@ fn rocksdb_worker_callback_and_completion_share_input_payload() {
             .to_string_lossy()
             .into_owned(),
     );
+    assert_worker_shares_payload(engine);
+    let engine = matrixcache::StorageEngineMultiSsd::with_paths(
+        [
+            directory.path().join("device-a"),
+            directory.path().join("device-b"),
+        ],
+        2 * 1024 * 1024,
+    );
+    assert_worker_shares_payload(engine);
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+fn assert_worker_shares_payload<E: StorageEngineApi + Send + 'static>(engine: E) {
     let mut runtime = AsyncStorageRuntime::start_with_byte_limit(engine, 2, 1024 * 1024).unwrap();
     let input = buffer("shared", &vec![7; 1024 * 1024]);
     let input_address = input.data_ptr() as usize;

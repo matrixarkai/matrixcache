@@ -3898,14 +3898,8 @@ impl StorageEngineApi for StorageEngineMultiSsd {
     where
         F: FnOnce(Result<CacheBuffer, CacheError>),
     {
-        let key = buffer.key().to_string();
-        let value = buffer.to_vec();
-        let result = self.put(&key, value);
-        match result {
-            Ok(buf) => {
-                cb(Ok(buf.clone_detached()));
-                Ok(buf)
-            }
+        match self.storage_index(buffer.key()) {
+            Ok(index) => self.storages[index].async_put(buffer, cb),
             Err(err) => {
                 cb(Err(cache_error_for_callback(&err)));
                 Err(err)
