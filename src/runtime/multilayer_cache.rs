@@ -1810,6 +1810,8 @@ struct CacheInner {
     /// as it did when they lived on the metadata struct.
     expiries: AHashMap<Arc<CacheKey>, u64>,
     tiering_policy: CacheTieringPolicy,
+    pmem_promotion_enabled: bool,
+    ssd_promotion_enabled: bool,
     block_options: CacheBlockOptions,
     /// Keyed on a shared handle, not on the key itself.
     ///
@@ -3222,6 +3224,10 @@ impl MultiLayerCache {
             CacheReplacementPolicy::from_config_name(&options.cache_ssd_replacement_policy),
         );
         cache.set_ssd_instance_only(options.cache_ssd_instance_only);
+        cache.set_read_promotion_enabled(
+            options.pmem_promotion_enabled,
+            options.ssd_promotion_enabled,
+        );
         cache.set_eviction_handler_enabled(options.eviction_handler_enabled);
         cache.set_pmem_paths(options.pmem_paths);
         cache.set_auto_recover_on_start(options.auto_recover_on_start);
@@ -3308,6 +3314,8 @@ impl MultiLayerCache {
                 manifest_appends: AtomicU64::new(0),
                 expiries: AHashMap::new(),
                 tiering_policy,
+                pmem_promotion_enabled: true,
+                ssd_promotion_enabled: true,
                 block_options,
                 memory: AHashMap::new(),
                 pmem: AHashMap::new(),
@@ -4292,6 +4300,13 @@ impl MultiLayerCache {
         }
     }
 
+    /// Control whether PMEM and SSD reads warm the upper tiers.
+    pub fn set_read_promotion_enabled(&self, pmem: bool, ssd: bool) {
+        let mut inner = self.inner.write().expect("cache lock poisoned");
+        inner.pmem_promotion_enabled = pmem;
+        inner.ssd_promotion_enabled = ssd;
+    }
+
     pub fn eviction_handler_enabled(&self) -> bool {
         self.inner
             .read()
@@ -4592,7 +4607,7 @@ impl MultiLayerCache {
                 let compressed = is_encoded_compressed_block(&block);
                 let ssd_only_outcome = {
                     let inner = self.inner.read().expect("cache lock poisoned");
-                    if inner.ssd_instance_only {
+                    if inner.ssd_instance_only || !inner.ssd_promotion_enabled {
                         if !inner.started {
                             return Err(CacheError::Stopped);
                         }
@@ -5800,7 +5815,11 @@ impl MultiLayerCache {
         // being taken.
         let (block, refill_wanted, probe_epoch) = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            (inner.read_ssd_block(key)?, !inner.ssd_instance_only, inner.ssd_batch_probe_epoch(&[key]))
+            (
+                inner.read_ssd_block(key)?,
+                !inner.ssd_instance_only && inner.ssd_promotion_enabled,
+                inner.ssd_batch_probe_epoch(&[key]),
+            )
         };
         match block {
             Some(block) => {
@@ -5809,7 +5828,7 @@ impl MultiLayerCache {
                 if !refill_wanted {
                     let outcome = {
                         let inner = self.inner.read().expect("cache lock poisoned");
-                        if inner.ssd_instance_only {
+                        if inner.ssd_instance_only || !inner.ssd_promotion_enabled {
                             if !inner.started {
                                 return Err(CacheError::Stopped);
                             }
@@ -5919,6 +5938,7 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             if inner.ssd_instance_only
+                || !inner.ssd_promotion_enabled
                 || keys.iter().any(|key| {
                     inner.entry_expired(key, now_millis)
                         || inner.memory.contains_key(key)
@@ -6212,7 +6232,9 @@ impl MultiLayerCache {
                         let occurrences = positions.len();
                         inner.read_counters.pmem_hits.add(occurrences as u64);
                         inner.record_hit_metadata(key, value.len());
-                        if !inner.put_memory_shared(key, Arc::clone(&value)) {
+                        if inner.pmem_should_refill_memory(value.len())
+                            && !inner.put_memory_shared(key, Arc::clone(&value))
+                        {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
@@ -6683,7 +6705,9 @@ impl MultiLayerCache {
             }
             if let Some(value) = inner.pmem_value(key).cloned() {
                 inner.increment_pin_for_handle(key, value.len());
-                if !inner.put_memory_shared(key, Arc::clone(&value)) {
+                if inner.pmem_should_refill_memory(value.len())
+                    && !inner.put_memory_shared(key, Arc::clone(&value))
+                {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.read_counters.pmem_hits.add(1);
@@ -7292,7 +7316,9 @@ impl MultiLayerCache {
                     }
                     if let Some(value) = inner.pmem_value(key).cloned() {
                         let occurrences = positions.len();
-                        if !inner.put_memory_shared(key, Arc::clone(&value)) {
+                        if inner.pmem_should_refill_memory(value.len())
+                            && !inner.put_memory_shared(key, Arc::clone(&value))
+                        {
                             inner.stats.refill_failures =
                                 inner.stats.refill_failures.saturating_add(1);
                         }
@@ -8246,6 +8272,15 @@ impl MultiLayerCache {
         value: &Arc<[u8]>,
         accounted: Option<HitOutcome>,
     ) {
+        if !inner.pmem_promotion_enabled {
+            match accounted {
+                Some(outcome) => {
+                    inner.promote_accounted_pmem_probe_if_current(key, value, outcome)
+                }
+                None => inner.promote_pmem_probe_if_current(key, value),
+            }
+            return;
+        }
         let async_enabled = self
             .async_promotion_queue
             .lock()
@@ -8293,6 +8328,9 @@ impl MultiLayerCache {
         value: Arc<[u8]>,
         probe_epoch: u64,
     ) -> bool {
+        if !inner.ssd_promotion_enabled {
+            return true;
+        }
         let current = inner.ssd_probe_is_current_for(key, probe_epoch);
         if current
             && self.enqueue_async_promotion(
@@ -9747,6 +9785,12 @@ impl ShardedMultiLayerCache {
 
     pub fn new(options: CacheOptions, shard_count: usize) -> Self {
         Self::with_options(options, shard_count)
+    }
+
+    pub fn set_read_promotion_enabled(&self, pmem: bool, ssd: bool) {
+        for shard in self.shards.iter() {
+            shard.set_read_promotion_enabled(pmem, ssd);
+        }
     }
 
     fn split_capacity(total: usize, shard_count: usize, index: usize) -> usize {
@@ -12965,6 +13009,7 @@ impl CacheInner {
         //   `lru_refresh_floor_millis`,
         //   `lru_refresh_ratio`, `lru_refresh_effective_millis`,
         //   `next_reconfigure_millis`, `eviction_handler_enabled`,
+        //   `pmem_promotion_enabled`, `ssd_promotion_enabled`,
         //   `ssd_instance_only`, `legacy_block_files_possible`, `cold_eviction_share_pct`,
         //   `admission_filter_enabled`, `expected_entry_bytes`,
         //   `sketch_sized_from_what_is_resident`,
