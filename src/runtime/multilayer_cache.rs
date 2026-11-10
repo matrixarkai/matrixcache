@@ -1689,6 +1689,37 @@ struct CacheWorkerWeak {
     pin_registry: Weak<CachePinRegistry>,
 }
 
+struct PinnedBatchCleanup<'a> {
+    cache: &'a MultiLayerCache,
+    handles: Vec<Option<CachePinnedHandle>>,
+}
+
+impl PinnedBatchCleanup<'_> {
+    fn finish(mut self) -> Vec<Option<CachePinnedHandle>> {
+        std::mem::take(&mut self.handles)
+    }
+}
+
+impl std::ops::Deref for PinnedBatchCleanup<'_> {
+    type Target = Vec<Option<CachePinnedHandle>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handles
+    }
+}
+
+impl std::ops::DerefMut for PinnedBatchCleanup<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handles
+    }
+}
+
+impl Drop for PinnedBatchCleanup<'_> {
+    fn drop(&mut self) {
+        self.cache.release_batch_iter(self.handles.drain(..).flatten());
+    }
+}
+
 impl MultiLayerCache {
     fn worker_weak(&self) -> CacheWorkerWeak {
         CacheWorkerWeak {
@@ -7379,9 +7410,9 @@ impl MultiLayerCache {
             return self.acquire(key).map(|handle| vec![handle]);
         }
 
-        let mut results = empty_batch_results(keys.len());
+        let mut results = PinnedBatchCleanup { cache: self, handles: empty_batch_results(keys.len()) };
         if keys.is_empty() {
-            return Ok(results);
+            return Ok(results.finish());
         }
 
         let positions_by_key = coalesce_batch_positions_borrowed(keys);
@@ -7668,7 +7699,7 @@ impl MultiLayerCache {
         if needs_eviction_drain {
             self.drain_eviction_records();
         }
-        Ok(results)
+        Ok(results.finish())
     }
 
     pub fn update_cached_value_if_current(
