@@ -402,19 +402,26 @@ impl AsyncStorageRuntime {
             None
         } else {
             let bytes = buffer.value().len();
-            if self
-                .pending_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
-                    pending
-                        .checked_add(bytes)
-                        .filter(|next| *next <= self.max_pending_bytes)
-                })
-                .is_err()
-            {
-                return Err(StorageWriteRejected {
-                    error: CacheError::CapacityExceeded,
-                    buffer,
-                });
+            let mut pending = self.pending_bytes.load(Ordering::Relaxed);
+            loop {
+                let Some(next) = pending
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.max_pending_bytes)
+                else {
+                    return Err(StorageWriteRejected {
+                        error: CacheError::CapacityExceeded,
+                        buffer,
+                    });
+                };
+                match self.pending_bytes.compare_exchange_weak(
+                    pending,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => pending = current,
+                }
             }
             Some(WriteReservation {
                 pending: Arc::clone(&self.pending_bytes),
