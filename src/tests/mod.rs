@@ -3,6 +3,70 @@
 
 #[cfg(test)]
 mod tests {
+    // rust-internal: idle worker polling uses shared access without recording a write attempt.
+    #[test]
+    fn empty_writeback_poll_shares_the_cache_read_lock() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(64, 0, 0));
+        cache.start().unwrap();
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let drain = cache.clone();
+        let worker = std::thread::spawn(move || {
+            sender.send(drain.drain_async_writeback_if_pending(8)).unwrap();
+        });
+        let completed = receiver.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        let report = completed.expect("idle writeback poll waited for exclusive access").unwrap();
+        assert_eq!(report.requested, 8);
+        assert_eq!(report.drained, 0);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.stats().writeback_latency_samples, 0);
+        assert!(cache.stop());
+        assert!(matches!(cache.drain_async_writeback_if_pending(8), Err(CacheError::Stopped)));
+        assert!(matches!(cache.drain_async_promotions(8), Err(CacheError::Stopped)));
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn idle_writeback_worker_accepts_later_work() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(128, 0, 0));
+        cache.start().unwrap();
+        assert!(cache.start_async_writeback_worker(8, Duration::from_millis(1)));
+        let key = CacheKey::string(0, "late-writeback");
+        cache.enqueue_async_writeback(key.clone(), vec![6; 32]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let completed = loop {
+            if cache.get(&key).unwrap() == Some(vec![6; 32]) { break true; }
+            if Instant::now() >= deadline { break false; }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(cache.stop_async_writeback_worker());
+        assert!(cache.stop());
+        assert!(completed, "worker did not process work enqueued after startup");
+    }
+
+    // rust-internal: empty promotion work must not wait for exclusive cache access.
+    #[test]
+    fn empty_promotion_drain_shares_the_cache_read_lock() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(64, 0, 0));
+        cache.start().unwrap();
+        let guard = cache.inner.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let drain = cache.clone();
+        let worker = std::thread::spawn(move || {
+            sender.send(drain.drain_async_promotions(8)).unwrap();
+        });
+        let completed = receiver.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(cache.stop());
+        let report = completed.expect("empty drain waited for the reader to release its lock").unwrap();
+        assert_eq!(report.requested, 8);
+        assert_eq!(report.drained, 0);
+        assert_eq!(report.remaining, 0);
+    }
+
     // shared-corpus: storage_cache_eviction
     #[test]
     fn zero_capacity_reads_still_serve_pinned_resident_data() {

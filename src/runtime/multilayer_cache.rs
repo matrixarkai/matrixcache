@@ -8274,7 +8274,7 @@ impl MultiLayerCache {
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 let Some(current) = cache.upgrade() else { break };
-                let result = current.drain_async_writeback(max_jobs_per_round);
+                let result = current.drain_async_writeback_if_pending(max_jobs_per_round);
                 drop(current);
                 match result {
                     Ok(report) if report.drained > 0 => std::thread::yield_now(),
@@ -8601,6 +8601,13 @@ impl MultiLayerCache {
             }
             (jobs, queue.jobs.len())
         };
+
+        if jobs.is_empty() {
+            if !self.is_started() { return Err(CacheError::Stopped); }
+            return Ok(CachePromotionDrainReport {
+                requested, drained: 0, promoted: 0, skipped: 0, remaining,
+            });
+        }
 
         let mut promoted = 0usize;
         let mut inner = self.inner.write().expect("cache lock poisoned");
@@ -8970,6 +8977,19 @@ impl MultiLayerCache {
                 })
             }
         }
+    }
+
+    fn drain_async_writeback_if_pending(
+        &self, max_jobs: usize,
+    ) -> Result<CacheWritebackDrainReport, CacheError> {
+        {
+            let inner = self.inner.read().expect("cache lock poisoned");
+            if !inner.started { return Err(CacheError::Stopped); }
+            if inner.async_writeback_queue.is_empty() {
+                return Ok(CacheWritebackDrainReport { requested: max_jobs, drained: 0, remaining: 0 });
+            }
+        }
+        self.drain_async_writeback(max_jobs)
     }
 
     pub fn drain_async_writeback(
