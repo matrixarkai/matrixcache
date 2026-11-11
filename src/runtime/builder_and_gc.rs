@@ -2480,6 +2480,24 @@ impl CacheInner {
         true
     }
 
+    fn ssd_demotion_is_colder(&self, key: &CacheKey, logical_bytes: usize, stored_bytes: usize) -> bool {
+        if self.ssd_access_frequency.is_none()
+            || self.ssd_bytes.saturating_add(stored_bytes as u64) <= self.ssd_capacity_bytes as u64
+        {
+            return false;
+        }
+        let meta = self.metadata_of(key);
+        let request = CacheAdmissionRequest {
+            block_kind: meta.map_or(CacheBlockKind::Object, |meta| meta.block_kind),
+            shard_id: key.shard_id,
+            routing_slot: meta.and_then(CacheEntryMeta::routing_slot),
+            block_bytes: logical_bytes,
+            hotness: meta.map_or(0, |meta| meta.hotness.load(Ordering::Relaxed)),
+            pinned: false,
+        };
+        self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, logical_bytes, false)
+    }
+
     fn put_ssd_bypass_if_absent(&mut self, key: &CacheKey, value: &[u8]) -> bool {
         if self.disk_index.contains_key(key) || self.ssd_capacity_bytes == 0 {
             return false;
@@ -2494,6 +2512,22 @@ impl CacheInner {
             self.stats.ssd_oversize_rejections =
                 self.stats.ssd_oversize_rejections.saturating_add(1);
             return false;
+        }
+        let raw_framing = matches!(self.block_options.compression, CacheCompression::None)
+            || value.len() < self.block_options.min_compress_bytes;
+        if raw_framing {
+            let stored_bytes = value.len().saturating_add(CACHE_HEADER_LEN);
+            if stored_bytes > self.tiering_policy.max_ssd_block_bytes
+                || stored_bytes > self.ssd_capacity_bytes
+            {
+                self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+                self.stats.ssd_oversize_rejections = self.stats.ssd_oversize_rejections.saturating_add(1);
+                return false;
+            }
+            if self.ssd_demotion_is_colder(key, value.len(), stored_bytes) {
+                self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+                return false;
+            }
         }
         let Ok(block) = encode_cache_block(value, self.block_options) else {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
@@ -2510,22 +2544,9 @@ impl CacheInner {
         }
         // Demotions are SSD admission candidates too. Otherwise a stream of
         // cold upper-tier victims can bypass the configured frequency filter.
-        if self.ssd_access_frequency.is_some()
-            && self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64
-        {
-            let meta = self.metadata_of(key);
-            let request = CacheAdmissionRequest {
-                block_kind: meta.map_or(CacheBlockKind::Object, |meta| meta.block_kind),
-                shard_id: key.shard_id,
-                routing_slot: meta.and_then(CacheEntryMeta::routing_slot),
-                block_bytes: value.len(),
-                hotness: meta.map_or(0, |meta| meta.hotness.load(Ordering::Relaxed)),
-                pinned: false,
-            };
-            if self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), false) {
-                self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
-                return false;
-            }
+        if !raw_framing && self.ssd_demotion_is_colder(key, value.len(), block_len) {
+            self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+            return false;
         }
         self.evict_ssd_for(block_len as u64);
         if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64 {
