@@ -5590,11 +5590,11 @@ impl MultiLayerCache {
 
         let block = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_block_with_cache_fill(key, false)?
+            inner.read_owned_ssd_probe(key, false)?
         };
         match block {
             Some(block) => Ok(Some(CacheReadResult {
-                value: decode_cache_block_owned(block)?,
+                value: block.decode()?.0,
                 tier: CacheReadTier::Ssd,
             })),
             None => Ok(None),
@@ -6141,15 +6141,15 @@ impl MultiLayerCache {
         let (block, refill_wanted, probe_epoch) = {
             let inner = self.inner.read().expect("cache lock poisoned");
             (
-                inner.read_ssd_block(key)?,
+                inner.read_owned_ssd_probe(key, true)?,
                 !inner.ssd_instance_only && inner.ssd_promotion_enabled,
                 inner.ssd_batch_probe_epoch(&[key]),
             )
         };
         match block {
             Some(block) => {
-                let compressed = is_encoded_compressed_block(&block);
-                let decoded = CacheDecodedBlock::decode(block, refill_wanted)?;
+                let (value, compressed) = block.decode()?;
+                let decoded = CacheDecodedBlock::from_value(value, refill_wanted);
                 if !refill_wanted {
                     let outcome = {
                         let inner = self.inner.read().expect("cache lock poisoned");

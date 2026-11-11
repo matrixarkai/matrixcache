@@ -24,12 +24,18 @@ mod tests {
                     assert_eq!(shared.as_ref(), &[3; 4096]);
                     assert_eq!(handle.as_slice(), &[3; 4096]);
                     assert_eq!(non_promoting.as_slice(), &[3; 4096]);
+                    let mut owned = cache.get(&key).unwrap().unwrap();
+                    assert_eq!(owned, vec![3; 4096]);
+                    owned[0] = 9;
+                    assert_eq!(cache.get_no_promotion(&key).unwrap().unwrap().value, vec![3; 4096]);
                     cache.put(key.clone(), vec![4; 4096]).unwrap();
                     assert_eq!(handle.as_slice(), &[3; 4096]);
                     assert_eq!(non_promoting.as_slice(), &[3; 4096]);
                     cache.release(handle);
                     cache.release(non_promoting);
                     assert_eq!(cache.get_shared(&key).unwrap().unwrap().as_ref(), &[4; 4096]);
+                    assert_eq!(cache.get(&key).unwrap().unwrap(), vec![4; 4096]);
+                    assert_eq!(cache.get_no_promotion(&key).unwrap().unwrap().value, vec![4; 4096]);
                     {
                         let mut inner = cache.inner.write().unwrap();
                         let mut corrupt = encode_cache_block(&[4; 4096], inner.block_options).unwrap();
@@ -39,6 +45,8 @@ mod tests {
                     assert!(matches!(cache.get_shared(&key), Err(CacheError::CorruptBlock(_))));
                     assert!(matches!(cache.acquire(&key), Err(CacheError::CorruptBlock(_))));
                     assert!(matches!(cache.acquire_no_promotion(&key), Err(CacheError::CorruptBlock(_))));
+                    assert!(matches!(cache.get(&key), Err(CacheError::CorruptBlock(_))));
+                    assert!(matches!(cache.get_no_promotion(&key), Err(CacheError::CorruptBlock(_))));
                     assert!(cache.stop());
                     assert_eq!(shared.as_ref(), &[3; 4096]);
                 }
@@ -79,6 +87,21 @@ mod tests {
                 std::hint::black_box(block.decode().unwrap());
             }
             println!("bytes={bytes} reads=1000 owned_ns={} scoped_ns={}", owned.as_nanos(), start.elapsed().as_nanos());
+            let old_value = decode_cache_block_owned(inner.read_ssd_block(&key).unwrap().unwrap()).unwrap();
+            let new_value = inner.read_owned_ssd_probe(&key, true).unwrap().unwrap().decode().unwrap().0;
+            assert_eq!(old_value, new_value);
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let block = inner.read_ssd_block(std::hint::black_box(&key)).unwrap().unwrap();
+                std::hint::black_box(decode_cache_block_owned(block).unwrap());
+            }
+            let old_owned = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let block = inner.read_owned_ssd_probe(std::hint::black_box(&key), true).unwrap().unwrap();
+                std::hint::black_box(block.decode().unwrap());
+            }
+            println!("bytes={bytes} reads=1000 copied_payload_old_ns={} copied_payload_scoped_ns={}", old_owned.as_nanos(), start.elapsed().as_nanos());
             drop(inner);
             assert!(cache.stop());
         }
