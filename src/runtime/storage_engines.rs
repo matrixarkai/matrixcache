@@ -2428,6 +2428,70 @@ struct RocksDbHandleRecord {
     read_cache: Option<std::sync::Weak<SsdReadCacheInner>>,
 }
 
+#[cfg(feature = "rocksdb-ssd")]
+fn prune_closed_rocksdb_handle(
+    registry: &mut HashMap<String, RocksDbHandleRecord>,
+    path: &str,
+) {
+    if registry.get(path).is_some_and(|record| record.db.strong_count() == 0) {
+        registry.remove(path);
+        if registry.capacity() > 64 && registry.len() <= registry.capacity() / 4 {
+            registry.shrink_to(registry.len().saturating_mul(2).max(32));
+        }
+    }
+}
+
+#[cfg(all(test, feature = "rocksdb-ssd"))]
+mod retired_native_handle_tests {
+    use super::*;
+
+    #[test]
+    fn retired_registry_capacity_is_released() {
+        let mut records = HashMap::new();
+        for index in 0..512 {
+            records.insert(index.to_string(), RocksDbHandleRecord {
+                db: std::sync::Weak::new(), read_cache: None,
+            });
+        }
+        for index in 0..512 {
+            prune_closed_rocksdb_handle(&mut records, &index.to_string());
+        }
+        assert!(records.is_empty());
+        assert!(records.capacity() <= 64);
+    }
+
+    #[test]
+    fn live_alias_keeps_registry_until_final_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store").to_str().unwrap().to_owned();
+        let pool = SsdReadCache::new(1024 * 1024);
+        let mut first = StorageEngineRocksDb::new(path.clone());
+        first.set_read_cache(pool.clone()).unwrap();
+        assert!(first.start());
+        let alias = first.clone();
+        drop(first);
+        let mut adopted = StorageEngineRocksDb::new(path.clone());
+        assert!(adopted.start());
+        assert_eq!(adopted.read_cache(), Some(&pool));
+        drop(alias);
+        assert!(ROCKSDB_HANDLE_REGISTRY.get().unwrap().lock().unwrap().contains_key(&path));
+        assert!(adopted.stop());
+        assert!(!ROCKSDB_HANDLE_REGISTRY.get().unwrap().lock().unwrap().contains_key(&path));
+        let mut reopened = StorageEngineRocksDb::new(path.clone());
+        reopened.set_read_cache(SsdReadCache::new(512 * 1024)).unwrap();
+        assert!(reopened.start());
+        drop(reopened);
+        assert!(!ROCKSDB_HANDLE_REGISTRY.get().unwrap().lock().unwrap().contains_key(&path));
+    }
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+impl Drop for StorageEngineRocksDb {
+    fn drop(&mut self) {
+        self.release_database();
+    }
+}
+
 /// One native block-cache capacity target shared across any number of stores.
 /// Pinned blocks may exceed the target. An optional shared write-buffer manager
 /// also charges arena reservations here. Otherwise memtables are separate;
@@ -2625,6 +2689,17 @@ impl Clone for StorageEngineRocksDb {
 }
 
 impl StorageEngineRocksDb {
+    #[cfg(feature = "rocksdb-ssd")]
+    fn release_database(&mut self) {
+        let Some(db) = self.db.take() else { return };
+        // Native close can flush; do not hold the global registry during I/O.
+        drop(db);
+        if let Some(registry) = ROCKSDB_HANDLE_REGISTRY.get() {
+            let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+            prune_closed_rocksdb_handle(&mut registry, &self.db_path);
+        }
+    }
+
     /// What this store holds in **memory**, which is not nothing.
     ///
     /// Without RocksDB the store is a `HashMap<String, Vec<u8>>` with a disk
@@ -3545,7 +3620,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
     fn stop(&mut self) -> bool {
         #[cfg(feature = "rocksdb-ssd")]
         {
-            self.db = None;
+            self.release_database();
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
