@@ -3,6 +3,41 @@
 
 #[cfg(test)]
 mod tests {
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn storage_batches_preserve_binary_payloads_and_unsorted_keys_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ssd").to_string_lossy().into_owned();
+        let mut storage = StorageEngineRocksDb::new(path.clone());
+        assert!(matches!(storage.get_batch(&[]), Err(CacheError::Stopped)));
+        assert!(storage.start());
+        let entries = vec![
+            (String::new(), Vec::new()),
+            ("z\0key".to_string(), vec![0, 255, 0, 128]),
+            ("large".to_string(), vec![17; 65536]),
+        ];
+        storage.put_batch(entries.clone()).unwrap();
+        assert!(storage.stop());
+        drop(storage);
+        let mut storage = StorageEngineRocksDb::new(path);
+        assert!(storage.start());
+        let keys = ["z\0key", "missing", "", "large", "z\0key"];
+        let expected = vec![Some(entries[1].1.clone()), None, Some(Vec::new()),
+            Some(entries[2].1.clone()), Some(entries[1].1.clone())];
+        assert_eq!(storage.get_batch(&keys.map(str::to_owned)).unwrap(), expected);
+        for fill_cache in [false, true] {
+            assert_eq!(storage.get_unique_batch_refs_with_cache_fill(&keys, fill_cache).unwrap(), expected);
+            assert!(storage.get_unique_batch_refs_with_cache_fill(&[], fill_cache).unwrap().is_empty());
+            for key in ["", "z\0key", "missing"] {
+                let value = entries.iter().find(|(stored, _)| stored == key).map(|(_, value)| value.clone());
+                assert_eq!(storage.get_unique_batch_refs_with_cache_fill(&[key], fill_cache).unwrap(), vec![value.clone()]);
+                assert_eq!(storage.get_batch(&vec![key.to_string(); 3]).unwrap(), vec![value; 3]);
+            }
+        }
+        assert!(storage.stop());
+        assert!(matches!(storage.get_unique_batch_refs_with_cache_fill(&keys, false), Err(CacheError::Stopped)));
+    }
+
     // rust-internal: idle worker polling uses shared access without recording a write attempt.
     #[test]
     fn empty_writeback_poll_shares_the_cache_read_lock() {

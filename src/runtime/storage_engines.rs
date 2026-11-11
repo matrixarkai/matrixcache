@@ -3341,6 +3341,15 @@ impl StorageEngineRocksDb {
         if len == 0 {
             return Ok(Vec::new());
         }
+        if len == 1 {
+            return keys.into_iter().map(|key| {
+                match self.get_owned_with_cache_fill(key, fill_cache) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(CacheError::NotFound) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }).collect();
+        }
         #[cfg(feature = "rocksdb-ssd")]
         {
             let mut options = rocksdb::ReadOptions::default();
@@ -3369,19 +3378,9 @@ impl StorageEngineRocksDb {
             return Ok(Vec::new());
         }
         let (unique_keys, output_positions) = coalesce_storage_batch_key_refs(keys);
-        #[cfg(feature = "rocksdb-ssd")]
-        let unique_values = {
-            self.rocksdb()?
-                .multi_get(unique_keys.iter().map(|key| key.as_bytes()))
-                .into_iter()
-                .map(|result| result.map_err(|err| CacheError::RocksDb(err.to_string())))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        #[cfg(not(feature = "rocksdb-ssd"))]
-        let unique_values = unique_keys
-            .iter()
-            .map(|key| self.records.get(*key).cloned())
-            .collect::<Vec<_>>();
+        let unique_values = self.get_unique_batch_iter(
+            unique_keys.iter().copied(), unique_keys.len(), true,
+        )?;
         Ok(expand_storage_batch_values(unique_values, output_positions))
     }
 
