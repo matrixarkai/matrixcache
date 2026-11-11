@@ -51,6 +51,21 @@ Enabled SSD backends still perform their existence checks; disabling a tier is n
 as configuring an enabled tier with no capacity. This avoids unnecessary key-rendering work
 without changing cache-hit results or the application's durability policy.
 
+## Deployment and Upgrade Checklist
+
+- Pin the crate version or revision and choose Cargo features explicitly. The
+  default RocksDB SSD backend and the no-default-features compatibility backend
+  have different build requirements and storage paths.
+- Keep authoritative records recoverable outside the cache. Select tier sync and
+  writeback policies using [Durability](#durability), not cache-hit behavior.
+- Include retained shared and pinned handles, queued work, and backend memory
+  in the process budget; configured tier capacity is not a process RSS limit.
+- Register record-key indexes only for namespaces that need targeted lookup or
+  invalidation. Registration backfills keys and adds ongoing index maintenance;
+  unregistered namespaces retain the scan path.
+- Compare the same backend, shard count, capacity, payloads, and promotion policy
+  when evaluating a change. Local cache operations are not network service QPS.
+
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
