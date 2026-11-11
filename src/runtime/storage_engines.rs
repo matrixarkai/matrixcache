@@ -3272,6 +3272,27 @@ impl StorageEngineRocksDb {
         self.get_owned_with_cache_fill(key, true)
     }
 
+    pub(crate) fn with_read_value<T>(
+        &self, key: &str, fill_cache: bool,
+        read: impl FnOnce(&[u8]) -> Result<T, CacheError>,
+    ) -> Result<T, CacheError> {
+        if !self.initialized { return Err(CacheError::Stopped); }
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            let mut options = rocksdb::ReadOptions::default();
+            if !fill_cache { options.fill_cache(false); }
+            let pinned = self.rocksdb()?.get_pinned_opt(key.as_bytes(), &options)
+                .map_err(|error| CacheError::RocksDb(error.to_string()))?
+                .ok_or(CacheError::NotFound)?;
+            read(&pinned)
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        {
+            let _ = fill_cache;
+            read(self.records.get(key).ok_or(CacheError::NotFound)?)
+        }
+    }
+
     pub(crate) fn get_owned_with_cache_fill(&self, key: &str, fill_cache: bool) -> Result<Vec<u8>, CacheError> {
         if !self.initialized {
             return Err(CacheError::Stopped);
@@ -3933,6 +3954,14 @@ pub struct StorageEngineMultiSsd {
 }
 
 impl StorageEngineMultiSsd {
+    pub(crate) fn with_read_value<T>(
+        &self, key: &str, fill_cache: bool,
+        read: impl FnOnce(&[u8]) -> Result<T, CacheError>,
+    ) -> Result<T, CacheError> {
+        let index = self.storage_index(key)?;
+        self.storages[index].with_read_value(key, fill_cache, read)
+    }
+
     pub(crate) fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
         let index = self.storage_index(key)?;
         self.storages[index].get_owned(key)

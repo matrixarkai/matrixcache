@@ -3129,6 +3129,17 @@ impl SsdTierStore {
         !matches!(self, Self::Disabled { .. })
     }
 
+    fn with_read_value<T>(
+        &self, key: &str, fill_cache: bool,
+        read: impl FnOnce(&[u8]) -> Result<T, CacheError>,
+    ) -> Result<T, CacheError> {
+        match self {
+            Self::Disabled { .. } => Err(CacheError::NotFound),
+            Self::Single(storage) => storage.with_read_value(key, fill_cache, read),
+            Self::Multi(storage) => storage.with_read_value(key, fill_cache, read),
+        }
+    }
+
     fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
         match self {
             Self::Disabled { .. } => Err(CacheError::NotFound),
@@ -4904,7 +4915,7 @@ impl MultiLayerCache {
 
         let (block, probe_epoch) = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            (inner.read_ssd_block(key)?, inner.ssd_batch_probe_epoch(&[key]))
+            (inner.read_shared_ssd_probe(key, true)?, inner.ssd_batch_probe_epoch(&[key]))
         };
         match block {
             Some(block) => {
@@ -4915,8 +4926,7 @@ impl MultiLayerCache {
                 // four payload-sized allocations, and a caller holding a
                 // different copy from the one the cache kept. The whole point
                 // of a shared read is that there is one.
-                let value = decode_cache_block_shared(&block)?;
-                let compressed = is_encoded_compressed_block(&block);
+                let (value, compressed) = block.decode()?;
                 let ssd_only_outcome = {
                     let inner = self.inner.read().expect("cache lock poisoned");
                     if inner.ssd_instance_only || !inner.ssd_promotion_enabled {
@@ -6965,13 +6975,13 @@ impl MultiLayerCache {
                 return Err(CacheError::Stopped);
             }
             if inner.ssd_instance_only {
-                match inner.read_ssd_block(key)? {
+                match inner.read_shared_ssd_probe(key, true)? {
                     Some(block) => {
-                        let decoded = decode_cache_block_shared(&block)?;
+                        let (decoded, compressed) = block.decode()?;
                         inner.increment_pin_for_handle(key, decoded.len());
                         inner.remember_pin_value(key, &decoded);
                         inner.read_counters.disk_hits.add(1);
-                        if is_encoded_compressed_block(&block) {
+                        if compressed {
                             inner
                                 .read_counters
                                 .compressed_hits
@@ -7058,11 +7068,11 @@ impl MultiLayerCache {
 
         let (block, probe_epoch) = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            (inner.read_ssd_block(key)?, inner.ssd_batch_probe_epoch(&[key]))
+            (inner.read_shared_ssd_probe(key, true)?, inner.ssd_batch_probe_epoch(&[key]))
         };
         match block {
             Some(block) => {
-                let decoded = decode_cache_block_shared(&block)?;
+                let (decoded, compressed) = block.decode()?;
                 let mut inner = self.inner.write().expect("cache lock poisoned");
                 inner.increment_pin_for_handle(key, decoded.len());
                 inner.remember_pin_value(key, &decoded);
@@ -7077,7 +7087,7 @@ impl MultiLayerCache {
                     inner.stats.refill_failures = inner.stats.refill_failures.saturating_add(1);
                 }
                 inner.read_counters.disk_hits.add(1);
-                if is_encoded_compressed_block(&block) {
+                if compressed {
                     inner.stats.compressed_hits = inner.stats.compressed_hits.saturating_add(1);
                 }
                 inner.record_hit(key, decoded.len());
@@ -7163,12 +7173,12 @@ impl MultiLayerCache {
 
         let block = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_block_with_cache_fill(key, false)?
+            inner.read_shared_ssd_probe(key, false)?
         };
         let Some(block) = block else {
             return Ok(None);
         };
-        let value = decode_cache_block_shared(&block)?;
+        let (value, _) = block.decode()?;
         // Shared: taking the pin changes only the pin state, which has its own
         // lock.
         let inner = self.inner.read().expect("cache lock poisoned");

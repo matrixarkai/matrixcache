@@ -682,6 +682,31 @@ fn uncompressed_block_payload(block: &[u8]) -> Result<Option<&[u8]>, CacheError>
     Ok(Some(payload))
 }
 
+enum SharedSsdProbe {
+    Decoded(Arc<[u8]>),
+    Encoded(Vec<u8>),
+}
+
+impl SharedSsdProbe {
+    fn capture(block: &[u8]) -> Result<Self, CacheError> {
+        match uncompressed_block_payload(block)? {
+            Some(payload) => Ok(Self::Decoded(Arc::from(payload))),
+            // Decompression stays outside the cache guard on deferred read paths.
+            None => Ok(Self::Encoded(block.to_vec())),
+        }
+    }
+
+    fn decode(self) -> Result<(Arc<[u8]>, bool), CacheError> {
+        match self {
+            Self::Decoded(value) => Ok((value, false)),
+            Self::Encoded(block) => {
+                let compressed = is_encoded_compressed_block(&block);
+                Ok((decode_cache_block_shared(&block)?, compressed))
+            }
+        }
+    }
+}
+
 fn decode_cache_block_owned(mut block: Vec<u8>) -> Result<Vec<u8>, CacheError> {
     if let Some(payload) = uncompressed_block_payload(&block)? {
         let len = payload.len();
@@ -855,6 +880,23 @@ impl CacheInner {
         let store_key = Self::inline_ssd_store_key(key);
         self.ssd_store
             .peek(Self::inline_ssd_store_key_str(&store_key))
+    }
+
+    fn read_shared_ssd_probe(&self, key: &CacheKey, fill_cache: bool) -> Result<Option<SharedSsdProbe>, CacheError> {
+        if !self.ssd_store.holds_blocks() { return Ok(None); }
+        let store_key = Self::inline_ssd_store_key(key);
+        match self.ssd_store.with_read_value(
+            Self::inline_ssd_store_key_str(&store_key), fill_cache, SharedSsdProbe::capture,
+        ) {
+            Ok(probe) => Ok(Some(probe)),
+            Err(CacheError::NotFound) if !self.legacy_block_files_possible() => Ok(None),
+            Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
+                Ok(block) => Ok(Some(SharedSsdProbe::Encoded(block))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(CacheError::Io(error)),
+            },
+            Err(error) => Err(error),
+        }
     }
 
     fn read_ssd_block(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
