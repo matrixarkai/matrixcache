@@ -2842,11 +2842,15 @@ impl CacheInner {
 
     // Skipping a raced promotion is not a refill failure. The caller may still
     // return the value observed by its read, but must not install it again.
+    fn ssd_refill_enabled(&self) -> bool {
+        self.ssd_promotion_enabled && !self.ssd_instance_only
+            && (self.memory_capacity_bytes > 0 || self.pmem_capacity_bytes > 0)
+    }
+
     fn refill_ssd_probe(&mut self, key: &CacheKey, value: Arc<[u8]>, current: bool) -> bool {
-        if !self.ssd_promotion_enabled
+        if !self.ssd_refill_enabled()
             || !current
             || !self.started
-            || self.ssd_instance_only
             || self.memory.contains_key(key)
             || self.pmem.contains_key(key)
             || self.entry_expired(key, CoarseClock::now_millis())

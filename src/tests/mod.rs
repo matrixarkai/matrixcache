@@ -5,6 +5,109 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn zero_capacity_reads_still_serve_pinned_resident_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions::new(64, 0, 4096)
+            .with_ssd_paths([directory.path().join("ssd")]));
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "pinned-at-zero");
+        cache.put(key.clone(), vec![4; 32]).unwrap();
+        let held = cache.acquire(&key).unwrap().unwrap();
+        cache.set_capacity_for_tier(CacheTier::Memory, 0);
+        let read = cache.get_with_tier(&key).unwrap().unwrap();
+        assert_eq!(read.tier, CacheReadTier::Memory);
+        assert_eq!(read.value, vec![4; 32]);
+        let next = cache.acquire(&key).unwrap().unwrap();
+        assert_eq!(next.tier, CacheReadTier::Memory);
+        cache.release(next);
+        cache.release(held);
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn disabled_ssd_promotion_does_not_bypass_newer_pmem_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions::new(0, 64, 4096)
+            .with_ssd_paths([directory.path().join("ssd")])
+            .with_pmem_paths([directory.path().join("pmem")]));
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "newer-pmem");
+        cache.put(key.clone(), vec![1; 32]).unwrap();
+        cache.set_capacity_for_tier(CacheTier::Memory, 64);
+        assert!(cache.inner.write().unwrap().put_pmem(&key, vec![9; 32]));
+        cache.set_read_promotion_enabled(true, false);
+        let held = cache.acquire(&key).unwrap().unwrap();
+        assert_eq!(held.as_slice(), &[9; 32]);
+        assert_eq!(held.tier, CacheReadTier::Pmem);
+        cache.release(held);
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn reads_without_upper_tiers_do_not_attempt_or_queue_refills() {
+        for deferred in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let cache = MultiLayerCache::with_options(CacheOptions::new(0, 0, 4096)
+                .with_ssd_paths([directory.path().join("ssd")]));
+            cache.start().unwrap();
+            assert!(!cache.ssd_instance_only());
+            let keys = [CacheKey::string(0, "one"), CacheKey::string(0, "two")];
+            for key in &keys { cache.put(key.clone(), vec![7; 64]).unwrap(); }
+            if deferred { assert!(cache.configure_async_promotion(8, 4096, 8, Duration::from_millis(10))); }
+            for key in &keys {
+                assert_eq!(cache.get(key).unwrap().unwrap(), vec![7; 64]);
+                assert_eq!(cache.get_shared(key).unwrap().unwrap().as_ref(), &[7; 64]);
+                let handle = cache.acquire(key).unwrap().unwrap();
+                assert_eq!(handle.as_slice(), &[7; 64]);
+                cache.release(handle);
+            }
+            let query = [keys[0].clone(), keys[1].clone(), keys[0].clone(), CacheKey::string(0, "missing")];
+            let owned = cache.get_batch(&query).unwrap();
+            let shared = cache.get_shared_batch(&query).unwrap();
+            let pinned = cache.acquire_batch(&query).unwrap();
+            for index in 0..3 {
+                assert_eq!(owned[index].as_deref(), Some(&[7; 64][..]));
+                assert_eq!(shared[index].as_deref(), Some(&[7; 64][..]));
+                assert_eq!(pinned[index].as_ref().unwrap().as_slice(), &[7; 64]);
+            }
+            assert!(owned[3].is_none() && shared[3].is_none() && pinned[3].is_none());
+            for handle in pinned.into_iter().flatten() { cache.release(handle); }
+            assert_eq!(cache.async_promotion_queue_depth(), 0);
+            assert_eq!(cache.stats().refill_failures, 0);
+            assert_eq!(cache.stats().memory_fills, 0);
+            assert_eq!(cache.stats().pmem_fills, 0);
+            assert!(!cache.ssd_instance_only());
+            assert!(cache.stop());
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn upper_tier_refill_resumes_after_live_capacity_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(CacheOptions::new(0, 0, 4096)
+            .with_ssd_paths([directory.path().join("ssd")])
+            .with_pmem_paths([directory.path().join("pmem")]));
+        cache.start().unwrap();
+        let key = CacheKey::string(0, "capacity-change");
+        cache.put(key.clone(), vec![8; 64]).unwrap();
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![8; 64]);
+        assert_eq!(cache.stats().refill_failures, 0);
+        cache.set_capacity_for_tier(CacheTier::Memory, 256);
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![8; 64]);
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Memory));
+        cache.set_capacity_for_tier(CacheTier::Memory, 0);
+        cache.set_capacity_for_tier(CacheTier::Pmem, 256);
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![8; 64]);
+        assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem));
+        assert_eq!(cache.stats().refill_failures, 0);
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn tiered_ssd_refills_pmem_when_memory_frequency_admission_refuses() {
         let directory = tempfile::tempdir().unwrap();
         let policy = CacheTieringPolicy {

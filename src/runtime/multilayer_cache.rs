@@ -4929,7 +4929,7 @@ impl MultiLayerCache {
                 let (value, compressed) = block.decode()?;
                 let ssd_only_outcome = {
                     let inner = self.inner.read().expect("cache lock poisoned");
-                    if inner.ssd_instance_only || !inner.ssd_promotion_enabled {
+                    if !inner.ssd_refill_enabled() {
                         if !inner.started {
                             return Err(CacheError::Stopped);
                         }
@@ -5121,7 +5121,7 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if inner.ssd_instance_only
+            if !inner.ssd_refill_enabled()
                 || keys.iter().any(|key| {
                     inner.entry_expired(key, now_millis)
                         || inner.memory.contains_key(key)
@@ -5386,12 +5386,12 @@ impl MultiLayerCache {
                 .map(|(_, started)| *started)
                 .unwrap_or_else(Instant::now);
             let refill_started = Instant::now();
-            let (blocks, probe_epoch, ssd_only) = {
+            let (blocks, probe_epoch, refill_disabled) = {
                 let inner = self.inner.read().expect("cache lock poisoned");
                 (
                     inner.read_ssd_blocks(&candidate_keys)?,
                     inner.ssd_batch_probe_epoch(&candidate_keys),
-                    inner.ssd_instance_only,
+                    !inner.ssd_refill_enabled(),
                 )
             };
             let mut decoded = Vec::with_capacity(ssd_candidates.len());
@@ -5405,7 +5405,7 @@ impl MultiLayerCache {
                 };
                 decoded.push((unique_position, started, decoded_block));
             }
-            if ssd_only {
+            if refill_disabled {
                 let mut deferred = Vec::new();
                 let mut disk_hits = 0u64;
                 let mut misses = 0u64;
@@ -6142,7 +6142,7 @@ impl MultiLayerCache {
             let inner = self.inner.read().expect("cache lock poisoned");
             (
                 inner.read_owned_ssd_probe(key, true)?,
-                !inner.ssd_instance_only && inner.ssd_promotion_enabled,
+                inner.ssd_refill_enabled(),
                 inner.ssd_batch_probe_epoch(&[key]),
             )
         };
@@ -6153,7 +6153,7 @@ impl MultiLayerCache {
                 if !refill_wanted {
                     let outcome = {
                         let inner = self.inner.read().expect("cache lock poisoned");
-                        if inner.ssd_instance_only || !inner.ssd_promotion_enabled {
+                        if !inner.ssd_refill_enabled() {
                             if !inner.started {
                                 return Err(CacheError::Stopped);
                             }
@@ -6262,8 +6262,7 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if inner.ssd_instance_only
-                || !inner.ssd_promotion_enabled
+            if !inner.ssd_refill_enabled()
                 || keys.iter().any(|key| {
                     inner.entry_expired(key, now_millis)
                         || inner.memory.contains_key(key)
@@ -6596,7 +6595,7 @@ impl MultiLayerCache {
             let inner = self.inner.read().expect("cache lock poisoned");
             (
                 inner.read_ssd_blocks(&candidate_keys)?,
-                !inner.ssd_instance_only,
+                inner.ssd_refill_enabled(),
                 inner.ssd_batch_probe_epoch(&candidate_keys),
             )
         };
@@ -6632,7 +6631,7 @@ impl MultiLayerCache {
                 SmallVec::<[(&CacheKey, HitOutcome, usize); INLINE_BATCH_KEYS]>::new();
             {
                 let inner = self.inner.read().expect("cache lock poisoned");
-                if inner.ssd_instance_only {
+                if !inner.ssd_refill_enabled() {
                     if !inner.started {
                         return Err(CacheError::Stopped);
                     }
@@ -6974,7 +6973,9 @@ impl MultiLayerCache {
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            if inner.ssd_instance_only {
+            if inner.ssd_instance_only
+                || (!inner.ssd_refill_enabled() && !inner.pmem.contains_key(key))
+            {
                 match inner.read_shared_ssd_probe(key, true)? {
                     Some(block) => {
                         let (decoded, compressed) = block.decode()?;
@@ -8725,7 +8726,7 @@ impl MultiLayerCache {
         value: Arc<[u8]>,
         probe_epoch: u64,
     ) -> bool {
-        if !inner.ssd_promotion_enabled {
+        if !inner.ssd_refill_enabled() {
             return true;
         }
         let current = inner.ssd_probe_is_current_for(key, probe_epoch);
