@@ -8,6 +8,68 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn shared_storage_batch_preserves_input_results_and_persisted_last_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("buffer-batch")
+        .to_string_lossy()
+        .into_owned();
+    let mut engine = matrixcache::StorageEngineRocksDb::new(path.clone());
+    assert!(engine.start());
+    let first = buffer("same", b"first");
+    let first_address = first.data_ptr() as usize;
+    let last = buffer("same", b"last");
+    let last_address = last.data_ptr() as usize;
+    let results = engine.put_buffers_batch(vec![first, buffer("other", b"other"), last]);
+    assert_eq!(results.len(), 3);
+    for (result, expected) in results.iter().zip([b"first".as_slice(), b"other", b"last"]) {
+        assert_eq!(result.as_ref().unwrap().value(), expected);
+    }
+    #[cfg(feature = "rocksdb-ssd")]
+    {
+        assert_eq!(
+            results[0].as_ref().unwrap().data_ptr() as usize,
+            first_address
+        );
+        assert_eq!(
+            results[2].as_ref().unwrap().data_ptr() as usize,
+            last_address
+        );
+    }
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    let _ = (first_address, last_address);
+    assert!(engine.stop());
+    let mut reopened = matrixcache::StorageEngineRocksDb::new(path);
+    assert!(reopened.start());
+    assert_eq!(reopened.get("same").unwrap().value(), b"last");
+    assert_eq!(reopened.get("other").unwrap().value(), b"other");
+    assert!(reopened.stop());
+    let failed = reopened.put_buffers_batch(vec![buffer("one", b"one"), buffer("two", b"two")]);
+    assert_eq!(failed.len(), 2);
+    assert!(failed
+        .iter()
+        .all(|result| matches!(result, Err(CacheError::Stopped))));
+}
+
+#[test]
+fn default_storage_batch_keeps_partial_failures_in_input_order() {
+    let mut engine = StorageEngineSimple::with_capacity(24);
+    assert!(engine.start());
+    let results = engine.put_buffers_batch(vec![
+        buffer("a", b"first"),
+        buffer("large", &[0; 100]),
+        buffer("a", b"last"),
+    ]);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].as_ref().unwrap().value(), b"first");
+    assert!(matches!(results[1], Err(CacheError::CapacityExceeded)));
+    assert_eq!(results[2].as_ref().unwrap().value(), b"last");
+    assert_eq!(engine.get("a").unwrap().value(), b"last");
+    assert!(engine.stop());
+}
+
+#[test]
 fn rejected_submissions_return_original_payload_and_release_reservations() {
     for byte_rejection in [false, true] {
         let limit = if byte_rejection { 8 } else { 32 };

@@ -1007,6 +1007,13 @@ impl CacheBuffer {
         }
     }
 
+    fn clone_storage_result(&self) -> Self {
+        let mut result = self.clone_detached();
+        result.logical_size = None;
+        result.tier = None;
+        result
+    }
+
     pub fn view(key: impl Into<String>, logical_size: usize) -> Self {
         Self {
             key: Arc::from(key.into()),
@@ -1561,6 +1568,11 @@ pub trait StorageEngineApi {
     fn start(&mut self) -> bool;
     fn stop(&mut self) -> bool;
     fn put(&mut self, key: &str, value: Vec<u8>) -> Result<CacheBuffer, CacheError>;
+    /// Write shared buffers and return one result per input in input order.
+    /// Implementations may group commits; this is not a portable atomic transaction.
+    fn put_buffers_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<Result<CacheBuffer, CacheError>> {
+        buffers.into_iter().map(|buffer| self.async_put(buffer, |_| {})).collect()
+    }
     fn async_put<F>(&mut self, buffer: CacheBuffer, cb: F) -> Result<CacheBuffer, CacheError>
     where
         F: FnOnce(Result<CacheBuffer, CacheError>);
@@ -2153,14 +2165,7 @@ impl StorageEngineApi for StorageEngineSimple {
     where
         F: FnOnce(Result<CacheBuffer, CacheError>),
     {
-        let result = self.install_record(buffer.key(), buffer.value()).map(|()| CacheBuffer {
-            key: Arc::clone(&buffer.key),
-            value: Arc::clone(&buffer.value),
-            logical_size: None,
-            tier: None,
-            cache: None,
-            handle: None,
-        });
+        let result = self.install_record(buffer.key(), buffer.value()).map(|()| buffer.clone_storage_result());
         match result {
             Ok(buf) => {
                 cb(Ok(buf.clone_detached()));
@@ -3270,6 +3275,26 @@ impl StorageEngineApi for StorageEngineRocksDb {
         Ok(view.into_cache_buffer_with_value(value))
     }
 
+    fn put_buffers_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<Result<CacheBuffer, CacheError>> {
+        #[cfg(feature = "rocksdb-ssd")]
+        {
+            if buffers.is_empty() { return Vec::new(); }
+            let result = (|| {
+                if !self.initialized { return Err(CacheError::Stopped); }
+                let mut batch = rocksdb::WriteBatch::default();
+                for buffer in &buffers { batch.put(buffer.key().as_bytes(), buffer.value()); }
+                self.rocksdb()?.write_opt(batch, &Self::rocksdb_write_options())
+                    .map_err(|error| CacheError::RocksDb(error.to_string()))
+            })();
+            match result {
+                Ok(()) => buffers.into_iter().map(|buffer| Ok(buffer.clone_storage_result())).collect(),
+                Err(error) => buffers.into_iter().map(|_| Err(cache_error_for_callback(&error))).collect(),
+            }
+        }
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        { buffers.into_iter().map(|buffer| self.async_put(buffer, |_| {})).collect() }
+    }
+
     fn async_put<F>(&mut self, buffer: CacheBuffer, cb: F) -> Result<CacheBuffer, CacheError>
     where
         F: FnOnce(Result<CacheBuffer, CacheError>),
@@ -3282,14 +3307,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
             self.rocksdb()?
                 .put_opt(buffer.key().as_bytes(), buffer.value(), &Self::rocksdb_write_options())
                 .map_err(|error| CacheError::RocksDb(error.to_string()))?;
-            Ok(CacheBuffer {
-                key: Arc::clone(&buffer.key),
-                value: Arc::clone(&buffer.value),
-                logical_size: None,
-                tier: None,
-                cache: None,
-                handle: None,
-            })
+            Ok(buffer.clone_storage_result())
         })();
         #[cfg(not(feature = "rocksdb-ssd"))]
         let result = {
