@@ -41,6 +41,9 @@ impl std::error::Error for StorageWriteRejected {
 trait StorageWorkerBackend: Send + 'static {
     fn start(&mut self) -> Result<(), CacheError>;
     fn put(&mut self, buffer: CacheBuffer) -> WriteResult;
+    fn put_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<WriteResult> {
+        buffers.into_iter().map(|buffer| self.put(buffer)).collect()
+    }
     fn delete(&mut self, key: &str) -> Result<(), CacheError>;
     fn stop(&mut self) -> bool;
 }
@@ -56,6 +59,9 @@ impl<E: StorageEngineApi + Send + 'static> StorageWorkerBackend for EngineBacken
     }
     fn put(&mut self, buffer: CacheBuffer) -> WriteResult {
         self.0.async_put(buffer, |_| {})
+    }
+    fn put_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<WriteResult> {
+        self.0.put_buffers_batch(buffers)
     }
     fn delete(&mut self, key: &str) -> Result<(), CacheError> {
         self.0.delete(key)
@@ -182,7 +188,41 @@ impl AsyncStorageRuntime {
         queue_capacity: usize,
         max_pending_bytes: usize,
     ) -> Result<Self, CacheError> {
-        Self::start_backend(EngineBackend(engine), queue_capacity, max_pending_bytes)
+        Self::start_backend(
+            EngineBackend(engine),
+            queue_capacity,
+            max_pending_bytes,
+            1,
+            usize::MAX,
+        )
+    }
+
+    /// Coalesce already-queued consecutive writes without waiting to fill a
+    /// batch. Deletes are ordering barriers. Callbacks run in submission order
+    /// after all writes in their group, so they may observe later group writes.
+    /// A group is not a portable atomic transaction across storage engines.
+    ///
+    /// Limits must be nonzero. A single payload larger than `max_batch_bytes`
+    /// runs alone if admitted by `max_pending_bytes`. The worker holds at most
+    /// `max_batch_writes` active writes and one deferred command in addition to
+    /// the bounded inbox. Payload reservations cover all of them and callbacks.
+    pub fn start_batched<E: StorageEngineApi + Send + 'static>(
+        engine: E,
+        queue_capacity: usize,
+        max_pending_bytes: usize,
+        max_batch_writes: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Self, CacheError> {
+        if max_batch_writes == 0 || max_batch_bytes == 0 {
+            return Err(CacheError::CapacityExceeded);
+        }
+        Self::start_backend(
+            EngineBackend(engine),
+            queue_capacity,
+            max_pending_bytes,
+            max_batch_writes,
+            max_batch_bytes,
+        )
     }
 
     /// Run cache-instance writes and deletes on the bounded worker. This runtime
@@ -193,13 +233,21 @@ impl AsyncStorageRuntime {
         queue_capacity: usize,
         max_pending_bytes: usize,
     ) -> Result<Self, CacheError> {
-        Self::start_backend(InstanceBackend(instance), queue_capacity, max_pending_bytes)
+        Self::start_backend(
+            InstanceBackend(instance),
+            queue_capacity,
+            max_pending_bytes,
+            1,
+            usize::MAX,
+        )
     }
 
     fn start_backend<B: StorageWorkerBackend>(
         mut engine: B,
         queue_capacity: usize,
         max_pending_bytes: usize,
+        max_batch_writes: usize,
+        max_batch_bytes: usize,
     ) -> Result<Self, CacheError> {
         engine.start()?;
         let (sender, receiver) = mpsc::sync_channel::<StorageCommand>(queue_capacity);
@@ -207,8 +255,56 @@ impl AsyncStorageRuntime {
         let worker = thread::Builder::new()
             .name("matrixcache-storage".into())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                let mut deferred = None;
+                while let Some(command) = deferred.take().or_else(|| receiver.recv().ok()) {
                     match command {
+                        StorageCommand::Put(write) if max_batch_writes > 1 => {
+                            let mut bytes = write.buffer.value().len();
+                            let mut writes = vec![write];
+                            while writes.len() < max_batch_writes && bytes < max_batch_bytes {
+                                let Ok(command) = receiver.try_recv() else {
+                                    break;
+                                };
+                                match command {
+                                    StorageCommand::Put(write)
+                                        if bytes
+                                            .checked_add(write.buffer.value().len())
+                                            .is_some_and(|total| total <= max_batch_bytes) =>
+                                    {
+                                        bytes += write.buffer.value().len();
+                                        writes.push(write);
+                                    }
+                                    command => {
+                                        deferred = Some(command);
+                                        break;
+                                    }
+                                }
+                            }
+                            let (buffers, completions): (Vec<_>, Vec<_>) = writes
+                                .into_iter()
+                                .map(|write| {
+                                    (
+                                        write.buffer,
+                                        (write.callback, write.reservation, write.completed),
+                                    )
+                                })
+                                .unzip();
+                            let results = engine.put_batch(buffers);
+                            for ((callback, reservation, completed), result) in
+                                completions.into_iter().zip(results)
+                            {
+                                let callback_result = match &result {
+                                    Ok(buffer) => Ok(buffer.clone_for_callback()),
+                                    Err(error) => Err(cache_error_for_callback(error)),
+                                };
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        callback(callback_result)
+                                    }));
+                                drop(reservation);
+                                completed.send(result);
+                            }
+                        }
                         StorageCommand::Put(write) => {
                             let result = engine.put(write.buffer);
                             let callback_result = match &result {
@@ -367,5 +463,111 @@ impl AsyncStorageRuntime {
 impl Drop for AsyncStorageRuntime {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct BatchBackend(Arc<Mutex<Vec<Vec<String>>>>);
+    impl StorageWorkerBackend for BatchBackend {
+        fn start(&mut self) -> Result<(), CacheError> {
+            Ok(())
+        }
+        fn stop(&mut self) -> bool {
+            true
+        }
+        fn put(&mut self, buffer: CacheBuffer) -> WriteResult {
+            Ok(buffer)
+        }
+        fn put_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<WriteResult> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(buffers.iter().map(|b| b.key().to_string()).collect());
+            buffers.into_iter().map(Ok).collect()
+        }
+        fn delete(&mut self, key: &str) -> Result<(), CacheError> {
+            self.0.lock().unwrap().push(vec![format!("delete:{key}")]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_coalescing_preserves_delete_barriers_callbacks_and_reservations() {
+        for (count, bytes, group_size) in [(2, 100, 2), (8, 6, 2), (8, 2, 1)] {
+            let history = Arc::new(Mutex::new(Vec::new()));
+            let mut runtime = AsyncStorageRuntime::start_backend(
+                BatchBackend(Arc::clone(&history)),
+                8,
+                12,
+                count,
+                bytes,
+            )
+            .unwrap();
+            let make = |key| {
+                let mut b = CacheBuffer::new(vec![7; 3]);
+                b.set_key(key);
+                b
+            };
+            let (entered, ready) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let first = runtime
+                .try_put(make("first"), move |_| {
+                    entered.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+                .unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let callbacks = Arc::new(Mutex::new(Vec::new()));
+            let mut completions = Vec::new();
+            for key in ["a", "b", "c"] {
+                let observed = Arc::clone(&callbacks);
+                completions.push(
+                    runtime
+                        .try_put(make(key), move |result| {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .push(result.unwrap().key().to_string());
+                            if key == "b" {
+                                panic!("callback isolation");
+                            }
+                        })
+                        .unwrap(),
+                );
+            }
+            assert!(matches!(
+                runtime.try_put(make("overflow"), |_| {}),
+                Err(CacheError::CapacityExceeded)
+            ));
+            let delete = runtime.try_delete("a", |_| {}).unwrap();
+            release.send(()).unwrap();
+            first.wait().unwrap();
+            for (completion, key) in completions.into_iter().zip(["a", "b", "c"]) {
+                assert_eq!(completion.wait().unwrap().key(), key);
+            }
+            delete.wait().unwrap();
+            assert_eq!(runtime.pending_bytes.load(Ordering::Acquire), 0);
+            runtime
+                .try_put(make("last"), |_| {})
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(runtime.shutdown().unwrap());
+            assert_eq!(*callbacks.lock().unwrap(), ["a", "b", "c"]);
+            let mut expected = vec![vec!["first".to_string()]];
+            expected.extend(
+                ["a", "b", "c"]
+                    .chunks(group_size)
+                    .map(|group| group.iter().map(|s| s.to_string()).collect()),
+            );
+            expected.push(vec!["delete:a".to_string()]);
+            expected.push(vec!["last".to_string()]);
+            assert_eq!(*history.lock().unwrap(), expected);
+        }
     }
 }
