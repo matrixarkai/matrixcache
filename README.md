@@ -37,6 +37,20 @@ value allocations after replacement; release handles promptly and size memory fo
 active workload, not only the current key count. Cache-tier durability settings do not
 replace the application's commit protocol.
 
+## Deployment Responsibilities
+
+| MatrixCache provides | The embedding application provides |
+|---|---|
+| Tier admission, eviction, and read-through refill | Authoritative records, request routing, and consistency policy |
+| Owned, shared-buffer, and pinned read choices | Handle lifetimes and budgets for retained old values |
+| Configurable tier persistence and writeback | The commit boundary and crash-recovery guarantees of the service |
+| Local sharding and placement helpers | Network transport, membership, and replica coordination |
+
+Memory-only operation skips SSD existence-key encoding when the SSD backend is disabled.
+Enabled SSD backends still perform their existence checks; disabling a tier is not the same
+as configuring an enabled tier with no capacity. This avoids unnecessary key-rendering work
+without changing cache-hit results or the application's durability policy.
+
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
