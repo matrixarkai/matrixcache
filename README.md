@@ -101,6 +101,22 @@ avoid taking the cache write lock when their read-side check finds no work.
 These paths reduce copying and lock contention; benchmark hit, miss, promotion,
 and concurrent-write workloads separately before treating them as a QPS result.
 
+## Record-Scoped Key Lookup
+
+For invalidation or expiry work on selected records, call
+`enable_record_key_index(namespace)` and then
+`keys_for_records(shard_id, namespace, records)`. Both `MultiLayerCache` and
+`ShardedMultiLayerCache` expose these APIs. Enabling a namespace backfills
+existing tier keys; repeated registration does no work. Other namespaces do
+not allocate per-entry record-index rows and retain the full tier-key scan.
+
+The returned `CacheRecordKeySnapshot` contains sorted, deduplicated keys,
+an `indexed` flag, and `entries_examined`. Lookup does not read value bytes or
+SSD files. It is a key snapshot, not an invalidation transaction: callers
+still perform deletion, and sharded snapshots visit cache shards sequentially
+rather than atomically. Budget the additional index metadata for enabled
+namespaces instead of treating reduced scan work as free memory.
+
 ## SSD backend
 
 RocksDB is the default SSD key-value backend, enabled by the `rocksdb-ssd`
