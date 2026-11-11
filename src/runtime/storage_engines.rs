@@ -2440,7 +2440,8 @@ pub struct SsdReadCache(Arc<SsdReadCacheInner>);
 #[cfg(feature = "rocksdb-ssd")]
 struct SsdReadCacheInner {
     cache: rocksdb::Cache,
-    capacity: usize,
+    capacity: std::sync::atomic::AtomicUsize,
+    budget_updates: Mutex<()>,
     write_buffers: Option<rocksdb::WriteBufferManager>,
     flush_on_pressure: bool,
     databases: Mutex<Vec<std::sync::Weak<rocksdb::DB>>>,
@@ -2452,7 +2453,8 @@ impl SsdReadCache {
     pub fn new(capacity_bytes: usize) -> Self {
         Self(Arc::new(SsdReadCacheInner {
             cache: rocksdb::Cache::new_lru_cache(capacity_bytes),
-            capacity: capacity_bytes,
+            capacity: std::sync::atomic::AtomicUsize::new(capacity_bytes),
+            budget_updates: Mutex::new(()),
             write_buffers: None,
             flush_on_pressure: false,
             databases: Mutex::new(Vec::new()),
@@ -2484,7 +2486,8 @@ impl SsdReadCache {
             write_buffer_bytes, flush_on_pressure, cache.clone());
         Ok(Self(Arc::new(SsdReadCacheInner {
             cache,
-            capacity: capacity_bytes,
+            capacity: std::sync::atomic::AtomicUsize::new(capacity_bytes),
+            budget_updates: Mutex::new(()),
             write_buffers: Some(write_buffers),
             flush_on_pressure,
             databases: Mutex::new(Vec::new()),
@@ -2492,7 +2495,37 @@ impl SsdReadCache {
         })))
     }
 
-    pub fn capacity_bytes(&self) -> usize { self.0.capacity }
+    pub fn capacity_bytes(&self) -> usize { self.0.capacity.load(Ordering::Acquire) }
+
+    /// Resize this pool for every store sharing it, without reopening them.
+    /// Pinned blocks and arena reservations may remain above a reduced target.
+    /// A managed pool cannot shrink below its current write-buffer target.
+    pub fn try_set_capacity_bytes(&self, capacity_bytes: usize) -> Result<(), CacheError> {
+        let _update = self.0.budget_updates.lock().expect("SSD budget update lock poisoned");
+        if self.write_buffer_capacity_bytes().is_some_and(|target| target > capacity_bytes) {
+            return Err(CacheError::InvalidConfig("cache capacity cannot be below its write-buffer target".into()));
+        }
+        let mut cache = self.0.cache.clone();
+        cache.set_capacity(capacity_bytes);
+        self.0.capacity.store(capacity_bytes, Ordering::Release);
+        Ok(())
+    }
+
+    /// Change a managed pool's shared write-buffer target. Arenas in already
+    /// opened stores retain their block size. Later writes drive pressure
+    /// flushing; this call does not wait for I/O or promise immediate reclaim.
+    /// Separate target getters may observe different concurrent updates.
+    pub fn try_set_write_buffer_capacity_bytes(&self, bytes: usize) -> Result<(), CacheError> {
+        let _update = self.0.budget_updates.lock().expect("SSD budget update lock poisoned");
+        let Some(manager) = &self.0.write_buffers else {
+            return Err(CacheError::InvalidConfig("pool has no write-buffer manager".into()));
+        };
+        if bytes == 0 || bytes > self.capacity_bytes() {
+            return Err(CacheError::InvalidConfig("write-buffer target must be positive and no larger than cache capacity".into()));
+        }
+        manager.set_buffer_size(bytes);
+        Ok(())
+    }
     /// Native cache charges, including arena reservations in managed pools.
     pub fn usage_bytes(&self) -> usize { self.0.cache.get_usage() }
     pub fn pinned_bytes(&self) -> usize { self.0.cache.get_pinned_usage() }
