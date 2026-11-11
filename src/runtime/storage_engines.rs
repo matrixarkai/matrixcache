@@ -2429,8 +2429,10 @@ struct RocksDbHandleRecord {
 }
 
 /// One native block-cache capacity target shared across any number of stores.
-/// Pinned blocks may exceed the target. Memtables, table readers and caller
-/// buffers are separate allocations, so this is not a process memory bound.
+/// Pinned blocks may exceed the target. An optional shared write-buffer manager
+/// also charges arena reservations here. Otherwise memtables are separate;
+/// table readers and caller buffers are always outside this target.
+/// This is not a hard process memory bound.
 #[cfg(feature = "rocksdb-ssd")]
 #[derive(Clone)]
 pub struct SsdReadCache(Arc<SsdReadCacheInner>);
@@ -2439,6 +2441,10 @@ pub struct SsdReadCache(Arc<SsdReadCacheInner>);
 struct SsdReadCacheInner {
     cache: rocksdb::Cache,
     capacity: usize,
+    write_buffers: Option<rocksdb::WriteBufferManager>,
+    flush_on_pressure: bool,
+    databases: Mutex<Vec<std::sync::Weak<rocksdb::DB>>>,
+    flush_coordinator: Mutex<()>,
 }
 
 #[cfg(feature = "rocksdb-ssd")]
@@ -2447,11 +2453,88 @@ impl SsdReadCache {
         Self(Arc::new(SsdReadCacheInner {
             cache: rocksdb::Cache::new_lru_cache(capacity_bytes),
             capacity: capacity_bytes,
+            write_buffers: None,
+            flush_on_pressure: false,
+            databases: Mutex::new(Vec::new()),
+            flush_coordinator: Mutex::new(()),
         }))
     }
+
+    /// Share both read-cache capacity and write-buffer pressure across stores.
+    /// Arena reservations charge this cache, so do not add write-buffer usage
+    /// to `usage_bytes()`. Native flush scheduling can temporarily exceed the
+    /// soft write target. With `flush_on_pressure`, writes flush the cohort
+    /// before approaching that target. Races with native stalls return
+    /// CapacityExceeded instead of waiting indefinitely on an idle database.
+    /// No existing pool or store is modified.
+    /// Smaller budgets can increase flush frequency and write amplification.
+    /// Managed stores use smaller arenas and no eager memtable Bloom filter;
+    /// their SST Bloom filters are unchanged. Without flush coordination, only
+    /// native soft flush triggers apply and memory may grow beyond the target.
+    pub fn new_with_write_buffer_budget(
+        capacity_bytes: usize,
+        write_buffer_bytes: usize,
+        flush_on_pressure: bool,
+    ) -> Result<Self, CacheError> {
+        if write_buffer_bytes == 0 || write_buffer_bytes > capacity_bytes {
+            return Err(CacheError::InvalidConfig("write-buffer target must be positive and no larger than cache capacity".into()));
+        }
+        let cache = rocksdb::Cache::new_lru_cache(capacity_bytes);
+        let write_buffers = rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
+            write_buffer_bytes, flush_on_pressure, cache.clone());
+        Ok(Self(Arc::new(SsdReadCacheInner {
+            cache,
+            capacity: capacity_bytes,
+            write_buffers: Some(write_buffers),
+            flush_on_pressure,
+            databases: Mutex::new(Vec::new()),
+            flush_coordinator: Mutex::new(()),
+        })))
+    }
+
     pub fn capacity_bytes(&self) -> usize { self.0.capacity }
+    /// Native cache charges, including arena reservations in managed pools.
     pub fn usage_bytes(&self) -> usize { self.0.cache.get_usage() }
     pub fn pinned_bytes(&self) -> usize { self.0.cache.get_pinned_usage() }
+    pub fn write_buffer_usage_bytes(&self) -> Option<usize> {
+        self.0.write_buffers.as_ref().map(rocksdb::WriteBufferManager::get_usage)
+    }
+    pub fn write_buffer_capacity_bytes(&self) -> Option<usize> {
+        self.0.write_buffers.as_ref().map(rocksdb::WriteBufferManager::get_buffer_size)
+    }
+
+    fn register_database(&self, database: &Arc<rocksdb::DB>) {
+        if self.0.write_buffers.is_none() { return; }
+        let mut databases = self.0.databases.lock().expect("write-buffer database list poisoned");
+        databases.retain(|database| database.strong_count() != 0);
+        databases.push(Arc::downgrade(database));
+    }
+
+    fn prepare_write(&self) -> Result<(), CacheError> {
+        if !self.0.flush_on_pressure { return Ok(()); }
+        let Some(manager) = &self.0.write_buffers else { return Ok(()); };
+        let target = manager.get_buffer_size();
+        let threshold = target.saturating_sub(target / 10);
+        if manager.get_usage() < threshold { return Ok(()); }
+        let _flush = self.0.flush_coordinator.lock().expect("write-buffer flush coordinator poisoned");
+        if manager.get_usage() < threshold { return Ok(()); }
+        // Native pressure checks can only flush the current DB. A cold DB can
+        // otherwise stall behind arenas retained by idle peers indefinitely.
+        let databases: Vec<_> = self.0.databases.lock().expect("write-buffer database list poisoned")
+            .iter().filter_map(std::sync::Weak::upgrade).collect();
+        let mut candidates = Vec::with_capacity(databases.len());
+        for database in databases {
+            let bytes = database.property_int_value("rocksdb.cur-size-active-mem-table")
+                .map_err(|error| CacheError::RocksDb(error.to_string()))?.unwrap_or(0);
+            candidates.push((bytes, database));
+        }
+        candidates.sort_unstable_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
+        for (_, database) in candidates {
+            if manager.get_usage() < threshold { break; }
+            database.flush().map_err(|error| CacheError::RocksDb(error.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "rocksdb-ssd")]
@@ -2463,7 +2546,10 @@ impl Eq for SsdReadCache {}
 #[cfg(feature = "rocksdb-ssd")]
 impl std::fmt::Debug for SsdReadCache {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SsdReadCache").field("capacity_bytes", &self.capacity_bytes()).finish_non_exhaustive()
+        formatter.debug_struct("SsdReadCache")
+            .field("capacity_bytes", &self.capacity_bytes())
+            .field("write_buffer_capacity_bytes", &self.write_buffer_capacity_bytes())
+            .finish_non_exhaustive()
     }
 }
 
@@ -2594,6 +2680,10 @@ impl StorageEngineRocksDb {
         Ok(())
     }
 
+    /// The configured pool, or the pool adopted when reusing an open path.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn read_cache(&self) -> Option<&SsdReadCache> { self.read_cache.as_ref() }
+
     /// Select the policy for subsequent writes, batches, deletes and resets
     /// through this engine. Other clones keep their own policy.
     #[cfg(feature = "rocksdb-ssd")]
@@ -2657,7 +2747,15 @@ impl StorageEngineRocksDb {
             table.set_bloom_filter(10.0, false);
             table.set_block_cache(&cache.0.cache);
             options.set_block_based_table_factory(&table);
-            options.set_memtable_prefix_bloom_ratio(0.02);
+            if let Some(manager) = &cache.0.write_buffers {
+                options.set_write_buffer_manager(manager);
+                // Avoid eagerly reserving a large Bloom arena in empty DBs:
+                // there is no data to flush if those reservations fill a pool.
+                options.set_memtable_prefix_bloom_ratio(0.0);
+                options.set_arena_block_size((manager.get_buffer_size() / 16).clamp(4096, 256 * 1024));
+            } else {
+                options.set_memtable_prefix_bloom_ratio(0.02);
+            }
             options.set_memtable_whole_key_filtering(true);
         } else {
             options.optimize_for_point_lookup(self.rocksdb_block_cache_mebibytes());
@@ -2671,11 +2769,22 @@ impl StorageEngineRocksDb {
     }
 
     #[cfg(feature = "rocksdb-ssd")]
-    fn rocksdb_write_options(&self) -> rocksdb::WriteOptions {
+    fn rocksdb_write_options(&self) -> Result<rocksdb::WriteOptions, CacheError> {
+        if let Some(cache) = &self.read_cache { cache.prepare_write()?; }
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(self.write_policy == SsdWritePolicy::Durable);
         options.disable_wal(self.write_policy == SsdWritePolicy::Rebuildable);
-        options
+        if self.read_cache.as_ref().is_some_and(|cache| cache.0.flush_on_pressure) {
+            options.set_no_slowdown(true);
+        }
+        Ok(options)
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    fn write_error(error: rocksdb::Error) -> CacheError {
+        if error.kind() == rocksdb::ErrorKind::Incomplete {
+            CacheError::CapacityExceeded
+        } else { CacheError::RocksDb(error.to_string()) }
     }
 
     #[cfg(feature = "rocksdb-ssd")]
@@ -2690,7 +2799,7 @@ impl StorageEngineRocksDb {
     }
 
     #[cfg(feature = "rocksdb-ssd")]
-    fn open_rocksdb_arc(&self) -> Result<Arc<rocksdb::DB>, CacheError> {
+    fn open_rocksdb_arc(&mut self) -> Result<Arc<rocksdb::DB>, CacheError> {
         let registry = ROCKSDB_HANDLE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry = registry.lock().expect("rocksdb registry lock poisoned");
         if let Some(record) = registry.get(&self.db_path) {
@@ -2699,11 +2808,15 @@ impl StorageEngineRocksDb {
                     let same_pool = record.read_cache.as_ref().and_then(std::sync::Weak::upgrade)
                         .is_some_and(|pool| Arc::ptr_eq(&requested.0, &pool));
                     if !same_pool { return Err(CacheError::InvalidConfig("open SSD path uses a different read cache".into())); }
+                } else {
+                    self.read_cache = record.read_cache.as_ref()
+                        .and_then(std::sync::Weak::upgrade).map(SsdReadCache);
                 }
                 return Ok(existing);
             }
         }
         let db = Arc::new(self.open_rocksdb()?);
+        if let Some(cache) = &self.read_cache { cache.register_database(&db); }
         registry.insert(self.db_path.clone(), RocksDbHandleRecord {
             db: Arc::downgrade(&db),
             read_cache: self.read_cache.as_ref().map(|pool| Arc::downgrade(&pool.0)),
@@ -3021,8 +3134,8 @@ impl StorageEngineRocksDb {
         #[cfg(feature = "rocksdb-ssd")]
         {
             self.rocksdb()?
-                .put_opt(key.as_bytes(), &value, &self.rocksdb_write_options())
-                .map_err(|err| CacheError::RocksDb(err.to_string()))?;
+                .put_opt(key.as_bytes(), &value, &self.rocksdb_write_options()?)
+                .map_err(Self::write_error)?;
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
@@ -3150,8 +3263,8 @@ impl StorageEngineRocksDb {
                 batch.put(key.as_bytes(), value);
             }
             self.rocksdb()?
-                .write_opt(batch, &self.rocksdb_write_options())
-                .map_err(|err| CacheError::RocksDb(err.to_string()))?;
+                .write_opt(batch, &self.rocksdb_write_options()?)
+                .map_err(Self::write_error)?;
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
@@ -3204,8 +3317,8 @@ impl StorageEngineRocksDb {
                 }
             }
             if deleted > 0 {
-                db.write_opt(batch, &self.rocksdb_write_options())
-                    .map_err(|err| CacheError::RocksDb(err.to_string()))?;
+                db.write_opt(batch, &self.rocksdb_write_options()?)
+                    .map_err(Self::write_error)?;
             }
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -3409,8 +3522,8 @@ impl StorageEngineApi for StorageEngineRocksDb {
                 if !self.initialized { return Err(CacheError::Stopped); }
                 let mut batch = rocksdb::WriteBatch::default();
                 for buffer in &buffers { batch.put(buffer.key().as_bytes(), buffer.value()); }
-                self.rocksdb()?.write_opt(batch, &self.rocksdb_write_options())
-                    .map_err(|error| CacheError::RocksDb(error.to_string()))
+                self.rocksdb()?.write_opt(batch, &self.rocksdb_write_options()?)
+                    .map_err(Self::write_error)
             })();
             match result {
                 Ok(()) => buffers.into_iter().map(|buffer| Ok(buffer.clone_storage_result())).collect(),
@@ -3431,8 +3544,8 @@ impl StorageEngineApi for StorageEngineRocksDb {
                 return Err(CacheError::Stopped);
             }
             self.rocksdb()?
-                .put_opt(buffer.key().as_bytes(), buffer.value(), &self.rocksdb_write_options())
-                .map_err(|error| CacheError::RocksDb(error.to_string()))?;
+                .put_opt(buffer.key().as_bytes(), buffer.value(), &self.rocksdb_write_options()?)
+                .map_err(Self::write_error)?;
             Ok(buffer.clone_storage_result())
         })();
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -3514,8 +3627,8 @@ impl StorageEngineApi for StorageEngineRocksDb {
             {
                 return Err(CacheError::NotFound);
             }
-            db.delete_opt(key.as_bytes(), &self.rocksdb_write_options())
-                .map_err(|err| CacheError::RocksDb(err.to_string()))?;
+            db.delete_opt(key.as_bytes(), &self.rocksdb_write_options()?)
+                .map_err(Self::write_error)?;
             Ok(())
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -3546,8 +3659,8 @@ impl StorageEngineApi for StorageEngineRocksDb {
             for key in keys {
                 batch.delete(key);
             }
-            db.write_opt(batch, &self.rocksdb_write_options())
-                .map_err(|err| CacheError::RocksDb(err.to_string()))?;
+            db.write_opt(batch, &self.rocksdb_write_options()?)
+                .map_err(Self::write_error)?;
             Ok(())
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
