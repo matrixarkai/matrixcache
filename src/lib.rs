@@ -94,3 +94,7 @@ mod background_recovery_tests;
 #[cfg(test)]
 #[path = "tests/key_snapshots.rs"]
 mod key_snapshot_tests;
+
+#[cfg(test)]
+#[path = "tests/disabled_ssd_peeks.rs"]
+mod disabled_ssd_peek_tests;

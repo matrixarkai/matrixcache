@@ -904,6 +904,9 @@ impl CacheInner {
     }
 
     fn ssd_block_exists(&self, key: &CacheKey) -> bool {
+        if !self.ssd_store.holds_blocks() {
+            return false;
+        }
         let store_key = Self::inline_ssd_store_key(key);
         self.ssd_store
             .peek(Self::inline_ssd_store_key_str(&store_key))
