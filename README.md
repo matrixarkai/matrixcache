@@ -128,6 +128,23 @@ tools/compare_backend_reports.py /tmp/matrixcache-rocksdb-backend-baseline.json 
 
 ## Durability
 
+### Ordered batches and queued writes
+
+Storage engines support ordered shared-buffer batches with one result per input. The
+RocksDB backend groups the writes into a write batch; other backends retain ordered
+individual operations and partial-failure results. Multi-device batches preserve result
+order and repeated-key order within each device, but device commits are independent:
+this is not a cross-device transaction.
+
+The asynchronous storage worker offers opt-in `start_batched` coalescing with operation
+and payload limits. It groups only writes already in the queue, keeps deletes as ordering
+barriers, and runs callbacks in input order after the grouped write. Existing constructors
+retain individual-write behavior. Batching does not change the configured sync policy or
+make an enqueue acknowledgement durable. See the [worker](src/runtime/async_storage.rs)
+and [storage engines](src/runtime/storage_engines.rs) for the embedding APIs.
+
+### Tier persistence
+
 Each durable tier decides separately whether a write also survives the machine
 losing power, and the two default differently. Both are set on `CacheOptions`.
 
