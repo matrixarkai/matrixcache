@@ -7,6 +7,69 @@ use matrixcache::{
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
+fn native_ssd_write_policies_control_wal_for_single_and_multi_device_writes() {
+    use matrixcache::{SsdWritePolicy, StorageEngineMultiSsd, StorageEngineRocksDb};
+    fn wal_bytes(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|file| file.unwrap())
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "log"))
+            .map(|file| file.metadata().unwrap().len())
+            .sum()
+    }
+    for policy in [
+        SsdWritePolicy::Buffered,
+        SsdWritePolicy::Durable,
+        SsdWritePolicy::Rebuildable,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("single");
+        let mut engine = StorageEngineRocksDb::new(path.to_string_lossy());
+        assert_eq!(engine.write_policy(), SsdWritePolicy::Buffered);
+        engine = engine.with_write_policy(policy);
+        assert_eq!(engine.clone().write_policy(), policy);
+        assert!(engine.start());
+        engine.put("one", vec![1; 1024]).unwrap();
+        engine.async_put(buffer("two", &[2; 1024]), |_| {}).unwrap();
+        for result in engine.put_buffers_batch(vec![
+            buffer("three", &[3; 1024]),
+            buffer("four", &[4; 1024]),
+        ]) {
+            result.unwrap();
+        }
+        assert_eq!(engine.get("one").unwrap().value(), &[1; 1024]);
+        engine.delete("one").unwrap();
+        assert!(matches!(engine.get("one"), Err(CacheError::NotFound)));
+        engine.reset().unwrap();
+        assert!(matches!(engine.get("two"), Err(CacheError::NotFound)));
+        assert_eq!(wal_bytes(&path) == 0, policy == SsdWritePolicy::Rebuildable);
+        assert!(engine.stop());
+
+        let paths: Vec<_> = (0..3)
+            .map(|i| directory.path().join(format!("multi-{i}")))
+            .collect();
+        let mut multi =
+            StorageEngineMultiSsd::with_paths(paths[..2].to_vec(), 0).with_write_policy(policy);
+        assert!(multi.start());
+        assert!(multi.add_device(paths[2].to_string_lossy()));
+        let inputs = (0..64)
+            .map(|i| buffer(&format!("key-{i}"), &[7; 1024]))
+            .collect();
+        for result in multi.put_buffers_batch(inputs) {
+            result.unwrap();
+        }
+        for i in 0..64 {
+            assert_eq!(multi.get(&format!("key-{i}")).unwrap().value(), &[7; 1024]);
+        }
+        for path in &paths {
+            assert_eq!(wal_bytes(path) == 0, policy == SsdWritePolicy::Rebuildable);
+        }
+        assert!(multi.stop());
+    }
+}
+
 #[test]
 fn queued_rocksdb_batches_preserve_versions_delete_order_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
