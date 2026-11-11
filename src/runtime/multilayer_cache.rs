@@ -11882,6 +11882,17 @@ impl ShardedMultiLayerCache {
         Ok(Self::aggregate_gc_reports(shard_id, reports))
     }
 
+    /// Snapshot the keys in a logical shard without reading values or filesystem metadata.
+    /// Each key is returned once, even when present in multiple tiers or cache shards.
+    pub fn keys_for_shard(&self, shard_id: ShardId) -> Vec<CacheKey> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.keys_for_shard(shard_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn entries_for_shard(&self, shard_id: ShardId) -> Vec<CacheEntryInfo> {
         let mut entries = self
             .shards
@@ -14776,6 +14787,24 @@ impl MultiLayerCache {
             memory_entries_removed,
             disk_bytes_removed,
         })
+    }
+
+    /// Snapshot the keys in a logical shard without reading values or filesystem metadata.
+    /// Includes all three indexed tiers, deduplicated in key order. Like the diagnostic
+    /// entry snapshot, this does not include unindexed legacy files. Mutations after the
+    /// snapshot are not reflected in the returned keys.
+    pub fn keys_for_shard(&self, shard_id: ShardId) -> Vec<CacheKey> {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        inner
+            .memory
+            .keys()
+            .chain(inner.pmem.keys())
+            .chain(inner.disk_index.keys())
+            .filter(|key| key.shard_id == shard_id)
+            .map(|key| key.as_ref().clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub fn entries_for_shard(&self, shard_id: ShardId) -> Vec<CacheEntryInfo> {

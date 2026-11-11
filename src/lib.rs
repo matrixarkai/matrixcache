@@ -90,3 +90,7 @@ mod ssd_promotion_tests;
 #[cfg(test)]
 #[path = "tests/background_recovery.rs"]
 mod background_recovery_tests;
+
+#[cfg(test)]
+#[path = "tests/key_snapshots.rs"]
+mod key_snapshot_tests;
