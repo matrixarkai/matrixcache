@@ -5,6 +5,65 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn ssd_frequency_admission_also_filters_upper_tier_demotions() {
+        for pmem in [false, true] {
+            for (filter, replacement) in [
+                (false, CacheReplacementPolicy::WeightedHotnessLru),
+                (true, CacheReplacementPolicy::WeightedHotnessLru),
+                (true, CacheReplacementPolicy::Fifo),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let policy = CacheTieringPolicy {
+                    memory_capacity_bytes: 64,
+                    pmem_capacity_bytes: if pmem { 64 } else { 0 },
+                    ssd_capacity_bytes: 90,
+                    memory_hotness_threshold: 1000,
+                    pmem_admit_hotness_threshold: 1000,
+                    ssd_admit_hotness_threshold: 99,
+                    max_memory_block_bytes: 64,
+                    max_pmem_block_bytes: 64,
+                    max_ssd_block_bytes: 90,
+                    ssd_write_through: false,
+                    ..CacheTieringPolicy::default()
+                };
+                let cache = MultiLayerCache::with_tiering_policy(directory.path(), policy,
+                    CacheBlockOptions { compression: CacheCompression::None, min_compress_bytes: usize::MAX });
+                if pmem { cache.set_pmem_paths(vec![directory.path().join("pmem")]); }
+                cache.set_replacement_policy_for_tier(CacheTier::Memory, CacheReplacementPolicy::Fifo);
+                cache.set_replacement_policy_for_tier(CacheTier::Pmem, CacheReplacementPolicy::Fifo);
+                cache.set_replacement_policy_for_tier(CacheTier::Ssd, replacement);
+                let hot = CacheKey::string(0, "hot-ssd-resident");
+                cache.put_with_admission(hot.clone(), vec![1; 64], CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Object, shard_id: 0, routing_slot: Some(7),
+                    block_bytes: 64, hotness: 99, pinned: false,
+                }).unwrap();
+                for _ in 0..128 { assert!(cache.get_no_promotion(&hot).unwrap().is_some()); }
+                cache.set_ssd_admission_filter_enabled(filter);
+                let before = cache.stats().ssd_bytes_written;
+                for index in 0..4 {
+                    cache.put(CacheKey::string(0, &format!("cold-{index}")), vec![2; 64]).unwrap();
+                }
+                let protected = filter && replacement != CacheReplacementPolicy::Fifo;
+                assert_eq!(cache.get_no_promotion(&hot).unwrap().map(|value| value.value),
+                    protected.then(|| vec![1; 64]), "pmem={pmem} filter={filter} replacement={replacement:?}");
+                let stats = cache.stats();
+                if protected {
+                    assert_eq!(stats.ssd_bytes_written, before);
+                    assert_eq!(stats.ssd_evictions, 0);
+                    assert!(stats.ssd_admission_rejected > 0);
+                } else {
+                    assert!(stats.ssd_bytes_written > before);
+                    assert!(stats.ssd_evictions > 0);
+                }
+                assert!(stats.memory_evictions > 0);
+                if pmem { assert!(stats.pmem_evictions > 0); }
+                assert!(cache.stop());
+            }
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn expiry_victim_scan_preserves_pins_and_disabled_ttl() {
         let cache = MultiLayerCache::with_options(CacheOptions::new(1024, 0, 0));
         let pinned = CacheKey::string(0, "expired-pinned");

@@ -2508,6 +2508,25 @@ impl CacheInner {
                 self.stats.ssd_oversize_rejections.saturating_add(1);
             return false;
         }
+        // Demotions are SSD admission candidates too. Otherwise a stream of
+        // cold upper-tier victims can bypass the configured frequency filter.
+        if self.ssd_access_frequency.is_some()
+            && self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64
+        {
+            let meta = self.metadata_of(key);
+            let request = CacheAdmissionRequest {
+                block_kind: meta.map_or(CacheBlockKind::Object, |meta| meta.block_kind),
+                shard_id: key.shard_id,
+                routing_slot: meta.and_then(CacheEntryMeta::routing_slot),
+                block_bytes: value.len(),
+                hotness: meta.map_or(0, |meta| meta.hotness.load(Ordering::Relaxed)),
+                pinned: false,
+            };
+            if self.incoming_ssd_block_is_colder_than_existing_groups(key, &request, value.len(), false) {
+                self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
+                return false;
+            }
+        }
         self.evict_ssd_for(block_len as u64);
         if self.ssd_bytes.saturating_add(block_len as u64) > self.ssd_capacity_bytes as u64 {
             self.stats.ssd_admission_rejected = self.stats.ssd_admission_rejected.saturating_add(1);
