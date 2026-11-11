@@ -62,6 +62,23 @@ replace the application's commit protocol.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
 
+### Read ownership and refill cost
+
+Use shared-buffer reads when the caller can consume an owned shared handle, and
+copied reads when it needs independent mutable bytes. Raw RocksDB SSD reads use
+scoped native pins while validating their encoded block; the native pin does not
+escape into the caller. Returning independent bytes still requires an owned
+result, and compressed blocks still require decoding. This is not a promise that
+every cache read is zero-copy.
+
+An SSD hit refills an enabled upper tier: DRAM when it can admit the value, or
+PMEM when DRAM cannot and PMEM can. With promotion disabled, SSD-instance-only
+mode, or no upper-tier capacity, it skips refill work. Revalidation prevents a
+raced refill from reinstalling an invalidated value. Idle background polls also
+avoid taking the cache write lock when their read-side check finds no work.
+These paths reduce copying and lock contention; benchmark hit, miss, promotion,
+and concurrent-write workloads separately before treating them as a QPS result.
+
 ## SSD backend
 
 RocksDB is the default SSD key-value backend, enabled by the `rocksdb-ssd`
