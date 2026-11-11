@@ -644,6 +644,31 @@ impl BaseLruList {
         true
     }
 
+    fn put_shared(&mut self, key: Arc<str>) {
+        if self.get(&key) {
+            return;
+        }
+        let node = self.arena.alloc(Arc::clone(&key));
+        self.arena.link_front(&mut self.list, node);
+        self.index.insert(key, node);
+    }
+
+    fn take_shared(&mut self, key: &str) -> Option<Arc<str>> {
+        let (key, node) = self.index.remove_entry(key)?;
+        self.arena.unlink(&mut self.list, node);
+        self.arena.release(node);
+        Some(key)
+    }
+
+    fn pop_back_shared(&mut self) -> Option<Arc<str>> {
+        let node = self.list.back()?;
+        let (key, _) = self.index.remove_entry(self.arena.key(node))
+            .expect("linked key belongs to index");
+        self.arena.unlink(&mut self.list, node);
+        self.arena.release(node);
+        Some(key)
+    }
+
     pub fn delete(&mut self, key: &str) -> bool {
         let Some(node) = self.index.remove(key) else {
             return false;
@@ -670,14 +695,7 @@ impl BaseLruList {
     }
 
     pub fn evict_one(&mut self) -> Vec<PolicyKey> {
-        let Some(node) = self.list.back() else {
-            return Vec::new();
-        };
-        let key = self.arena.key(node).to_string();
-        self.arena.unlink(&mut self.list, node);
-        self.arena.release(node);
-        self.index.remove(key.as_str());
-        vec![key]
+        self.pop_back_shared().map(|key| vec![key.to_string()]).unwrap_or_default()
     }
 
     pub fn reset(&mut self) {
@@ -804,8 +822,8 @@ impl GhostLruList {
     }
 
     pub fn downgrade(&mut self) {
-        for key in self.data_list.evict_one() {
-            self.ghost_list.put(key);
+        if let Some(key) = self.data_list.pop_back_shared() {
+            self.ghost_list.put_shared(key);
         }
     }
 
@@ -831,19 +849,15 @@ impl GhostLruList {
     }
 
     pub fn pop(&mut self, key: &str) -> GhostLruPopResult {
-        if self.data_list.delete(key) {
-            return GhostLruPopResult {
-                item: key.to_string(),
-                is_ghost: false,
-            };
-        }
-        if self.ghost_list.delete(key) {
-            return GhostLruPopResult {
-                item: key.to_string(),
-                is_ghost: true,
-            };
+        if let Some((item, is_ghost)) = self.pop_shared(key) {
+            return GhostLruPopResult { item: item.to_string(), is_ghost };
         }
         GhostLruPopResult::default()
+    }
+
+    fn pop_shared(&mut self, key: &str) -> Option<(Arc<str>, bool)> {
+        self.data_list.take_shared(key).map(|item| (item, false))
+            .or_else(|| self.ghost_list.take_shared(key).map(|item| (item, true)))
     }
 
     pub fn reset(&mut self) {
@@ -934,6 +948,13 @@ pub struct ArcPopResult {
     pub is_ghost: bool,
 }
 
+#[derive(Default)]
+struct SharedArcPopResult {
+    item: Option<Arc<str>>,
+    is_active: bool,
+    is_ghost: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArcList {
     capacity: usize,
@@ -993,12 +1014,12 @@ impl ArcList {
 
     pub fn put(&mut self, key: PolicyKey) {
         if !self.refresh_active(&key) {
-            self.access(key);
+            self.access(std::borrow::Cow::Owned(key));
         }
     }
 
     pub fn get(&mut self, key: &str) -> bool {
-        self.refresh_active(key) || self.access(key.to_owned())
+        self.refresh_active(key) || self.access(std::borrow::Cow::Borrowed(key))
     }
 
     pub fn evict(&mut self) -> Vec<PolicyKey> {
@@ -1033,25 +1054,26 @@ impl ArcList {
         !key.is_empty() && self.active_list.data_list.get(key)
     }
 
-    fn access(&mut self, key: PolicyKey) -> bool {
+    fn access(&mut self, key: std::borrow::Cow<'_, str>) -> bool {
         let result = self.pop(&key);
-        if result.item.is_empty() {
+        let Some(shared) = result.item else {
             if self.fetch_list.total_size() >= self.capacity() {
                 if self.fetch_list.size() < self.capacity() {
-                    self.fetch_list.evict_one_ghost();
+                    drop(self.fetch_list.ghost_list.pop_back_shared());
                     self.replace(false);
                 } else {
-                    self.fetch_list.evict_one_data();
+                    drop(self.fetch_list.data_list.pop_back_shared());
                 }
             } else if self.total_size() >= self.capacity() {
                 if self.total_size() >= self.capacity().saturating_mul(2) {
-                    self.active_list.evict_one_ghost();
+                    drop(self.active_list.ghost_list.pop_back_shared());
                 }
                 self.replace(false);
             }
-            self.fetch_list.put(key);
-            false
-        } else if result.is_ghost {
+            self.fetch_list.put(key.into_owned());
+            return false;
+        };
+        if result.is_ghost {
             if result.is_active {
                 let c = self.capacity();
                 let mut p = self.fetch_list.capacity();
@@ -1062,7 +1084,7 @@ impl ArcList {
                 self.fetch_list.set_capacity(p);
                 self.active_list.set_capacity(c.saturating_sub(p));
                 self.replace(true);
-                self.active_list.put(key);
+                self.active_list.data_list.put_shared(shared);
             } else {
                 let c = self.capacity();
                 let mut p = self.fetch_list.capacity();
@@ -1073,11 +1095,11 @@ impl ArcList {
                 self.fetch_list.set_capacity(p);
                 self.active_list.set_capacity(c.saturating_sub(p));
                 self.replace(false);
-                self.active_list.put(key);
+                self.active_list.data_list.put_shared(shared);
             }
             false
         } else {
-            self.active_list.put(key);
+            self.active_list.data_list.put_shared(shared);
             true
         }
     }
@@ -1093,24 +1115,24 @@ impl ArcList {
         }
     }
 
-    fn pop(&mut self, key: &str) -> ArcPopResult {
-        let fetch = self.fetch_list.pop(key);
-        if !fetch.item.is_empty() {
-            return ArcPopResult {
-                item: fetch.item,
+    fn pop(&mut self, key: &str) -> SharedArcPopResult {
+        let fetch = self.fetch_list.pop_shared(key).filter(|(item, _)| !item.is_empty());
+        if let Some((item, is_ghost)) = fetch {
+            return SharedArcPopResult {
+                item: Some(item),
                 is_active: false,
-                is_ghost: fetch.is_ghost,
+                is_ghost,
             };
         }
-        let active = self.active_list.pop(key);
-        if !active.item.is_empty() {
-            return ArcPopResult {
-                item: active.item,
+        let active = self.active_list.pop_shared(key).filter(|(item, _)| !item.is_empty());
+        if let Some((item, is_ghost)) = active {
+            return SharedArcPopResult {
+                item: Some(item),
                 is_active: true,
-                is_ghost: active.is_ghost,
+                is_ghost,
             };
         }
-        ArcPopResult::default()
+        SharedArcPopResult::default()
     }
 }
 
