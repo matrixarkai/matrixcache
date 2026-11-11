@@ -117,6 +117,15 @@ still perform deletion, and sharded snapshots visit cache shards sequentially
 rather than atomically. Budget the additional index metadata for enabled
 namespaces instead of treating reduced scan work as free memory.
 
+`invalidate_record(shard_id, namespace, record_key)` uses this lookup directly:
+registered namespaces select only the record's indexed keys, while unregistered
+namespaces keep the tier-key scan. Selected keys still go through normal
+invalidation; the index does not skip persistent-tier deletion or change error
+handling. Register namespaces before sustained record-scoped invalidation, and
+budget their index memory separately from cached payload bytes. See the
+[lookup implementation](src/runtime/record_key_index.rs) and
+[invalidation implementation](src/runtime/multilayer_cache.rs).
+
 ## SSD backend
 
 RocksDB is the default SSD key-value backend, enabled by the `rocksdb-ssd`
