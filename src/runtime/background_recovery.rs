@@ -28,7 +28,7 @@ impl MultiLayerCache {
                 report.skipped_files = report.skipped_files.saturating_add(1);
                 continue;
             }
-            inner.disk_index.insert(shared.clone(), *block_len);
+            inner.insert_disk_index(shared.clone(), *block_len);
             inner
                 .disk_order
                 .push_back_if_absent_shared(Arc::clone(&shared));

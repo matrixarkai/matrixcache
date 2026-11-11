@@ -60,6 +60,7 @@ pub use async_storage::{
     AsyncStorageRuntime, StorageDeleteCompletion, StorageWriteCompletion, StorageWriteRejected,
 };
 include!("runtime/multilayer_cache.rs");
+include!("runtime/record_key_index.rs");
 include!("runtime/background_recovery.rs");
 include!("runtime/cold_tier_migration.rs");
 include!("runtime/cache_facades.rs");
@@ -98,3 +99,7 @@ mod key_snapshot_tests;
 #[cfg(test)]
 #[path = "tests/disabled_ssd_peeks.rs"]
 mod disabled_ssd_peek_tests;
+
+#[cfg(test)]
+#[path = "tests/record_key_index.rs"]
+mod record_key_index_tests;
