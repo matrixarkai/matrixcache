@@ -2959,6 +2959,8 @@ enum SsdTierStore {
     Disabled {
         disk_dir: PathBuf,
         ssd_paths: Vec<PathBuf>,
+        #[cfg(feature = "rocksdb-ssd")]
+        write_policy: SsdWritePolicy,
     },
     Single(StorageEngineRocksDb),
     Multi(StorageEngineMultiSsd),
@@ -2979,6 +2981,8 @@ impl SsdTierStore {
             return Self::Disabled {
                 disk_dir: disk_dir.to_path_buf(),
                 ssd_paths: ssd_paths.to_vec(),
+                #[cfg(feature = "rocksdb-ssd")]
+                write_policy: SsdWritePolicy::default(),
             };
         }
         Self::build(disk_dir, ssd_paths, capacity_bytes)
@@ -3027,10 +3031,32 @@ impl SsdTierStore {
         if capacity_bytes == 0 {
             return;
         }
-        if let Self::Disabled { disk_dir, ssd_paths } = self {
+        if let Self::Disabled { disk_dir, ssd_paths, .. } = self {
             let (disk_dir, ssd_paths) = (disk_dir.clone(), ssd_paths.clone());
+            #[cfg(feature = "rocksdb-ssd")]
+            let write_policy = self.write_policy();
             *self = Self::build(&disk_dir, &ssd_paths, capacity_bytes);
+            #[cfg(feature = "rocksdb-ssd")]
+            self.set_write_policy(write_policy);
             let _ = self.start();
+        }
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    fn set_write_policy(&mut self, policy: SsdWritePolicy) {
+        match self {
+            Self::Disabled { write_policy, .. } => *write_policy = policy,
+            Self::Single(store) => store.set_write_policy(policy),
+            Self::Multi(store) => store.set_write_policy(policy),
+        }
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    fn write_policy(&self) -> SsdWritePolicy {
+        match self {
+            Self::Disabled { write_policy, .. } => *write_policy,
+            Self::Single(store) => store.write_policy(),
+            Self::Multi(store) => store.write_policy(),
         }
     }
 
@@ -3885,6 +3911,20 @@ impl MultiLayerCache {
             .expect("cache lock poisoned")
             .ssd_write_budget
             .target_bytes_per_sec()
+    }
+
+    /// Select subsequent native SSD block write behavior, including queued
+    /// work when it executes. This does not flush earlier writes or make cache
+    /// manifests and block writes a transaction. Rebuildable mode requires
+    /// discarding or rebuilding the cache after a crash. Upper tiers are unchanged.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_ssd_write_policy(&self, policy: SsdWritePolicy) {
+        self.inner.write().expect("cache lock poisoned").ssd_store.set_write_policy(policy);
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn ssd_write_policy(&self) -> SsdWritePolicy {
+        self.inner.read().expect("cache lock poisoned").ssd_store.write_policy()
     }
 
     pub fn set_capacity_for_tier(&self, tier: CacheTier, capacity_bytes: usize) {
@@ -12544,6 +12584,18 @@ impl ShardedMultiLayerCache {
             .iter()
             .map(|shard| shard.ssd_write_budget_bytes_per_sec())
             .sum()
+    }
+
+    /// Apply to each shard's subsequent SSD writes. Concurrent writes may
+    /// observe the transition at different times on different shards.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_ssd_write_policy(&self, policy: SsdWritePolicy) {
+        for shard in self.shards.iter() { shard.set_ssd_write_policy(policy); }
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn ssd_write_policies(&self) -> Vec<SsdWritePolicy> {
+        self.shards.iter().map(MultiLayerCache::ssd_write_policy).collect()
     }
 
     pub fn set_capacity_for_tier(&self, tier: CacheTier, capacity: usize) {

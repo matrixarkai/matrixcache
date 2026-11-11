@@ -8,6 +8,8 @@
 //! `--frequency-ssd` opts into bounded recent-frequency SSD admission and eviction.
 //! `--rounds N` repeats the working set 1..=1024 times (default: 4).
 //! `--ssd-write-budget N` sets the caller-reported SSD byte-rate target (zero: unlimited).
+//! `--rebuildable-ssd` disables native block WAL writes for disposable data.
+//! Restart checks are controlled shutdown checks, not crash recovery evidence.
 
 use matrixcache::{CacheAdmissionRequest, CacheBlockKind, CacheKey, CacheOptions, MultiLayerCache};
 use std::time::Instant;
@@ -28,6 +30,10 @@ fn main() {
     let mut promoted_working_set = false;
     let mut fifo_ssd = false;
     let mut frequency_ssd = false;
+    #[cfg(feature = "rocksdb-ssd")]
+    let mut rebuildable_ssd = false;
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    let rebuildable_ssd = false;
     let mut rounds = 4usize;
     let mut write_budget = 0u64;
     let mut args = std::env::args().skip(1);
@@ -36,6 +42,14 @@ fn main() {
             "--promoted-working-set" => promoted_working_set = true,
             "--fifo-ssd" => fifo_ssd = true,
             "--frequency-ssd" => frequency_ssd = true,
+            "--rebuildable-ssd" => {
+                #[cfg(not(feature = "rocksdb-ssd"))]
+                panic!("--rebuildable-ssd requires rocksdb-ssd");
+                #[cfg(feature = "rocksdb-ssd")]
+                {
+                    rebuildable_ssd = true;
+                }
+            }
             "--ssd-write-budget" => {
                 write_budget = args
                     .next()
@@ -66,6 +80,10 @@ fn main() {
         options
     };
     let cache = MultiLayerCache::with_options(options());
+    #[cfg(feature = "rocksdb-ssd")]
+    if rebuildable_ssd {
+        cache.set_ssd_write_policy(matrixcache::SsdWritePolicy::Rebuildable);
+    }
     cache.start().unwrap();
     cache.set_ssd_admission_filter_enabled(frequency_ssd);
     cache.set_ssd_write_budget_bytes_per_sec(write_budget);
@@ -138,6 +156,10 @@ fn main() {
     assert!(cache.stop());
     drop(cache);
     let recovered = MultiLayerCache::with_options(options());
+    #[cfg(feature = "rocksdb-ssd")]
+    if rebuildable_ssd {
+        recovered.set_ssd_write_policy(matrixcache::SsdWritePolicy::Rebuildable);
+    }
     recovered.start().unwrap();
     let mut retained = 0;
     for (index, key) in keys.iter().enumerate() {
@@ -151,7 +173,7 @@ fn main() {
     }
     assert!(retained > 0);
     let puts = rounds * keys.len();
-    println!("frequency_ssd={frequency_ssd} fifo_ssd={fifo_ssd} promoted_working_set={promoted_working_set} rounds={rounds} puts={puts} reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
+    println!("rebuildable_ssd={rebuildable_ssd} frequency_ssd={frequency_ssd} fifo_ssd={fifo_ssd} promoted_working_set={promoted_working_set} rounds={rounds} puts={puts} reads={} hits={hits} misses={misses} elapsed_s={elapsed:.3} workload_ops_per_s={:.1} memory_evictions={} pmem_evictions={} ssd_evictions={} ssd_rejections={} restart_retained={retained}",
         hits + misses, (puts + hits + misses) as f64 / elapsed,
         stats.memory_evictions, stats.pmem_evictions, stats.ssd_evictions, stats.ssd_admission_rejected);
     assert!(recovered.stop());

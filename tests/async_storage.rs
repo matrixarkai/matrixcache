@@ -9,6 +9,97 @@ use std::time::Duration;
 
 #[cfg(feature = "rocksdb-ssd")]
 #[test]
+fn sharded_ssd_write_policy_reaches_newly_enabled_tiers() {
+    use matrixcache::{CacheKey, CacheOptions, CacheTier, ShardedMultiLayerCache, SsdWritePolicy};
+    let directory = tempfile::tempdir().unwrap();
+    let options = CacheOptions::new(0, 0, 0).with_ssd_paths([directory.path().join("ssd")]);
+    let cache = ShardedMultiLayerCache::with_options(options, 3);
+    assert_eq!(
+        cache.ssd_write_policies(),
+        vec![SsdWritePolicy::Buffered; 3]
+    );
+    cache.set_ssd_write_policy(SsdWritePolicy::Rebuildable);
+    cache.start().unwrap();
+    cache.set_capacity_for_tier(CacheTier::Ssd, 256 * 1024);
+    assert_eq!(
+        cache.ssd_write_policies(),
+        vec![SsdWritePolicy::Rebuildable; 3]
+    );
+    for i in 0..64 {
+        let key = CacheKey::string(0, &format!("key-{i}"));
+        cache.put(key.clone(), vec![i as u8; 1024]).unwrap();
+        assert_eq!(cache.get(&key).unwrap().unwrap(), vec![i as u8; 1024]);
+    }
+    cache.set_ssd_write_policy(SsdWritePolicy::Durable);
+    assert_eq!(cache.ssd_write_policies(), vec![SsdWritePolicy::Durable; 3]);
+    assert!(cache.stop());
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
+fn multilayer_ssd_policy_survives_enable_and_restart_on_single_and_multi_device_stores() {
+    use matrixcache::{CacheKey, CacheOptions, CacheTier, MultiLayerCache, SsdWritePolicy};
+    for devices in [1, 3] {
+        for capacity in [0, 128 * 1024] {
+            let directory = tempfile::tempdir().unwrap();
+            let paths: Vec<_> = (0..devices)
+                .map(|i| directory.path().join(format!("ssd-{i}")))
+                .collect();
+            let options = CacheOptions::new(0, 0, capacity).with_ssd_paths(paths.clone());
+            let cache = MultiLayerCache::with_options(options);
+            assert_eq!(cache.ssd_write_policy(), SsdWritePolicy::Buffered);
+            cache.set_ssd_write_policy(SsdWritePolicy::Rebuildable);
+            cache.start().unwrap();
+            if capacity == 0 {
+                cache.set_capacity_for_tier(CacheTier::Ssd, 128 * 1024);
+            }
+            assert_eq!(cache.ssd_write_policy(), SsdWritePolicy::Rebuildable);
+            for i in 0..64 {
+                cache
+                    .put(CacheKey::string(0, &format!("key-{i}")), vec![7; 1024])
+                    .unwrap();
+            }
+            let wal_bytes = || -> u64 {
+                paths
+                    .iter()
+                    .map(|path| {
+                        std::fs::read_dir(path.join("rocksdb-cache-blocks"))
+                            .unwrap()
+                            .map(|file| file.unwrap())
+                            .filter(|file| file.path().extension().is_some_and(|ext| ext == "log"))
+                            .map(|file| file.metadata().unwrap().len())
+                            .sum::<u64>()
+                    })
+                    .sum()
+            };
+            assert_eq!(wal_bytes(), 0);
+            for i in 0..64 {
+                let key = CacheKey::string(0, &format!("key-{i}"));
+                assert_eq!(
+                    cache.get_no_promotion(&key).unwrap().unwrap().value,
+                    vec![7; 1024]
+                );
+            }
+            cache.set_ssd_write_policy(SsdWritePolicy::Durable);
+            let durable = CacheKey::string(0, "durable");
+            cache.put(durable.clone(), vec![8; 1024]).unwrap();
+            assert!(wal_bytes() > 0);
+            assert!(cache.stop());
+            cache.start().unwrap();
+            assert_eq!(cache.ssd_write_policy(), SsdWritePolicy::Durable);
+            assert_eq!(
+                cache.get_no_promotion(&durable).unwrap().unwrap().value,
+                vec![8; 1024]
+            );
+            cache.set_ssd_write_policy(SsdWritePolicy::Buffered);
+            assert_eq!(cache.ssd_write_policy(), SsdWritePolicy::Buffered);
+            assert!(cache.stop());
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
 fn native_ssd_write_policies_control_wal_for_single_and_multi_device_writes() {
     use matrixcache::{SsdWritePolicy, StorageEngineMultiSsd, StorageEngineRocksDb};
     fn wal_bytes(path: &std::path::Path) -> u64 {
