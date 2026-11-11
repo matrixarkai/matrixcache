@@ -9,6 +9,98 @@ use std::time::Duration;
 
 #[cfg(feature = "rocksdb-ssd")]
 #[test]
+fn shared_ssd_targets_resize_during_writes_without_reopening_stores() {
+    let (completed, completion) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        use matrixcache::{SsdReadCache, StorageEngineRocksDb};
+        let directory = tempfile::tempdir().unwrap();
+        let pool =
+            SsdReadCache::new_with_write_buffer_budget(8 * 1024 * 1024, 2 * 1024 * 1024, true)
+                .unwrap();
+        assert!(pool.try_set_capacity_bytes(1024 * 1024).is_err());
+        assert_eq!(pool.capacity_bytes(), 8 * 1024 * 1024);
+        assert!(pool.try_set_write_buffer_capacity_bytes(0).is_err());
+        assert!(pool
+            .try_set_write_buffer_capacity_bytes(16 * 1024 * 1024)
+            .is_err());
+        assert_eq!(pool.write_buffer_capacity_bytes(), Some(2 * 1024 * 1024));
+        let mut store = StorageEngineRocksDb::new(directory.path().join("db").to_string_lossy());
+        store.set_read_cache(pool.clone()).unwrap();
+        assert!(store.start());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let controllers: Vec<_> = [false, true]
+            .into_iter()
+            .map(|write_target| {
+                let pool = pool.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for round in 0..128 {
+                        let result = if write_target {
+                            pool.try_set_write_buffer_capacity_bytes(if round % 2 == 0 {
+                                256 * 1024
+                            } else {
+                                2 * 1024 * 1024
+                            })
+                        } else {
+                            pool.try_set_capacity_bytes(if round % 2 == 0 {
+                                512 * 1024
+                            } else {
+                                4 * 1024 * 1024
+                            })
+                        };
+                        match result {
+                            Ok(()) | Err(CacheError::InvalidConfig(_)) => {}
+                            Err(error) => panic!("unexpected resize error: {error}"),
+                        }
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for key in 0..512 {
+            let mut retries = 0;
+            loop {
+                match store.put(&format!("key-{key}"), vec![(key % 251) as u8; 4096]) {
+                    Ok(_) => break,
+                    Err(CacheError::CapacityExceeded) if retries < 500 => {
+                        retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("write failed after {retries} retries: {error}"),
+                }
+            }
+        }
+        for controller in controllers {
+            controller.join().unwrap();
+        }
+        assert!(pool.write_buffer_capacity_bytes().unwrap() <= pool.capacity_bytes());
+        let observer = pool.clone();
+        observer
+            .try_set_write_buffer_capacity_bytes(256 * 1024)
+            .unwrap();
+        observer.try_set_capacity_bytes(512 * 1024).unwrap();
+        assert_eq!(pool.capacity_bytes(), 512 * 1024);
+        assert_eq!(pool.write_buffer_capacity_bytes(), Some(256 * 1024));
+        for key in 0..512 {
+            assert_eq!(
+                store.get(&format!("key-{key}")).unwrap().value(),
+                vec![(key % 251) as u8; 4096]
+            );
+        }
+        assert!(store.stop());
+        assert_eq!(pool.write_buffer_usage_bytes(), Some(0));
+        completed.send(()).unwrap();
+    });
+    completion
+        .recv_timeout(Duration::from_secs(30))
+        .expect("resize and write pressure must make progress");
+    worker.join().unwrap();
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
 fn managed_ssd_write_buffers_share_pressure_and_release_arenas_after_close() {
     let (completed, completion) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -132,6 +224,34 @@ fn shared_ssd_read_cache_is_used_across_independent_stores() {
     assert!(
         pool.usage_bytes() > 0,
         "reads must populate the configured pool"
+    );
+    assert!(pool.usage_bytes() <= pool.capacity_bytes());
+    let observer = pool.clone();
+    assert!(observer.try_set_write_buffer_capacity_bytes(1024).is_err());
+    observer.try_set_capacity_bytes(128 * 1024).unwrap();
+    assert_eq!(pool.capacity_bytes(), 128 * 1024);
+    for (device, store) in stores.iter().enumerate() {
+        for i in 0..128 {
+            assert_eq!(
+                store.get(&format!("key-{i}")).unwrap().value(),
+                vec![device as u8; 4096]
+            );
+        }
+    }
+    assert!(pool.usage_bytes() <= pool.capacity_bytes());
+    observer.try_set_capacity_bytes(1024 * 1024).unwrap();
+    assert_eq!(pool.capacity_bytes(), 1024 * 1024);
+    for (device, store) in stores.iter().enumerate() {
+        for i in 0..128 {
+            assert_eq!(
+                store.get(&format!("key-{i}")).unwrap().value(),
+                vec![device as u8; 4096]
+            );
+        }
+    }
+    assert!(
+        pool.usage_bytes() > 128 * 1024,
+        "growth must reach the native cache"
     );
     assert!(pool.usage_bytes() <= pool.capacity_bytes());
     for store in &mut stores {
