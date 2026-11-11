@@ -62,6 +62,11 @@ fn default_ssd_recovery_batch_size() -> usize {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheOptions {
+    /// Runtime-only native read-cache sharing. Cloned shard options retain
+    /// the same pool; serialization does not preserve this process-local handle.
+    #[cfg(feature = "rocksdb-ssd")]
+    #[serde(skip)]
+    pub ssd_read_cache: Option<SsdReadCache>,
     pub dram_capacity: usize,
     #[serde(default)]
     pub pmem_capacity: usize,
@@ -215,6 +220,8 @@ impl Default for CacheOptions {
     fn default() -> Self {
         let policy = CacheTieringPolicy::default();
         Self {
+            #[cfg(feature = "rocksdb-ssd")]
+            ssd_read_cache: None,
             dram_capacity: policy.memory_capacity_bytes,
             pmem_capacity: policy.pmem_capacity_bytes,
             ssd_capacity: policy.ssd_capacity_bytes,
@@ -2352,6 +2359,8 @@ pub type StorageEnginePmem = StorageEngineSimple;
 /// not have to touch it; `recover_data` walks the database itself, which is what
 /// makes a restart able to re-enumerate what is on disk.
 pub struct StorageEngineRocksDb {
+    #[cfg(feature = "rocksdb-ssd")]
+    read_cache: Option<SsdReadCache>,
     db_path: String,
     initialized: bool,
     /// Keyed by a `Box<str>` rather than a `String`: the key is the
@@ -2410,8 +2419,53 @@ pub enum SsdWritePolicy {
 }
 
 #[cfg(feature = "rocksdb-ssd")]
-static ROCKSDB_HANDLE_REGISTRY: OnceLock<Mutex<HashMap<String, std::sync::Weak<rocksdb::DB>>>> =
+static ROCKSDB_HANDLE_REGISTRY: OnceLock<Mutex<HashMap<String, RocksDbHandleRecord>>> =
     OnceLock::new();
+
+#[cfg(feature = "rocksdb-ssd")]
+struct RocksDbHandleRecord {
+    db: std::sync::Weak<rocksdb::DB>,
+    read_cache: Option<std::sync::Weak<SsdReadCacheInner>>,
+}
+
+/// One native block-cache capacity target shared across any number of stores.
+/// Pinned blocks may exceed the target. Memtables, table readers and caller
+/// buffers are separate allocations, so this is not a process memory bound.
+#[cfg(feature = "rocksdb-ssd")]
+#[derive(Clone)]
+pub struct SsdReadCache(Arc<SsdReadCacheInner>);
+
+#[cfg(feature = "rocksdb-ssd")]
+struct SsdReadCacheInner {
+    cache: rocksdb::Cache,
+    capacity: usize,
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+impl SsdReadCache {
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self(Arc::new(SsdReadCacheInner {
+            cache: rocksdb::Cache::new_lru_cache(capacity_bytes),
+            capacity: capacity_bytes,
+        }))
+    }
+    pub fn capacity_bytes(&self) -> usize { self.0.capacity }
+    pub fn usage_bytes(&self) -> usize { self.0.cache.get_usage() }
+    pub fn pinned_bytes(&self) -> usize { self.0.cache.get_pinned_usage() }
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+impl PartialEq for SsdReadCache {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+#[cfg(feature = "rocksdb-ssd")]
+impl Eq for SsdReadCache {}
+#[cfg(feature = "rocksdb-ssd")]
+impl std::fmt::Debug for SsdReadCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SsdReadCache").field("capacity_bytes", &self.capacity_bytes()).finish_non_exhaustive()
+    }
+}
 
 impl std::fmt::Debug for StorageEngineRocksDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2428,6 +2482,8 @@ impl std::fmt::Debug for StorageEngineRocksDb {
 impl Clone for StorageEngineRocksDb {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(feature = "rocksdb-ssd")]
+            read_cache: self.read_cache.clone(),
             db_path: self.db_path.clone(),
             initialized: self.initialized,
             records: self.records.clone(),
@@ -2506,6 +2562,8 @@ impl StorageEngineRocksDb {
 
     pub fn new(db_path: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "rocksdb-ssd")]
+            read_cache: None,
             db_path: db_path.into(),
             initialized: false,
             records: HashMap::new(),
@@ -2525,6 +2583,15 @@ impl StorageEngineRocksDb {
 
     pub fn with_metric_registry(db_path: impl Into<String>, _registry: ()) -> Self {
         Self::new(db_path)
+    }
+
+    /// Configure before start. An already-open path using a different pool
+    /// refuses to start rather than silently ignoring this budget.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_read_cache(&mut self, cache: SsdReadCache) -> Result<(), CacheError> {
+        if self.initialized { return Err(CacheError::InvalidConfig("read cache must be configured before start".into())); }
+        self.read_cache = Some(cache);
+        Ok(())
     }
 
     /// Select the policy for subsequent writes, batches, deletes and resets
@@ -2583,7 +2650,18 @@ impl StorageEngineRocksDb {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.increase_parallelism(4);
-        options.optimize_for_point_lookup(self.rocksdb_block_cache_mebibytes());
+        if let Some(cache) = &self.read_cache {
+            let mut table = rocksdb::BlockBasedOptions::default();
+            table.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
+            table.set_data_block_hash_ratio(0.75);
+            table.set_bloom_filter(10.0, false);
+            table.set_block_cache(&cache.0.cache);
+            options.set_block_based_table_factory(&table);
+            options.set_memtable_prefix_bloom_ratio(0.02);
+            options.set_memtable_whole_key_filtering(true);
+        } else {
+            options.optimize_for_point_lookup(self.rocksdb_block_cache_mebibytes());
+        }
         options.set_write_buffer_size(Self::rocksdb_write_buffer_bytes());
         options.set_max_write_buffer_number(4);
         options.set_level_zero_file_num_compaction_trigger(16);
@@ -2615,14 +2693,21 @@ impl StorageEngineRocksDb {
     fn open_rocksdb_arc(&self) -> Result<Arc<rocksdb::DB>, CacheError> {
         let registry = ROCKSDB_HANDLE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry = registry.lock().expect("rocksdb registry lock poisoned");
-        if let Some(existing) = registry
-            .get(&self.db_path)
-            .and_then(std::sync::Weak::upgrade)
-        {
-            return Ok(existing);
+        if let Some(record) = registry.get(&self.db_path) {
+            if let Some(existing) = record.db.upgrade() {
+                if let Some(requested) = &self.read_cache {
+                    let same_pool = record.read_cache.as_ref().and_then(std::sync::Weak::upgrade)
+                        .is_some_and(|pool| Arc::ptr_eq(&requested.0, &pool));
+                    if !same_pool { return Err(CacheError::InvalidConfig("open SSD path uses a different read cache".into())); }
+                }
+                return Ok(existing);
+            }
         }
         let db = Arc::new(self.open_rocksdb()?);
-        registry.insert(self.db_path.clone(), Arc::downgrade(&db));
+        registry.insert(self.db_path.clone(), RocksDbHandleRecord {
+            db: Arc::downgrade(&db),
+            read_cache: self.read_cache.as_ref().map(|pool| Arc::downgrade(&pool.0)),
+        });
         Ok(db)
     }
 
@@ -3600,6 +3685,8 @@ pub type StorageEngineSsd = StorageEngineRocksDb;
 /// it held, and because placement is by hash of the key, changing the device set
 /// changes where subsequent keys land.
 pub struct StorageEngineMultiSsd {
+    #[cfg(feature = "rocksdb-ssd")]
+    read_cache: Option<SsdReadCache>,
     paths: Vec<String>,
     storages: Vec<StorageEngineRocksDb>,
     capacity: u64,
@@ -3643,6 +3730,8 @@ impl StorageEngineMultiSsd {
         ssdcache_type: StorageEngineKind,
     ) -> Self {
         Self {
+            #[cfg(feature = "rocksdb-ssd")]
+            read_cache: None,
             paths: paths.into_iter().collect(),
             storages: Vec::new(),
             capacity,
@@ -3670,6 +3759,13 @@ impl StorageEngineMultiSsd {
     #[cfg(feature = "rocksdb-ssd")]
     pub fn write_policy(&self) -> SsdWritePolicy { self.write_policy }
 
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_read_cache(&mut self, cache: SsdReadCache) -> Result<(), CacheError> {
+        if self.initialized { return Err(CacheError::InvalidConfig("read cache must be configured before start".into())); }
+        self.read_cache = Some(cache);
+        Ok(())
+    }
+
     fn init(&mut self) -> bool {
         if self.paths.is_empty() {
             return false;
@@ -3688,6 +3784,8 @@ impl StorageEngineMultiSsd {
 
     fn create_storage_by_device_path(&self, path: &str) -> StorageEngineRocksDb {
         let mut storage = StorageEngineRocksDb::new(path.to_string());
+        #[cfg(feature = "rocksdb-ssd")]
+        { storage.read_cache = self.read_cache.clone(); }
         #[cfg(feature = "rocksdb-ssd")]
         { storage.write_policy = self.write_policy; }
         if self.capacity != 0 {
