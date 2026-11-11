@@ -3904,6 +3904,33 @@ impl StorageEngineMultiSsd {
 }
 
 impl StorageEngineApi for StorageEngineMultiSsd {
+    /// Group writes by device, preserving order within each device. Device
+    /// commits are independent; results retain the original input order.
+    fn put_buffers_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<Result<CacheBuffer, CacheError>> {
+        if !self.initialized || self.storages.is_empty() {
+            return buffers.into_iter().map(|_| Err(CacheError::Stopped)).collect();
+        }
+        if buffers.is_empty() {
+            return Vec::new();
+        }
+        let mut results: Vec<Option<Result<CacheBuffer, CacheError>>> =
+            std::iter::repeat_with(|| None).take(buffers.len()).collect();
+        let mut groups: Vec<Vec<(usize, CacheBuffer)>> =
+            (0..self.storages.len()).map(|_| Vec::new()).collect();
+        for (position, buffer) in buffers.into_iter().enumerate() {
+            let device = Self::hash(buffer.key()) as usize % self.storages.len();
+            groups[device].push((position, buffer));
+        }
+        for (storage, group) in self.storages.iter_mut().zip(groups) {
+            if group.is_empty() { continue; }
+            let (positions, buffers): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+            for (position, result) in positions.into_iter().zip(storage.put_buffers_batch(buffers)) {
+                results[position] = Some(result);
+            }
+        }
+        results.into_iter().map(|result| result.expect("one result per device write")).collect()
+    }
+
     fn start(&mut self) -> bool {
         if self.initialized {
             return true;
