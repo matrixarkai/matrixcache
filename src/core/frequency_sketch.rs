@@ -175,14 +175,36 @@ impl FrequencySketch {
     }
 
     /// Records repeated accesses while hashing the key only once.
-    /// Counter saturation and aging are identical to repeated `record` calls.
-    pub fn record_many(&self, key: &CacheKey, count: u64) {
+    /// Counter saturation and aging match repeated `record` calls when isolated.
+    /// Concurrent aging remains approximate, as with individual updates.
+    pub fn record_many(&self, key: &CacheKey, mut count: u64) {
         if count == 0 {
             return;
         }
         let positions = self.positions(key);
-        for _ in 0..count {
+        if count == 1 {
             self.record_positions(positions);
+            return;
+        }
+        while count != 0 {
+            // Stop at the next decay boundary instead of aging a whole batch once.
+            // A concurrent sweep must never make this writer wait for ownership.
+            let remaining = self.max_window.saturating_sub(self.window.load(Ordering::Relaxed));
+            let batch = count.min(remaining.max(1));
+            let increment = batch.min(u8::MAX as u64) as u8;
+            for position in positions {
+                #[allow(deprecated)]
+                let _ = self.counters[position].fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |value| (value != u8::MAX).then_some(value.saturating_add(increment)),
+                );
+            }
+            self.window.fetch_add(batch, Ordering::Relaxed);
+            if self.window.load(Ordering::Relaxed) >= self.max_window {
+                self.decay();
+            }
+            count -= batch;
         }
     }
 
