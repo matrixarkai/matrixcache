@@ -5,6 +5,65 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn compressed_demotions_use_encoded_capacity_not_raw_prediction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = CacheOptions::new(0, 0, 4096 + CACHE_HEADER_LEN)
+            .with_ssd_paths([directory.path().join("ssd")]);
+        options.block_options = CacheBlockOptions {
+            compression: CacheCompression::Zstd { level: 1 }, min_compress_bytes: 0,
+        };
+        let cache = MultiLayerCache::with_options(options);
+        cache.start().unwrap();
+        let hot = CacheKey::string(0, "hot-ssd-resident");
+        let cold = CacheKey::string(0, "cold-0");
+        cache.put(hot.clone(), vec![1; 4096]).unwrap();
+        for _ in 0..128 { assert!(cache.get_no_promotion(&hot).unwrap().is_some()); }
+        cache.set_ssd_admission_filter_enabled(true);
+        {
+            let mut inner = cache.inner.write().unwrap();
+            assert!(inner.put_ssd_bypass_if_absent(&cold, &vec![2; 4096]));
+            assert_eq!(inner.stats.ssd_evictions, 0);
+            assert_eq!(inner.disk_index.len(), 2);
+        }
+        assert_eq!(cache.get_no_promotion(&cold).unwrap().unwrap().value, vec![2; 4096]);
+        assert_eq!(cache.get_no_promotion(&hot).unwrap().unwrap().value, vec![1; 4096]);
+        assert!(cache.stop());
+    }
+
+    // rust-internal: manual rejected-demotion CPU cost with unchanged SSD contents.
+    #[test]
+    #[ignore]
+    fn measure_rejected_ssd_demotions() {
+        for bytes in [64, 4096, 262144] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = CacheOptions::new(0, 0, bytes + CACHE_HEADER_LEN)
+                .with_ssd_paths([directory.path().join("ssd")]);
+            options.block_options = CacheBlockOptions {
+                compression: CacheCompression::None, min_compress_bytes: usize::MAX,
+            };
+            let cache = MultiLayerCache::with_options(options);
+            cache.start().unwrap();
+            let hot = CacheKey::string(0, "hot-ssd-resident");
+            let cold = CacheKey::string(0, "cold-0");
+            cache.put(hot.clone(), vec![1; bytes]).unwrap();
+            for _ in 0..128 { assert!(cache.get_no_promotion(&hot).unwrap().is_some()); }
+            cache.set_ssd_admission_filter_enabled(true);
+            let value = vec![2; bytes];
+            let mut inner = cache.inner.write().unwrap();
+            let before = inner.stats.ssd_bytes_written;
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                assert!(!inner.put_ssd_bypass_if_absent(&cold, std::hint::black_box(&value)));
+            }
+            println!("raw_bytes={bytes} rejected=1000 elapsed_ns={}", start.elapsed().as_nanos());
+            assert_eq!(inner.stats.ssd_bytes_written, before);
+            drop(inner);
+            assert!(cache.stop());
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn ssd_frequency_admission_also_filters_upper_tier_demotions() {
         for pmem in [false, true] {
             for (filter, replacement) in [
