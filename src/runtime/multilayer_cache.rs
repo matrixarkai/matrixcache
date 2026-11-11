@@ -3137,6 +3137,15 @@ impl SsdTierStore {
         }
     }
 
+    fn get_owned_with_cache_fill(&self, key: &str, fill_cache: bool) -> Result<Vec<u8>, CacheError> {
+        if fill_cache { return self.get_owned(key); }
+        match self {
+            Self::Disabled { .. } => Err(CacheError::NotFound),
+            Self::Single(storage) => storage.get_owned_with_cache_fill(key, false),
+            Self::Multi(storage) => storage.get_owned_with_cache_fill(key, false),
+        }
+    }
+
     #[cfg(test)]
     fn get_batch(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         match self {
@@ -3151,6 +3160,15 @@ impl SsdTierStore {
             Self::Disabled { .. } => Ok(vec![None; keys.len()]),
             Self::Single(storage) => storage.get_unique_batch_refs(keys),
             Self::Multi(storage) => storage.get_unique_batch(keys),
+        }
+    }
+
+    fn get_unique_batch_with_cache_fill(&self, keys: &[&str], fill_cache: bool) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        if fill_cache { return self.get_unique_batch(keys); }
+        match self {
+            Self::Disabled { .. } => Ok(vec![None; keys.len()]),
+            Self::Single(storage) => storage.get_unique_batch_refs_with_cache_fill(keys, false),
+            Self::Multi(storage) => storage.get_unique_batch_with_cache_fill(keys, false),
         }
     }
 
@@ -5530,15 +5548,17 @@ impl MultiLayerCache {
         self.get(key)
     }
 
+    /// Read without upper-tier refill or native data-block admission on misses.
+    /// Existing native cache hits remain usable. This does not bypass the OS
+    /// page cache or table-reader metadata.
     pub fn get_no_promotion(&self, key: &CacheKey) -> Result<Option<CacheReadResult>, CacheError> {
         {
             let inner = self.inner.read().expect("cache lock poisoned");
             if !inner.started {
                 return Err(CacheError::Stopped);
             }
-            // Refused, not reclaimed. This path is documented as leaving the
-            // cache alone -- that is what "no promotion" means -- and it holds
-            // the cache shared, so dropping the entry would mean escalating.
+            // Refused, not reclaimed. Resident entries stay in place on this
+            // shared-lock path; dropping one would require escalating.
             // The sweep, eviction and `get` all reclaim it; none of them is
             // needed for the caller to be told the truth now.
             if inner.entry_expired(key, CoarseClock::now_millis()) {
@@ -5560,7 +5580,7 @@ impl MultiLayerCache {
 
         let block = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_block(key)?
+            inner.read_ssd_block_with_cache_fill(key, false)?
         };
         match block {
             Some(block) => Ok(Some(CacheReadResult {
@@ -5571,6 +5591,7 @@ impl MultiLayerCache {
         }
     }
 
+    /// Batched reads with the same admission policy as [`Self::get_no_promotion`].
     pub fn get_batch_no_promotion(
         &self,
         keys: &[CacheKey],
@@ -5623,7 +5644,7 @@ impl MultiLayerCache {
             .collect::<Vec<_>>();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_blocks(&candidate_keys)?
+            inner.read_ssd_blocks_with_cache_fill(&candidate_keys, false)?
         };
         for ((_, positions), block) in unique_ssd_candidates.into_iter().zip(blocks) {
             let Some(block) = block else {
@@ -7083,6 +7104,8 @@ impl MultiLayerCache {
         }
     }
 
+    /// Pin read results without upper-tier refill or new native data admission.
+    /// Handle accounting still runs; existing native hits and OS caching remain usable.
     pub fn acquire_no_promotion(
         &self,
         key: &CacheKey,
@@ -7140,7 +7163,7 @@ impl MultiLayerCache {
 
         let block = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_block(key)?
+            inner.read_ssd_block_with_cache_fill(key, false)?
         };
         let Some(block) = block else {
             return Ok(None);
@@ -7161,6 +7184,7 @@ impl MultiLayerCache {
         }))
     }
 
+    /// Batched pinned reads using the non-admitting policy.
     pub fn acquire_batch_no_promotion(
         &self,
         keys: &[CacheKey],
@@ -7250,7 +7274,7 @@ impl MultiLayerCache {
             .collect::<SmallVec<[&CacheKey; INLINE_BATCH_KEYS]>>();
         let blocks = {
             let inner = self.inner.read().expect("cache lock poisoned");
-            inner.read_ssd_blocks(&candidate_keys)?
+            inner.read_ssd_blocks_with_cache_fill(&candidate_keys, false)?
         };
         let mut decoded_hits =
             SmallVec::<[(&CacheKey, BatchPositions, Arc<[u8]>); INLINE_BATCH_KEYS]>::new();
