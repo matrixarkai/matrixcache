@@ -9,6 +9,104 @@ use std::time::Duration;
 
 #[cfg(feature = "rocksdb-ssd")]
 #[test]
+fn non_promoting_reads_do_not_admit_native_ssd_data_blocks() {
+    use matrixcache::{
+        CacheBlockOptions, CacheCompression, CacheKey, CacheOptions, ShardedMultiLayerCache,
+        SsdReadCache,
+    };
+    for devices in [1, 3] {
+        for shards in [1, 3] {
+            let directory = tempfile::tempdir().unwrap();
+            let pool = SsdReadCache::new(1024 * 1024);
+            let mut options = CacheOptions::new(0, 0, 8 * 1024 * 1024)
+                .with_ssd_paths((0..devices).map(|i| directory.path().join(format!("ssd-{i}"))));
+            options.ssd_read_cache = Some(pool.clone());
+            options.block_options = CacheBlockOptions {
+                compression: CacheCompression::None,
+                min_compress_bytes: usize::MAX,
+            };
+            let cache = ShardedMultiLayerCache::with_options(options, shards);
+            cache.start().unwrap();
+            let keys: Vec<_> = (0..32)
+                .map(|i| CacheKey::string(0, &format!("key-{i}")))
+                .collect();
+            for (index, key) in keys.iter().enumerate() {
+                cache.put(key.clone(), vec![index as u8; 4096]).unwrap();
+            }
+            assert!(cache.stop());
+            cache.start().unwrap();
+            let baseline = pool.usage_bytes();
+            for (index, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    cache.get_no_promotion(key).unwrap().unwrap().value,
+                    vec![index as u8; 4096]
+                );
+            }
+            assert_eq!(
+                pool.usage_bytes(),
+                baseline,
+                "copied no-promotion reads must not populate the native data cache"
+            );
+            let missing = CacheKey::string(0, "missing");
+            let query = [
+                keys[1].clone(),
+                keys[2].clone(),
+                keys[1].clone(),
+                missing.clone(),
+            ];
+            let values = cache.get_batch_no_promotion(&query).unwrap();
+            for (position, expected) in [1, 2, 1].into_iter().enumerate() {
+                assert_eq!(
+                    values[position].as_ref().unwrap().value,
+                    vec![expected; 4096]
+                );
+            }
+            assert!(values[3].is_none());
+            assert_eq!(pool.usage_bytes(), baseline);
+            let handle = cache.acquire_no_promotion(&keys[3]).unwrap().unwrap();
+            assert_eq!(handle.value(), &[3; 4096]);
+            cache.release(handle);
+            assert_eq!(pool.usage_bytes(), baseline);
+            let handles = cache.acquire_batch_no_promotion(&query).unwrap();
+            for (position, expected) in [1, 2, 1].into_iter().enumerate() {
+                assert_eq!(
+                    handles[position].as_ref().unwrap().value(),
+                    vec![expected; 4096]
+                );
+            }
+            assert!(handles[3].is_none());
+            cache.release_batch(handles.into_iter().flatten().collect());
+            assert_eq!(pool.usage_bytes(), baseline);
+            let fanout_keys: Vec<_> = (0..2112).map(|i| keys[i % keys.len()].clone()).collect();
+            let values = cache.get_batch_no_promotion(&fanout_keys).unwrap();
+            for (index, value) in values.into_iter().enumerate() {
+                assert_eq!(value.unwrap().value, vec![(index % keys.len()) as u8; 4096]);
+            }
+            let handles = cache.acquire_batch_no_promotion(&fanout_keys).unwrap();
+            for (index, handle) in handles.iter().enumerate() {
+                assert_eq!(
+                    handle.as_ref().unwrap().value(),
+                    vec![(index % keys.len()) as u8; 4096]
+                );
+            }
+            cache.release_batch(handles.into_iter().flatten().collect());
+            assert_eq!(
+                pool.usage_bytes(),
+                baseline,
+                "fanout must retain the no-fill hint"
+            );
+            assert_eq!(cache.get(&keys[0]).unwrap().unwrap(), vec![0; 4096]);
+            assert!(
+                pool.usage_bytes() > baseline,
+                "normal reads must retain native cache admission"
+            );
+            assert!(cache.stop());
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
 fn shared_ssd_targets_resize_during_writes_without_reopening_stores() {
     let (completed, completion) = mpsc::channel();
     let worker = std::thread::spawn(move || {

@@ -858,13 +858,17 @@ impl CacheInner {
     }
 
     fn read_ssd_block(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, CacheError> {
+        self.read_ssd_block_with_cache_fill(key, true)
+    }
+
+    fn read_ssd_block_with_cache_fill(&self, key: &CacheKey, fill_cache: bool) -> Result<Option<Vec<u8>>, CacheError> {
         if !self.ssd_store.holds_blocks() {
             return Ok(None);
         }
         let store_key = Self::inline_ssd_store_key(key);
         match self
             .ssd_store
-            .get_owned(Self::inline_ssd_store_key_str(&store_key))
+            .get_owned_with_cache_fill(Self::inline_ssd_store_key_str(&store_key), fill_cache)
         {
             Ok(block) => Ok(Some(block)),
             Err(CacheError::NotFound) if !self.legacy_block_files_possible() => Ok(None),
@@ -883,6 +887,10 @@ impl CacheInner {
     /// already and only their contents are read here, so cloning every one to
     /// build the argument copied three `String`s per candidate for nothing.
     fn read_ssd_blocks(&self, keys: &[&CacheKey]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        self.read_ssd_blocks_with_cache_fill(keys, true)
+    }
+
+    fn read_ssd_blocks_with_cache_fill(&self, keys: &[&CacheKey], fill_cache: bool) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.ssd_store.holds_blocks() {
             return Ok(empty_batch_results(keys.len()));
         }
@@ -901,7 +909,7 @@ impl CacheInner {
             .iter()
             .map(|range| &store_key_buffer[range.clone()])
             .collect::<SmallVec<[&str; INLINE_BATCH_KEYS]>>();
-        let mut blocks = self.ssd_store.get_unique_batch(&store_keys)?;
+        let mut blocks = self.ssd_store.get_unique_batch_with_cache_fill(&store_keys, fill_cache)?;
         if !self.legacy_block_files_possible() {
             return Ok(blocks);
         }

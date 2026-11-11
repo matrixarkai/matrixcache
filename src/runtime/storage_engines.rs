@@ -3194,18 +3194,25 @@ impl StorageEngineRocksDb {
     }
     // Internal decoders consume owned bytes, avoiding a temporary shared buffer.
     pub(crate) fn get_owned(&self, key: &str) -> Result<Vec<u8>, CacheError> {
+        self.get_owned_with_cache_fill(key, true)
+    }
+
+    pub(crate) fn get_owned_with_cache_fill(&self, key: &str, fill_cache: bool) -> Result<Vec<u8>, CacheError> {
         if !self.initialized {
             return Err(CacheError::Stopped);
         }
         #[cfg(feature = "rocksdb-ssd")]
         {
+            let mut options = rocksdb::ReadOptions::default();
+            if !fill_cache { options.fill_cache(false); }
             self.rocksdb()?
-                .get(key.as_bytes())
+                .get_opt(key.as_bytes(), &options)
                 .map_err(|err| CacheError::RocksDb(err.to_string()))?
                 .ok_or(CacheError::NotFound)
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
+            let _ = fill_cache;
             self.records.get(key).cloned().ok_or(CacheError::NotFound)
         }
     }
@@ -3219,13 +3226,18 @@ impl StorageEngineRocksDb {
         &self,
         keys: &[&str],
     ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        self.get_unique_batch_iter(keys.iter().copied(), keys.len())
+        self.get_unique_batch_iter(keys.iter().copied(), keys.len(), true)
+    }
+
+    pub(crate) fn get_unique_batch_refs_with_cache_fill(&self, keys: &[&str], fill_cache: bool) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        self.get_unique_batch_iter(keys.iter().copied(), keys.len(), fill_cache)
     }
 
     fn get_unique_batch_iter<'a>(
         &self,
         keys: impl IntoIterator<Item = &'a str>,
         len: usize,
+        fill_cache: bool,
     ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.initialized {
             return Err(CacheError::Stopped);
@@ -3235,14 +3247,17 @@ impl StorageEngineRocksDb {
         }
         #[cfg(feature = "rocksdb-ssd")]
         {
+            let mut options = rocksdb::ReadOptions::default();
+            if !fill_cache { options.fill_cache(false); }
             self.rocksdb()?
-                .multi_get(keys.into_iter().map(str::as_bytes))
+                .multi_get_opt(keys.into_iter().map(str::as_bytes), &options)
                 .into_iter()
                 .map(|result| result.map_err(|err| CacheError::RocksDb(err.to_string())))
                 .collect()
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
         {
+            let _ = fill_cache;
             Ok(keys
                 .into_iter()
                 .map(|key| self.records.get(key).cloned())
@@ -3848,6 +3863,11 @@ impl StorageEngineMultiSsd {
         self.storages[index].get_owned(key)
     }
 
+    pub(crate) fn get_owned_with_cache_fill(&self, key: &str, fill_cache: bool) -> Result<Vec<u8>, CacheError> {
+        let index = self.storage_index(key)?;
+        self.storages[index].get_owned_with_cache_fill(key, fill_cache)
+    }
+
     /// What every store behind this one holds in memory. See
     /// [`StorageEngineRocksDb::resident_bytes`].
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -4056,6 +4076,14 @@ impl StorageEngineMultiSsd {
         &self,
         keys: &[&str],
     ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        self.get_unique_batch_with_cache_fill(keys, true)
+    }
+
+    pub(crate) fn get_unique_batch_with_cache_fill(
+        &self,
+        keys: &[&str],
+        fill_cache: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
         if !self.initialized || self.storages.is_empty() {
             return Err(CacheError::Stopped);
         }
@@ -4082,6 +4110,7 @@ impl StorageEngineMultiSsd {
             let storage_values = self.storages[storage_index].get_unique_batch_iter(
                 entries.iter().map(|(_, key)| *key),
                 entry_count,
+                fill_cache,
             )?;
             for ((index, _), value) in entries.into_iter().zip(storage_values) {
                 values[index] = value;
