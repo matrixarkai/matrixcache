@@ -8,6 +8,58 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn queued_rocksdb_batches_preserve_versions_delete_order_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("queued-batches")
+        .to_string_lossy()
+        .into_owned();
+    assert!(matches!(
+        AsyncStorageRuntime::start_batched(
+            matrixcache::StorageEngineRocksDb::new(path.clone()),
+            8,
+            4096,
+            0,
+            1024
+        ),
+        Err(CacheError::CapacityExceeded)
+    ));
+    let mut runtime = AsyncStorageRuntime::start_batched(
+        matrixcache::StorageEngineRocksDb::new(path.clone()),
+        8,
+        4096,
+        8,
+        1024,
+    )
+    .unwrap();
+    let (entered, ready) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let first = runtime
+        .try_put(buffer("gate", b"gate"), move |_| {
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let one = runtime.try_put(buffer("same", b"first"), |_| {}).unwrap();
+    let two = runtime.try_put(buffer("same", b"second"), |_| {}).unwrap();
+    let delete = runtime.try_delete("same", |_| {}).unwrap();
+    let three = runtime.try_put(buffer("same", b"last"), |_| {}).unwrap();
+    release.send(()).unwrap();
+    first.wait().unwrap();
+    assert_eq!(one.wait().unwrap().value(), b"first");
+    assert_eq!(two.wait().unwrap().value(), b"second");
+    delete.wait().unwrap();
+    assert_eq!(three.wait().unwrap().value(), b"last");
+    assert!(runtime.shutdown().unwrap());
+    let mut engine = matrixcache::StorageEngineRocksDb::new(path);
+    assert!(engine.start());
+    assert_eq!(engine.get("same").unwrap().value(), b"last");
+    assert!(engine.stop());
+}
+
+#[test]
 fn multi_device_batches_keep_order_payloads_and_restart_values() {
     let directory = tempfile::tempdir().unwrap();
     let paths: Vec<_> = (0..3)
