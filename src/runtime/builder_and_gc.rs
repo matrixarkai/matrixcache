@@ -1600,6 +1600,7 @@ impl CacheInner {
                 ));
             }
             self.disk_index = recovered_index;
+            self.rebuild_record_key_index();
             self.disk_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             Ok(report)
@@ -1609,6 +1610,7 @@ impl CacheInner {
             let manifest_path = self.manifest_path();
             if !manifest_path.exists() {
                 self.disk_index.clear();
+                self.rebuild_record_key_index();
                 self.ssd_bytes = 0;
                 return Ok(CacheRecoverReport::default());
             }
@@ -1677,6 +1679,7 @@ impl CacheInner {
             }
 
             self.disk_index = recovered_index;
+            self.rebuild_record_key_index();
             self.disk_order = recovered_order.into_iter().collect();
             self.ssd_bytes = recovered_bytes;
             Ok(report)
@@ -1775,7 +1778,7 @@ impl CacheInner {
                 departing = Some((CacheTier::Ssd, value));
             }
         }
-        if let Some(block_len) = self.disk_index.remove(key) {
+        if let Some(block_len) = self.remove_disk_index(key) {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(block_len);
             self.stats.disk_bytes = self.ssd_bytes;
         }
@@ -2650,8 +2653,7 @@ impl CacheInner {
             return false;
         }
         let shared = self.shared_key(key);
-        self.disk_index
-            .insert(Arc::clone(&shared), block_len as u64);
+        self.insert_disk_index(Arc::clone(&shared), block_len as u64);
         self.disk_order.push_back_if_absent_shared(shared);
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
@@ -3071,7 +3073,7 @@ impl CacheInner {
                 .ssd_eviction_pinned_skips
                 .saturating_add(pinned_skips);
             let evicted_value = self.read_ssd_value_for_eviction(&victim);
-            let removed_bytes = self.disk_index.remove(&victim).unwrap_or_default();
+            let removed_bytes = self.remove_disk_index(&victim).unwrap_or_default();
             // Drop the victim from the order as it is taken. Selection reads
             // that order, so leaving it until after the loop lets the next
             // round pick the same key, whose bytes are already gone.
@@ -3634,7 +3636,7 @@ impl CacheInner {
             }
             self.memory_order.remove(key);
             if remove_disk {
-                let disk_bytes = self.disk_index.remove(key).unwrap_or_default();
+                let disk_bytes = self.remove_disk_index(key).unwrap_or_default();
                 removed_pinned_bytes = removed_pinned_bytes.max(
                     disk_bytes
                         .min(usize::MAX as u64)
@@ -3681,10 +3683,11 @@ impl CacheInner {
 
     fn clear_all_locked(&mut self, reset_stats: bool) -> Result<(), CacheError> {
         self.bump_ssd_probe_epoch();
-        self.memory.clear();
+        self.clear_resident();
         self.clear_pmem_resident();
         self.clear_pmem_persistence()?;
         self.disk_index.clear();
+        self.record_key_index.clear_entries();
         self.disk_order.clear();
         self.memory_order.clear();
         self.pmem_order.clear();

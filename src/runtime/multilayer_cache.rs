@@ -1128,7 +1128,8 @@ pub struct CacheTableBytes {
     /// held inline in its buckets -- so this is the one table here that holds
     /// its values rather than handles to them.
     ///
-    /// Empty while every tracked entry remains in either resident tier.
+    /// Also includes optional record-key index tables. Empty while every tracked
+    /// entry remains resident and no record namespace is registered.
     pub metadata: usize,
     /// The expiries, which are empty -- and so free -- for a cache that was
     /// never given a time to live.
@@ -1306,6 +1307,7 @@ impl CacheInner {
     /// overwrite is not a new entry and its hit history carries across.
     fn make_resident(&mut self, key: Arc<CacheKey>, value: Arc<[u8]>) -> Option<Arc<[u8]>> {
         self.note_ssd_probe_mutation(&key);
+        self.record_key_index.insert(&key);
         if let Some(resident) = self.memory.get_mut(key.as_ref()) {
             return Some(std::mem::replace(&mut resident.value, value));
         }
@@ -1330,6 +1332,7 @@ impl CacheInner {
         self.bump_ssd_probe_epoch();
         let drained: Vec<(Arc<CacheKey>, MemoryResident)> = self.memory.drain().collect();
         for (held, resident) in drained {
+            self.forget_record_key_if_absent(&held);
             if let Some(meta) = resident.meta {
                 if let Some(pmem) = self.pmem.get_mut(held.as_ref()) {
                     pmem.meta = Some(meta);
@@ -1350,6 +1353,7 @@ impl CacheInner {
     fn take_resident(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
         self.note_ssd_probe_mutation(key);
         let (held, resident) = self.memory.remove_entry(key)?;
+        self.forget_record_key_if_absent(key);
         if let Some(meta) = resident.meta {
             if let Some(pmem) = self.pmem.get_mut(key) {
                 pmem.meta = Some(meta);
@@ -1365,6 +1369,7 @@ impl CacheInner {
         key: Arc<CacheKey>,
         value: Arc<[u8]>,
     ) -> Option<Arc<[u8]>> {
+        self.record_key_index.insert(&key);
         if let Some(resident) = self.pmem.get_mut(key.as_ref()) {
             return Some(std::mem::replace(&mut resident.value, value));
         }
@@ -1379,6 +1384,7 @@ impl CacheInner {
 
     fn take_pmem_resident(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
         let (held, resident) = self.pmem.remove_entry(key)?;
+        self.forget_record_key_if_absent(key);
         if let Some(meta) = resident.meta {
             if let Some(memory) = self.memory.get_mut(key) {
                 memory.meta = Some(meta);
@@ -1392,6 +1398,7 @@ impl CacheInner {
     fn clear_pmem_resident(&mut self) {
         let drained: Vec<(Arc<CacheKey>, PmemResident)> = self.pmem.drain().collect();
         for (held, resident) in drained {
+            self.forget_record_key_if_absent(&held);
             if let Some(meta) = resident.meta {
                 if let Some(memory) = self.memory.get_mut(held.as_ref()) {
                     memory.meta = Some(meta);
@@ -1944,6 +1951,7 @@ struct CacheInner {
     memory: AHashMap<Arc<CacheKey>, MemoryResident>,
     pmem: AHashMap<Arc<CacheKey>, PmemResident>,
     disk_index: AHashMap<Arc<CacheKey>, u64>,
+    record_key_index: RecordKeyIndex,
     disk_order: CacheKeyOrder,
     /// Shared with `MultiLayerCache`, allowing handle release to update pin
     /// ownership without opening the cache-wide lock.
@@ -3620,6 +3628,7 @@ impl MultiLayerCache {
                 memory: AHashMap::new(),
                 pmem: AHashMap::new(),
                 disk_index: AHashMap::new(),
+                record_key_index: RecordKeyIndex::default(),
                 disk_order: CacheKeyOrder::new(),
                 pin_registry: Arc::clone(&pin_registry),
                 cold_eviction_share_pct: COLD_EVICTION_SHARE_PCT_DEFAULT,
@@ -13347,6 +13356,7 @@ impl CacheInner {
             .chain(self.pmem.keys().map(|key| key.as_ref()))
             .chain(self.disk_index.keys().map(|key| key.as_ref()))
             .chain(self.metadata_keys().map(|key| key.as_ref()))
+            .chain(self.record_key_index.keys().map(|key| key.as_ref()))
             .chain(self.memory_order.iter())
             .chain(self.pmem_order.iter())
             .chain(self.disk_order.iter())
@@ -13363,6 +13373,12 @@ impl CacheInner {
             if counted_characters.insert(key.shared_heap_address()) {
                 shared_character_bytes =
                     shared_character_bytes.saturating_add(key.shared_heap_bytes());
+            }
+        }
+
+        for name in self.record_key_index.record_names() {
+            if counted_characters.insert(name.as_ptr()) {
+                shared_character_bytes += 2 * std::mem::size_of::<usize>() + name.len();
             }
         }
 
@@ -13384,6 +13400,7 @@ impl CacheInner {
             .chain(self.pmem.keys())
             .chain(self.disk_index.keys())
             .chain(self.async_writeback_positions.keys())
+            .chain(self.record_key_index.keys())
             .chain(pin_stripes.iter().flat_map(|pins| pins.entries.keys()))
             .chain(self.memory_order.shared_handles())
             .chain(self.pmem_order.shared_handles())
@@ -13523,6 +13540,7 @@ impl CacheInner {
         // histograms are fixed per-cache bookkeeping rather than per-entry
         // state, so account for the allocation here.
         let fixed_bytes = manifest_writer_bytes
+            + self.record_key_index.namespaces.keys().map(String::capacity).sum::<usize>()
             + std::mem::size_of::<ReadPathCounters>()
             + self.disk_dir.capacity()
             + self
@@ -13553,7 +13571,7 @@ impl CacheInner {
             memory: map_table_bytes(&self.memory),
             pmem: map_table_bytes(&self.pmem),
             disk_index: map_table_bytes(&self.disk_index),
-            metadata: map_table_bytes(&self.metadata),
+            metadata: map_table_bytes(&self.metadata) + self.record_key_index.table_bytes(),
             // `expiries` is empty, and so free, for a cache that never sets a
             // time to live.
             expiries: map_table_bytes(&self.expiries),
@@ -13640,7 +13658,7 @@ impl CacheInner {
             // previous SSD value available after the newer upper copy leaves.
             self.delete_ssd_block(key)?;
             self.append_disk_manifest_delete(key)?;
-            if let Some(bytes) = self.disk_index.remove(key) {
+            if let Some(bytes) = self.remove_disk_index(key) {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(bytes);
                 self.stats.disk_bytes = self.ssd_bytes;
             }
@@ -13857,8 +13875,7 @@ impl CacheInner {
         self.write_ssd_block(key, block)?;
         let shared = self.shared_key(key);
         if let Some(old_len) = self
-            .disk_index
-            .insert(Arc::clone(&shared), block_len as u64)
+            .insert_disk_index(Arc::clone(&shared), block_len as u64)
         {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
         }
@@ -14095,7 +14112,7 @@ impl CacheInner {
         self.delete_ssd_blocks(&stale_keys)?;
         for key in &stale_keys {
             self.append_disk_manifest_delete(key)?;
-            if let Some(bytes) = self.disk_index.remove(key) {
+            if let Some(bytes) = self.remove_disk_index(key) {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(bytes);
             }
             self.disk_order.remove(key);
@@ -14131,8 +14148,7 @@ impl CacheInner {
         for entry in staged_ssd {
             let shared = self.shared_key(&entry.key);
             if let Some(old_len) = self
-                .disk_index
-                .insert(Arc::clone(&shared), entry.block_len)
+                .insert_disk_index(Arc::clone(&shared), entry.block_len)
             {
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
             }
@@ -14272,7 +14288,7 @@ impl CacheInner {
             return Err(error);
         }
         let shared = self.shared_key(key);
-        self.disk_index.insert(Arc::clone(&shared), block_len as u64);
+        self.insert_disk_index(Arc::clone(&shared), block_len as u64);
         self.disk_order.push_back_if_absent_shared(shared);
         self.ssd_bytes = self.ssd_bytes.saturating_add(block_len as u64);
         self.stats.disk_fills = self.stats.disk_fills.saturating_add(1);
@@ -14289,7 +14305,7 @@ impl CacheInner {
         routing_slot: Option<u32>,
     ) -> Result<(), CacheError> {
         let shared = self.shared_key(key);
-        if let Some(old_len) = self.disk_index.insert(Arc::clone(&shared), block_len) {
+        if let Some(old_len) = self.insert_disk_index(Arc::clone(&shared), block_len) {
             self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
         }
         self.disk_order.push_back_if_absent_shared(shared);
@@ -14352,8 +14368,7 @@ impl CacheInner {
                 self.write_ssd_block(&key, block)?;
                 let shared = self.shared_key(&key);
                 if let Some(old_len) = self
-                    .disk_index
-                    .insert(Arc::clone(&shared), block_len as u64)
+                    .insert_disk_index(Arc::clone(&shared), block_len as u64)
                 {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
@@ -14395,7 +14410,7 @@ impl CacheInner {
                 self.persist_pmem_delete(key)?;
             }
             CacheTier::Ssd => {
-                if let Some(old_len) = self.disk_index.remove(key) {
+                if let Some(old_len) = self.remove_disk_index(key) {
                     self.ssd_bytes = self.ssd_bytes.saturating_sub(old_len);
                 }
                 self.delete_ssd_block(key)?;
@@ -14487,8 +14502,7 @@ impl CacheInner {
                     return Err(CacheError::CapacityExceeded);
                 }
                 let indexed_old_len = self
-                    .disk_index
-                    .remove(key)
+                    .remove_disk_index(key)
                     .unwrap_or(existing_block.len() as u64);
                 self.ssd_bytes = self.ssd_bytes.saturating_sub(indexed_old_len);
                 self.disk_order.remove(key);
@@ -14497,8 +14511,7 @@ impl CacheInner {
                     > self.ssd_capacity_bytes as u64
                 {
                     let shared = self.shared_key(key);
-                    self.disk_index
-                        .insert(Arc::clone(&shared), indexed_old_len);
+                    self.insert_disk_index(Arc::clone(&shared), indexed_old_len);
                     self.disk_order.push_back_if_absent_shared(shared);
                     self.ssd_bytes = self.ssd_bytes.saturating_add(indexed_old_len);
                     return Err(CacheError::CapacityExceeded);
@@ -14508,7 +14521,7 @@ impl CacheInner {
                 let block_len = block.len() as u64;
                 self.write_ssd_block(key, block)?;
                 let shared = self.shared_key(key);
-                self.disk_index.insert(Arc::clone(&shared), block_len);
+                self.insert_disk_index(Arc::clone(&shared), block_len);
                 self.disk_order.push_back_if_absent_shared(shared);
                 self.ssd_bytes = self.ssd_bytes.saturating_add(block_len);
                 self.record_metadata(
@@ -14590,7 +14603,7 @@ impl MultiLayerCache {
         let mut disk_bytes_before = 0u64;
         for key in &disk_keys {
             disk_bytes_before =
-                disk_bytes_before.saturating_add(inner.disk_index.remove(key).unwrap_or_default());
+                disk_bytes_before.saturating_add(inner.remove_disk_index(key).unwrap_or_default());
         }
         let _ = inner.delete_ssd_blocks(&disk_keys);
         inner.disk_order.retain(|key| key.shard_id != shard_id);
@@ -14675,7 +14688,7 @@ impl MultiLayerCache {
                     CacheRemovalCause::Evicted,
                 );
             }
-            if let Some(bytes) = inner.disk_index.remove(key) {
+            if let Some(bytes) = inner.remove_disk_index(key) {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
@@ -14763,7 +14776,7 @@ impl MultiLayerCache {
                     CacheRemovalCause::Evicted,
                 );
             }
-            if let Some(bytes) = inner.disk_index.remove(key) {
+            if let Some(bytes) = inner.remove_disk_index(key) {
                 disk_bytes_removed = disk_bytes_removed.saturating_add(bytes);
                 disk_delete_keys.push(key.clone());
             }
