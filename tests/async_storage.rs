@@ -8,6 +8,57 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn multi_device_batches_keep_order_payloads_and_restart_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = (0..3)
+        .map(|i| directory.path().join(format!("device-{i}")))
+        .collect();
+    let mut engine = matrixcache::StorageEngineMultiSsd::with_paths(paths.clone(), 0);
+    assert!(engine.start());
+    let mut inputs = Vec::new();
+    let mut expected = Vec::new();
+    let mut devices = std::collections::BTreeSet::new();
+    for round in 0..2 {
+        for key in 0..64 {
+            let name = format!("key-{key}");
+            devices.insert(engine.device_for_key(&name).unwrap().to_string());
+            let value = format!("value-{round}-{key}");
+            let input = buffer(&name, value.as_bytes());
+            expected.push((name, value, input.data_ptr() as usize));
+            inputs.push(input);
+        }
+    }
+    assert_eq!(devices.len(), 3);
+    let results = engine.put_buffers_batch(inputs);
+    assert_eq!(results.len(), expected.len());
+    for (result, (key, value, address)) in results.into_iter().zip(expected) {
+        let result = result.unwrap();
+        assert_eq!(result.key(), key);
+        assert_eq!(result.value(), value.as_bytes());
+        #[cfg(feature = "rocksdb-ssd")]
+        assert_eq!(result.data_ptr() as usize, address);
+        #[cfg(not(feature = "rocksdb-ssd"))]
+        let _ = address;
+    }
+    assert!(engine.stop());
+    let mut reopened = matrixcache::StorageEngineMultiSsd::with_paths(paths, 0);
+    assert!(reopened.start());
+    for key in 0..64 {
+        assert_eq!(
+            reopened.get(&format!("key-{key}")).unwrap().value(),
+            format!("value-1-{key}").as_bytes()
+        );
+    }
+    assert!(reopened.stop());
+    assert!(reopened.put_buffers_batch(Vec::new()).is_empty());
+    let results = reopened.put_buffers_batch(vec![buffer("a", b"a"), buffer("b", b"b")]);
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .all(|result| matches!(result, Err(CacheError::Stopped))));
+}
+
+#[test]
 fn shared_storage_batch_preserves_input_results_and_persisted_last_write() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory
