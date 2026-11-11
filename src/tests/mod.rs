@@ -5,6 +5,87 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn scoped_shared_ssd_reads_preserve_payloads_handles_and_corruption_errors() {
+        for devices in [1, 3] {
+            for instance_only in [false, true] {
+                for compression in [CacheCompression::None, CacheCompression::Zstd { level: 1 }] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut options = CacheOptions::new(0, 0, 1024 * 1024)
+                        .with_ssd_paths((0..devices).map(|i| directory.path().join(format!("ssd-{i}"))))
+                        .with_ssd_instance_only(instance_only);
+                    options.block_options = CacheBlockOptions { compression, min_compress_bytes: 0 };
+                    let cache = MultiLayerCache::with_options(options);
+                    cache.start().unwrap();
+                    let key = CacheKey::string(0, "scoped-read");
+                    cache.put(key.clone(), vec![3; 4096]).unwrap();
+                    let shared = cache.get_shared(&key).unwrap().unwrap();
+                    let handle = cache.acquire(&key).unwrap().unwrap();
+                    let non_promoting = cache.acquire_no_promotion(&key).unwrap().unwrap();
+                    assert_eq!(shared.as_ref(), &[3; 4096]);
+                    assert_eq!(handle.as_slice(), &[3; 4096]);
+                    assert_eq!(non_promoting.as_slice(), &[3; 4096]);
+                    cache.put(key.clone(), vec![4; 4096]).unwrap();
+                    assert_eq!(handle.as_slice(), &[3; 4096]);
+                    assert_eq!(non_promoting.as_slice(), &[3; 4096]);
+                    cache.release(handle);
+                    cache.release(non_promoting);
+                    assert_eq!(cache.get_shared(&key).unwrap().unwrap().as_ref(), &[4; 4096]);
+                    {
+                        let mut inner = cache.inner.write().unwrap();
+                        let mut corrupt = encode_cache_block(&[4; 4096], inner.block_options).unwrap();
+                        corrupt.pop();
+                        inner.write_ssd_block(&key, corrupt).unwrap();
+                    }
+                    assert!(matches!(cache.get_shared(&key), Err(CacheError::CorruptBlock(_))));
+                    assert!(matches!(cache.acquire(&key), Err(CacheError::CorruptBlock(_))));
+                    assert!(matches!(cache.acquire_no_promotion(&key), Err(CacheError::CorruptBlock(_))));
+                    assert!(cache.stop());
+                    assert_eq!(shared.as_ref(), &[3; 4096]);
+                }
+            }
+        }
+    }
+
+    // rust-internal: isolate native point-read/decode copying from public bookkeeping.
+    #[cfg(feature = "rocksdb-ssd")]
+    #[test]
+    #[ignore]
+    fn measure_scoped_shared_ssd_reads() {
+        for bytes in [256, 4096, 262144] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = CacheOptions::new(0, 0, 4 * 1024 * 1024)
+                .with_ssd_paths([directory.path().join("ssd")]);
+            options.block_options = CacheBlockOptions {
+                compression: CacheCompression::None, min_compress_bytes: 0,
+            };
+            let cache = MultiLayerCache::with_options(options);
+            cache.start().unwrap();
+            let key = CacheKey::string(0, "point-read");
+            cache.put(key.clone(), vec![5; bytes]).unwrap();
+            let inner = cache.inner.read().unwrap();
+            let before = inner.read_ssd_block(&key).unwrap().unwrap();
+            let expected = decode_cache_block_shared(&before).unwrap();
+            let captured = inner.read_shared_ssd_probe(&key, true).unwrap().unwrap().decode().unwrap().0;
+            assert_eq!(expected, captured);
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let block = inner.read_ssd_block(std::hint::black_box(&key)).unwrap().unwrap();
+                std::hint::black_box(decode_cache_block_shared(&block).unwrap());
+            }
+            let owned = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let block = inner.read_shared_ssd_probe(std::hint::black_box(&key), true).unwrap().unwrap();
+                std::hint::black_box(block.decode().unwrap());
+            }
+            println!("bytes={bytes} reads=1000 owned_ns={} scoped_ns={}", owned.as_nanos(), start.elapsed().as_nanos());
+            drop(inner);
+            assert!(cache.stop());
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn compressed_demotions_use_encoded_capacity_not_raw_prediction() {
         let directory = tempfile::tempdir().unwrap();
         let mut options = CacheOptions::new(0, 0, 4096 + CACHE_HEADER_LEN)
