@@ -2531,8 +2531,13 @@ impl StorageEngineRocksDb {
     /// through this engine. Other clones keep their own policy.
     #[cfg(feature = "rocksdb-ssd")]
     pub fn with_write_policy(mut self, policy: SsdWritePolicy) -> Self {
-        self.write_policy = policy;
+        self.set_write_policy(policy);
         self
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_write_policy(&mut self, policy: SsdWritePolicy) {
+        self.write_policy = policy;
     }
 
     #[cfg(feature = "rocksdb-ssd")]
@@ -3652,10 +3657,18 @@ impl StorageEngineMultiSsd {
     /// Device commits remain independent even with the durable policy.
     #[cfg(feature = "rocksdb-ssd")]
     pub fn with_write_policy(mut self, policy: SsdWritePolicy) -> Self {
-        self.write_policy = policy;
-        for storage in &mut self.storages { storage.write_policy = policy; }
+        self.set_write_policy(policy);
         self
     }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn set_write_policy(&mut self, policy: SsdWritePolicy) {
+        self.write_policy = policy;
+        for storage in &mut self.storages { storage.set_write_policy(policy); }
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn write_policy(&self) -> SsdWritePolicy { self.write_policy }
 
     fn init(&mut self) -> bool {
         if self.paths.is_empty() {
