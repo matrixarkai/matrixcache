@@ -40,6 +40,12 @@ fn key_snapshot_matches_entry_snapshot_across_tiers_and_shards() {
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), expected.len());
         assert_eq!(keys.into_iter().collect::<BTreeSet<_>>(), expected);
+        let selected = cache.keys_for_shard_matching(shard, |key| key.record_key.ends_with('3'));
+        let filtered: Vec<_> = expected
+            .into_iter()
+            .filter(|key| key.record_key.ends_with('3'))
+            .collect();
+        assert_eq!(selected, filtered);
     }
     let deleted = cache.keys_for_shard(1);
     cache.invalidate_batch(&deleted).unwrap();
@@ -68,6 +74,11 @@ fn key_snapshot_is_deduplicated_and_does_not_touch_cache_state() {
     let handle = cache.acquire(&key).unwrap().unwrap();
     let before = cache.stats();
     assert_eq!(cache.keys_for_shard(7), vec![key.clone()]);
+    assert_eq!(
+        cache.keys_for_shard_matching(7, |_| true),
+        vec![key.clone()]
+    );
+    assert!(cache.keys_for_shard_matching(7, |_| false).is_empty());
     assert_eq!(cache.stats().pinned_entries, before.pinned_entries);
     assert_eq!(cache.stats().memory_hits, before.memory_hits);
     assert_eq!(cache.stats().disk_hits, before.disk_hits);
@@ -102,6 +113,15 @@ fn sharded_key_snapshot_preserves_every_selector() {
         expected
     );
     assert!(cache.keys_for_shard(6).is_empty());
+    let selected = cache.keys_for_shard_matching(5, |key| key.record_key.as_ref() == "record-3");
+    assert_eq!(selected.len(), 4);
+    assert_eq!(
+        selected,
+        expected
+            .into_iter()
+            .filter(|key| key.record_key.as_ref() == "record-3")
+            .collect::<Vec<_>>()
+    );
     assert!(cache.stop());
 }
 
@@ -132,7 +152,15 @@ fn key_snapshot_cost_at_scale() {
             assert_eq!(std::hint::black_box(cache.keys_for_shard(1)).len(), count);
         }
         let keys_us = started.elapsed().as_micros();
-        eprintln!("KEY_SNAPSHOT count={count} rounds=5 entries_us={entries_us} keys_us={keys_us}");
+        let wanted: BTreeSet<_> = (0..8).map(|index| format!("key-{index}")).collect();
+        let started = Instant::now();
+        for _ in 0..5 {
+            let selected =
+                cache.keys_for_shard_matching(1, |key| wanted.contains(key.record_key.as_ref()));
+            assert_eq!(std::hint::black_box(selected).len(), wanted.len());
+        }
+        let selected_us = started.elapsed().as_micros();
+        eprintln!("KEY_SNAPSHOT count={count} rounds=5 entries_us={entries_us} keys_us={keys_us} selected_us={selected_us} selected=8");
         assert!(cache.stop());
     }
 }
