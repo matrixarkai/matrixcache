@@ -2389,6 +2389,24 @@ pub struct StorageEngineRocksDb {
     capacity: u64,
     #[cfg(feature = "rocksdb-ssd")]
     db: Option<Arc<rocksdb::DB>>,
+    #[cfg(feature = "rocksdb-ssd")]
+    write_policy: SsdWritePolicy,
+}
+
+/// Persistence cost for native SSD writes. Buffered WAL writes are the default.
+#[cfg(feature = "rocksdb-ssd")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SsdWritePolicy {
+    /// Keep the WAL enabled without a per-write fsync. Acknowledged writes may
+    /// still be lost on power failure.
+    #[default]
+    Buffered,
+    /// Sync the WAL before acknowledging each write or batch.
+    Durable,
+    /// Disable the WAL for disposable cache data. After a crash, entries and
+    /// deletes may be lost; discard or rebuild the cache before using it.
+    /// Never select this for authoritative storage.
+    Rebuildable,
 }
 
 #[cfg(feature = "rocksdb-ssd")]
@@ -2425,6 +2443,8 @@ impl Clone for StorageEngineRocksDb {
             capacity: self.capacity,
             #[cfg(feature = "rocksdb-ssd")]
             db: self.db.clone(),
+            #[cfg(feature = "rocksdb-ssd")]
+            write_policy: self.write_policy,
         }
     }
 }
@@ -2498,11 +2518,26 @@ impl StorageEngineRocksDb {
             capacity: u64::MAX,
             #[cfg(feature = "rocksdb-ssd")]
             db: None,
+            #[cfg(feature = "rocksdb-ssd")]
+            write_policy: SsdWritePolicy::default(),
         }
     }
 
     pub fn with_metric_registry(db_path: impl Into<String>, _registry: ()) -> Self {
         Self::new(db_path)
+    }
+
+    /// Select the policy for subsequent writes, batches, deletes and resets
+    /// through this engine. Other clones keep their own policy.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn with_write_policy(mut self, policy: SsdWritePolicy) -> Self {
+        self.write_policy = policy;
+        self
+    }
+
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn write_policy(&self) -> SsdWritePolicy {
+        self.write_policy
     }
 
     /// Memtable size for the SSD tier, in MiB. Default 64, matching the previous constant.
@@ -2553,9 +2588,10 @@ impl StorageEngineRocksDb {
     }
 
     #[cfg(feature = "rocksdb-ssd")]
-    fn rocksdb_write_options() -> rocksdb::WriteOptions {
+    fn rocksdb_write_options(&self) -> rocksdb::WriteOptions {
         let mut options = rocksdb::WriteOptions::default();
-        options.set_sync(false);
+        options.set_sync(self.write_policy == SsdWritePolicy::Durable);
+        options.disable_wal(self.write_policy == SsdWritePolicy::Rebuildable);
         options
     }
 
@@ -2895,7 +2931,7 @@ impl StorageEngineRocksDb {
         #[cfg(feature = "rocksdb-ssd")]
         {
             self.rocksdb()?
-                .put_opt(key.as_bytes(), &value, &Self::rocksdb_write_options())
+                .put_opt(key.as_bytes(), &value, &self.rocksdb_write_options())
                 .map_err(|err| CacheError::RocksDb(err.to_string()))?;
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -3024,7 +3060,7 @@ impl StorageEngineRocksDb {
                 batch.put(key.as_bytes(), value);
             }
             self.rocksdb()?
-                .write_opt(batch, &Self::rocksdb_write_options())
+                .write_opt(batch, &self.rocksdb_write_options())
                 .map_err(|err| CacheError::RocksDb(err.to_string()))?;
         }
         #[cfg(not(feature = "rocksdb-ssd"))]
@@ -3078,7 +3114,7 @@ impl StorageEngineRocksDb {
                 }
             }
             if deleted > 0 {
-                db.write_opt(batch, &Self::rocksdb_write_options())
+                db.write_opt(batch, &self.rocksdb_write_options())
                     .map_err(|err| CacheError::RocksDb(err.to_string()))?;
             }
         }
@@ -3283,7 +3319,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
                 if !self.initialized { return Err(CacheError::Stopped); }
                 let mut batch = rocksdb::WriteBatch::default();
                 for buffer in &buffers { batch.put(buffer.key().as_bytes(), buffer.value()); }
-                self.rocksdb()?.write_opt(batch, &Self::rocksdb_write_options())
+                self.rocksdb()?.write_opt(batch, &self.rocksdb_write_options())
                     .map_err(|error| CacheError::RocksDb(error.to_string()))
             })();
             match result {
@@ -3305,7 +3341,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
                 return Err(CacheError::Stopped);
             }
             self.rocksdb()?
-                .put_opt(buffer.key().as_bytes(), buffer.value(), &Self::rocksdb_write_options())
+                .put_opt(buffer.key().as_bytes(), buffer.value(), &self.rocksdb_write_options())
                 .map_err(|error| CacheError::RocksDb(error.to_string()))?;
             Ok(buffer.clone_storage_result())
         })();
@@ -3388,7 +3424,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
             {
                 return Err(CacheError::NotFound);
             }
-            db.delete_opt(key.as_bytes(), &Self::rocksdb_write_options())
+            db.delete_opt(key.as_bytes(), &self.rocksdb_write_options())
                 .map_err(|err| CacheError::RocksDb(err.to_string()))?;
             Ok(())
         }
@@ -3420,7 +3456,7 @@ impl StorageEngineApi for StorageEngineRocksDb {
             for key in keys {
                 batch.delete(key);
             }
-            db.write_opt(batch, &Self::rocksdb_write_options())
+            db.write_opt(batch, &self.rocksdb_write_options())
                 .map_err(|err| CacheError::RocksDb(err.to_string()))?;
             Ok(())
         }
@@ -3564,6 +3600,8 @@ pub struct StorageEngineMultiSsd {
     capacity: u64,
     initialized: bool,
     ssdcache_type: StorageEngineKind,
+    #[cfg(feature = "rocksdb-ssd")]
+    write_policy: SsdWritePolicy,
 }
 
 impl StorageEngineMultiSsd {
@@ -3605,7 +3643,18 @@ impl StorageEngineMultiSsd {
             capacity,
             initialized: false,
             ssdcache_type,
+            #[cfg(feature = "rocksdb-ssd")]
+            write_policy: SsdWritePolicy::default(),
         }
+    }
+
+    /// Select write behavior on all devices, including devices added later.
+    /// Device commits remain independent even with the durable policy.
+    #[cfg(feature = "rocksdb-ssd")]
+    pub fn with_write_policy(mut self, policy: SsdWritePolicy) -> Self {
+        self.write_policy = policy;
+        for storage in &mut self.storages { storage.write_policy = policy; }
+        self
     }
 
     fn init(&mut self) -> bool {
@@ -3626,6 +3675,8 @@ impl StorageEngineMultiSsd {
 
     fn create_storage_by_device_path(&self, path: &str) -> StorageEngineRocksDb {
         let mut storage = StorageEngineRocksDb::new(path.to_string());
+        #[cfg(feature = "rocksdb-ssd")]
+        { storage.write_policy = self.write_policy; }
         if self.capacity != 0 {
             storage.SetCapacity(self.capacity);
         }
