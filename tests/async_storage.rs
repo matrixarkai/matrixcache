@@ -9,6 +9,96 @@ use std::time::Duration;
 
 #[cfg(feature = "rocksdb-ssd")]
 #[test]
+fn managed_ssd_write_buffers_share_pressure_and_release_arenas_after_close() {
+    let (completed, completion) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        use matrixcache::{SsdReadCache, StorageEngineRocksDb};
+        assert!(SsdReadCache::new_with_write_buffer_budget(1024, 0, true).is_err());
+        assert!(SsdReadCache::new_with_write_buffer_budget(1024, 2048, true).is_err());
+        assert_eq!(SsdReadCache::new(1024).write_buffer_usage_bytes(), None);
+        let directory = tempfile::tempdir().unwrap();
+        let pool =
+            SsdReadCache::new_with_write_buffer_budget(16 * 1024 * 1024, 2 * 1024 * 1024, true)
+                .unwrap();
+        assert_eq!(pool.write_buffer_capacity_bytes(), Some(2 * 1024 * 1024));
+        assert_eq!(pool.write_buffer_usage_bytes(), Some(0));
+        let mut stores = Vec::new();
+        for i in 0..4 {
+            let mut store = StorageEngineRocksDb::new(
+                directory.path().join(format!("db-{i}")).to_string_lossy(),
+            );
+            store.set_read_cache(pool.clone()).unwrap();
+            assert!(store.start());
+            stores.push(store);
+        }
+        let mut alias = StorageEngineRocksDb::new(directory.path().join("db-0").to_string_lossy());
+        assert!(alias.start());
+        assert_eq!(alias.read_cache(), Some(&pool));
+        alias.put("alias", vec![9; 4096]).unwrap();
+        assert_eq!(alias.get("alias").unwrap().value(), vec![9; 4096]);
+        assert!(alias.stop());
+        let mut observed_arena_bytes = false;
+        // More than the shared target, interleaved across independently opened DBs.
+        for key in 0..512 {
+            for (index, store) in stores.iter_mut().enumerate() {
+                store
+                    .put(&format!("key-{key}"), vec![index as u8; 4096])
+                    .unwrap();
+                observed_arena_bytes |= pool.write_buffer_usage_bytes().unwrap() > 0;
+            }
+        }
+        assert!(observed_arena_bytes);
+        let barrier = Arc::new(std::sync::Barrier::new(stores.len()));
+        let writers: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut store)| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for key in 512..1024 {
+                        let mut retries = 0;
+                        loop {
+                            match store.put(&format!("key-{key}"), vec![index as u8; 4096]) {
+                                Ok(_) => break,
+                                Err(CacheError::CapacityExceeded) if retries < 500 => {
+                                    retries += 1;
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(error) => {
+                                    panic!("write failed after {retries} retries: {error}")
+                                }
+                            }
+                        }
+                    }
+                    store
+                })
+            })
+            .collect();
+        let mut stores: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect();
+        for (index, store) in stores.iter_mut().enumerate() {
+            for key in 0..1024 {
+                assert_eq!(
+                    store.get(&format!("key-{key}")).unwrap().value(),
+                    vec![index as u8; 4096]
+                );
+            }
+            assert!(store.stop());
+        }
+        assert_eq!(pool.write_buffer_usage_bytes(), Some(0));
+        completed.send(()).unwrap();
+    });
+    completion
+        .recv_timeout(Duration::from_secs(30))
+        .expect("managed writes must make flush progress");
+    worker.join().unwrap();
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
 fn shared_ssd_read_cache_is_used_across_independent_stores() {
     use matrixcache::{SsdReadCache, StorageEngineRocksDb};
     let directory = tempfile::tempdir().unwrap();
@@ -87,36 +177,43 @@ fn shared_ssd_read_cache_refuses_conflicting_open_path_configuration() {
 #[test]
 fn shared_ssd_read_cache_survives_shard_cloning_and_disabled_tier_activation() {
     use matrixcache::{CacheKey, CacheOptions, CacheTier, ShardedMultiLayerCache, SsdReadCache};
-    let directory = tempfile::tempdir().unwrap();
-    let pool = SsdReadCache::new(512 * 1024);
-    let mut options = CacheOptions::new(0, 0, 0).with_ssd_paths([directory.path().join("ssd")]);
-    options.ssd_read_cache = Some(pool.clone());
-    assert_eq!(options.clone().ssd_read_cache, Some(pool.clone()));
-    let cache = ShardedMultiLayerCache::with_options(options, 3);
-    cache.start().unwrap();
-    cache.set_capacity_for_tier(CacheTier::Ssd, 8 * 1024 * 1024);
-    for i in 0..64 {
-        cache
-            .put(
-                CacheKey::string(0, &format!("key-{i}")),
-                vec![i as u8; 16384],
-            )
-            .unwrap();
-    }
-    assert!(cache.stop());
-    cache.start().unwrap();
-    for i in 0..64 {
-        assert_eq!(
+    for pool in [
+        SsdReadCache::new(512 * 1024),
+        SsdReadCache::new_with_write_buffer_budget(8 * 1024 * 1024, 2 * 1024 * 1024, true).unwrap(),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = CacheOptions::new(0, 0, 0).with_ssd_paths([directory.path().join("ssd")]);
+        options.ssd_read_cache = Some(pool.clone());
+        assert_eq!(options.clone().ssd_read_cache, Some(pool.clone()));
+        let cache = ShardedMultiLayerCache::with_options(options, 3);
+        cache.start().unwrap();
+        cache.set_capacity_for_tier(CacheTier::Ssd, 8 * 1024 * 1024);
+        for i in 0..64 {
             cache
-                .get(&CacheKey::string(0, &format!("key-{i}")))
-                .unwrap()
-                .unwrap(),
-            vec![i as u8; 16384]
-        );
+                .put(
+                    CacheKey::string(0, &format!("key-{i}")),
+                    vec![i as u8; 16384],
+                )
+                .unwrap();
+        }
+        assert!(cache.stop());
+        cache.start().unwrap();
+        for i in 0..64 {
+            assert_eq!(
+                cache
+                    .get(&CacheKey::string(0, &format!("key-{i}")))
+                    .unwrap()
+                    .unwrap(),
+                vec![i as u8; 16384]
+            );
+        }
+        assert!(pool.usage_bytes() > 0);
+        assert!(pool.usage_bytes() <= pool.capacity_bytes());
+        assert!(cache.stop());
+        if pool.write_buffer_capacity_bytes().is_some() {
+            assert_eq!(pool.write_buffer_usage_bytes(), Some(0));
+        }
     }
-    assert!(pool.usage_bytes() > 0);
-    assert!(pool.usage_bytes() <= pool.capacity_bytes());
-    assert!(cache.stop());
 }
 
 #[cfg(feature = "rocksdb-ssd")]
