@@ -16033,6 +16033,31 @@ mod tests {
         assert!(arc.GetActiveDataTail(8).contains(&"a".to_string()));
     }
 
+    // rust-internal: resident and ghost transitions share the original long key allocation.
+    #[test]
+    fn arc_transitions_preserve_shared_key_allocations() {
+        let mut policy = ArcList::new(2);
+        let a = format!("a-{}", "x".repeat(4096));
+        let b = format!("b-{}", "x".repeat(4096));
+        policy.put(a.clone());
+        let original_a = Arc::clone(policy.fetch_list.data_list.index.get_key_value(a.as_str()).unwrap().0);
+        assert!(policy.get(&a));
+        assert!(Arc::ptr_eq(&original_a, policy.active_list.data_list.index.get_key_value(a.as_str()).unwrap().0));
+        policy.put(b.clone());
+        let original_b = Arc::clone(policy.fetch_list.data_list.index.get_key_value(b.as_str()).unwrap().0);
+        policy.put("c".to_owned());
+        assert!(Arc::ptr_eq(&original_a, policy.active_list.ghost_list.index.get_key_value(a.as_str()).unwrap().0));
+        assert!(!policy.get(&a));
+        assert!(Arc::ptr_eq(&original_a, policy.active_list.data_list.index.get_key_value(a.as_str()).unwrap().0));
+        assert!(Arc::ptr_eq(&original_b, policy.fetch_list.ghost_list.index.get_key_value(b.as_str()).unwrap().0));
+        assert!(!policy.get(&b));
+        assert!(Arc::ptr_eq(&original_b, policy.active_list.data_list.index.get_key_value(b.as_str()).unwrap().0));
+        assert_eq!(policy.fetch_capacity(), 1);
+        assert_eq!(policy.active_capacity(), 1);
+        assert_eq!(policy.size(), 2);
+        assert_eq!(policy.ghost_size(), 1);
+    }
+
     // rust-internal: active refresh preserves key allocation and arena identity.
     #[test]
     fn arc_active_refresh_reuses_key_and_node() {
@@ -16058,7 +16083,7 @@ mod tests {
         assert_eq!(policy.active_capacity(), 2);
     }
 
-    // rust-internal: manual active-list bookkeeping comparison with the old access path.
+    // rust-internal: manual active-list comparison with the unrefreshed access path.
     #[test]
     #[ignore]
     fn measure_arc_active_refresh() {
@@ -16071,7 +16096,7 @@ mod tests {
         let mut refreshed = baseline.clone();
         let start = std::time::Instant::now();
         for i in 0..100000 {
-            assert!(baseline.access(std::hint::black_box(&keys[i % keys.len()]).clone()));
+            assert!(baseline.access(std::hint::black_box(&keys[i % keys.len()]).clone().into()));
         }
         let before = start.elapsed();
         let start = std::time::Instant::now();
@@ -16081,7 +16106,7 @@ mod tests {
         let after = start.elapsed();
         assert_eq!(baseline.get_active_data_tail(128), refreshed.get_active_data_tail(128));
         assert_eq!(baseline.total_size(), refreshed.total_size());
-        println!("active_hits=100000 old_ns={} refreshed_ns={}", before.as_nanos(), after.as_nanos());
+        println!("active_hits=100000 unrefreshed_ns={} refreshed_ns={}", before.as_nanos(), after.as_nanos());
     }
 
     #[test]
