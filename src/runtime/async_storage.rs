@@ -105,6 +105,29 @@ struct StorageWrite {
     reservation: Option<WriteReservation>,
 }
 
+impl StorageWrite {
+    fn run<B: StorageWorkerBackend>(self, engine: &mut B) {
+        let result = engine.put(self.buffer);
+        finish_write(self.callback, self.reservation, self.completed, result);
+    }
+}
+
+fn finish_write(
+    callback: WriteCallback,
+    reservation: Option<WriteReservation>,
+    completed: CompletionSender<CacheBuffer>,
+    result: WriteResult,
+) {
+    let callback_result = match &result {
+        Ok(buffer) => Ok(buffer.clone_for_callback()),
+        Err(error) => Err(cache_error_for_callback(error)),
+    };
+    // A caller callback must not strand the rest of the queue.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(callback_result)));
+    drop(reservation);
+    completed.send(result);
+}
+
 struct WriteReservation {
     pending: Arc<AtomicUsize>,
     bytes: usize,
@@ -260,7 +283,27 @@ impl AsyncStorageRuntime {
                     match command {
                         StorageCommand::Put(write) if max_batch_writes > 1 => {
                             let mut bytes = write.buffer.value().len();
-                            let mut writes = vec![write];
+                            let next = if bytes < max_batch_bytes {
+                                receiver.try_recv().ok()
+                            } else {
+                                None
+                            };
+                            let second = match next {
+                                Some(StorageCommand::Put(second))
+                                    if bytes
+                                        .checked_add(second.buffer.value().len())
+                                        .is_some_and(|total| total <= max_batch_bytes) =>
+                                {
+                                    second
+                                }
+                                next => {
+                                    deferred = next;
+                                    write.run(&mut engine);
+                                    continue;
+                                }
+                            };
+                            bytes += second.buffer.value().len();
+                            let mut writes = vec![write, second];
                             while writes.len() < max_batch_writes && bytes < max_batch_bytes {
                                 let Ok(command) = receiver.try_recv() else {
                                     break;
@@ -293,30 +336,11 @@ impl AsyncStorageRuntime {
                             for ((callback, reservation, completed), result) in
                                 completions.into_iter().zip(results)
                             {
-                                let callback_result = match &result {
-                                    Ok(buffer) => Ok(buffer.clone_for_callback()),
-                                    Err(error) => Err(cache_error_for_callback(error)),
-                                };
-                                let _ =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        callback(callback_result)
-                                    }));
-                                drop(reservation);
-                                completed.send(result);
+                                finish_write(callback, reservation, completed, result);
                             }
                         }
                         StorageCommand::Put(write) => {
-                            let result = engine.put(write.buffer);
-                            let callback_result = match &result {
-                                Ok(buffer) => Ok(buffer.clone_for_callback()),
-                                Err(error) => Err(cache_error_for_callback(error)),
-                            };
-                            // A caller callback must not strand the rest of the queue.
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                (write.callback)(callback_result);
-                            }));
-                            drop(write.reservation);
-                            write.completed.send(result);
+                            write.run(&mut engine);
                         }
                         StorageCommand::Delete {
                             key,
@@ -481,9 +505,14 @@ mod tests {
             true
         }
         fn put(&mut self, buffer: CacheBuffer) -> WriteResult {
+            self.0.lock().unwrap().push(vec![buffer.key().to_string()]);
             Ok(buffer)
         }
         fn put_batch(&mut self, buffers: Vec<CacheBuffer>) -> Vec<WriteResult> {
+            assert!(
+                buffers.len() > 1,
+                "single writes must bypass batch allocation"
+            );
             self.0
                 .lock()
                 .unwrap()
