@@ -582,8 +582,8 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 /// handle and then copy that handle for the caller. Together with the storage
 /// buffer, that was three payload-sized allocations to serve two holders.
 struct CacheDecodedBlock {
-    /// The storage engine's allocation, stripped to the decoded value in
-    /// place for raw blocks. The copied read returns this allocation.
+    /// The copying caller's decoded payload. Raw batch reads reuse their storage
+    /// allocation; scoped point reads copy the payload directly into this value.
     value: Vec<u8>,
     /// The independent handle retained by an upper tier after a refill.
     refill: Option<Arc<[u8]>>,
@@ -592,8 +592,12 @@ struct CacheDecodedBlock {
 impl CacheDecodedBlock {
     fn decode(block: Vec<u8>, refilling: bool) -> Result<Self, CacheError> {
         let value = decode_cache_block_owned(block)?;
+        Ok(Self::from_value(value, refilling))
+    }
+
+    fn from_value(value: Vec<u8>, refilling: bool) -> Self {
         let refill = refilling.then(|| Arc::<[u8]>::from(value.as_slice()));
-        Ok(Self { value, refill })
+        Self { value, refill }
     }
 
     fn len(&self) -> usize {
@@ -608,7 +612,7 @@ impl CacheDecodedBlock {
         self.refill.as_ref().map(Arc::clone)
     }
 
-    /// Move the storage engine's allocation to the copied read result.
+    /// Move the decoded allocation to the copied read result.
     fn into_vec(self) -> Vec<u8> {
         self.value
     }
@@ -682,28 +686,51 @@ fn uncompressed_block_payload(block: &[u8]) -> Result<Option<&[u8]>, CacheError>
     Ok(Some(payload))
 }
 
-enum SharedSsdProbe {
-    Decoded(Arc<[u8]>),
+enum SsdReadProbe<T> {
+    Decoded(T),
     Encoded(Vec<u8>),
 }
 
-impl SharedSsdProbe {
-    fn capture(block: &[u8]) -> Result<Self, CacheError> {
+type SharedSsdProbe = SsdReadProbe<Arc<[u8]>>;
+type OwnedSsdProbe = SsdReadProbe<Vec<u8>>;
+
+impl<T> SsdReadProbe<T> {
+    fn capture_with(block: &[u8], raw: impl FnOnce(&[u8]) -> T) -> Result<Self, CacheError> {
         match uncompressed_block_payload(block)? {
-            Some(payload) => Ok(Self::Decoded(Arc::from(payload))),
+            Some(payload) => Ok(Self::Decoded(raw(payload))),
             // Decompression stays outside the cache guard on deferred read paths.
             None => Ok(Self::Encoded(block.to_vec())),
         }
     }
 
-    fn decode(self) -> Result<(Arc<[u8]>, bool), CacheError> {
+    fn decode_with(self, encoded: impl FnOnce(Vec<u8>) -> Result<T, CacheError>) -> Result<(T, bool), CacheError> {
         match self {
             Self::Decoded(value) => Ok((value, false)),
             Self::Encoded(block) => {
                 let compressed = is_encoded_compressed_block(&block);
-                Ok((decode_cache_block_shared(&block)?, compressed))
+                Ok((encoded(block)?, compressed))
             }
         }
+    }
+}
+
+impl SsdReadProbe<Arc<[u8]>> {
+    fn capture(block: &[u8]) -> Result<Self, CacheError> {
+        Self::capture_with(block, |payload| Arc::from(payload))
+    }
+
+    fn decode(self) -> Result<(Arc<[u8]>, bool), CacheError> {
+        self.decode_with(|block| decode_cache_block_shared(&block))
+    }
+}
+
+impl SsdReadProbe<Vec<u8>> {
+    fn capture(block: &[u8]) -> Result<Self, CacheError> {
+        Self::capture_with(block, |payload| payload.to_vec())
+    }
+
+    fn decode(self) -> Result<(Vec<u8>, bool), CacheError> {
+        self.decode_with(decode_cache_block_owned)
     }
 }
 
@@ -883,15 +910,26 @@ impl CacheInner {
     }
 
     fn read_shared_ssd_probe(&self, key: &CacheKey, fill_cache: bool) -> Result<Option<SharedSsdProbe>, CacheError> {
+        self.read_ssd_probe(key, fill_cache, SharedSsdProbe::capture)
+    }
+
+    fn read_owned_ssd_probe(&self, key: &CacheKey, fill_cache: bool) -> Result<Option<OwnedSsdProbe>, CacheError> {
+        self.read_ssd_probe(key, fill_cache, OwnedSsdProbe::capture)
+    }
+
+    fn read_ssd_probe<T>(
+        &self, key: &CacheKey, fill_cache: bool,
+        capture: impl FnOnce(&[u8]) -> Result<SsdReadProbe<T>, CacheError>,
+    ) -> Result<Option<SsdReadProbe<T>>, CacheError> {
         if !self.ssd_store.holds_blocks() { return Ok(None); }
         let store_key = Self::inline_ssd_store_key(key);
         match self.ssd_store.with_read_value(
-            Self::inline_ssd_store_key_str(&store_key), fill_cache, SharedSsdProbe::capture,
+            Self::inline_ssd_store_key_str(&store_key), fill_cache, capture,
         ) {
             Ok(probe) => Ok(Some(probe)),
             Err(CacheError::NotFound) if !self.legacy_block_files_possible() => Ok(None),
             Err(CacheError::NotFound) => match fs::read(self.disk_path(key)) {
-                Ok(block) => Ok(Some(SharedSsdProbe::Encoded(block))),
+                Ok(block) => Ok(Some(SsdReadProbe::Encoded(block))),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(CacheError::Io(error)),
             },
