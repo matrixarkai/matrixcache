@@ -2961,6 +2961,8 @@ enum SsdTierStore {
         ssd_paths: Vec<PathBuf>,
         #[cfg(feature = "rocksdb-ssd")]
         write_policy: SsdWritePolicy,
+        #[cfg(feature = "rocksdb-ssd")]
+        read_cache: Option<SsdReadCache>,
     },
     Single(StorageEngineRocksDb),
     Multi(StorageEngineMultiSsd),
@@ -2976,23 +2978,35 @@ impl SsdTierStore {
         }
     }
 
+    #[cfg(test)]
     fn new(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize) -> Self {
+        Self::with_read_cache(disk_dir, ssd_paths, capacity_bytes,
+            #[cfg(feature = "rocksdb-ssd")] None)
+    }
+
+    fn with_read_cache(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize,
+        #[cfg(feature = "rocksdb-ssd")] read_cache: Option<SsdReadCache>,
+    ) -> Self {
         if capacity_bytes == 0 {
             return Self::Disabled {
                 disk_dir: disk_dir.to_path_buf(),
                 ssd_paths: ssd_paths.to_vec(),
                 #[cfg(feature = "rocksdb-ssd")]
                 write_policy: SsdWritePolicy::default(),
+                #[cfg(feature = "rocksdb-ssd")]
+                read_cache,
             };
         }
-        Self::build(disk_dir, ssd_paths, capacity_bytes)
+        Self::build(disk_dir, ssd_paths, capacity_bytes, #[cfg(feature = "rocksdb-ssd")] read_cache)
     }
 
     /// Build the store for a non-zero capacity.
     ///
     /// Split out from [`Self::new`] so a tier switched on after construction comes up exactly
     /// the way one built with a capacity does, rather than by a second, similar path.
-    fn build(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize) -> Self {
+    fn build(disk_dir: &Path, ssd_paths: &[PathBuf], capacity_bytes: usize,
+        #[cfg(feature = "rocksdb-ssd")] read_cache: Option<SsdReadCache>,
+    ) -> Self {
         let capacity = capacity_bytes as u64;
         let default_path = disk_dir.join("rocksdb-cache-blocks");
         let paths = if ssd_paths.is_empty() {
@@ -3004,7 +3018,10 @@ impl SsdTierStore {
                 .collect::<Vec<_>>()
         };
         if paths.len() > 1 {
-            Self::Multi(StorageEngineMultiSsd::with_paths(paths, capacity))
+            let storage = StorageEngineMultiSsd::with_paths(paths, capacity);
+            #[cfg(feature = "rocksdb-ssd")]
+            let storage = { let mut storage = storage; storage.read_cache = read_cache; storage };
+            Self::Multi(storage)
         } else {
             let mut storage = StorageEngineRocksDb::new(
                 paths
@@ -3017,6 +3034,8 @@ impl SsdTierStore {
             if capacity != 0 {
                 storage.SetCapacity(capacity);
             }
+            #[cfg(feature = "rocksdb-ssd")]
+            { storage.read_cache = read_cache; }
             Self::Single(storage)
         }
     }
@@ -3035,7 +3054,12 @@ impl SsdTierStore {
             let (disk_dir, ssd_paths) = (disk_dir.clone(), ssd_paths.clone());
             #[cfg(feature = "rocksdb-ssd")]
             let write_policy = self.write_policy();
-            *self = Self::build(&disk_dir, &ssd_paths, capacity_bytes);
+            #[cfg(feature = "rocksdb-ssd")]
+            let read_cache = match self {
+                Self::Disabled { read_cache, .. } => read_cache.clone(),
+                _ => unreachable!(),
+            };
+            *self = Self::build(&disk_dir, &ssd_paths, capacity_bytes, #[cfg(feature = "rocksdb-ssd")] read_cache);
             #[cfg(feature = "rocksdb-ssd")]
             self.set_write_policy(write_policy);
             let _ = self.start();
@@ -3434,11 +3458,13 @@ impl MultiLayerCache {
     }
 
     fn build_with_options(options: CacheOptions) -> Self {
-        let cache = Self::with_tiering_policy_and_ssd_paths(
+        let cache = Self::with_tiering_policy_and_ssd_read_cache(
             options.disk_dir(),
             options.ssd_paths.clone(),
             options.tiering_policy(),
             options.block_options,
+            #[cfg(feature = "rocksdb-ssd")]
+            options.ssd_read_cache.clone(),
         );
         cache.set_ssd_write_budget_bytes_per_sec(options.ssd_write_bytes_per_sec);
         cache.set_replacement_policy_for_tier(
@@ -3507,10 +3533,22 @@ impl MultiLayerCache {
         tiering_policy: CacheTieringPolicy,
         block_options: CacheBlockOptions,
     ) -> Self {
+        Self::with_tiering_policy_and_ssd_read_cache(disk_dir, ssd_paths, tiering_policy, block_options,
+            #[cfg(feature = "rocksdb-ssd")] None)
+    }
+
+    fn with_tiering_policy_and_ssd_read_cache(
+        disk_dir: impl Into<PathBuf>,
+        ssd_paths: Vec<PathBuf>,
+        tiering_policy: CacheTieringPolicy,
+        block_options: CacheBlockOptions,
+        #[cfg(feature = "rocksdb-ssd")] read_cache: Option<SsdReadCache>,
+    ) -> Self {
         let disk_dir = disk_dir.into();
         let _ = fs::create_dir_all(&disk_dir);
         let mut ssd_store =
-            SsdTierStore::new(&disk_dir, &ssd_paths, tiering_policy.ssd_capacity_bytes);
+            SsdTierStore::with_read_cache(&disk_dir, &ssd_paths, tiering_policy.ssd_capacity_bytes,
+                #[cfg(feature = "rocksdb-ssd")] read_cache);
         let _ = ssd_store.start();
         let legacy_block_files_possible =
             AtomicBool::new(CacheInner::probe_legacy_block_files(&disk_dir));

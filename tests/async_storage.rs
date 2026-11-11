@@ -9,6 +9,118 @@ use std::time::Duration;
 
 #[cfg(feature = "rocksdb-ssd")]
 #[test]
+fn shared_ssd_read_cache_is_used_across_independent_stores() {
+    use matrixcache::{SsdReadCache, StorageEngineRocksDb};
+    let directory = tempfile::tempdir().unwrap();
+    let pool = SsdReadCache::new(512 * 1024);
+    let initial_pinned_bytes = pool.pinned_bytes();
+    let mut stores = Vec::new();
+    for device in 0..4 {
+        let path = directory.path().join(format!("store-{device}"));
+        let mut store = StorageEngineRocksDb::new(path.to_string_lossy());
+        store.set_read_cache(pool.clone()).unwrap();
+        assert!(store.start());
+        store
+            .put_batch(
+                (0..128)
+                    .map(|i| (format!("key-{i}"), vec![device; 4096]))
+                    .collect(),
+            )
+            .unwrap();
+        assert!(store.stop());
+        assert!(store.start());
+        stores.push(store);
+    }
+    for (device, store) in stores.iter().enumerate() {
+        for i in 0..128 {
+            assert_eq!(
+                store.get(&format!("key-{i}")).unwrap().value(),
+                vec![device as u8; 4096]
+            );
+        }
+    }
+    assert!(
+        pool.usage_bytes() > 0,
+        "reads must populate the configured pool"
+    );
+    assert!(pool.usage_bytes() <= pool.capacity_bytes());
+    for store in &mut stores {
+        assert!(store.stop());
+    }
+    assert_eq!(pool.pinned_bytes(), initial_pinned_bytes);
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
+fn shared_ssd_read_cache_refuses_conflicting_open_path_configuration() {
+    use matrixcache::{SsdReadCache, StorageEngineRocksDb};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("shared")
+        .to_string_lossy()
+        .into_owned();
+    let pool = SsdReadCache::new(1024 * 1024);
+    let mut first = StorageEngineRocksDb::new(path.clone());
+    first.set_read_cache(pool.clone()).unwrap();
+    assert!(first.start());
+    first.put("key", vec![7; 4096]).unwrap();
+    assert!(first.set_read_cache(pool.clone()).is_err());
+    let mut second = StorageEngineRocksDb::new(path);
+    second
+        .set_read_cache(SsdReadCache::new(1024 * 1024))
+        .unwrap();
+    assert!(!second.start());
+    second.set_read_cache(pool).unwrap();
+    assert!(second.start());
+    assert_eq!(second.get("key").unwrap().value(), vec![7; 4096]);
+    assert!(first.stop());
+    assert!(second.stop());
+    second
+        .set_read_cache(SsdReadCache::new(512 * 1024))
+        .unwrap();
+    assert!(second.start());
+    assert!(second.stop());
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
+fn shared_ssd_read_cache_survives_shard_cloning_and_disabled_tier_activation() {
+    use matrixcache::{CacheKey, CacheOptions, CacheTier, ShardedMultiLayerCache, SsdReadCache};
+    let directory = tempfile::tempdir().unwrap();
+    let pool = SsdReadCache::new(512 * 1024);
+    let mut options = CacheOptions::new(0, 0, 0).with_ssd_paths([directory.path().join("ssd")]);
+    options.ssd_read_cache = Some(pool.clone());
+    assert_eq!(options.clone().ssd_read_cache, Some(pool.clone()));
+    let cache = ShardedMultiLayerCache::with_options(options, 3);
+    cache.start().unwrap();
+    cache.set_capacity_for_tier(CacheTier::Ssd, 8 * 1024 * 1024);
+    for i in 0..64 {
+        cache
+            .put(
+                CacheKey::string(0, &format!("key-{i}")),
+                vec![i as u8; 16384],
+            )
+            .unwrap();
+    }
+    assert!(cache.stop());
+    cache.start().unwrap();
+    for i in 0..64 {
+        assert_eq!(
+            cache
+                .get(&CacheKey::string(0, &format!("key-{i}")))
+                .unwrap()
+                .unwrap(),
+            vec![i as u8; 16384]
+        );
+    }
+    assert!(pool.usage_bytes() > 0);
+    assert!(pool.usage_bytes() <= pool.capacity_bytes());
+    assert!(cache.stop());
+}
+
+#[cfg(feature = "rocksdb-ssd")]
+#[test]
 fn sharded_ssd_write_policy_reaches_newly_enabled_tiers() {
     use matrixcache::{CacheKey, CacheOptions, CacheTier, ShardedMultiLayerCache, SsdWritePolicy};
     let directory = tempfile::tempdir().unwrap();
