@@ -71,6 +71,14 @@ escape into the caller. Returning independent bytes still requires an owned
 result, and compressed blocks still require decoding. This is not a promise that
 every cache read is zero-copy.
 
+SSD batches containing one unique key use a point read after duplicate coalescing;
+larger batches retain the native multi-get path. This avoids singleton multi-get
+scratch buffers without changing miss handling, result ownership, or refill policy.
+Run `cargo run --release --example storage_batch_read_cost` to measure warm reopened
+storage at 1, 16, and 128 requested keys with 256-byte and 4,096-byte values. The
+example includes owned result allocation and missing keys; its timings are local
+storage costs, not network service QPS or cold-device latency.
+
 An SSD hit refills an enabled upper tier: DRAM when it can admit the value, or
 PMEM when DRAM cannot and PMEM can. With promotion disabled, SSD-instance-only
 mode, or no upper-tier capacity, it skips refill work. Revalidation prevents a
