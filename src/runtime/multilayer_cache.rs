@@ -11885,9 +11885,19 @@ impl ShardedMultiLayerCache {
     /// Snapshot the keys in a logical shard without reading values or filesystem metadata.
     /// Each key is returned once, even when present in multiple tiers or cache shards.
     pub fn keys_for_shard(&self, shard_id: ShardId) -> Vec<CacheKey> {
+        self.keys_for_shard_matching(shard_id, |_| true)
+    }
+
+    /// Snapshot only matching keys; see [`MultiLayerCache::keys_for_shard_matching`].
+    /// Cache shards are visited sequentially, without a cache-wide atomic snapshot.
+    pub fn keys_for_shard_matching(
+        &self,
+        shard_id: ShardId,
+        mut matches: impl FnMut(&CacheKey) -> bool,
+    ) -> Vec<CacheKey> {
         self.shards
             .iter()
-            .flat_map(|shard| shard.keys_for_shard(shard_id))
+            .flat_map(|shard| shard.keys_for_shard_matching(shard_id, &mut matches))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -14794,6 +14804,18 @@ impl MultiLayerCache {
     /// entry snapshot, this does not include unindexed legacy files. Mutations after the
     /// snapshot are not reflected in the returned keys.
     pub fn keys_for_shard(&self, shard_id: ShardId) -> Vec<CacheKey> {
+        self.keys_for_shard_matching(shard_id, |_| true)
+    }
+
+    /// Snapshot matching indexed keys, filtering before copying or deduplication.
+    /// The predicate runs under the cache read lock and must not call cache methods.
+    /// It may see a key more than once when several tiers hold it. Results are unique
+    /// and sorted; nonmatching keys are not copied. This still scans all tier keys.
+    pub fn keys_for_shard_matching(
+        &self,
+        shard_id: ShardId,
+        mut matches: impl FnMut(&CacheKey) -> bool,
+    ) -> Vec<CacheKey> {
         let inner = self.inner.read().expect("cache lock poisoned");
         inner
             .memory
@@ -14801,9 +14823,11 @@ impl MultiLayerCache {
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
             .filter(|key| key.shard_id == shard_id)
-            .map(|key| key.as_ref().clone())
+            .map(|key| key.as_ref())
+            .filter(|key| matches(key))
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .cloned()
             .collect()
     }
 
