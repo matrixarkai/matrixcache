@@ -345,3 +345,124 @@ fn record_key_index_tracks_background_recovery() {
     assert_eq!(snapshot.keys.len(), 32);
     assert!(cache.stop());
 }
+
+#[test]
+fn record_invalidation_preserves_other_namespaces_shards_and_shared_values() {
+    for indexed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 0).with_ssd_paths([directory.path().to_path_buf()]),
+        );
+        for shard in [1, 2] {
+            for namespace in ["feature", "hash", "page"] {
+                for record in ["shared", "other"] {
+                    for selector in ["a", "b", "c"] {
+                        cache
+                            .put(query_key(shard, namespace, record, selector), vec![9; 16])
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        if indexed {
+            cache.enable_record_key_index("feature");
+            cache.enable_record_key_index("hash");
+        }
+        let target = query_key(1, "feature", "shared", "a");
+        let held = cache.get_shared(&target).unwrap().unwrap();
+        for namespace in ["feature", "hash"] {
+            cache.invalidate_record(1, namespace, "shared").unwrap();
+            cache.invalidate_record(1, namespace, "shared").unwrap();
+            for selector in ["a", "b", "c"] {
+                assert!(cache
+                    .get(&query_key(1, namespace, "shared", selector))
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    cache
+                        .get(&query_key(2, namespace, "shared", selector))
+                        .unwrap(),
+                    Some(vec![9; 16])
+                );
+                assert_eq!(
+                    cache
+                        .get(&query_key(1, namespace, "other", selector))
+                        .unwrap(),
+                    Some(vec![9; 16])
+                );
+                assert_eq!(
+                    cache
+                        .get(&query_key(1, "page", "shared", selector))
+                        .unwrap(),
+                    Some(vec![9; 16])
+                );
+            }
+            assert_exact_index(&cache);
+        }
+        assert_eq!(&*held, &[9; 16]);
+        cache.inner.write().unwrap().started = false;
+        assert!(cache.invalidate_record(1, "feature", "absent").is_ok());
+        assert!(matches!(
+            cache.invalidate_record(1, "feature", "other"),
+            Err(CacheError::Stopped)
+        ));
+        cache.inner.write().unwrap().started = true;
+    }
+}
+
+#[test]
+fn indexed_record_invalidation_survives_tier_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = CacheOptions::new(128, 128, 1 << 20)
+        .with_ssd_paths([directory.path().join("ssd")])
+        .with_pmem_paths([directory.path().join("pmem")])
+        .with_auto_recover_on_start(true);
+    let removed = ["record-0", "record-31"];
+    {
+        let cache = MultiLayerCache::with_options(options.clone());
+        cache.enable_record_key_index("feature");
+        cache.start().unwrap();
+        cache.set_ssd_admission_filter_enabled(false);
+        for index in 0..96 {
+            cache
+                .put(
+                    query_key(
+                        1,
+                        "feature",
+                        &format!("record-{}", index / 3),
+                        &format!("field-{index}"),
+                    ),
+                    vec![index; 64],
+                )
+                .unwrap();
+        }
+        assert!(cache.item_count_for_tier(CacheTier::Memory) > 0);
+        assert!(cache.item_count_for_tier(CacheTier::Pmem) > 0);
+        assert!(cache.item_count_for_tier(CacheTier::Ssd) > 0);
+        for record in removed {
+            let keys = cache.keys_for_records(1, "feature", &[record]).keys;
+            assert_eq!(keys.len(), 3);
+            cache.invalidate_record(1, "feature", record).unwrap();
+            for key in keys {
+                assert!(cache.get(&key).unwrap().is_none());
+            }
+            assert_exact_index(&cache);
+        }
+        assert!(cache.stop());
+    }
+    let cache = MultiLayerCache::with_options(options);
+    cache.enable_record_key_index("feature");
+    cache.start().unwrap();
+    assert_exact_index(&cache);
+    for record in removed {
+        assert!(cache
+            .keys_for_records(1, "feature", &[record])
+            .keys
+            .is_empty());
+    }
+    assert!(!cache
+        .keys_for_records(1, "feature", &["record-10"])
+        .keys
+        .is_empty());
+    assert!(cache.stop());
+}

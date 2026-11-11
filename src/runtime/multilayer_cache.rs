@@ -14547,23 +14547,7 @@ impl MultiLayerCache {
         namespace: &str,
         record_key: &str,
     ) -> Result<(), CacheError> {
-        let keys = {
-            let inner = self.inner.read().expect("cache lock poisoned");
-            inner
-                .memory
-                .keys()
-                .chain(inner.pmem.keys())
-                .chain(inner.disk_index.keys())
-                .filter(|key| {
-                    key.shard_id == shard_id
-                        && key.namespace == namespace
-                        && key.record_key.as_ref() == record_key
-                })
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-        };
+        let keys = self.keys_for_records(shard_id, namespace, &[record_key]).keys;
         for key in keys {
             self.invalidate(&key)?;
         }
