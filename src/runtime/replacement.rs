@@ -992,11 +992,13 @@ impl ArcList {
     }
 
     pub fn put(&mut self, key: PolicyKey) {
-        self.access(key);
+        if !self.refresh_active(&key) {
+            self.access(key);
+        }
     }
 
     pub fn get(&mut self, key: &str) -> bool {
-        self.access(key.to_string())
+        self.refresh_active(key) || self.access(key.to_owned())
     }
 
     pub fn evict(&mut self) -> Vec<PolicyKey> {
@@ -1023,6 +1025,12 @@ impl ArcList {
 
     pub fn get_fetch_ghost_tail(&self, size: usize) -> Vec<PolicyKey> {
         self.fetch_list.get_ghost_tail(size)
+    }
+
+    fn refresh_active(&mut self, key: &str) -> bool {
+        // Active hits only change recency. Keep their key allocation and node.
+        // Empty keys retain the existing absent-item sentinel behavior.
+        !key.is_empty() && self.active_list.data_list.get(key)
     }
 
     fn access(&mut self, key: PolicyKey) -> bool {

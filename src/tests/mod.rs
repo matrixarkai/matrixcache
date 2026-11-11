@@ -16033,6 +16033,57 @@ mod tests {
         assert!(arc.GetActiveDataTail(8).contains(&"a".to_string()));
     }
 
+    // rust-internal: active refresh preserves key allocation and arena identity.
+    #[test]
+    fn arc_active_refresh_reuses_key_and_node() {
+        let mut policy = ArcList::new(4);
+        for key in ["alpha", "beta"] {
+            policy.put(key.to_owned());
+            assert!(policy.get(key));
+        }
+        let (key, node) = policy.active_list.data_list.index.get_key_value("alpha").unwrap();
+        let original = Arc::clone(key);
+        let original_node = *node;
+        for _ in 0..2048 {
+            assert!(policy.get("alpha"));
+            policy.put("alpha".to_owned());
+        }
+        let (key, node) = policy.active_list.data_list.index.get_key_value("alpha").unwrap();
+        assert!(Arc::ptr_eq(&original, key));
+        assert_eq!(original_node, *node);
+        assert_eq!(policy.get_active_data_tail(8), vec!["beta", "alpha"]);
+        assert_eq!(policy.size(), 2);
+        assert_eq!(policy.ghost_size(), 0);
+        assert_eq!(policy.fetch_capacity(), 2);
+        assert_eq!(policy.active_capacity(), 2);
+    }
+
+    // rust-internal: manual active-list bookkeeping comparison with the old access path.
+    #[test]
+    #[ignore]
+    fn measure_arc_active_refresh() {
+        let keys: Vec<_> = (0..64).map(|i| format!("{i}-{}", "k".repeat(256))).collect();
+        let mut baseline = ArcList::new(128);
+        for key in &keys {
+            baseline.put(key.clone());
+            assert!(baseline.get(key));
+        }
+        let mut refreshed = baseline.clone();
+        let start = std::time::Instant::now();
+        for i in 0..100000 {
+            assert!(baseline.access(std::hint::black_box(&keys[i % keys.len()]).clone()));
+        }
+        let before = start.elapsed();
+        let start = std::time::Instant::now();
+        for i in 0..100000 {
+            assert!(refreshed.get(std::hint::black_box(&keys[i % keys.len()])));
+        }
+        let after = start.elapsed();
+        assert_eq!(baseline.get_active_data_tail(128), refreshed.get_active_data_tail(128));
+        assert_eq!(baseline.total_size(), refreshed.total_size());
+        println!("active_hits=100000 old_ns={} refreshed_ns={}", before.as_nanos(), after.as_nanos());
+    }
+
     #[test]
     fn arc_list_hit_on_fetch_data_promotes_to_active() {
         let mut arc = ArcList::new(4);
