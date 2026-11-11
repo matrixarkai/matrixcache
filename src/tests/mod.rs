@@ -249,10 +249,10 @@ mod tests {
     // rust-internal: reused sketch positions preserve every counter and decay boundary.
     #[test]
     fn frequency_batch_records_match_individual_records() {
-        for capacity in [1, 17, 4096] {
+        for capacity in [0, 1, 17, 4096] {
             let individual = FrequencySketch::with_capacity(capacity);
             let batched = FrequencySketch::with_capacity(capacity);
-            for (i, count) in [0, 1, 31, 32, 255, 4096, 17].into_iter().enumerate() {
+            for (i, count) in [0, 1, 31, 32, 255, 4096, 131073, 17].into_iter().enumerate() {
                 let key = CacheKey::string(0, &format!("{i}-{}", "k".repeat(4096)));
                 for _ in 0..count { individual.record(&key); }
                 batched.record_many(&key, count);
@@ -261,6 +261,62 @@ mod tests {
                     assert_eq!(left.load(Ordering::Relaxed), right.load(Ordering::Relaxed));
                 }
             }
+        }
+    }
+
+    // rust-internal: bulk updates remain nonblocking while another thread owns aging.
+    #[test]
+    fn frequency_batch_does_not_wait_for_an_aging_owner() {
+        let sketch = FrequencySketch::with_capacity(1);
+        let key = CacheKey::string(0, "batch-aging-owner");
+        sketch.aging.store(true, Ordering::Release);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let sketch = &sketch;
+                let key = &key;
+                scope.spawn(move || sketch.record_many(key, 16));
+            }
+        });
+        assert_eq!(sketch.window(), 64);
+        assert_eq!(sketch.estimate(&key), 64);
+        sketch.aging.store(false, Ordering::Release);
+        sketch.decay();
+        assert_eq!(sketch.window(), 32);
+        assert_eq!(sketch.estimate(&key), 32);
+    }
+
+    // rust-internal: manual CPU comparison of equivalent frequency bookkeeping.
+    #[test]
+    #[ignore]
+    fn measure_coalesced_frequency_updates() {
+        #[inline(never)]
+        fn individual_batch(sketch: &FrequencySketch, key: &CacheKey, count: u64) {
+            let positions = sketch.positions(key);
+            for _ in 0..count { sketch.record_positions(positions); }
+        }
+        #[inline(never)]
+        fn coalesced_batch(sketch: &FrequencySketch, key: &CacheKey, count: u64) {
+            sketch.record_many(key, count);
+        }
+        for batch in [1, 8, 64] {
+            let key = CacheKey::string(0, "frequency-cpu");
+            let individual = FrequencySketch::with_capacity(4096);
+            let coalesced = FrequencySketch::with_capacity(4096);
+            let start = std::time::Instant::now();
+            for _ in 0..10000 {
+                individual_batch(&individual, std::hint::black_box(&key), batch);
+            }
+            let individual_time = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..10000 {
+                coalesced_batch(&coalesced, std::hint::black_box(&key), batch);
+            }
+            let coalesced_time = start.elapsed();
+            assert_eq!(individual.window(), coalesced.window());
+            for (left, right) in individual.counters.iter().zip(&coalesced.counters) {
+                assert_eq!(left.load(Ordering::Relaxed), right.load(Ordering::Relaxed));
+            }
+            println!("batch={batch} individual_ns={} coalesced_ns={}", individual_time.as_nanos(), coalesced_time.as_nanos());
         }
     }
 
