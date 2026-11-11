@@ -657,6 +657,7 @@ impl BaseLruList {
         let (key, node) = self.index.remove_entry(key)?;
         self.arena.unlink(&mut self.list, node);
         self.arena.release(node);
+        self.shrink_if_sparse();
         Some(key)
     }
 
@@ -666,16 +667,41 @@ impl BaseLruList {
             .expect("linked key belongs to index");
         self.arena.unlink(&mut self.list, node);
         self.arena.release(node);
+        self.shrink_if_sparse();
         Some(key)
     }
 
+    fn shrink_if_sparse(&mut self) {
+        let live = self.index.len();
+        if self.arena.nodes.capacity() <= 64
+            || live.saturating_mul(4) > self.arena.nodes.capacity()
+        {
+            return;
+        }
+        // Walk only live nodes, oldest first. No high-water-sized remapping
+        // array is needed, and the existing shared keys keep their allocations.
+        let mut rebuilt = Self::new(self.capacity);
+        rebuilt.arena.nodes.reserve_exact(live);
+        rebuilt.index.reserve(live);
+        let mut cursor = self.list.tail;
+        for _ in 0..live {
+            let Some(node) = self.arena.nodes.get(cursor as usize) else { return };
+            let Some(key) = &node.key else { return };
+            if self.index.get(key.as_ref()) != Some(&cursor) {
+                return;
+            }
+            rebuilt.put_shared(Arc::clone(key));
+            cursor = node.prev;
+        }
+        // Refuse inconsistent chains rather than silently dropping entries.
+        if cursor != KEY_LIST_NIL || rebuilt.size() != live {
+            return;
+        }
+        *self = rebuilt;
+    }
+
     pub fn delete(&mut self, key: &str) -> bool {
-        let Some(node) = self.index.remove(key) else {
-            return false;
-        };
-        self.arena.unlink(&mut self.list, node);
-        self.arena.release(node);
-        true
+        self.take_shared(key).is_some()
     }
 
     pub fn get_tail(&self, size: usize) -> Vec<PolicyKey> {
@@ -702,6 +728,7 @@ impl BaseLruList {
         self.list.clear();
         self.arena.clear();
         self.index.clear();
+        self.shrink_if_sparse();
     }
 }
 

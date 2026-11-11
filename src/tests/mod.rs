@@ -16035,6 +16035,43 @@ mod tests {
 
     // rust-internal: resident and ghost transitions share the original long key allocation.
     #[test]
+    fn policy_arena_releases_burst_capacity_and_preserves_order() {
+        let mut policy = BaseLruList::new(20000);
+        for i in 0..20000 { policy.put(format!("key-{i}")); }
+        let original = Arc::clone(policy.index.get_key_value("key-19999").unwrap().0);
+        let before = policy.arena.nodes.capacity();
+        for i in 0..19992 { assert!(policy.delete(&format!("key-{i}"))); }
+        assert_eq!(policy.size(), 8);
+        assert!(policy.arena.nodes.capacity() <= 64);
+        assert!(policy.arena.free.capacity() <= 64);
+        assert!(policy.index.capacity() <= 64);
+        assert!(before > policy.arena.nodes.capacity() * 100);
+        assert_eq!(policy.get_tail(16), (19992..20000).map(|i| format!("key-{i}")).collect::<Vec<_>>());
+        assert!(Arc::ptr_eq(&original, policy.index.get_key_value("key-19999").unwrap().0));
+        assert!(policy.get("key-19992"));
+        assert_eq!(policy.evict_one(), vec!["key-19993"]);
+        policy.put("replacement".to_owned());
+        assert!(policy.get("replacement"));
+        assert_eq!(policy.capacity(), 20000);
+    }
+
+    // rust-internal: reset returns large policy backing allocations without changing capacity.
+    #[test]
+    fn policy_reset_releases_large_backing_allocations() {
+        let mut policy = BaseLruList::new(4096);
+        for i in 0..4096 { policy.put(i.to_string()); }
+        policy.reset();
+        assert_eq!(policy.capacity(), 4096);
+        assert_eq!(policy.size(), 0);
+        assert_eq!(policy.arena.nodes.capacity(), 0);
+        assert_eq!(policy.arena.free.capacity(), 0);
+        assert_eq!(policy.index.capacity(), 0);
+        policy.put("after-reset".to_owned());
+        assert!(policy.get("after-reset"));
+    }
+
+    // rust-internal: resident and ghost transitions share the original long key allocation.
+    #[test]
     fn arc_transitions_preserve_shared_key_allocations() {
         let mut policy = ArcList::new(2);
         let a = format!("a-{}", "x".repeat(4096));
