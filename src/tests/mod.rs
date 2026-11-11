@@ -5,6 +5,95 @@
 mod tests {
     // shared-corpus: storage_cache_eviction
     #[test]
+    fn tiered_ssd_refills_pmem_when_memory_frequency_admission_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = CacheTieringPolicy {
+            memory_capacity_bytes: 64, pmem_capacity_bytes: 256, ssd_capacity_bytes: 4096,
+            memory_hotness_threshold: 1000, pmem_admit_hotness_threshold: 1000,
+            ssd_admit_hotness_threshold: 99, max_memory_block_bytes: 64,
+            max_pmem_block_bytes: 256, max_ssd_block_bytes: 4096,
+            ssd_write_through: false, ..CacheTieringPolicy::default()
+        };
+        let cache = MultiLayerCache::with_tiering_policy(directory.path(), policy, CacheBlockOptions::default());
+        cache.set_pmem_paths(vec![directory.path().join("pmem")]);
+        cache.start().unwrap();
+        let hot = CacheKey::string(0, "hot-memory-value");
+        let cold = CacheKey::string(0, "cold-ssd-value");
+        cache.put(hot.clone(), vec![1; 64]).unwrap();
+        cache.put_with_admission(cold.clone(), vec![2; 64], CacheAdmissionRequest {
+            block_kind: CacheBlockKind::Object, shard_id: 0, routing_slot: Some(7),
+            block_bytes: 64, hotness: 99, pinned: false,
+        }).unwrap();
+        cache.set_admission_filter_enabled(true);
+        for _ in 0..512 { assert!(cache.get(&hot).unwrap().is_some()); }
+        let before = cache.stats();
+        assert_eq!(cache.get_shared(&cold).unwrap().unwrap().as_ref(), &[2; 64]);
+        assert_eq!(cache.peek_tier(&hot), Some(CacheReadTier::Memory));
+        assert_eq!(cache.peek_tier(&cold), Some(CacheReadTier::Pmem));
+        let after = cache.stats();
+        assert!(after.memory_admission_rejected > before.memory_admission_rejected);
+        assert_eq!(after.refill_failures, before.refill_failures);
+        assert!(cache.stop());
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
+    fn tiered_ssd_refills_pmem_when_memory_cannot_hold_the_value() {
+        for (memory, bytes) in [(0, 0), (0, 128), (64, 128)] {
+            for read_kind in 0..3 {
+                let directory = tempfile::tempdir().unwrap();
+                let policy = CacheTieringPolicy {
+                    memory_capacity_bytes: memory,
+                    pmem_capacity_bytes: 256,
+                    ssd_capacity_bytes: 4096,
+                    memory_hotness_threshold: 1000,
+                    pmem_admit_hotness_threshold: 1000,
+                    ssd_admit_hotness_threshold: 99,
+                    max_memory_block_bytes: memory,
+                    max_pmem_block_bytes: 256,
+                    max_ssd_block_bytes: 4096,
+                    ssd_write_through: false,
+                    ..CacheTieringPolicy::default()
+                };
+                let cache = MultiLayerCache::with_tiering_policy(directory.path(), policy, CacheBlockOptions::default());
+                cache.set_pmem_paths(vec![directory.path().join("pmem")]);
+                cache.start().unwrap();
+                let key = CacheKey::string(0, "large-cold-value");
+                cache.put_with_admission(key.clone(), vec![7; bytes], CacheAdmissionRequest {
+                    block_kind: CacheBlockKind::Object, shard_id: 0, routing_slot: Some(7),
+                    block_bytes: bytes, hotness: 99, pinned: false,
+                }).unwrap();
+                assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+                assert_eq!(cache.get_no_promotion(&key).unwrap().unwrap().value, vec![7; bytes]);
+                assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Ssd));
+                let before = cache.stats();
+                let before_epoch = cache.inner.read().unwrap().ssd_probe_epoch;
+                match read_kind {
+                    0 => assert_eq!(cache.get(&key).unwrap().unwrap(), vec![7; bytes]),
+                    1 => assert_eq!(cache.get_shared(&key).unwrap().unwrap().as_ref(), vec![7; bytes].as_slice()),
+                    _ => {
+                        let handle = cache.acquire(&key).unwrap().unwrap();
+                        assert_eq!(handle.as_slice(), vec![7; bytes].as_slice());
+                        cache.release(handle);
+                    }
+                }
+                assert_eq!(cache.peek_tier(&key), Some(CacheReadTier::Pmem), "memory={memory} bytes={bytes} read_kind={read_kind}");
+                assert!(cache.inner.read().unwrap().ssd_probe_epoch > before_epoch);
+                let after = cache.stats();
+                assert_eq!(after.memory_bytes, 0);
+                assert_eq!(after.pmem_bytes, bytes as u64);
+                assert_eq!(after.refill_failures, before.refill_failures);
+                let repeat = cache.get_with_tier(&key).unwrap().unwrap();
+                assert_eq!(repeat.value, vec![7; bytes]);
+                assert_eq!(repeat.tier, CacheReadTier::Pmem);
+                assert_eq!(cache.stats().disk_hits, after.disk_hits);
+                assert!(cache.stop());
+            }
+        }
+    }
+
+    // shared-corpus: storage_cache_eviction
+    #[test]
     fn scoped_shared_ssd_reads_preserve_payloads_handles_and_corruption_errors() {
         for devices in [1, 3] {
             for instance_only in [false, true] {
