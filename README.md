@@ -66,6 +66,20 @@ without changing cache-hit results or the application's durability policy.
 - Compare the same backend, shard count, capacity, payloads, and promotion policy
   when evaluating a change. Local cache operations are not network service QPS.
 
+## Choose an Access Pattern
+
+| Workload | Choice | Cost to include |
+|---|---|---|
+| Caller needs independent mutable bytes | Copied reads | Result allocation and copying, including on a memory hit. |
+| Caller can consume a shared immutable value | Shared-buffer reads | Old allocations remain live while handles exist; returned ownership is not a process-memory bound. |
+| Scan should not warm upper tiers | No-promotion reads or pinned handles | Release retained handles; lower-tier decoding and I/O still apply. |
+| Repeated invalidation of selected records | [Record-scoped lookup](#record-scoped-key-lookup) | Opt-in namespace indexes consume metadata and require normal deletion afterward. |
+| Placement across changing nodes | [Cluster topology helpers](#placing-keys-on-a-cluster) | The host must transfer data and coordinate membership; a handoff plan does not move bytes. |
+
+See [read ownership](#read-ownership-and-refill-cost) before calling a path
+zero-copy. Compare resident hits, SSD misses, refill, and writes at capacity
+separately: each exercises different allocation, locking, and eviction work.
+
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
