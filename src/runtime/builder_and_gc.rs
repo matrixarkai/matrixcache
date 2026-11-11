@@ -2856,11 +2856,7 @@ impl CacheInner {
         // Installing the bytes just read into unused memory does not change
         // logical data. Do not cancel other pending reads for that placement.
         // Retain invalidation when placement can evict or touch another tier.
-        let memory_target = !matches!(
-            self.tiering_policy.data_placement,
-            CacheDataPlacement::SideBySide
-        ) || self.pmem_capacity_bytes == 0
-            || value.len() <= self.tiering_policy.data_placement_threshold_bytes;
+        let memory_target = !self.ssd_refill_targets_pmem(value.len());
         let spare_memory = self.memory_bytes.checked_add(value.len())
             .is_some_and(|bytes| bytes <= self.memory_capacity_bytes);
         let epoch = self.ssd_probe_epoch;
@@ -2869,7 +2865,7 @@ impl CacheInner {
         let refilled = self.refill_from_ssd_shared(key, value);
         // The cache lock stays exclusive here. Suppress only the single
         // resident insertion increment; any extra mutation keeps the guard.
-        if refilled && memory_target && spare_memory
+        if refilled && memory_target && spare_memory && self.memory.contains_key(key)
             && epoch.checked_add(1) == Some(self.ssd_probe_epoch)
             && self.ssd_probe_global_epoch <= epoch
         {
@@ -2879,16 +2875,27 @@ impl CacheInner {
         refilled
     }
 
+    fn ssd_refill_targets_pmem(&self, value_len: usize) -> bool {
+        if self.pmem_capacity_bytes == 0 { return false; }
+        match self.tiering_policy.data_placement {
+            CacheDataPlacement::SideBySide => value_len > self.tiering_policy.data_placement_threshold_bytes,
+            CacheDataPlacement::Tiered => value_len <= self.pmem_capacity_bytes
+                && (self.memory_capacity_bytes == 0 || value_len > self.memory_capacity_bytes),
+        }
+    }
+
     fn refill_from_ssd_shared(&mut self, key: &CacheKey, value: Arc<[u8]>) -> bool {
-        if matches!(
-            self.tiering_policy.data_placement,
-            CacheDataPlacement::SideBySide
-        ) && self.pmem_capacity_bytes > 0
-            && value.len() > self.tiering_policy.data_placement_threshold_bytes
+        if self.ssd_refill_targets_pmem(value.len()) {
+            return self.put_pmem_shared(key, value);
+        }
+        let admitted = self.put_memory_shared(key, Arc::clone(&value));
+        if !admitted
+            && matches!(self.tiering_policy.data_placement, CacheDataPlacement::Tiered)
+            && self.pmem_capacity_bytes > 0 && value.len() <= self.pmem_capacity_bytes
         {
             return self.put_pmem_shared(key, value);
         }
-        self.put_memory_shared(key, value)
+        admitted
     }
 
     fn evict_memory_to_capacity(&mut self) {
