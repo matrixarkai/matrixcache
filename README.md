@@ -156,6 +156,17 @@ configured tier capacity alone does not bound total process memory.
 - Persistent-tier auto-recovery and restart refill.
 - Latency and tier metrics for observability.
 
+### Executor completion is not a durability acknowledgement
+
+For joined work, `CacheExecutorTask::try_join` waits for completion; despite its
+name, it is not a nonblocking poll. It returns `None` for panicked, expired, or
+cancelled tasks. Handle that outcome explicitly before publishing state that
+depends on the task. Queue expiration and cancelling shutdown do not interrupt
+an already running closure. A completed closure establishes only what that
+closure did, not that authoritative records were synced or replicated. See the
+[executor implementation](src/runtime/allocators_executors.rs) and
+[durability policy](#durability).
+
 ### Read ownership and refill cost
 
 Use shared-buffer reads when the caller can consume an owned shared handle, and
