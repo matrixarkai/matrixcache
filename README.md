@@ -41,6 +41,18 @@ Use synthetic values and remove credentials from backend configuration. Follow t
 [security policy](SECURITY.md) for sensitive reports, not a public issue. For code
 or documentation changes, start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Implementation entry points
+
+| Area | Start reading |
+|---|---|
+| Cache operations and cross-tier behavior | [Multilayer cache](src/runtime/multilayer_cache.rs) |
+| Construction, pin handling, and eviction selection | [Builder and eviction implementation](src/runtime/builder_and_gc.rs) |
+
+Bounded eviction groups candidates using a fixed-size position table rather than
+sorting every grouped candidate window. The ungrouped shortcut and wider fallback
+remain separate paths. This reduces selection work without increasing configured
+cache capacity; it does not by itself establish higher application throughput.
+
 ## Start Here
 
 | Task | Read |
