@@ -14,6 +14,10 @@ invalidation, and asynchronous writeback with backpressure accounting.
 
 ## Related Projects
 
+**On this page:** [Start here](#start-here) | [Access patterns](#choose-an-access-pattern) |
+[Usage](#usage) | [Durability](#durability) | [Sizing](#choosing-a-shard-count) |
+[Measurement](#measuring) | [Contributing](#contributing-security-and-license).
+
 All six projects are independently usable under Apache-2.0. Choose by workload
 and execution model; MatrixCache itself does not start a network cache service.
 
