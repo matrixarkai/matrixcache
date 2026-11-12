@@ -119,6 +119,18 @@ See [read ownership](#read-ownership-and-refill-cost) before calling a path
 zero-copy. Compare resident hits, SSD misses, refill, and writes at capacity
 separately: each exercises different allocation, locking, and eviction work.
 
+### Budget read ownership alongside cache capacity
+
+A copied read transfers independent bytes to the caller. Shared or pinned reads
+can avoid that copy, but an overwritten value remains allocated while a caller
+retains its handle. Release handles at the request boundary rather than storing
+them indefinitely in another cache or work queue. Include those retained values,
+refill buffers, and pending writeback in the application's memory budget.
+
+Compare equivalent ownership and promotion modes when measuring latency. A warm
+shared-buffer hit is not the same workload as a copied hit or an SSD refill, and
+configured tier capacity alone does not bound total process memory.
+
 ## Features
 
 - Multi-tier placement across DRAM, a PMEM-like resident tier, and an SSD tier.
