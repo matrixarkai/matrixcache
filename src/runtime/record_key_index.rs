@@ -148,6 +148,23 @@ impl CacheInner {
 }
 
 impl MultiLayerCache {
+    /// Conservatively test whether a record can have cached selectors.
+    ///
+    /// Unregistered namespaces return true. Registered namespaces consult only
+    /// the key index, without allocating, accessing values, or scanning tiers.
+    /// False describes this instant, not a reusable negative cache entry; callers
+    /// must serialize relevant cache fills with any mutation that skips work.
+    pub fn may_have_record_keys(&self, shard_id: ShardId, namespace: &str, record: &str) -> bool {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        let Some(shards) = inner.record_key_index.namespaces.get(namespace) else {
+            return true;
+        };
+        shards
+            .get(&shard_id)
+            .and_then(|records| records.get(record))
+            .is_some_and(|keys| !keys.is_empty())
+    }
+
     /// Enable record-scoped lookup for one namespace, backfilling existing tier keys.
     /// Registration is retained across clears and recovery. Other namespaces incur
     /// no per-entry index allocation. Repeated registration does no work.
@@ -227,6 +244,13 @@ impl MultiLayerCache {
 }
 
 impl ShardedMultiLayerCache {
+    /// Conservatively inspect each cache shard without a cache-wide atomic snapshot.
+    pub fn may_have_record_keys(&self, shard_id: ShardId, namespace: &str, record: &str) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.may_have_record_keys(shard_id, namespace, record))
+    }
+
     pub fn enable_record_key_index(&self, namespace: &str) {
         for shard in self.shards.iter() {
             shard.enable_record_key_index(namespace);

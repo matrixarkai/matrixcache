@@ -33,6 +33,92 @@ fn assert_exact_index(cache: &MultiLayerCache) {
         .map(|key| key.as_ref())
         .collect::<BTreeSet<_>>();
     assert_eq!(actual, expected);
+    let queries = expected
+        .iter()
+        .map(|key| {
+            (
+                key.shard_id,
+                key.namespace.to_string(),
+                key.record_key.to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    drop(inner);
+    for (shard, namespace, record) in queries {
+        assert!(cache.may_have_record_keys(shard, &namespace, &record));
+    }
+}
+
+#[test]
+fn record_presence_is_conservative_until_registered_and_isolates_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, directory.path());
+    assert!(cache.may_have_record_keys(1, "hash", "missing"));
+    cache.put_memory_only(query_key(1, "hash", "row", "a"), vec![1]);
+    cache.enable_record_key_index("hash");
+    assert!(cache.may_have_record_keys(1, "hash", "row"));
+    assert!(!cache.may_have_record_keys(1, "hash", "missing"));
+    assert!(!cache.may_have_record_keys(2, "hash", "row"));
+    assert!(cache.may_have_record_keys(1, "feature", "row"));
+    let stats = cache.stats();
+    for _ in 0..1000 {
+        assert!(cache.may_have_record_keys(1, "hash", "row"));
+        assert!(!cache.may_have_record_keys(1, "hash", "missing"));
+    }
+    assert_eq!(cache.stats().memory_hits, stats.memory_hits);
+    assert_eq!(cache.stats().misses, stats.misses);
+    cache.invalidate(&query_key(1, "hash", "row", "a")).unwrap();
+    assert!(!cache.may_have_record_keys(1, "hash", "row"));
+}
+
+#[test]
+fn record_presence_remains_true_until_the_final_tier_copy_is_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, directory.path());
+    cache.enable_record_key_index("hash");
+    let key = Arc::new(query_key(1, "hash", "row", "a"));
+    {
+        let mut inner = cache.inner.write().unwrap();
+        inner.make_resident(key.clone(), Arc::from([1; 16]));
+        inner.make_pmem_resident(key.clone(), Arc::from([1; 16]));
+        inner.insert_disk_index(key.clone(), 16);
+        inner.take_resident(&key);
+    }
+    assert!(cache.may_have_record_keys(1, "hash", "row"));
+    cache.inner.write().unwrap().take_pmem_resident(&key);
+    assert!(cache.may_have_record_keys(1, "hash", "row"));
+    cache.inner.write().unwrap().remove_disk_index(&key);
+    assert!(!cache.may_have_record_keys(1, "hash", "row"));
+    assert_exact_index(&cache);
+}
+
+#[test]
+fn record_presence_visits_all_cache_shards_and_keeps_registration_on_clear() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = ShardedMultiLayerCache::with_options(
+        CacheOptions::new(1 << 20, 0, 0).with_ssd_paths([directory.path().to_path_buf()]),
+        4,
+    );
+    assert!(cache.may_have_record_keys(1, "hash", "missing"));
+    cache.enable_record_key_index("hash");
+    assert!(!cache.may_have_record_keys(1, "hash", "row"));
+    for (index, shard) in cache.shards.iter().enumerate() {
+        let key = query_key(1, "hash", "row", &index.to_string());
+        shard.put_memory_only(key.clone(), vec![1]);
+        assert!(cache.may_have_record_keys(1, "hash", "row"));
+        shard.invalidate(&key).unwrap();
+        assert!(!cache.may_have_record_keys(1, "hash", "row"));
+    }
+    for shard in cache.shards.iter() {
+        shard
+            .inner
+            .write()
+            .unwrap()
+            .clear_all_locked(false)
+            .unwrap();
+    }
+    assert!(!cache.may_have_record_keys(1, "hash", "row"));
+    assert!(cache.may_have_record_keys(1, "other", "row"));
 }
 
 #[test]
