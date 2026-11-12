@@ -49,9 +49,12 @@ or documentation changes, start with [CONTRIBUTING.md](CONTRIBUTING.md).
 | Construction, pin handling, and eviction selection | [Builder and eviction implementation](src/runtime/builder_and_gc.rs) |
 
 Bounded eviction groups candidates using a fixed-size position table rather than
-sorting every grouped candidate window. The ungrouped shortcut and wider fallback
-remain separate paths. This reduces selection work without increasing configured
-cache capacity; it does not by itself establish higher application throughput.
+sorting every grouped candidate window. Selection compares borrowed score rows,
+retains the winning index, and clones only the selected victim key. Group score,
+victim score, and key still determine ordering. The ungrouped shortcut and wider
+fallback remain separate paths. This reduces selection work without increasing
+configured cache capacity; it does not by itself establish higher application
+throughput or reduce persistent bytes written.
 
 ## Start Here
 
@@ -216,6 +219,15 @@ sudo apt-get install -y build-essential pkg-config libssl-dev clang libclang-dev
 ```
 
 ## Usage
+
+After installing the build prerequisites above, check out the public source:
+
+```bash
+git clone https://github.com/matrixarkai/matrixcache.git
+cd matrixcache
+```
+
+Run these commands from that checkout:
 
 ```bash
 cargo build
