@@ -208,13 +208,19 @@ still perform deletion, and sharded snapshots visit cache shards sequentially
 rather than atomically. Budget the additional index metadata for enabled
 namespaces instead of treating reduced scan work as free memory.
 
-`may_have_record_keys(shard_id, namespace, record_key)` tests presence without
-allocating a key snapshot, scanning tiers, or accessing values. Unregistered
-namespaces and enabled SSD backends conservatively return true. A backend can
-discover persisted blocks not represented in its in-memory disk index; this
-query does not probe the backend. A false result is only an instantaneous
-absence check: serialize relevant cache fills with a mutation before using it
-to skip invalidation, rather than retaining it as a negative cache entry.
+`may_have_record_keys(shard_id, namespace, record_key)` is a conservative
+presence query on both cache types. It does not allocate a key snapshot, scan
+tiers, access values, or probe the SSD backend.
+
+| Result | Meaning |
+|---|---|
+| `true` | Indexed selectors exist, the namespace is unregistered, or an SSD backend is enabled. It does not guarantee a readable cached value. |
+| `false` | The registered index proves absence at this instant with the SSD backend disabled. It is not a reusable negative cache entry. |
+
+An enabled backend can discover persisted blocks absent from its in-memory disk
+index. The sharded query visits caches sequentially, not as one atomic snapshot.
+Serialize relevant fills with the mutation before using a false result to skip
+invalidation; the query itself does not hold a lock across the caller's work.
 
 `invalidate_record(shard_id, namespace, record_key)` uses this lookup directly:
 registered namespaces select only the record's indexed keys, while unregistered
