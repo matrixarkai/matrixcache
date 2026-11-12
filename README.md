@@ -620,6 +620,12 @@ caller knows which it is getting.
 
 ## Measuring
 
+Record cache capacity, enabled tiers, value sizes, read ownership, and working-set
+size with each result. Separate resident hits from cold refill and replacement at
+capacity; a copied read and a pinned read retain different amounts of caller-owned
+memory. Library operation throughput excludes any network, authoritative-store,
+and commit costs added by the embedding application.
+
 The examples are measurements rather than demonstrations. Each prints a table
 and says what the number means:
 
