@@ -21,6 +21,18 @@ invalidation, and asynchronous writeback with backpressure accounting.
 [MatrixAdsDemo](https://github.com/matrixarkai/MatrixAdsDemo) demonstrates ads serving.
 Each project is independently usable and Apache-2.0 licensed.
 
+## Getting Help
+
+Search [public issues](https://github.com/matrixarkai/matrixcache/issues) before
+opening a report. Include the revision, Rust version, Cargo features, enabled tiers,
+capacity and shard settings, key/value sizes, and the smallest reproducing call
+sequence. Distinguish copied, shared, and pinned reads, and identify whether a
+problem involves a resident hit, refill, eviction, writeback, or restart recovery.
+
+Use synthetic values and remove credentials from backend configuration. Follow the
+[security policy](SECURITY.md) for sensitive reports, not a public issue. For code
+or documentation changes, start with [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Start Here
 
 | Task | Read |
