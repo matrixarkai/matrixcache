@@ -208,6 +208,12 @@ still perform deletion, and sharded snapshots visit cache shards sequentially
 rather than atomically. Budget the additional index metadata for enabled
 namespaces instead of treating reduced scan work as free memory.
 
+`may_have_record_keys(shard_id, namespace, record_key)` tests presence without
+allocating a key snapshot, scanning tiers, or accessing values. Unregistered
+namespaces conservatively return true. A false result is only an instantaneous
+absence check: serialize relevant cache fills with a mutation before using it
+to skip invalidation, rather than retaining it as a negative cache entry.
+
 `invalidate_record(shard_id, namespace, record_key)` uses this lookup directly:
 registered namespaces select only the record's indexed keys, while unregistered
 namespaces keep the tier-key scan. Selected keys still go through normal
