@@ -3450,21 +3450,36 @@ impl CacheInner {
                 slot = (slot + 1) & (EVICTION_GROUP_SLOTS - 1);
             }
         }
-        let best = positions.into_iter().filter(|index| *index != u8::MAX).map(|index| {
-            let index = usize::from(index);
-            let (_, victim, victim_score) = groups[index].expect("bounded group present");
-            SlotEvictionGroup { group_score: scores[index], victim, victim_score }
-        }).min_by(|left, right| {
-            left.group_score.cmp(&right.group_score)
-                .then_with(|| left.victim_score.cmp(&right.victim_score))
-                .then_with(|| left.victim.cmp(right.victim))
-        });
+        // Compare borrowed rows and retain only the winning index, rather than moving
+        // both scores through an iterator accumulator for every candidate group.
+        let mut best: Option<usize> = None;
+        for &position in &positions {
+            if position == u8::MAX {
+                continue;
+            }
+            let index = usize::from(position);
+            let replace = match best {
+                None => true,
+                Some(held) => {
+                    let (_, victim, victim_score) = groups[index].as_ref().expect("bounded group present");
+                    let (_, held_victim, held_score) = groups[held].as_ref().expect("bounded group present");
+                    scores[index].cmp(&scores[held])
+                        .then_with(|| victim_score.cmp(held_score))
+                        .then_with(|| victim.cmp(held_victim))
+                        .is_lt()
+                }
+            };
+            if replace {
+                best = Some(index);
+            }
+        }
         let victim = best
-            .map(|group| {
+            .map(|index| {
+                let (_, victim, victim_score) = groups[index].as_ref().expect("bounded group present");
                 // The one clone this selection makes.
                 (
-                    group.victim.clone(),
-                    eviction_reason_for(group.victim_score),
+                    (*victim).clone(),
+                    eviction_reason_for(*victim_score),
                     pinned_skips,
                 )
             });
