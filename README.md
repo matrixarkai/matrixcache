@@ -14,12 +14,20 @@ invalidation, and asynchronous writeback with backpressure accounting.
 
 ## Related Projects
 
-[TemporalStore](https://github.com/matrixarkai/TemporalStore) serves temporal features and context;
-[MatrixObject](https://github.com/matrixarkai/MatrixObject) provides distributed object storage;
-[MatrixRaft](https://github.com/matrixarkai/matrixraft) provides consensus;
-[MatrixArk](https://github.com/matrixarkai/matrixark) provides the Python context runtime; and
-[MatrixAdsDemo](https://github.com/matrixarkai/MatrixAdsDemo) demonstrates ads serving.
-Each project is independently usable and Apache-2.0 licensed.
+All six projects are independently usable under Apache-2.0. Choose by workload
+and execution model; MatrixCache itself does not start a network cache service.
+
+| Project | Use it for | Execution model |
+|---|---|---|
+| **MatrixCache (this repository)** | Tiered caching inside a Rust application | Embedded library; the application owns authoritative data and network requests. |
+| [TemporalStore](https://github.com/matrixarkai/TemporalStore) | Temporal features, sequences, and context serving | Serving engine with its own endpoints, persistence, and replication settings. |
+| [MatrixObject](https://github.com/matrixarkai/MatrixObject) | Distributed object storage | Object API with separately configured metadata and replica services. |
+| [MatrixRaft](https://github.com/matrixarkai/matrixraft) | Consensus inside a service | Embedded library; the host supplies transport and state-machine application. |
+| [MatrixArk](https://github.com/matrixarkai/matrixark) | Context ingestion, retrieval, and feedback | Python runtime with explicitly configured storage and model providers. |
+| [MatrixAdsDemo](https://github.com/matrixarkai/MatrixAdsDemo) | Exploring an ads retrieval and auction pipeline | Standalone generated-data demonstration, not a cache-server benchmark. |
+
+For cache integration, begin with [access patterns](#choose-an-access-pattern)
+and [durability](#durability), rather than treating a library call as a service acknowledgement.
 
 ## Getting Help
 
