@@ -545,6 +545,42 @@ mod tests {
         assert!(inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false).victim.is_none());
     }
 
+    #[test]
+    fn eviction_candidate_scan_checks_empty_pin_registry_once() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
+        for index in 0..128 {
+            cache.put_memory_only(CacheKey::page_with_slot(0, index, 0, 64, Some(index as u32 % 7)), vec![1; 64]);
+        }
+        let inner = cache.inner.write().unwrap();
+        PIN_REGISTRY_PROBES.with(|count| count.set(0));
+        let selected = inner.select_eviction_victim(inner.memory_order.iter_access(), false, 128, false);
+        assert!(selected.victim.is_some());
+        assert_eq!(PIN_REGISTRY_PROBES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn eviction_window_respects_live_handles_after_empty_scan() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
+        let keys: Vec<_> = (0..128).map(|index| CacheKey::string(0, &format!("pin-scan-{index}"))).collect();
+        for key in &keys {
+            cache.put_memory_only(key.clone(), vec![1; 64]);
+        }
+        {
+            let inner = cache.inner.write().unwrap();
+            assert!(inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false).victim.is_some());
+        }
+        let mut handles: Vec<_> = keys.iter().map(|key| cache.acquire(key).unwrap().unwrap()).collect();
+        {
+            let inner = cache.inner.write().unwrap();
+            assert!(inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false).victim.is_none());
+        }
+        cache.release(handles.pop().unwrap());
+        let inner = cache.inner.write().unwrap();
+        assert_eq!(inner.select_windowed_eviction_victim(&inner.memory_order, false, 128, false).victim.unwrap().0, *keys.last().unwrap());
+        drop(inner);
+        cache.release_batch(handles);
+    }
+
     // shared-corpus: storage_cache_eviction
     #[test]
     fn sorted_eviction_groups_match_hash_group_selection() {

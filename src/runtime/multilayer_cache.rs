@@ -2695,6 +2695,11 @@ struct CachePinRegistry {
     reclaim_needed: AtomicBool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PIN_REGISTRY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CachePinRegistry {
     fn new() -> Self {
         Self {
@@ -2725,6 +2730,8 @@ impl CachePinRegistry {
     }
 
     fn has_handles(&self) -> bool {
+        #[cfg(test)]
+        PIN_REGISTRY_PROBES.with(|count| count.set(count.get() + 1));
         self.stripes
             .iter()
             .any(|stripe| stripe.handle_count.load(Ordering::Acquire) != 0)

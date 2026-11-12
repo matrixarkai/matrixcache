@@ -3202,9 +3202,12 @@ impl CacheInner {
         &self,
         keys: &CacheKeyOrder,
     ) -> Option<(CacheKey, EvictionReason, u64)> {
+        // Selection runs under the cache write lock. Registering the first pin
+        // requires its read lock, so an empty registry stays empty for this scan.
+        let pins_may_exist = self.pin_registry.has_handles();
         let mut pinned_skips = 0u64;
         for key in keys.iter() {
-            if self.is_pinned(key) {
+            if pins_may_exist && self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
                 continue;
             }
@@ -3344,6 +3347,8 @@ impl CacheInner {
     where
         I: IntoIterator<Item = &'a CacheKey>,
     {
+        // The caller holds the cache write lock; first-pin admission needs its read lock.
+        let pins_may_exist = self.pin_registry.has_handles();
         let mut pinned_skips = 0u64;
         // Keep wide fallback scans hash-grouped: many entries can share one group.
         let wide = candidates > EVICTION_CANDIDATE_WINDOW;
@@ -3358,7 +3363,7 @@ impl CacheInner {
         ] = [None; EVICTION_CANDIDATE_WINDOW];
         let mut bounded_group_count = 0usize;
         for key in keys {
-            if self.is_pinned(key) {
+            if pins_may_exist && self.is_pinned(key) {
                 pinned_skips = pinned_skips.saturating_add(1);
                 continue;
             }
