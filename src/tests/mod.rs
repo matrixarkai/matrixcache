@@ -641,6 +641,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_eviction_groups_handle_collisions_and_wraparound() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
+        let hasher = cache.inner.read().unwrap().memory.hasher().clone();
+        let mask = EVICTION_GROUP_SLOTS - 1;
+        let mut slots = Vec::new();
+        let mut candidate = 0u32;
+        while slots.len() < EVICTION_CANDIDATE_WINDOW {
+            if hasher.hash_one(EvictionGroupKey::Slot(candidate)) as usize & mask == mask {
+                slots.push(candidate);
+            }
+            candidate += 1;
+            assert!(candidate < 1_000_000);
+        }
+        let keys: Vec<_> = slots.iter().enumerate().map(|(index, slot)| {
+            CacheKey::page_with_slot(0, index as u64, 0, 64, Some(*slot))
+        }).collect();
+        for key in &keys { cache.put_memory_only(key.clone(), vec![1; 64]); }
+        let inner = cache.inner.read().unwrap();
+        for count in [1, 2, 63, 64, 127, 128] {
+            for segmented in [false, true] {
+                let expected = inner.select_eviction_victim(keys[..count].iter(), segmented, EVICTION_CANDIDATE_WINDOW + 1, false);
+                let actual = inner.select_eviction_victim(keys[..count].iter(), segmented, count, false);
+                assert_eq!(actual.victim, expected.victim);
+                assert_eq!(actual.groups_weighed, count);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_eviction_preserves_unrouted_shortcut_and_mixed_grouping() {
+        let cache = MultiLayerCache::with_options(CacheOptions::new(65536, 0, 0));
+        let mut keys = Vec::new();
+        for object in ["row-a", "row-b"] {
+            for field in ["f0", "f1", "f2"] {
+                let key = CacheKey::hash(0, object, field);
+                cache.put_memory_only(key.clone(), vec![1; 64]);
+                keys.push(key);
+            }
+        }
+        {
+            let inner = cache.inner.read().unwrap();
+            let expected = keys.iter().min_by(|left, right| {
+                eviction_score_of(inner.metadata_of(left), false)
+                    .cmp(&eviction_score_of(inner.metadata_of(right), false))
+                    .then_with(|| left.cmp(right))
+            }).unwrap().clone();
+            let actual = inner.select_eviction_victim(keys.iter(), false, keys.len(), false);
+            assert_eq!(actual.victim.unwrap().0, expected);
+            assert_eq!(actual.groups_weighed, keys.len());
+        }
+        let page = CacheKey::page_with_slot(0, 1, 0, 64, Some(7));
+        cache.put_memory_only(page.clone(), vec![1; 64]);
+        keys.push(page);
+        let inner = cache.inner.read().unwrap();
+        for segmented in [false, true] {
+            let expected = inner.select_eviction_victim(keys.iter(), segmented, EVICTION_CANDIDATE_WINDOW + 1, false);
+            let actual = inner.select_eviction_victim(keys.iter(), segmented, keys.len(), false);
+            assert_eq!(actual.victim, expected.victim);
+            assert_eq!(actual.groups_weighed, 3);
+        }
+    }
+
     // shared-corpus: storage_cache_eviction
     #[test]
     fn write_budget_hashes_only_for_partial_admission() {
