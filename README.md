@@ -210,7 +210,9 @@ namespaces instead of treating reduced scan work as free memory.
 
 `may_have_record_keys(shard_id, namespace, record_key)` tests presence without
 allocating a key snapshot, scanning tiers, or accessing values. Unregistered
-namespaces conservatively return true. A false result is only an instantaneous
+namespaces and enabled SSD backends conservatively return true. A backend can
+discover persisted blocks not represented in its in-memory disk index; this
+query does not probe the backend. A false result is only an instantaneous
 absence check: serialize relevant cache fills with a mutation before using it
 to skip invalidation, rather than retaining it as a negative cache entry.
 

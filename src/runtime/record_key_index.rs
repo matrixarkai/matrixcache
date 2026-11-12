@@ -152,6 +152,8 @@ impl MultiLayerCache {
     ///
     /// Unregistered namespaces return true. Registered namespaces consult only
     /// the key index, without allocating, accessing values, or scanning tiers.
+    /// Enabled SSD backends also return true: a backend can still discover a
+    /// persisted block absent from the in-memory disk index.
     /// False describes this instant, not a reusable negative cache entry; callers
     /// must serialize relevant cache fills with any mutation that skips work.
     pub fn may_have_record_keys(&self, shard_id: ShardId, namespace: &str, record: &str) -> bool {
@@ -163,6 +165,7 @@ impl MultiLayerCache {
             .get(&shard_id)
             .and_then(|records| records.get(record))
             .is_some_and(|keys| !keys.is_empty())
+            || inner.ssd_store.holds_blocks()
     }
 
     /// Enable record-scoped lookup for one namespace, backfilling existing tier keys.
