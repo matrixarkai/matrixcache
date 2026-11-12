@@ -3416,34 +3416,49 @@ impl CacheInner {
                 promote: Vec::new(),
             };
         }
-        groups.sort_unstable_by(|left, right| {
-            left.as_ref()
-                .expect("bounded candidate present")
-                .0
-                .cmp(&right.as_ref().expect("bounded candidate present").0)
-        });
-        let mut groups = groups
-            .iter_mut()
-            .map(|candidate| candidate.take().expect("bounded candidate present"))
-            .peekable();
+        // Group by representative index without sorting or moving the candidate rows.
+        // At most half the slots are occupied, even when every candidate is distinct.
+        let mut positions = [u8::MAX; EVICTION_GROUP_SLOTS];
+        let mut scores = [EvictionScore {
+            segment: 0, hotness: 0, hits: 0, last_access_epoch: 0,
+        }; EVICTION_CANDIDATE_WINDOW];
         let mut group_count = 0;
-        let mut best: Option<SlotEvictionGroup<'a>> = None;
-        while let Some((key, victim, score)) = groups.next() {
-            let mut group = SlotEvictionGroup::new(victim, score);
-            while groups.peek().is_some_and(|next| next.0 == key) {
-                let (_, member, score) = groups.next().expect("group member present");
-                group.observe(member, score);
-            }
-            group_count += 1;
-            let replace = best.as_ref().is_none_or(|old| {
-                group.group_score.cmp(&old.group_score)
-                    .then_with(|| group.victim_score.cmp(&old.victim_score))
-                    .then_with(|| group.victim.cmp(old.victim)).is_lt()
-            });
-            if replace {
-                best = Some(group);
+        for index in 0..groups.len() {
+            let (key, victim, score) = groups[index].expect("bounded candidate present");
+            let mut slot = self.memory.hasher().hash_one(key) as usize & (EVICTION_GROUP_SLOTS - 1);
+            loop {
+                let representative = positions[slot];
+                if representative == u8::MAX {
+                    positions[slot] = index as u8;
+                    scores[index] = score;
+                    group_count += 1;
+                    break;
+                }
+                let representative = usize::from(representative);
+                let (held_key, held_victim, held_score) = groups[representative].expect("bounded group present");
+                if held_key == key {
+                    let mut group = SlotEvictionGroup {
+                        group_score: scores[representative],
+                        victim: held_victim,
+                        victim_score: held_score,
+                    };
+                    group.observe(victim, score);
+                    scores[representative] = group.group_score;
+                    groups[representative] = Some((held_key, group.victim, group.victim_score));
+                    break;
+                }
+                slot = (slot + 1) & (EVICTION_GROUP_SLOTS - 1);
             }
         }
+        let best = positions.into_iter().filter(|index| *index != u8::MAX).map(|index| {
+            let index = usize::from(index);
+            let (_, victim, victim_score) = groups[index].expect("bounded group present");
+            SlotEvictionGroup { group_score: scores[index], victim, victim_score }
+        }).min_by(|left, right| {
+            left.group_score.cmp(&right.group_score)
+                .then_with(|| left.victim_score.cmp(&right.victim_score))
+                .then_with(|| left.victim.cmp(right.victim))
+        });
         let victim = best
             .map(|group| {
                 // The one clone this selection makes.
@@ -4203,6 +4218,9 @@ fn infer_block_kind(key: &CacheKey) -> CacheBlockKind {
 /// working set of a small cache, so those keep weighing everything and choose
 /// exactly what they chose before.
 const EVICTION_CANDIDATE_WINDOW: usize = 128;
+const EVICTION_GROUP_SLOTS: usize = EVICTION_CANDIDATE_WINDOW * 2;
+const _: () = assert!(EVICTION_CANDIDATE_WINDOW < u8::MAX as usize
+    && EVICTION_GROUP_SLOTS.is_power_of_two());
 
 /// Share of the access order, coldest first, an eviction may choose from when a
 /// caller has not asked for one.
