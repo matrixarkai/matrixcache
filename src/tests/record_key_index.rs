@@ -52,7 +52,9 @@ fn assert_exact_index(cache: &MultiLayerCache) {
 #[test]
 fn record_presence_is_conservative_until_registered_and_isolates_records() {
     let directory = tempfile::tempdir().unwrap();
-    let cache = MultiLayerCache::new(1 << 20, directory.path());
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(1 << 20, 0, 0).with_ssd_paths([directory.path().to_path_buf()]),
+    );
     assert!(cache.may_have_record_keys(1, "hash", "missing"));
     cache.put_memory_only(query_key(1, "hash", "row", "a"), vec![1]);
     cache.enable_record_key_index("hash");
@@ -74,7 +76,9 @@ fn record_presence_is_conservative_until_registered_and_isolates_records() {
 #[test]
 fn record_presence_remains_true_until_the_final_tier_copy_is_removed() {
     let directory = tempfile::tempdir().unwrap();
-    let cache = MultiLayerCache::new(1 << 20, directory.path());
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(1 << 20, 0, 0).with_ssd_paths([directory.path().to_path_buf()]),
+    );
     cache.enable_record_key_index("hash");
     let key = Arc::new(query_key(1, "hash", "row", "a"));
     {
@@ -119,6 +123,33 @@ fn record_presence_visits_all_cache_shards_and_keeps_registration_on_clear() {
     }
     assert!(!cache.may_have_record_keys(1, "hash", "row"));
     assert!(cache.may_have_record_keys(1, "other", "row"));
+}
+
+#[test]
+fn record_presence_does_not_rule_out_unindexed_ssd_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(0, 0, 1 << 20).with_ssd_paths([directory.path().to_path_buf()]),
+    );
+    cache.start().unwrap();
+    cache.enable_record_key_index("hash");
+    cache.set_ssd_admission_filter_enabled(false);
+    let key = query_key(1, "hash", "row", "field");
+    cache.put(key.clone(), vec![7; 16]).unwrap();
+    {
+        let mut inner = cache.inner.write().unwrap();
+        assert!(inner.ssd_store.holds_blocks());
+        assert!(inner.ssd_block_exists(&key));
+        inner.take_resident(&key);
+        inner.take_pmem_resident(&key);
+        inner.remove_disk_index(&key);
+        assert!(inner.record_key_index.namespaces["hash"].is_empty());
+        assert!(inner.ssd_block_exists(&key));
+    }
+    assert!(cache.peek(&key));
+    assert!(cache.may_have_record_keys(1, "hash", "row"));
+    assert!(cache.may_have_record_keys(1, "hash", "missing"));
+    assert_eq!(cache.get(&key).unwrap(), Some(vec![7; 16]));
 }
 
 #[test]
