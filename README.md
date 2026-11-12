@@ -270,6 +270,14 @@ and [storage engines](src/runtime/storage_engines.rs) for the embedding APIs.
 
 ### Tier persistence
 
+Persistence cost depends on the selected backend. The default RocksDB SSD path
+uses RocksDB as its block authority, without raw block shadow files; the
+file-backed compatibility path has different filesystem work. Keep backend,
+sync policy, batch size, and value size fixed when comparing write costs.
+Fewer cache metadata operations or eviction instructions do not establish fewer
+device writes. Include the application's authoritative log and backend compaction
+before making an end-to-end write-amplification claim.
+
 Each durable tier decides separately whether a write also survives the machine
 losing power, and the two default differently. Both are set on `CacheOptions`.
 
