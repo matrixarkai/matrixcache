@@ -101,6 +101,10 @@ mod key_snapshot_tests;
 mod invalidate_disk_order_tests;
 
 #[cfg(test)]
+#[path = "tests/put_disk_order.rs"]
+mod put_disk_order_tests;
+
+#[cfg(test)]
 #[path = "tests/disabled_ssd_peeks.rs"]
 mod disabled_ssd_peek_tests;
 
