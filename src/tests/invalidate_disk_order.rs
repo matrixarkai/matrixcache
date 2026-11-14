@@ -39,7 +39,11 @@ fn an_invalidation_leaves_the_disk_order_as_a_walk_that_keeps_the_rest_would() {
             .iter()
             .cloned()
             .collect();
-        assert_eq!(before.len(), keys.len(), "the corpus must all sit in the disk tier");
+        assert_eq!(
+            before.len(),
+            keys.len(),
+            "the corpus must all sit in the disk tier"
+        );
 
         // Not contiguous, not in order: every third key from the back, then absent keys.
         let mut batch: Vec<CacheKey> = keys.iter().rev().step_by(3).take(named).cloned().collect();
@@ -55,8 +59,15 @@ fn an_invalidation_leaves_the_disk_order_as_a_walk_that_keeps_the_rest_would() {
         let after: Vec<CacheKey> = inner.disk_order.iter().cloned().collect();
         assert_eq!(after, expected, "{named} named keys");
         assert_eq!(
-            after.iter().cloned().collect::<std::collections::HashSet<_>>(),
-            inner.disk_index.keys().map(|held| CacheKey::clone(held)).collect(),
+            after
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            inner
+                .disk_index
+                .keys()
+                .map(|held| CacheKey::clone(held))
+                .collect(),
             "the order and the index must hold the same keys after {named} named keys"
         );
         drop(inner);
@@ -64,7 +75,11 @@ fn an_invalidation_leaves_the_disk_order_as_a_walk_that_keeps_the_rest_would() {
             assert_eq!(cache.get(key).unwrap(), None, "a named key is still served");
         }
         for key in expected.iter().take(5) {
-            assert_eq!(cache.get(key).unwrap(), Some(vec![7; 64]), "a survivor was lost");
+            assert_eq!(
+                cache.get(key).unwrap(),
+                Some(vec![7; 64]),
+                "a survivor was lost"
+            );
         }
     }
 }
@@ -88,5 +103,8 @@ fn invalidating_keys_does_not_walk_the_whole_disk_order() {
         !body.contains("disk_order") || !body.contains(".retain("),
         "invalidate_keys_locked walks the disk order again"
     );
-    assert!(body.contains("disk_order.remove("), "it must remove each key by handle");
+    assert!(
+        body.contains("disk_order.remove("),
+        "it must remove each key by handle"
+    );
 }
