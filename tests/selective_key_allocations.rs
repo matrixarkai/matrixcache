@@ -55,8 +55,14 @@ fn selective_snapshot_allocations_follow_matches_not_cache_population() {
         assert!(indexed.indexed);
         assert_eq!(indexed.entries_examined, 8);
         assert_eq!(indexed.keys, selected);
-        assert!(indexed_allocations.allocations <= 128, "{count}: {indexed_allocations:?}");
-        assert!(indexed_allocations.bytes_allocated <= 32 * 1024, "{count}: {indexed_allocations:?}");
+        assert!(
+            indexed_allocations.allocations <= 128,
+            "{count}: {indexed_allocations:?}"
+        );
+        assert!(
+            indexed_allocations.bytes_allocated <= 32 * 1024,
+            "{count}: {indexed_allocations:?}"
+        );
         eprintln!("RECORD_INDEX_ALLOC count={count} selected=8 allocations={} bytes={} index_bytes={index_bytes}", indexed_allocations.allocations, indexed_allocations.bytes_allocated);
         assert!(cache.stop());
     }

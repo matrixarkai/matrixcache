@@ -6,8 +6,9 @@ use super::*;
 #[test]
 fn disabled_ssd_probes_preserve_resident_hits_and_missing_results() {
     let directory = tempfile::tempdir().unwrap();
-    let cache = MultiLayerCache::with_options(CacheOptions::new(4096, 0, 0)
-        .with_ssd_paths([directory.path().join("ssd")]));
+    let cache = MultiLayerCache::with_options(
+        CacheOptions::new(4096, 0, 0).with_ssd_paths([directory.path().join("ssd")]),
+    );
     cache.start().unwrap();
     let present = CacheKey::hash(1, "entity", "value");
     let missing = CacheKey::hash(1, "entity", "missing");
@@ -20,7 +21,10 @@ fn disabled_ssd_probes_preserve_resident_hits_and_missing_results() {
         assert!(!inner.ssd_block_exists(&present));
         assert!(!inner.ssd_block_exists(&missing));
     }
-    assert_eq!(cache.get_shared(&present).unwrap().unwrap().as_ref(), &[7; 64]);
+    assert_eq!(
+        cache.get_shared(&present).unwrap().unwrap().as_ref(),
+        &[7; 64]
+    );
     assert!(cache.stop());
     assert!(!cache.peek(&present));
 }
@@ -29,8 +33,11 @@ fn disabled_ssd_probes_preserve_resident_hits_and_missing_results() {
 fn enabled_ssd_probes_keep_single_and_multi_backend_visibility() {
     for count in [1, 2] {
         let directory = tempfile::tempdir().unwrap();
-        let paths: Vec<_> = (0..count).map(|index| directory.path().join(format!("ssd-{index}"))).collect();
-        let cache = MultiLayerCache::with_options(CacheOptions::new(0, 0, 4096).with_ssd_paths(paths));
+        let paths: Vec<_> = (0..count)
+            .map(|index| directory.path().join(format!("ssd-{index}")))
+            .collect();
+        let cache =
+            MultiLayerCache::with_options(CacheOptions::new(0, 0, 4096).with_ssd_paths(paths));
         cache.start().unwrap();
         let present = CacheKey::hash(1, "entity", "value");
         let empty = CacheKey::hash(1, "entity", "empty");
