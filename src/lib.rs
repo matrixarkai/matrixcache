@@ -105,6 +105,10 @@ mod invalidate_disk_order_tests;
 mod put_disk_order_tests;
 
 #[cfg(test)]
+#[path = "tests/ssd_store_index_invariant.rs"]
+mod ssd_store_index_invariant_tests;
+
+#[cfg(test)]
 #[path = "tests/disabled_ssd_peeks.rs"]
 mod disabled_ssd_peek_tests;
 
