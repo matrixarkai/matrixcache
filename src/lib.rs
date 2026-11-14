@@ -97,6 +97,10 @@ mod background_recovery_tests;
 mod key_snapshot_tests;
 
 #[cfg(test)]
+#[path = "tests/invalidate_disk_order.rs"]
+mod invalidate_disk_order_tests;
+
+#[cfg(test)]
 #[path = "tests/disabled_ssd_peeks.rs"]
 mod disabled_ssd_peek_tests;
 
