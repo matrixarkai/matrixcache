@@ -14135,22 +14135,11 @@ impl CacheInner {
             .map(|entry| (entry.key.clone(), std::mem::take(&mut entry.block)))
             .collect::<Vec<_>>();
         self.write_ssd_blocks(storage_entries)?;
-        if !staged_ssd.is_empty() {
-            const SET_MEMBERSHIP_THRESHOLD: usize = 8;
-            // Borrowed, not cloned. Building this list used to clone every
-            // staged key, and then clone them all again into the set.
-            if staged_ssd.len() > SET_MEMBERSHIP_THRESHOLD {
-                let staged_key_set = staged_ssd
-                    .iter()
-                    .map(|entry| &entry.key)
-                    .collect::<HashSet<_>>();
-                self.disk_order
-                    .retain(|candidate| !staged_key_set.contains(candidate));
-            } else {
-                self.disk_order.retain(|candidate| {
-                    !staged_ssd.iter().any(|entry| &entry.key == candidate)
-                });
-            }
+        // Each staged key leaves the order by its own handle and is pushed back below. `retain` found
+        // them by walking every entry in the order, so one batch cost as much as the number of entries
+        // on disk however few keys it staged.
+        for entry in &staged_ssd {
+            self.disk_order.remove(&entry.key);
         }
         for entry in staged_ssd {
             let shared = self.shared_key(&entry.key);
