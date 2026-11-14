@@ -3659,9 +3659,6 @@ impl CacheInner {
         if keys.is_empty() {
             return;
         }
-        const SET_MEMBERSHIP_THRESHOLD: usize = 8;
-        let key_set = (keys.len() > SET_MEMBERSHIP_THRESHOLD)
-            .then(|| keys.iter().collect::<HashSet<_>>());
         let mut disk_keys = Vec::new();
         for key in keys {
             let mut removed_pinned_bytes = 0usize;
@@ -3701,15 +3698,11 @@ impl CacheInner {
             self.stats.invalidations += 1;
         }
         if remove_disk {
-            match key_set.as_ref() {
-                Some(key_set) => {
-                    self.disk_order
-                        .retain(|candidate| !key_set.contains(candidate));
-                }
-                None => {
-                    self.disk_order
-                        .retain(|candidate| !keys.contains(candidate));
-                }
+            // Each key leaves the order by its own handle, as at every other site that drops a
+            // disk entry. `retain` walked the whole list to find them, so one invalidation cost
+            // as much as the number of entries on disk, however few keys it named.
+            for key in keys {
+                self.disk_order.remove(key);
             }
             let delete_keys = disk_delete_keys.unwrap_or(&disk_keys);
             let _ = self.delete_ssd_blocks(delete_keys);
