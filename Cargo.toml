@@ -19,6 +19,7 @@ rocksdb-ssd = ["dep:rocksdb"]
 
 [dependencies]
 ahash = "0.8"
+crc32c = "0.6.9"
 serde = { version = "1", features = ["derive", "rc"] }
 smallvec = "1"
 thiserror = "2"

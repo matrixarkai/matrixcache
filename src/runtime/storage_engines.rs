@@ -1650,16 +1650,9 @@ pub struct MemStorage;
 /// result as checksumming the concatenated input in one go, which is what lets
 /// a record be checksummed header-then-value-then-key without copying it into
 /// one buffer first.
+#[inline]
 pub fn crc32c_with_seed(bytes: &[u8], seed: u32) -> u32 {
-    let mut crc = !seed;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-        }
-    }
-    !crc
+    if bytes.is_empty() { seed } else { ::crc32c::crc32c_append(seed, bytes) }
 }
 
 /// CRC-32C (Castagnoli) checksum of `bytes`.
