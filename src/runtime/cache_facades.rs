@@ -3381,6 +3381,11 @@ struct CacheOrderNode {
     access_next: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CACHE_ORDER_RETAIN_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Recency ordering over cache keys, from least recently used at the front to
 /// most recently used at the back.
 ///
@@ -3688,6 +3693,8 @@ impl CacheKeyOrder {
     {
         let mut cursor = self.head;
         while cursor != CACHE_ORDER_NIL {
+            #[cfg(test)]
+            CACHE_ORDER_RETAIN_VISITS.with(|count| count.set(count.get() + 1));
             let next = self.nodes[cursor as usize].next;
             if !predicate(self.nodes[cursor as usize].key.as_ref()) {
                 // Taken rather than cloned, as in `pop_front`: this key is

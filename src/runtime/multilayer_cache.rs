@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 MatrixArkAI
 
+#[cfg(test)]
+thread_local! {
+    static INSPECTION_DISK_METADATA_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn average_latency_us(total_us: u64, count: u64) -> u64 {
     if count == 0 {
         0
@@ -11920,10 +11925,20 @@ impl ShardedMultiLayerCache {
     }
 
     pub fn entries_for_shard(&self, shard_id: ShardId) -> Vec<CacheEntryInfo> {
+        self.entries_for_shard_matching(shard_id, |_| true)
+    }
+
+    /// Inspect matching entries without constructing information for unrelated keys.
+    /// Cache shards are visited sequentially, without a cache-wide atomic snapshot.
+    pub fn entries_for_shard_matching(
+        &self,
+        shard_id: ShardId,
+        mut matches: impl FnMut(&CacheKey) -> bool,
+    ) -> Vec<CacheEntryInfo> {
         let mut entries = self
             .shards
             .iter()
-            .flat_map(|shard| shard.entries_for_shard(shard_id))
+            .flat_map(|shard| shard.entries_for_shard_matching(shard_id, &mut matches))
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             left.namespace
@@ -14676,15 +14691,11 @@ impl MultiLayerCache {
             inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
-        inner
-            .memory_order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
-        inner
-            .pmem_order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
-        inner
-            .disk_order
-            .retain(|key| !(key.shard_id == shard_id && key.selector.starts_with(&prefix)));
+        for key in &slot_keys {
+            inner.memory_order.remove(key);
+            inner.pmem_order.remove(key);
+            inner.disk_order.remove(key);
+        }
         inner.stats.invalidations = inner
             .stats
             .invalidations
@@ -14764,15 +14775,11 @@ impl MultiLayerCache {
             inner.forget_metadata_of(key);
         }
         let _ = inner.delete_ssd_blocks(&disk_delete_keys);
-        inner.memory_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
-        });
-        inner.pmem_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
-        });
-        inner.disk_order.retain(|key| {
-            !(key.shard_id == shard_id && key.namespace == "page" && key.record_key.as_ref() == record_key)
-        });
+        for key in &segment_keys {
+            inner.memory_order.remove(key);
+            inner.pmem_order.remove(key);
+            inner.disk_order.remove(key);
+        }
         inner.stats.invalidations = inner
             .stats
             .invalidations
@@ -14825,13 +14832,23 @@ impl MultiLayerCache {
     }
 
     pub fn entries_for_shard(&self, shard_id: ShardId) -> Vec<CacheEntryInfo> {
+        self.entries_for_shard_matching(shard_id, |_| true)
+    }
+
+    /// Filter tier keys before cloning names, sorting rows, or inspecting disk metadata.
+    /// This still enumerates tier keys; it is not an indexed or bounded key lookup.
+    pub fn entries_for_shard_matching(
+        &self,
+        shard_id: ShardId,
+        mut matches: impl FnMut(&CacheKey) -> bool,
+    ) -> Vec<CacheEntryInfo> {
         let inner = self.inner.read().expect("cache lock poisoned");
         let keys = inner
             .memory
             .keys()
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
-            .filter(|key| key.shard_id == shard_id)
+            .filter(|key| key.shard_id == shard_id && matches(key))
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let mut entries = keys
@@ -14848,6 +14865,8 @@ impl MultiLayerCache {
                     .map(|value| value.len() as u64)
                     .unwrap_or_default();
                 let disk_bytes = inner.disk_index.get(&key).copied().unwrap_or_else(|| {
+                    #[cfg(test)]
+                    INSPECTION_DISK_METADATA_PROBES.with(|count| count.set(count.get() + 1));
                     inner
                         .disk_path(&key)
                         .metadata()

@@ -115,3 +115,7 @@ mod disabled_ssd_peek_tests;
 #[cfg(test)]
 #[path = "tests/record_key_index.rs"]
 mod record_key_index_tests;
+
+#[cfg(test)]
+#[path = "tests/filtered_inspection.rs"]
+mod filtered_inspection_tests;
