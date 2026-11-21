@@ -23,8 +23,8 @@ fn populate(directory: &Path, spec: u8) -> (MultiLayerCache, Vec<CacheKey>) {
     let keys = (0..96)
         .map(|index| {
             CacheKey::page_with_slot(
-                (index % 3) as u64,
-                (index % 4) as u64,
+                index % 3,
+                index % 4,
                 index * 96,
                 96,
                 Some((index % 5) as u32),
