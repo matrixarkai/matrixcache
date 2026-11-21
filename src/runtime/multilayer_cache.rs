@@ -4,6 +4,7 @@
 #[cfg(test)]
 thread_local! {
     static INSPECTION_DISK_METADATA_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOT_INVALIDATION_KEY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn average_latency_us(total_us: u64, count: u64) -> u64 {
@@ -11848,11 +11849,24 @@ impl ShardedMultiLayerCache {
         shard_id: ShardId,
         routing_slot: u32,
     ) -> Result<CacheGcReport, CacheError> {
+        self.invalidate_slots(shard_id, &[routing_slot])
+    }
+
+    /// Remove the selected slots with one tier-key walk per cache shard.
+    /// Eviction callbacks run after each cache shard releases its write lock.
+    pub fn invalidate_slots(
+        &self,
+        shard_id: ShardId,
+        routing_slots: &[u32],
+    ) -> Result<CacheGcReport, CacheError> {
+        if routing_slots.is_empty() {
+            return Ok(Self::aggregate_gc_reports(shard_id, Vec::new()));
+        }
         let reports = std::thread::scope(|scope| {
             let workers = self
                 .shards
                 .iter()
-                .map(|shard| scope.spawn(move || shard.invalidate_slot(shard_id, routing_slot)))
+                .map(|shard| scope.spawn(move || shard.invalidate_slots(shard_id, routing_slots)))
                 .collect::<Vec<_>>();
 
             let mut reports = Vec::with_capacity(workers.len());
@@ -11862,7 +11876,7 @@ impl ShardedMultiLayerCache {
                     Ok(Err(err)) => return Err(err),
                     Err(_) => {
                         return Err(CacheError::CorruptBlock(
-                            "sharded cache invalidate_slot worker panicked".to_string(),
+                            "sharded cache invalidate_slots worker panicked".to_string(),
                         ));
                     }
                 }
@@ -14638,14 +14652,37 @@ impl MultiLayerCache {
         shard_id: ShardId,
         routing_slot: u32,
     ) -> Result<CacheGcReport, CacheError> {
+        self.invalidate_slots(shard_id, &[routing_slot])
+    }
+
+    /// Remove a snapshot of the selected slots, preserving resident-value callbacks.
+    /// Duplicate slots are removed once; an empty selection performs no storage I/O.
+    pub fn invalidate_slots(
+        &self,
+        shard_id: ShardId,
+        routing_slots: &[u32],
+    ) -> Result<CacheGcReport, CacheError> {
+        if routing_slots.is_empty() {
+            return Ok(CacheGcReport {
+                shard_id,
+                memory_entries_removed: 0,
+                disk_bytes_removed: 0,
+            });
+        }
+        let prefixes = routing_slots.iter().map(|slot| format!("slot-{slot}"))
+            .collect::<BTreeSet<_>>();
         let mut inner = self.inner.write().expect("cache lock poisoned");
-        let prefix = format!("slot-{routing_slot}:");
         let slot_keys = inner
             .memory
             .keys()
             .chain(inner.pmem.keys())
             .chain(inner.disk_index.keys())
-            .filter(|key| key.shard_id == shard_id && key.selector.starts_with(&prefix))
+            .filter(|key| {
+                #[cfg(test)]
+                SLOT_INVALIDATION_KEY_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
+                key.shard_id == shard_id && key.selector.split_once(':')
+                    .is_some_and(|(prefix, _)| prefixes.contains(prefix))
+            })
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()

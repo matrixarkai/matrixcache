@@ -137,3 +137,144 @@ fn targeted_invalidations_unlink_only_named_entries_from_every_order() {
         }
     }
 }
+
+#[test]
+fn batched_slots_walk_each_tier_key_once_and_match_single_slot_results() {
+    for spec in [0, 2] {
+        let left_dir = tempfile::tempdir().unwrap();
+        let right_dir = tempfile::tempdir().unwrap();
+        let (batched, keys) = populate(left_dir.path(), spec);
+        let (single, _) = populate(right_dir.path(), spec);
+        let selected = [1, 3, 1, u32::MAX];
+        let remove = |key: &CacheKey| key.shard_id == 0
+            && ["slot-1:", "slot-3:", "slot-4294967295:"].iter()
+                .any(|prefix| key.selector.starts_with(prefix));
+        let expected_batched = orders(&batched)
+            .map(|rows| rows.into_iter().filter(|key| !remove(key)).collect::<Vec<_>>());
+        let expected_single = orders(&single)
+            .map(|rows| rows.into_iter().filter(|key| !remove(key)).collect::<Vec<_>>());
+        let before = batched.inner.read().unwrap();
+        let visits = before.memory.len() + before.pmem.len() + before.disk_index.len();
+        drop(before);
+        SLOT_INVALIDATION_KEY_VISITS.with(|count| count.set(0));
+        let report = batched.invalidate_slots(0, &selected).unwrap();
+        assert_eq!(SLOT_INVALIDATION_KEY_VISITS.with(|count| count.get()), visits as u64);
+        let mut memory_removed = 0;
+        let mut disk_removed = 0;
+        for slot in [1, 3, u32::MAX] {
+            let report = single.invalidate_slot(0, slot).unwrap();
+            memory_removed += report.memory_entries_removed;
+            disk_removed += report.disk_bytes_removed;
+        }
+        assert_eq!(report.shard_id, 0);
+        assert_eq!(report.memory_entries_removed, memory_removed);
+        assert_eq!(report.disk_bytes_removed, disk_removed);
+        assert_eq!(orders(&batched), expected_batched, "batch insertion_spec={spec}");
+        assert_eq!(orders(&single), expected_single, "single insertion_spec={spec}");
+        assert_eq!(batched.stats().invalidations, single.stats().invalidations);
+        for key in &keys {
+            assert_eq!(batched.get(key).unwrap(), single.get(key).unwrap());
+        }
+        batched.stop();
+        single.stop();
+    }
+}
+
+#[test]
+fn batched_slot_selection_keeps_exact_prefix_and_shard_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    let selectors = ["slot-3:x", "slot-30:x", "slot-03:x", "slot-3", "slot-3:",
+                     "slot-4294967295:x", "slot-42949672950:x", "slot-3:x:y"];
+    for shard in [1, 2] {
+        for (index, selector) in selectors.iter().enumerate() {
+            let mut key = CacheKey::string(shard, &format!("key-{index}"));
+            key.selector = (*selector).into();
+            cache.put_memory_only(key, vec![index as u8]);
+        }
+    }
+    let report = cache.invalidate_slots(1, &[3, u32::MAX, 3]).unwrap();
+    assert_eq!(report.memory_entries_removed, 4);
+    for shard in [1, 2] {
+        for (index, selector) in selectors.iter().enumerate() {
+            let mut key = CacheKey::string(shard, &format!("key-{index}"));
+            key.selector = (*selector).into();
+            let removed = shard == 1 && (selector.starts_with("slot-3:")
+                || selector.starts_with("slot-4294967295:"));
+            assert_eq!(cache.get(&key).unwrap(), (!removed).then(|| vec![index as u8]));
+        }
+    }
+}
+
+#[test]
+fn empty_slot_batch_does_not_scan_or_publish_a_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    let key = CacheKey::page_with_slot(1, 1, 0, 3, Some(3));
+    cache.put_memory_only(key.clone(), b"hot".to_vec());
+    #[cfg(not(feature = "rocksdb-ssd"))]
+    {
+        let manifest = cache.inner.read().unwrap().manifest_path();
+        fs::create_dir_all(&manifest).unwrap();
+    }
+    SLOT_INVALIDATION_KEY_VISITS.with(|count| count.set(0));
+    let report = cache.invalidate_slots(1, &[]).unwrap();
+    assert_eq!(report.memory_entries_removed, 0);
+    assert_eq!(report.disk_bytes_removed, 0);
+    assert_eq!(SLOT_INVALIDATION_KEY_VISITS.with(|count| count.get()), 0);
+    assert_eq!(cache.get(&key).unwrap(), Some(b"hot".to_vec()));
+}
+
+#[test]
+#[cfg(not(feature = "rocksdb-ssd"))]
+fn batched_slot_callbacks_keep_values_even_when_manifest_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1 << 20, dir.path());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let output = Arc::clone(&seen);
+    cache.register_eviction_callback(move |record| {
+        output.lock().unwrap().push((record.key.clone(), record.cause, record.value.clone()));
+    });
+    let keys = [3, 7].map(|slot| CacheKey::page_with_slot(1, u32::MAX as u64, 0, 3, Some(slot)));
+    for (index, key) in keys.iter().enumerate() {
+        cache.put_memory_only(key.clone(), vec![index as u8; 3]);
+    }
+    let manifest = cache.inner.read().unwrap().manifest_path();
+    fs::create_dir_all(&manifest).unwrap();
+    assert!(cache.invalidate_slots(1, &[3, 7, 3]).is_err());
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (index, key) in keys.iter().enumerate() {
+        assert!(seen.iter().any(|(actual, cause, value)| actual == key
+            && *cause == CacheRemovalCause::Evicted && *value == vec![index as u8; 3]));
+        assert!(!cache.inner.read().unwrap().memory.contains_key(key));
+    }
+}
+
+#[test]
+fn sharded_slot_batch_removes_each_selected_value_and_keeps_other_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardedMultiLayerCache::with_options(
+        CacheOptions::new(1 << 20, 0, 0).with_ssd_paths([dir.path().to_path_buf()]), 4,
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    for (index, shard) in cache.shards.iter().enumerate() {
+        let output = Arc::clone(&seen);
+        shard.register_eviction_callback(move |record| {
+            output.lock().unwrap().push((record.key.clone(), record.value.clone()));
+        });
+        for logical_shard in [1, 2] {
+            for slot in [3, 7, 9] {
+                let key = CacheKey::page_with_slot(logical_shard, index as u64, 0, 3, Some(slot));
+                shard.put_memory_only(key, vec![index as u8; 3]);
+            }
+        }
+    }
+    let report = cache.invalidate_slots(1, &[3, 7, 3]).unwrap();
+    assert_eq!(report.memory_entries_removed, 8);
+    assert_eq!(seen.lock().unwrap().len(), 8);
+    assert_eq!(cache.entries_for_shard(1).len(), 4);
+    assert_eq!(cache.entries_for_shard(2).len(), 12);
+    assert!(cache.entries_for_shard(1).iter().all(|entry| entry.selector.starts_with("slot-9:")));
+    assert_eq!(cache.invalidate_slots(1, &[]).unwrap().memory_entries_removed, 0);
+}
