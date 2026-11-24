@@ -72,6 +72,14 @@ pub struct CacheOptions {
     pub pmem_capacity: usize,
     #[serde(default)]
     pub ssd_capacity: usize,
+    /// Maximum entry size admitted to each tier. An unset limit
+    /// uses the corresponding CacheTieringPolicy default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_block_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pmem_block_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ssd_block_bytes: Option<usize>,
     /// Persist each admitted write to SSD immediately. Disable to use bounded
     /// cold-tier migration instead; SSD is still populated on upper-tier eviction.
     #[serde(default = "default_ssd_write_through")]
@@ -225,6 +233,9 @@ impl Default for CacheOptions {
             dram_capacity: policy.memory_capacity_bytes,
             pmem_capacity: policy.pmem_capacity_bytes,
             ssd_capacity: policy.ssd_capacity_bytes,
+            max_memory_block_bytes: None,
+            max_pmem_block_bytes: None,
+            max_ssd_block_bytes: None,
             ssd_write_through: policy.ssd_write_through,
             pmem_promotion_enabled: true,
             ssd_promotion_enabled: true,
@@ -506,6 +517,15 @@ impl CacheOptions {
                 &self.cache_dram_pmem_data_placement_type,
             ),
             data_placement_threshold_bytes: self.cache_dram_pmem_data_placement_threshold,
+            max_memory_block_bytes: self
+                .max_memory_block_bytes
+                .unwrap_or(defaults.max_memory_block_bytes),
+            max_pmem_block_bytes: self
+                .max_pmem_block_bytes
+                .unwrap_or(defaults.max_pmem_block_bytes),
+            max_ssd_block_bytes: self
+                .max_ssd_block_bytes
+                .unwrap_or(defaults.max_ssd_block_bytes),
             ..defaults
         }
     }
