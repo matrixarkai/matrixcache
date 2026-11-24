@@ -46,6 +46,31 @@ fn background_ssd_recovery_restores_values_in_bounded_batches() {
 }
 
 #[test]
+fn configured_ssd_entry_limit_allows_large_values_to_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = CacheOptions::new(1 << 20, 0, 128 << 20)
+        .with_ssd_paths([dir.path().to_path_buf()])
+        .with_auto_recover_on_start(true);
+    let default_limit = CacheTieringPolicy::default().max_ssd_block_bytes;
+    assert_eq!(options.tiering_policy().max_ssd_block_bytes, default_limit);
+    options.max_ssd_block_bytes = Some(40 << 20);
+    options.block_options.compression = CacheCompression::None;
+
+    let key = CacheKey::page_with_slot(1, 1, 0, 36 << 20, Some(1));
+    let mut value = vec![0xff; 36 << 20];
+    value[0] = 0;
+    let cache = MultiLayerCache::try_with_options(options.clone()).unwrap();
+    cache.put(key.clone(), value.clone()).unwrap();
+    assert_eq!(cache.stats().disk_fills, 1);
+    cache.stop();
+    drop(cache);
+
+    let restarted = MultiLayerCache::try_with_options(options).unwrap();
+    assert_eq!(restarted.get(&key).unwrap(), Some(value));
+    assert_eq!(restarted.stats().disk_hits, 1);
+}
+
+#[test]
 fn live_write_wins_while_ssd_recovery_is_running() {
     let dir = tempfile::tempdir().unwrap();
     let key = CacheKey::string(19, "live-write");
