@@ -18154,10 +18154,10 @@ mod tests {
         cache.put(key.clone(), vec![1; 64]).unwrap();
         let _handle = cache.acquire(&key).unwrap().unwrap();
         let expected = pressure_fields(cache.stats());
-        let inner = cache.inner.read().unwrap();
-        let stripe = inner.pins_for(&key);
-        assert!(stripe.entries.contains_key(&key));
         std::thread::scope(|scope| {
+            let inner = cache.inner.read().unwrap();
+            let stripe = inner.pins_for(&key);
+            assert!(stripe.entries.contains_key(&key));
             let (done, result) = mpsc::channel();
             let cache = &cache;
             let worker = scope.spawn(move || done.send(cache.pressure_snapshot()).unwrap());
