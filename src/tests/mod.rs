@@ -18069,6 +18069,106 @@ mod tests {
         assert_eq!(cache.stats().pinned_entries, 0);
     }
 
+    fn pressure_fields(stats: CacheStats) -> CachePressureSnapshot {
+        CachePressureSnapshot {
+            memory_bytes: stats.memory_bytes,
+            disk_bytes: stats.disk_bytes,
+            async_writeback_queue_bytes: stats.async_writeback_queue_bytes,
+            async_writeback_queue_depth: stats.async_writeback_queue_depth,
+        }
+    }
+
+    #[test]
+    fn pressure_snapshot_matches_stats_after_cache_and_writeback_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MultiLayerCache::with_options(
+            CacheOptions::new(1 << 20, 0, 1 << 20)
+                .with_ssd_paths([dir.path().join("ssd")]),
+        );
+        let memory = CacheKey::string(1, "resident");
+        let disk = CacheKey::string(1, "disk");
+        let queued = CacheKey::string(1, "queued");
+        let assert_equivalent = || {
+            let pressure = cache.pressure_snapshot();
+            assert_eq!(pressure, pressure_fields(cache.stats()));
+            pressure
+        };
+        assert_eq!(assert_equivalent(), CachePressureSnapshot::default());
+        cache.put(memory.clone(), vec![1; 64]).unwrap();
+        cache.put_bypass_storage_for_tier(CacheTier::Ssd, disk.clone(), vec![2; 32]).unwrap();
+        let handle = cache.acquire(&memory).unwrap().unwrap();
+        assert!(cache.stats().pinned_entries > 0);
+        let pressure = assert_equivalent();
+        assert!(pressure.memory_bytes > 0 && pressure.disk_bytes > 0);
+        cache.enqueue_async_writeback(queued.clone(), vec![3; 20]).unwrap();
+        let pressure = assert_equivalent();
+        assert_eq!(pressure.async_writeback_queue_depth, 1);
+        assert_eq!(pressure.async_writeback_queue_bytes, 20);
+        cache.enqueue_async_writeback(queued, vec![4; 30]).unwrap();
+        let pressure = assert_equivalent();
+        assert_eq!(pressure.async_writeback_queue_depth, 1);
+        assert_eq!(pressure.async_writeback_queue_bytes, 30);
+        assert_eq!(cache.drain_async_writeback(8).unwrap().drained, 1);
+        let pressure = assert_equivalent();
+        assert_eq!(pressure.async_writeback_queue_depth, 0);
+        assert_eq!(pressure.async_writeback_queue_bytes, 0);
+        drop(handle);
+        cache.remove(&memory).unwrap();
+        cache.remove(&disk).unwrap();
+        assert_equivalent();
+    }
+
+    #[test]
+    fn sharded_pressure_snapshot_folds_populated_shards_and_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ShardedMultiLayerCache::new(
+            CacheOptions::new(1 << 20, 0, 1 << 20)
+                .with_ssd_paths([dir.path().join("ssd")]),
+            4,
+        );
+        for index in 0..32_u64 {
+            let key = CacheKey::string(index, &format!("pressure-{index}"));
+            cache.put(key.clone(), vec![1; 64]).unwrap();
+            cache.enqueue_async_writeback(key, vec![2; 16]).unwrap();
+        }
+        assert!(cache.shards.iter()
+            .filter(|shard| shard.pressure_snapshot().async_writeback_queue_depth > 0)
+            .count() > 1);
+        let pressure = cache.pressure_snapshot();
+        assert_eq!(pressure, pressure_fields(cache.stats()));
+        assert_eq!(pressure.async_writeback_queue_depth, 32);
+        assert_eq!(pressure.async_writeback_queue_bytes, 32 * 16);
+        cache.drain_async_writeback(64).unwrap();
+        assert_eq!(cache.pressure_snapshot(), pressure_fields(cache.stats()));
+        assert_eq!(cache.pressure_snapshot().async_writeback_queue_depth, 0);
+        assert_eq!(cache.pressure_snapshot().async_writeback_queue_bytes, 0);
+    }
+
+    #[test]
+    fn pressure_snapshot_finishes_while_a_real_pin_stripe_is_held() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cache = MultiLayerCache::with_options(CacheOptions::new(1 << 20, 0, 0));
+        let key = CacheKey::string(1, "pinned");
+        cache.put(key.clone(), vec![1; 64]).unwrap();
+        let _handle = cache.acquire(&key).unwrap().unwrap();
+        let expected = pressure_fields(cache.stats());
+        let inner = cache.inner.read().unwrap();
+        let stripe = inner.pins_for(&key);
+        assert!(stripe.entries.contains_key(&key));
+        std::thread::scope(|scope| {
+            let (done, result) = mpsc::channel();
+            let cache = &cache;
+            let worker = scope.spawn(move || done.send(cache.pressure_snapshot()).unwrap());
+            let observed = result.recv_timeout(Duration::from_secs(5));
+            drop(stripe);
+            drop(inner);
+            worker.join().unwrap();
+            assert_eq!(observed.expect("pressure snapshot waited on a locked pin stripe"), expected);
+        });
+    }
+
     #[test]
     fn sharded_release_batch_iter_drains_pins_across_shards() {
         let dir = tempfile::tempdir().unwrap();
