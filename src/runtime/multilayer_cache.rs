@@ -10199,6 +10199,15 @@ fn finish_sharded_fanout_batch<T, E>(
     result
 }
 
+/// Maintained cache occupancy and asynchronous writeback counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CachePressureSnapshot {
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+    pub async_writeback_queue_bytes: u64,
+    pub async_writeback_queue_depth: u64,
+}
+
 impl ShardedMultiLayerCache {
     const BATCH_FANOUT_THRESHOLD: usize = 256;
     // Queue dispatch and result merging cost more than the resident read for
@@ -10938,6 +10947,24 @@ impl ShardedMultiLayerCache {
         let mut total = CacheFootprint::default();
         for shard in self.shards.iter() {
             total.add(&shard.footprint());
+        }
+        total
+    }
+
+    /// Sample maintained cache pressure counters, one shard at a time.
+    ///
+    /// Like the sharded stats fold, concurrent writes can change a shard
+    /// between samples. No pin or entry inspection is needed.
+    pub fn pressure_snapshot(&self) -> CachePressureSnapshot {
+        let mut total = CachePressureSnapshot::default();
+        for shard in self.shards.iter() {
+            let pressure = shard.pressure_snapshot();
+            total.memory_bytes = total.memory_bytes.saturating_add(pressure.memory_bytes);
+            total.disk_bytes = total.disk_bytes.saturating_add(pressure.disk_bytes);
+            total.async_writeback_queue_bytes = total.async_writeback_queue_bytes
+                .saturating_add(pressure.async_writeback_queue_bytes);
+            total.async_writeback_queue_depth = total.async_writeback_queue_depth
+                .saturating_add(pressure.async_writeback_queue_depth);
         }
         total
     }
@@ -15011,6 +15038,18 @@ impl MultiLayerCache {
     pub fn footprint(&self) -> CacheFootprint {
         let inner = self.inner.read().expect("cache lock poisoned");
         inner.footprint()
+    }
+
+    /// Read the maintained occupancy and writeback counters under one cache
+    /// read guard. This does not acquire the pin stripes or walk any entries.
+    pub fn pressure_snapshot(&self) -> CachePressureSnapshot {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        CachePressureSnapshot {
+            memory_bytes: inner.memory_bytes as u64,
+            disk_bytes: inner.ssd_bytes,
+            async_writeback_queue_bytes: inner.async_writeback_queue_bytes,
+            async_writeback_queue_depth: inner.async_writeback_queue.len() as u64,
+        }
     }
 
     pub fn stats(&self) -> CacheStats {
